@@ -1,0 +1,56 @@
+model:
+  name: "unsloth/Llama-3.2-1B-Instruct"
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  load_in_4bit: true
+  gradient_checkpointing: true
+  allow_tf32: true
+  chat_template: |-
+    {% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] + eos_token }}{% set loop_messages = messages[1:] %}{% else %}{{ 'You are given a problem.
+    Think about the problem and provide your working out.
+    Place it between <start_working_out> and <end_working_out>.
+    Then, provide your solution between <SOLUTION></SOLUTION>' + eos_token }}{% set loop_messages = messages %}{% endif %}{% for message in loop_messages %}{% if message['role'] == 'user' %}{{ message['content'] }}{% elif message['role'] == 'assistant' %}{{ message['content'] + eos_token }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<start_working_out>' }}{% endif %}
+
+data:
+  source: local
+  path: outputs/unsloth_math_data/sft_train.jsonl
+  batch_size: 8
+  micro_batch_size: 2
+  seq_len: 512
+  pack_function: pad
+  shuffle: true
+  seed: 3407
+
+optim:
+  type: adamw_8bit
+  implementation: for-loop
+  lr: 2e-4
+  weight_decay: 0.001
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: linear
+  warmup_steps: 5
+  min_lr: 0.0
+
+lora:
+  rank: 32
+  alpha: 32.0
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+loss_impl: torch
+
+max_grad_norm: 1.0
+max_steps: 60
+seed: 3407
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-unsloth-math
+    name: wavelet-unsloth-math-sft
+    mode: online
+
+output_dir: outputs/unsloth_math_sft

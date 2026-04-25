@@ -1,0 +1,241 @@
+"""Wavelet smart gradient checkpointing — no unsloth dependency.
+
+Monkey-patches torch.utils.checkpoint.CheckpointFunction so that large
+activation tensors saved at each checkpoint boundary are streamed to
+pinned CPU RAM during forward and fetched back during backward.
+
+Based on the approach described in https://unsloth.ai/docs/blog/500k-context-length-fine-tuning#unsloth-gradient-checkpointing-enhancements
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+# Tensors smaller than 2 MB are not worth the CPU↔GPU round-trip overhead.
+_MINIMUM_OFFLOAD_NUMEL = 2 * 1024 * 1024 // 2  # elements (assumes bf16/fp16)
+
+_original_CheckpointFunction: type | None = None
+_original_checkpoint: Any = None
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+
+def _get_device_states(*args) -> tuple[list[int], list]:
+    seen: set[int] = set()
+    devices: list[int] = []
+    for arg in args:
+        if torch.is_tensor(arg) and arg.is_cuda:
+            dev = arg.get_device()
+            if dev not in seen:
+                devices.append(dev)
+                seen.add(dev)
+    states = [torch.cuda.get_rng_state(d) for d in devices]
+    return devices, states
+
+
+def _set_device_states(devices: list[int], states: list) -> None:
+    for dev, state in zip(devices, states):
+        torch.cuda.set_rng_state(state, dev)
+
+
+# ── WaveletCheckpointFunction ─────────────────────────────────────────────────
+
+
+class WaveletCheckpointFunction(torch.autograd.Function):
+    """Reentrant gradient checkpointing with CPU offloading of saved tensors.
+
+    Large CUDA tensors (> 2 MB) are moved to pinned CPU RAM immediately
+    after saving, freeing GPU memory between the forward and backward passes.
+    They are moved back to GPU just before the recomputation in backward.
+    """
+
+    @staticmethod
+    def forward(ctx, run_function, preserve_rng_state, *args):  # type: ignore[override]
+        ctx.run_function = run_function
+        ctx.preserve_rng_state = preserve_rng_state
+
+        ctx.fwd_cpu_state = torch.get_rng_state()
+        ctx.had_cuda_in_fwd = torch.cuda._initialized
+        if ctx.had_cuda_in_fwd:
+            ctx.fwd_gpu_devices, ctx.fwd_gpu_states = _get_device_states(*args)
+
+        with torch.no_grad():
+            outputs = run_function(*args)
+
+        # Split tensor / non-tensor args.  Non-tensors go into ctx.inputs
+        # directly; tensors are saved via save_for_backward (possibly as
+        # CPU copies for large ones).
+        ctx.inputs: list = list(args)
+        ctx.tensor_indices: list[int] = []
+        ctx.offload_info: list[tuple[bool, torch.device | None, bool]] = []
+        tensor_saves: list[torch.Tensor] = []
+
+        for i, arg in enumerate(args):
+            if not torch.is_tensor(arg):
+                continue
+            ctx.tensor_indices.append(i)
+            if arg.is_cuda and arg.numel() > _MINIMUM_OFFLOAD_NUMEL:
+                cpu = torch.empty(
+                    arg.shape, dtype=arg.dtype, device="cpu", pin_memory=True
+                )
+                cpu.copy_(arg, non_blocking=False)
+                tensor_saves.append(cpu)
+                ctx.offload_info.append((True, arg.device, arg.requires_grad))
+                ctx.inputs[i] = None  # release GPU reference
+            else:
+                tensor_saves.append(arg)
+                ctx.offload_info.append((False, None, arg.requires_grad))
+
+        ctx.save_for_backward(*tensor_saves)
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *args):  # type: ignore[override]
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError(
+                "WaveletCheckpointFunction is not compatible with .grad(). "
+                "Use .backward() instead."
+            )
+
+        # Restore saved tensors, moving CPU copies back to GPU.
+        inputs: list = list(ctx.inputs)
+        saved = list(ctx.saved_tensors)
+        for k, (idx, (was_offloaded, device, _)) in enumerate(
+            zip(ctx.tensor_indices, ctx.offload_info)
+        ):
+            if was_offloaded:
+                saved[k] = saved[k].to(device, non_blocking=False)
+            inputs[idx] = saved[k]
+
+        # Rebuild requires_grad info from offload_info.
+        idx_to_rg: dict[int, bool] = {
+            idx: rg for idx, (_, __, rg) in zip(ctx.tensor_indices, ctx.offload_info)
+        }
+
+        # Restore RNG state.
+        rng_devices: list[int] = []
+        if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
+            rng_devices = ctx.fwd_gpu_devices
+
+        with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
+            if ctx.preserve_rng_state:
+                torch.set_rng_state(ctx.fwd_cpu_state)
+                if ctx.had_cuda_in_fwd:
+                    _set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+
+            detached = tuple(
+                inp.detach().requires_grad_(idx_to_rg.get(i, False))
+                if torch.is_tensor(inp)
+                else inp
+                for i, inp in enumerate(inputs)
+            )
+            with torch.enable_grad():
+                outputs = ctx.run_function(*detached)
+
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
+
+        outputs_with_grad, args_with_grad = [], []
+        for out, grad in zip(outputs, args):
+            if torch.is_tensor(out) and out.requires_grad:
+                outputs_with_grad.append(out)
+                args_with_grad.append(grad)
+
+        if not outputs_with_grad:
+            raise RuntimeError(
+                "WaveletCheckpointFunction: none of the recomputed outputs "
+                "require grad — check your model configuration."
+            )
+
+        torch.autograd.backward(outputs_with_grad, args_with_grad)
+
+        return (None, None) + tuple(
+            inp.grad if torch.is_tensor(inp) and inp.requires_grad else None
+            for inp in detached
+        )
+
+
+# ── patch / unpatch ───────────────────────────────────────────────────────────
+
+
+def patch_smart_gc(
+    model: "torch.nn.Module",
+    *,
+    seq_len: int,
+    dtype: torch.dtype = torch.bfloat16,
+) -> bool:
+    """Apply Wavelet smart gradient checkpointing.
+
+    - Monkey-patches torch.utils.checkpoint.CheckpointFunction with
+      WaveletCheckpointFunction which offloads large (> 2 MB) activation
+      tensors to pinned CPU RAM during forward and restores them in backward.
+    - Re-enables model gradient checkpointing with use_reentrant=True so the
+      patched CheckpointFunction is actually used.
+
+    For seq_len < 512 the CPU I/O overhead exceeds the VRAM savings, so
+    standard GC is left in place and this function returns False.
+
+    Returns True if the patch was applied.
+    """
+    global _original_CheckpointFunction, _original_checkpoint
+
+    if seq_len < 512:
+        logger.info("patch_smart_gc: seq_len=%d < 512 — skipping CPU offload", seq_len)
+        return False
+
+    if _original_CheckpointFunction is not None:
+        logger.debug("patch_smart_gc: already patched")
+        return True
+
+    import torch.utils.checkpoint as _cp
+
+    _original_CheckpointFunction = _cp.CheckpointFunction
+    _original_checkpoint = _cp.checkpoint
+
+    _cp.CheckpointFunction = WaveletCheckpointFunction
+
+    _orig = _original_checkpoint
+
+    def _wavelet_checkpoint(function, *args, **kwargs):
+        preserve = kwargs.pop("preserve_rng_state", True)
+        use_reentrant = kwargs.pop("use_reentrant", True)
+        if not use_reentrant:
+            # Non-reentrant path: fall back to original (no offloading)
+            return _orig(function, *args, use_reentrant=False, **kwargs)
+        return WaveletCheckpointFunction.apply(function, preserve, *args)
+
+    _cp.checkpoint = _wavelet_checkpoint
+
+    # Switch the model to reentrant GC so our patched CheckpointFunction runs.
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )
+
+    logger.info(
+        "patch_smart_gc: WaveletCheckpointFunction active (seq_len=%d)", seq_len
+    )
+    return True
+
+
+def unpatch_smart_gc() -> None:
+    """Restore the original torch.utils.checkpoint.CheckpointFunction."""
+    global _original_CheckpointFunction, _original_checkpoint
+
+    if _original_CheckpointFunction is None:
+        return
+
+    import torch.utils.checkpoint as _cp
+
+    _cp.CheckpointFunction = _original_CheckpointFunction
+    _cp.checkpoint = _original_checkpoint
+    _original_CheckpointFunction = None
+    _original_checkpoint = None
+    logger.info("unpatch_smart_gc: restored original CheckpointFunction")
