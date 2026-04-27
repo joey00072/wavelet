@@ -92,6 +92,8 @@ def compute_loss(
     advantages: Tensor,
     loss_mask: Tensor,
     loss_config: RLLossConfig,
+    *,
+    loss_scale: int | float | Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
     outputs = default_loss_fn(
         LossInputs(
@@ -103,6 +105,11 @@ def compute_loss(
         ),
         loss_config,
     )
-    loss_scale = torch.clamp_min(loss_mask.sum(), 1)
-    scaled_loss = outputs.loss / loss_scale
+    if loss_scale is None:
+        scale = torch.clamp_min(loss_mask.sum(), 1)
+    elif isinstance(loss_scale, Tensor):
+        scale = torch.clamp_min(loss_scale.to(outputs.loss.device), 1)
+    else:
+        scale = max(float(loss_scale), 1.0)
+    scaled_loss = outputs.loss / scale
     return scaled_loss, outputs.metrics

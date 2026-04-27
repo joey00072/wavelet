@@ -1,16 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import math
 import random
 from pathlib import Path
+from collections.abc import Callable
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample, load_rl_records
 from wavelet.inference.policy import RLInference
 from wavelet.orchestrator.reward import RLRewardScorer
 from wavelet.orchestrator.queue import FileSystemRolloutSender, RolloutBatch
+
+CustomRolloutFunction = Callable[
+    ["RLOrchestrator", list[RLExample], object | None],
+    list[RLExample],
+]
 
 
 class RLOrchestrator:
@@ -90,6 +97,14 @@ class RLOrchestrator:
         *,
         inference_engine=None,
     ) -> list[RLExample]:
+        if self.config.orchestrator.custom_rollout_function is not None:
+            custom_rollout = self._load_custom_rollout_function(
+                self.config.orchestrator.custom_rollout_function
+            )
+            return self._assign_advantages(
+                custom_rollout(self, records, inference_engine)
+            )
+
         inference = RLInference(self.config)
         if inference_engine is not None:
             annotated = inference_engine.annotate(records)
@@ -143,6 +158,12 @@ class RLOrchestrator:
             self.config.data.reward_column: record.reward,
             self.config.data.temperature_column: record.temperatures,
         }
+        if record.input_ids is not None:
+            payload["input_ids"] = record.input_ids
+        if record.target_ids is not None:
+            payload["target_ids"] = record.target_ids
+        if record.loss_mask is not None:
+            payload["loss_mask"] = record.loss_mask
         if record.inference_logprobs is not None:
             payload[self.config.data.inference_logprobs_column] = (
                 record.inference_logprobs
@@ -155,6 +176,8 @@ class RLOrchestrator:
             payload[self.config.data.chat_template_kwargs_column] = (
                 record.chat_template_kwargs
             )
+        if record.metadata is not None:
+            payload[self.config.data.metadata_column] = record.metadata
         return payload
 
     def _score_record(
@@ -168,12 +191,16 @@ class RLOrchestrator:
             completion=record.completion,
             advantage=record.advantage,
             reward=reward,
+            input_ids=record.input_ids,
+            target_ids=record.target_ids,
+            loss_mask=record.loss_mask,
             target_completion=record.target_completion,
             inference_logprobs=record.inference_logprobs,
             teacher_logprobs=record.teacher_logprobs,
             temperatures=record.temperatures,
             tools=record.tools,
             chat_template_kwargs=record.chat_template_kwargs,
+            metadata=record.metadata,
             source=record.source,
         )
 
@@ -190,6 +217,8 @@ class RLOrchestrator:
             ]
         if mode != "group_reward":
             raise ValueError(f"Unsupported advantage mode: {mode}")
+        if records and all(record.advantage is not None for record in records):
+            return records
 
         grouped: dict[str, list[RLExample]] = {}
         for record in records:
@@ -221,7 +250,9 @@ class RLOrchestrator:
     def _should_retry_zero_advantage(self, records: list[RLExample]) -> bool:
         return not self._filter_zero_advantage_records(records)
 
-    def _filter_zero_advantage_records(self, records: list[RLExample]) -> list[RLExample]:
+    def _filter_zero_advantage_records(
+        self, records: list[RLExample]
+    ) -> list[RLExample]:
         if not self.config.orchestrator.filter_zero_advantage:
             return records
         if self.config.orchestrator.advantage_mode != "group_reward":
@@ -243,16 +274,22 @@ class RLOrchestrator:
             completion=record.completion,
             advantage=advantage,
             reward=record.reward,
+            input_ids=record.input_ids,
+            target_ids=record.target_ids,
+            loss_mask=record.loss_mask,
             target_completion=record.target_completion,
             inference_logprobs=record.inference_logprobs,
             teacher_logprobs=record.teacher_logprobs,
             temperatures=record.temperatures,
             tools=record.tools,
             chat_template_kwargs=record.chat_template_kwargs,
+            metadata=record.metadata,
             source=record.source,
         )
 
     def _group_key(self, record: RLExample) -> str:
+        if record.metadata is not None and "group_key" in record.metadata:
+            return str(record.metadata["group_key"])
         payload = {
             "prompt": record.prompt,
             "target_completion": record.target_completion,
@@ -261,3 +298,19 @@ class RLOrchestrator:
 
     def _example_id(self, record: RLExample) -> str:
         return hashlib.sha1(self._group_key(record).encode("utf-8")).hexdigest()[:12]
+
+    def _load_custom_rollout_function(
+        self,
+        function_path: str,
+    ) -> CustomRolloutFunction:
+        if ":" not in function_path:
+            raise ValueError(
+                "orchestrator.custom_rollout_function must be formatted as "
+                "'module.path:function_name'."
+            )
+        module_name, function_name = function_path.split(":", 1)
+        module = importlib.import_module(module_name)
+        function = getattr(module, function_name)
+        if not callable(function):
+            raise TypeError(f"Custom rollout function is not callable: {function_path}")
+        return function

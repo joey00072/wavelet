@@ -53,12 +53,16 @@ class RLExample:
     completion: list[dict[str, str]]
     advantage: float | list[float] | None
     reward: float | None
+    input_ids: list[int] | None = None
+    target_ids: list[int] | None = None
+    loss_mask: list[bool] | None = None
     target_completion: list[dict[str, str]] | None = None
     inference_logprobs: list[float] | None = None
     teacher_logprobs: list[float] | None = None
     temperatures: float | list[float] | None = None
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
     source: str = "dataset"
 
 
@@ -103,6 +107,121 @@ def _coerce_optional_sequence(
     return [float(value)] * num_trainable_tokens
 
 
+def _trim_loss_mask_to_sequence(
+    loss_mask: list[bool],
+    sequence: list[float] | None,
+) -> list[bool]:
+    if sequence is None:
+        return loss_mask
+    trainable_count = sum(loss_mask)
+    if len(sequence) >= trainable_count:
+        return loss_mask
+
+    to_mask = trainable_count - len(sequence)
+    trimmed = list(loss_mask)
+    for index in range(len(trimmed) - 1, -1, -1):
+        if not trimmed[index]:
+            continue
+        trimmed[index] = False
+        to_mask -= 1
+        if to_mask == 0:
+            break
+    return trimmed
+
+
+def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
+    if record.input_ids is None or record.target_ids is None or record.loss_mask is None:
+        return None
+
+    shifted_seq_len = max(seq_len - 1, 0)
+    input_ids = [int(token_id) for token_id in record.input_ids[:shifted_seq_len]]
+    target_ids = [int(token_id) for token_id in record.target_ids[:shifted_seq_len]]
+    loss_mask = [bool(value) for value in record.loss_mask[:shifted_seq_len]]
+    if not (len(input_ids) == len(target_ids) == len(loss_mask)):
+        raise ValueError(
+            "Pretokenized RL row has mismatched input_ids, target_ids, and loss_mask "
+            f"lengths ({len(input_ids)}, {len(target_ids)}, {len(loss_mask)})."
+        )
+    if sum(loss_mask) == 0:
+        return None
+    return {
+        "input_ids": input_ids,
+        "position_ids": list(range(len(input_ids))),
+        "target_ids": target_ids,
+        "loss_mask": loss_mask,
+        "advantages": [],
+        "temperatures": [],
+        "reward": record.reward,
+    }
+
+
+def prepare_rl_sample(
+    record: RLExample,
+    tokenizer: PreTrainedTokenizerBase,
+    data_config: RLDataConfig,
+    seq_len: int,
+) -> RLSample | None:
+    base_sample = _pretokenized_sample(record, seq_len)
+    if base_sample is None:
+        base_sample = build_sample(
+            Example(
+                prompt=record.prompt,
+                completion=record.completion,
+                tools=record.tools,
+                chat_template_kwargs=record.chat_template_kwargs,
+                source=record.source,
+            ),
+            tokenizer,
+            seq_len=seq_len,
+            loss_mask_config=data_config.loss_mask,
+        )
+    if base_sample is None:
+        return None
+
+    base_sample["loss_mask"] = _trim_loss_mask_to_sequence(
+        base_sample["loss_mask"],
+        record.inference_logprobs if isinstance(record.inference_logprobs, list) else None,
+    )
+    num_trainable_tokens = sum(base_sample["loss_mask"])
+    advantages = _coerce_advantages(
+        record.advantage,
+        fallback_reward=record.reward,
+        num_trainable_tokens=num_trainable_tokens,
+    )
+    inference_logprobs = _coerce_optional_sequence(
+        record.inference_logprobs,
+        num_trainable_tokens=num_trainable_tokens,
+        field_name="inference_logprobs",
+    )
+    teacher_logprobs = _coerce_optional_sequence(
+        record.teacher_logprobs,
+        num_trainable_tokens=num_trainable_tokens,
+        field_name="teacher_logprobs",
+    )
+    temperatures = _coerce_optional_sequence(
+        record.temperatures,
+        num_trainable_tokens=num_trainable_tokens,
+        field_name="temperature",
+        default=1.0,
+    )
+    assert temperatures is not None
+
+    sample: RLSample = {
+        "input_ids": base_sample["input_ids"],
+        "position_ids": base_sample["position_ids"],
+        "target_ids": base_sample["target_ids"],
+        "loss_mask": base_sample["loss_mask"],
+        "advantages": advantages,
+        "temperatures": temperatures,
+        "reward": record.reward,
+    }
+    if inference_logprobs is not None:
+        sample["inference_logprobs"] = inference_logprobs
+    if teacher_logprobs is not None:
+        sample["teacher_logprobs"] = teacher_logprobs
+    return sample
+
+
 def _normalize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLExample:
     from wavelet.data import loading as loading_mod
 
@@ -113,6 +232,9 @@ def _normalize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLExa
     inference_logprobs = payload.get(config.inference_logprobs_column)
     teacher_logprobs = payload.get(config.teacher_logprobs_column)
     temperatures = payload.get(config.temperature_column)
+    metadata = payload.get(config.metadata_column)
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object when provided.")
 
     if config.source == "fake":
         if advantage is None and reward is None:
@@ -129,9 +251,13 @@ def _normalize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLExa
         source=base.source,
         advantage=advantage,
         reward=reward,
+        input_ids=payload.get("input_ids"),
+        target_ids=payload.get("target_ids"),
+        loss_mask=payload.get("loss_mask"),
         inference_logprobs=inference_logprobs,
         teacher_logprobs=teacher_logprobs,
         temperatures=temperatures,
+        metadata=metadata,
     )
 
 
@@ -200,6 +326,37 @@ class RLDataset(IterableDataset[RLSample]):
             "skipped": self.skipped,
         }
 
+    def loss_scale_for_next_local_batch(self, local_batch_size: int) -> int:
+        """Count trainable tokens for the next local optimizer batch."""
+        if local_batch_size <= 0:
+            return 1
+
+        num_examples = len(self.records)
+        data_rank, data_world_size = self._effective_data_partition()
+        total = 0
+        collected = 0
+        offset = 0
+        while collected < local_batch_size:
+            next_step = self.step + offset + 1
+            epoch = (next_step - 1) // num_examples
+            sample_index = (next_step - 1) % num_examples
+            offset += 1
+            if (next_step - 1) % data_world_size != data_rank:
+                continue
+
+            record_index = self._order_for_epoch(epoch)[sample_index]
+            sample = prepare_rl_sample(
+                self.records[record_index],
+                self.tokenizer,
+                self.data_config,
+                self.seq_len,
+            )
+            if sample is None:
+                continue
+            total += sum(sample["loss_mask"])
+            collected += 1
+        return max(total, 1)
+
     def __iter__(self) -> Iterator[RLSample]:
         num_examples = len(self.records)
         if num_examples == 0:
@@ -217,63 +374,19 @@ class RLDataset(IterableDataset[RLSample]):
 
             record_index = self._order_for_epoch(epoch)[sample_index]
             record = self.records[record_index]
-            base_sample = build_sample(
-                Example(
-                    prompt=record.prompt,
-                    completion=record.completion,
-                    tools=record.tools,
-                    chat_template_kwargs=record.chat_template_kwargs,
-                    source=record.source,
-                ),
+            sample = prepare_rl_sample(
+                record,
                 self.tokenizer,
-                seq_len=self.seq_len,
-                loss_mask_config=self.data_config.loss_mask,
+                self.data_config,
+                self.seq_len,
             )
-            if base_sample is None:
+            if sample is None:
                 self.skipped += 1
                 continue
 
-            num_trainable_tokens = sum(base_sample["loss_mask"])
-            advantages = _coerce_advantages(
-                record.advantage,
-                fallback_reward=record.reward,
-                num_trainable_tokens=num_trainable_tokens,
-            )
-            inference_logprobs = _coerce_optional_sequence(
-                record.inference_logprobs,
-                num_trainable_tokens=num_trainable_tokens,
-                field_name="inference_logprobs",
-            )
-            teacher_logprobs = _coerce_optional_sequence(
-                record.teacher_logprobs,
-                num_trainable_tokens=num_trainable_tokens,
-                field_name="teacher_logprobs",
-            )
-            temperatures = _coerce_optional_sequence(
-                record.temperatures,
-                num_trainable_tokens=num_trainable_tokens,
-                field_name="temperature",
-                default=1.0,
-            )
-            assert temperatures is not None
-
             source = record.source or "dataset"
             self.num_samples[source] += 1
-            self.num_tokens[source] += len(base_sample["input_ids"])
-
-            sample: RLSample = {
-                "input_ids": base_sample["input_ids"],
-                "position_ids": base_sample["position_ids"],
-                "target_ids": base_sample["target_ids"],
-                "loss_mask": base_sample["loss_mask"],
-                "advantages": advantages,
-                "temperatures": temperatures,
-                "reward": record.reward,
-            }
-            if inference_logprobs is not None:
-                sample["inference_logprobs"] = inference_logprobs
-            if teacher_logprobs is not None:
-                sample["teacher_logprobs"] = teacher_logprobs
+            self.num_tokens[source] += len(sample["input_ids"])
             yield sample
 
     def _order_for_epoch(self, epoch: int) -> list[int]:
@@ -291,6 +404,190 @@ class RLDataset(IterableDataset[RLSample]):
             self.data_rank * worker_info.num_workers + worker_info.id,
             self.data_world_size * worker_info.num_workers,
         )
+
+
+def _sample_trainable_count(sample: RLSample) -> int:
+    return sum(bool(value) for value in sample["loss_mask"])
+
+
+def _packed_sample(samples: list[RLSample], *, pad_to_multiple_of: int) -> RLSample:
+    input_ids: list[int] = []
+    target_ids: list[int] = []
+    position_ids: list[int] = []
+    loss_mask: list[bool] = []
+    advantages: list[float] = []
+    inference_logprobs: list[float] = []
+    teacher_logprobs: list[float] = []
+    temperatures: list[float] = []
+    rewards = [
+        float(sample["reward"])
+        for sample in samples
+        if sample["reward"] is not None
+    ]
+    has_inference = all("inference_logprobs" in sample for sample in samples)
+    has_teacher = all("teacher_logprobs" in sample for sample in samples)
+
+    for sample in samples:
+        input_ids.extend(sample["input_ids"])
+        target_ids.extend(sample["target_ids"])
+        position_ids.extend(sample["position_ids"])
+        loss_mask.extend(sample["loss_mask"])
+        advantages.extend(sample["advantages"])
+        temperatures.extend(sample["temperatures"])
+        if has_inference:
+            inference_logprobs.extend(sample["inference_logprobs"])
+        if has_teacher:
+            teacher_logprobs.extend(sample["teacher_logprobs"])
+
+    if pad_to_multiple_of > 1:
+        pad_len = (-len(input_ids)) % pad_to_multiple_of
+        if pad_len:
+            input_ids.extend([1] * pad_len)
+            target_ids.extend([0] * pad_len)
+            position_ids.extend(range(pad_len))
+            loss_mask.extend([False] * pad_len)
+
+    packed: RLSample = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "target_ids": target_ids,
+        "loss_mask": loss_mask,
+        "advantages": advantages,
+        "temperatures": temperatures,
+        "reward": sum(rewards) / len(rewards) if rewards else None,
+    }
+    if has_inference:
+        packed["inference_logprobs"] = inference_logprobs
+    if has_teacher:
+        packed["teacher_logprobs"] = teacher_logprobs
+    return packed
+
+
+def _pack_rl_samples(
+    samples: list[RLSample],
+    *,
+    seq_len: int,
+    pad_to_multiple_of: int,
+) -> list[RLSample]:
+    indexed = sorted(enumerate(samples), key=lambda item: -len(item[1]["input_ids"]))
+    bins: list[list[RLSample]] = []
+    bin_lengths: list[int] = []
+    for _, sample in indexed:
+        sample_len = len(sample["input_ids"])
+        for index, current_len in enumerate(bin_lengths):
+            if current_len + sample_len <= seq_len:
+                bins[index].append(sample)
+                bin_lengths[index] += sample_len
+                break
+        else:
+            bins.append([sample])
+            bin_lengths.append(sample_len)
+    return [
+        _packed_sample(items, pad_to_multiple_of=pad_to_multiple_of)
+        for items in bins
+    ]
+
+
+@dataclass
+class PackedRLDataset(IterableDataset[RLSample]):
+    records: list[RLExample]
+    tokenizer: PreTrainedTokenizerBase
+    seq_len: int
+    data_config: RLDataConfig
+    shuffle: bool = False
+    seed: int = 0
+    data_rank: int = 0
+    data_world_size: int = 1
+
+    def __post_init__(self) -> None:
+        self.step = 0
+        self.epoch = 0
+        self.num_samples: dict[str, int] = defaultdict(int)
+        self.num_tokens: dict[str, int] = defaultdict(int)
+        self.skipped = 0
+        self._epoch_bins: dict[int, list[RLSample]] = {}
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "epoch": self.epoch,
+            "num_samples": dict(self.num_samples),
+            "num_tokens": dict(self.num_tokens),
+            "skipped": self.skipped,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.step = int(state_dict["step"])
+        self.epoch = int(state_dict["epoch"])
+        self.num_samples = defaultdict(int, state_dict.get("num_samples", {}))
+        self.num_tokens = defaultdict(int, state_dict.get("num_tokens", {}))
+        self.skipped = int(state_dict.get("skipped", 0))
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "samples": dict(self.num_samples),
+            "tokens": dict(self.num_tokens),
+            "skipped": self.skipped,
+        }
+
+    def micro_batch_count(self) -> int:
+        return max(len(self._bins_for_epoch(self.epoch)), 1)
+
+    def loss_scale_for_next_local_batch(self, _local_batch_size: int) -> int:
+        return max(
+            sum(
+                _sample_trainable_count(sample)
+                for sample in self._bins_for_epoch(self.epoch)
+            ),
+            1,
+        )
+
+    def __iter__(self) -> Iterator[RLSample]:
+        while True:
+            bins = self._bins_for_epoch(self.epoch)
+            if not bins:
+                return
+            for sample in bins:
+                self.step += 1
+                yield sample
+            self.epoch += 1
+
+    def _bins_for_epoch(self, epoch: int) -> list[RLSample]:
+        cached = self._epoch_bins.get(epoch)
+        if cached is not None:
+            return cached
+
+        order = list(range(len(self.records)))
+        if self.shuffle:
+            rng = random.Random(self.seed + epoch)
+            rng.shuffle(order)
+        samples: list[RLSample] = []
+        data_rank, data_world_size = self.data_rank, self.data_world_size
+        for logical_index, record_index in enumerate(order):
+            if logical_index % data_world_size != data_rank:
+                continue
+            record = self.records[record_index]
+            sample = prepare_rl_sample(
+                record,
+                self.tokenizer,
+                self.data_config,
+                self.seq_len,
+            )
+            if sample is None:
+                self.skipped += 1
+                continue
+            source = record.source or "dataset"
+            self.num_samples[source] += 1
+            self.num_tokens[source] += len(sample["input_ids"])
+            samples.append(sample)
+
+        packed = _pack_rl_samples(
+            samples,
+            seq_len=self.seq_len,
+            pad_to_multiple_of=self.data_config.pad_to_multiple_of,
+        )
+        self._epoch_bins[epoch] = packed
+        return packed
 
 
 class FakeRLDataset(IterableDataset[RLSample]):
@@ -507,8 +804,24 @@ def setup_rl_dataset(
             input_mode=config.fake_input_ids,
             seed=config.seed + data_rank,
         )
+    records = load_rl_records(config)
+    has_rl_targets = all(
+        record.advantage is not None or record.reward is not None
+        for record in records
+    )
+    if config.pack_sequences and has_rl_targets:
+        return PackedRLDataset(
+            records=records,
+            tokenizer=tokenizer,
+            seq_len=config.seq_len,
+            data_config=config,
+            shuffle=config.shuffle,
+            seed=config.seed,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
+        )
     return RLDataset(
-        records=load_rl_records(config),
+        records=records,
         tokenizer=tokenizer,
         seq_len=config.seq_len,
         data_config=config,

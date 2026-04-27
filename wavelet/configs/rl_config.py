@@ -29,6 +29,8 @@ class RLDataConfig(BaseModel):
     stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted"
     batch_size: int = Field(default=4, ge=1)
     micro_batch_size: int = Field(default=1, ge=1)
+    pack_sequences: bool = False
+    pad_to_multiple_of: int = Field(default=1, ge=1)
     num_workers: int = Field(default=0, ge=0)
     pin_memory: bool = True
     seq_len: int = Field(default=128, ge=8)
@@ -47,6 +49,7 @@ class RLDataConfig(BaseModel):
     inference_logprobs_column: str = "inference_logprobs"
     teacher_logprobs_column: str = "teacher_logprobs"
     temperature_column: str = "temperature"
+    metadata_column: str = "metadata"
     fake_vocab_size: int = Field(default=32000, ge=8)
     fake_length: Literal["fixed", "variable"] = "fixed"
     fake_input_ids: Literal["random", "increasing"] = "random"
@@ -125,7 +128,8 @@ class RLPolicyTransferConfig(BaseModel):
 class RLSamplingConfig(BaseModel):
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
-    top_k: int = Field(default=0, ge=0)
+    top_k: int = Field(default=-1, ge=-1)
+    min_p: float = Field(default=0.0, ge=0.0, le=1.0)
     repetition_penalty: float = Field(default=1.0, gt=0.0)
     max_completion_tokens: int = Field(default=128, ge=1)
     do_sample: bool = True
@@ -144,6 +148,7 @@ class RLVLLMConfig(BaseModel):
     trust_remote_code: bool | None = None
     dtype: Literal["auto", "float32", "float16", "bfloat16"] | None = None
     use_generation_logprobs: bool = True
+    openai_batch_wait_seconds: float = Field(default=0.01, ge=0.0)
 
 
 class RLVLLMHTTPConfig(BaseModel):
@@ -182,24 +187,41 @@ class RLRewardConfig(BaseModel):
     @model_validator(mode="after")
     def validate_reward_postprocessing(self) -> "RLRewardConfig":
         if (self.rescale_min is None) != (self.rescale_max is None):
-            raise ValueError("reward.rescale_min and reward.rescale_max must be set together")
+            raise ValueError(
+                "reward.rescale_min and reward.rescale_max must be set together"
+            )
         if (
             self.rescale_min is not None
             and self.rescale_max is not None
             and self.rescale_max <= self.rescale_min
         ):
-            raise ValueError("reward.rescale_max must be greater than reward.rescale_min")
+            raise ValueError(
+                "reward.rescale_max must be greater than reward.rescale_min"
+            )
         if (
             self.clamp_min is not None
             and self.clamp_max is not None
             and self.clamp_max < self.clamp_min
         ):
-            raise ValueError("reward.clamp_max must be greater than or equal to reward.clamp_min")
+            raise ValueError(
+                "reward.clamp_max must be greater than or equal to reward.clamp_min"
+            )
         return self
 
 
 class RLOrchestratorConfig(BaseModel):
     enabled: bool = True
+    custom_rollout_function: str | None = None
+    verifier_env_id: str | None = None
+    verifier_env_args: dict[str, Any] = Field(default_factory=dict)
+    verifier_model: str | None = None
+    verifier_base_url: str | None = None
+    verifier_api_key_var: str = "PRIME_API_KEY"
+    verifier_client_type: Literal[
+        "openai_chat_completions",
+        "openai_chat_completions_token",
+    ] = "openai_chat_completions"
+    verifier_max_retries: int = Field(default=0, ge=0)
     materialize_path: Path | None = None
     overwrite: bool = True
     advantage_mode: Literal["passthrough", "reward", "group_reward"] = "passthrough"
@@ -271,6 +293,7 @@ class RLConfig(BaseModel):
         if (
             self.inference.mode in {"vllm", "vllm_http"}
             and self.reward.mode == "passthrough"
+            and self.orchestrator.custom_rollout_function is None
         ):
             raise ValueError(
                 "reward.mode must score generated completions when inference.mode "
@@ -281,7 +304,7 @@ class RLConfig(BaseModel):
     @model_validator(mode="after")
     def resolve_rollouts_per_example(self) -> "RLConfig":
         rollouts_per_example = self.orchestrator.rollouts_per_example
-        if rollouts_per_example is None:
+        if rollouts_per_example is None or self.orchestrator.custom_rollout_function:
             return self
         self.inference = self.inference.model_copy(
             update={

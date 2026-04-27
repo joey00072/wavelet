@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import gc
 import os
-from dataclasses import replace
+import threading
+from dataclasses import dataclass, replace
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import torch
@@ -12,8 +14,20 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.loading import Example
 from wavelet.data.rl_dataset import RLExample
 from wavelet.data.tokenization import build_sample
-from wavelet.inference.policy import PolicyInferenceEngine, RLInference
+from wavelet.inference.policy import PolicyInferenceEngine, RLInference, token_ids
 from wavelet.trainer.model import setup_tokenizer
+
+
+def _perf_enabled() -> bool:
+    return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class _OpenAIBatchRequest:
+    payload: dict[str, Any]
+    done: threading.Event
+    result: dict[str, Any] | None = None
+    error: BaseException | None = None
 
 
 def _logprob_value(value: object) -> float:
@@ -98,6 +112,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         self.llm = None
         self.tokenizer = None
         self._lora_request = None
+        self._generate_lock = threading.Lock()
+        self._openai_batch: list[_OpenAIBatchRequest] = []
+        self._openai_batch_condition = threading.Condition()
+        self._openai_batch_worker: threading.Thread | None = None
+        self._tokenize_calls = 0
+        self._tokenize_tokens = 0
+        self._tokenize_seconds = 0.0
 
     def setup(self) -> None:
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
@@ -134,12 +155,25 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         }
         self.llm = LLM(**kwargs)
         self.tokenizer = setup_tokenizer(self.config.model)
+        self._openai_batch_worker = threading.Thread(
+            target=self._openai_batch_loop,
+            name="wavelet-openai-batcher",
+            daemon=True,
+        )
+        self._openai_batch_worker.start()
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
+        started_at = perf_counter()
         adapter_dir = policy_dir / "adapter"
         if adapter_dir.exists():
-            self._load_adapter_policy(adapter_dir)
+            self._load_adapter_policy(adapter_dir, step=step)
             self.policy_step = step
+            if _perf_enabled():
+                print(
+                    "WAVELET_PERF vllm_load_policy "
+                    f"step={step} kind=adapter seconds={perf_counter() - started_at:.3f}",
+                    flush=True,
+                )
             return
         model_dir = policy_dir / "model"
         if model_dir.exists():
@@ -181,12 +215,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             for record in records
         ]
         sampling_params = self._sampling_params()
-        request_outputs = self.llm.generate(
-            prompts,
-            sampling_params,
-            use_tqdm=False,
-            lora_request=self._lora_request,
-        )
+        with self._generate_lock:
+            request_outputs = self.llm.generate(
+                prompts,
+                sampling_params,
+                use_tqdm=False,
+                lora_request=self._lora_request,
+            )
         self._mark_lora_loaded()
 
         generated_records: list[RLExample] = []
@@ -219,6 +254,273 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             generation_logprobs=generation_logprobs,
         )
 
+    def openai_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = _OpenAIBatchRequest(payload=payload, done=threading.Event())
+        with self._openai_batch_condition:
+            self._openai_batch.append(request)
+            self._openai_batch_condition.notify()
+        request.done.wait()
+        if request.error is not None:
+            raise request.error
+        if request.result is None:
+            raise RuntimeError("OpenAI chat completion batcher returned no result.")
+        return request.result
+
+    def _openai_batch_loop(self) -> None:
+        while True:
+            with self._openai_batch_condition:
+                while not self._openai_batch:
+                    self._openai_batch_condition.wait()
+                # Give concurrent verifier calls a short window to coalesce into
+                # fewer vLLM generate calls. Prime-RL's token client relies on
+                # continuous batching; this approximates that for our in-process
+                # compatibility server.
+                self._openai_batch_condition.wait(
+                    timeout=self.config.inference.vllm.openai_batch_wait_seconds,
+                )
+                batch = self._openai_batch
+                self._openai_batch = []
+
+            try:
+                results = self._openai_chat_completion_batch(
+                    [request.payload for request in batch],
+                )
+            except BaseException as exc:
+                for request in batch:
+                    request.error = exc
+                    request.done.set()
+                continue
+
+            for request, result in zip(batch, results, strict=True):
+                request.result = result
+                request.done.set()
+
+    def _openai_chat_completion_batch(
+        self,
+        payloads: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        started_at = perf_counter()
+        if self.llm is None or self.tokenizer is None:
+            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        try:
+            from vllm import SamplingParams
+        except ImportError as exc:
+            raise ImportError("vLLM SamplingParams import failed.") from exc
+
+        prompts: list[dict[str, list[int]]] = []
+        prompt_id_rows: list[list[int]] = []
+        sampling_params: list[Any] = []
+        for payload in payloads:
+            messages = payload["messages"]
+            prompt_ids = payload.get("tokens")
+            if prompt_ids is None:
+                prompt_ids = token_ids(
+                    self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=payload.get("tools"),
+                    )
+                )
+            else:
+                prompt_ids = [int(token_id) for token_id in prompt_ids]
+            sampling_kwargs = self._openai_sampling_kwargs(payload)
+            prompt_ids, sampling_kwargs = self._fit_openai_context(
+                prompt_ids,
+                sampling_kwargs,
+            )
+            prompt_id_rows.append(prompt_ids)
+            prompts.append({"prompt_token_ids": prompt_ids})
+            sampling_params.append(SamplingParams(**sampling_kwargs))
+
+        prefill_tokens = sum(len(row) for row in prompt_id_rows)
+        with self._generate_lock:
+            outputs = self.llm.generate(
+                prompts,
+                sampling_params,
+                use_tqdm=False,
+                lora_request=self._lora_request,
+            )
+        self._mark_lora_loaded()
+        results: list[dict[str, Any]] = []
+        completion_tokens = 0
+        for payload, prompt_ids, request_output in zip(
+            payloads,
+            prompt_id_rows,
+            outputs,
+            strict=True,
+        ):
+            output = request_output.outputs[0]
+            completion_ids = [
+                int(token_id) for token_id in (getattr(output, "token_ids", None) or [])
+            ]
+            completion_tokens += len(completion_ids)
+            completion_logprobs = self._openai_logprob_content(
+                completion_ids,
+                getattr(output, "logprobs", None),
+            )
+            finish_reason = (
+                "length"
+                if getattr(output, "finish_reason", None) == "length"
+                else "stop"
+            )
+            results.append(
+                {
+                    "id": f"wavelet-{self.policy_step or 0}",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": payload.get("model") or self.config.model.name,
+                    "prompt_token_ids": prompt_ids,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": output.text,
+                            },
+                            "finish_reason": finish_reason,
+                            "token_ids": completion_ids,
+                            "logprobs": {"content": completion_logprobs},
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(prompt_ids),
+                        "completion_tokens": len(completion_ids),
+                        "total_tokens": len(prompt_ids) + len(completion_ids),
+                    },
+                }
+            )
+        seconds = perf_counter() - started_at
+        max_memory = 0
+        if torch.cuda.is_available():
+            max_memory = torch.cuda.max_memory_reserved()
+        if _perf_enabled():
+            tokenize_calls = self._tokenize_calls
+            tokenize_tokens = self._tokenize_tokens
+            tokenize_seconds = self._tokenize_seconds
+            self._tokenize_calls = 0
+            self._tokenize_tokens = 0
+            self._tokenize_seconds = 0.0
+            print(
+                "WAVELET_PERF vllm_openai_batch "
+                f"batch={len(payloads)} prefill_tokens={prefill_tokens} "
+                f"completion_tokens={completion_tokens} seconds={seconds:.3f} "
+                f"tokens_per_s={(prefill_tokens + completion_tokens) / max(seconds, 1e-9):.1f} "
+                f"tokenize_calls={tokenize_calls} tokenize_tokens={tokenize_tokens} "
+                f"tokenize_seconds={tokenize_seconds:.4f} "
+                f"cuda_max_reserved={max_memory}",
+                flush=True,
+            )
+        return results
+
+    def _openai_sampling_kwargs(self, payload: dict[str, Any]) -> dict[str, Any]:
+        extra_body = payload.get("extra_body") or {}
+        max_tokens = (
+            payload.get("max_completion_tokens")
+            or payload.get("max_tokens")
+            or self.config.inference.sampling.max_completion_tokens
+        )
+        kwargs: dict[str, Any] = {
+            "n": 1,
+            "temperature": float(payload.get("temperature", 1.0)),
+            "top_p": float(payload.get("top_p", 1.0)),
+            "max_tokens": int(max_tokens),
+        }
+        repetition_penalty = payload.get("repetition_penalty") or extra_body.get(
+            "repetition_penalty"
+        )
+        if repetition_penalty is not None:
+            kwargs["repetition_penalty"] = float(repetition_penalty)
+        top_k = payload.get("top_k") or extra_body.get("top_k")
+        if top_k is not None:
+            kwargs["top_k"] = int(top_k)
+        min_p = payload.get("min_p") or extra_body.get("min_p")
+        if min_p is not None:
+            kwargs["min_p"] = float(min_p)
+        seed = payload.get("seed")
+        if seed is not None:
+            kwargs["seed"] = int(seed)
+        if (
+            payload.get("logprobs")
+            or payload.get("return_token_ids")
+            or extra_body.get("return_token_ids")
+        ):
+            kwargs["logprobs"] = 1
+        return kwargs
+
+    def _fit_openai_context(
+        self,
+        prompt_ids: list[int],
+        sampling_kwargs: dict[str, Any],
+    ) -> tuple[list[int], dict[str, Any]]:
+        max_model_len = self.config.inference.vllm.max_model_len
+        if max_model_len is None or max_model_len <= 0:
+            return prompt_ids, sampling_kwargs
+
+        fitted_kwargs = dict(sampling_kwargs)
+        max_prompt_len = max(max_model_len - 1, 1)
+        if len(prompt_ids) > max_prompt_len:
+            prompt_ids = prompt_ids[-max_prompt_len:]
+
+        room = max(max_model_len - len(prompt_ids), 1)
+        fitted_kwargs["max_tokens"] = min(int(fitted_kwargs["max_tokens"]), room)
+        return prompt_ids, fitted_kwargs
+
+    def tokenize_messages(self, payload: dict[str, Any]) -> dict[str, Any]:
+        started_at = perf_counter()
+        if self.tokenizer is None:
+            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        if "prompt" in payload:
+            ids = token_ids(self.tokenizer(payload["prompt"], add_special_tokens=False))
+        else:
+            ids = token_ids(
+                self.tokenizer.apply_chat_template(
+                    payload["messages"],
+                    tokenize=True,
+                    add_generation_prompt=payload.get("add_generation_prompt", True),
+                    tools=payload.get("tools"),
+                )
+            )
+        seconds = perf_counter() - started_at
+        self._tokenize_calls += 1
+        self._tokenize_tokens += len(ids)
+        self._tokenize_seconds += seconds
+        return {
+            "count": len(ids),
+            "max_model_len": self.config.inference.vllm.max_model_len
+            or self.config.data.seq_len
+            + 1,
+            "tokens": ids,
+        }
+
+    def _openai_logprob_content(
+        self,
+        token_ids: list[int],
+        logprobs: object,
+    ) -> list[dict[str, object]]:
+        if self.tokenizer is None:
+            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        if logprobs is None:
+            return [
+                {
+                    "token": "",
+                    "logprob": 0.0,
+                    "bytes": None,
+                    "top_logprobs": [],
+                }
+                for token_id in token_ids
+            ]
+        values = _extract_vllm_generation_logprobs(logprobs, token_ids)
+        return [
+            {
+                "token": "",
+                "logprob": logprob,
+                "bytes": None,
+                "top_logprobs": [],
+            }
+            for token_id, logprob in zip(token_ids, values, strict=True)
+        ]
+
     def close(self) -> None:
         self.llm = None
         self.tokenizer = None
@@ -242,13 +544,14 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         }
         if self.config.inference.vllm.use_generation_logprobs:
             kwargs["logprobs"] = 1
-        if sampling.top_k > 0:
+        if sampling.top_k != 0:
             kwargs["top_k"] = sampling.top_k
+        kwargs["min_p"] = sampling.min_p
         if sampling.seed is not None:
             kwargs["seed"] = sampling.seed
         return SamplingParams(**kwargs)
 
-    def _load_adapter_policy(self, adapter_dir: Path) -> None:
+    def _load_adapter_policy(self, adapter_dir: Path, *, step: int | None = None) -> None:
         if self.llm is None:
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
         if self.config.lora is None:
@@ -258,11 +561,14 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         except ImportError as exc:
             raise ImportError("vLLM LoRARequest import failed.") from exc
 
+        adapter_id = self.config.policy_transfer.adapter_id
+        if step is not None:
+            adapter_id += step
         self._lora_request = LoRARequest(
             self.config.policy_transfer.adapter_name,
-            self.config.policy_transfer.adapter_id,
+            adapter_id,
             str(adapter_dir),
-            load_inplace=True,
+            load_inplace=False,
         )
 
     def _attach_generation_or_prompt_logprobs(
@@ -368,12 +674,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             full_token_ids = list(sample["input_ids"]) + [sample["target_ids"][-1]]
             prompts.append({"prompt_token_ids": full_token_ids})
 
-        scoring_outputs = self.llm.generate(
-            prompts,
-            self._prompt_logprob_params(),
-            use_tqdm=False,
-            lora_request=self._lora_request,
-        )
+        with self._generate_lock:
+            scoring_outputs = self.llm.generate(
+                prompts,
+                self._prompt_logprob_params(),
+                use_tqdm=False,
+                lora_request=self._lora_request,
+            )
         self._mark_lora_loaded()
 
         effective_temperature = max(
