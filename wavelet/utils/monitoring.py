@@ -103,6 +103,7 @@ class RunMonitor:
 
         if self._wandb_run is not None:
             wandb_metrics = {k: v for k, v in row.items() if k != "timestamp"}
+            wandb_metrics.update(self._wandb_alias_metrics(row))
             self._wandb_run.log(wandb_metrics, step=step)
 
         self._write_heartbeat(status="running", step=step, metrics=row)
@@ -278,6 +279,22 @@ class RunMonitor:
             config=run_config,
             resume="allow" if resumed_from is not None else None,
         )
+        self._wandb_run.define_metric("step")
+        self._wandb_run.define_metric("*", step_metric="step")
+
+    @staticmethod
+    def _wandb_alias_metrics(row: dict[str, Any]) -> dict[str, Any]:
+        aliases: dict[str, Any] = {}
+        if "reward_mean" in row:
+            aliases["reward"] = row["reward_mean"]
+            aliases["train/reward_mean"] = row["reward_mean"]
+        if "reward/all/mean" in row:
+            aliases["rollout/reward_mean"] = row["reward/all/mean"]
+        if "rollout/count" in row:
+            aliases["rollout/count"] = row["rollout/count"]
+        if "loss" in row:
+            aliases["train/loss"] = row["loss"]
+        return aliases
 
     def _timestamp(self) -> str:
         return datetime.now(timezone.utc).isoformat()

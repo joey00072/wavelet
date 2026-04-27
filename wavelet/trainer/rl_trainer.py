@@ -16,20 +16,22 @@ from tqdm import tqdm
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.loading import Example
 from wavelet.data.rl_dataset import (
+    PackedRLDataset,
     RLDataset,
     _normalize_rl_record,
+    _pretokenized_sample,
     setup_rl_dataloader,
     setup_rl_dataset,
 )
 from wavelet.data.tokenization import build_sample
-from wavelet.trainer.base import BaseTrainer
-from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.orchestrator.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
     get_policy_step_dir,
     resolve_policy_dir,
 )
+from wavelet.trainer.base import BaseTrainer
+from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.rl_loss import compute_loss, selective_log_softmax
 from wavelet.utils.monitoring import RunMonitor
 from wavelet.utils.pathing import resolve_resume_checkpoint
@@ -63,8 +65,12 @@ class RLTrainer(BaseTrainer):
         self.monitor: RunMonitor | None = None
         self.step = 0
         self._micro_step = 0
+        self._accumulated_micro_batches = 0
         self._reward_accum: list[float] = []
         self._rollout_metric_accum: list[dict[str, float]] = []
+        self._train_loss_accum: list[float] = []
+        self._train_metric_accum: list[dict[str, float]] = []
+        self._optimizer_batch_loss_scale: int | None = None
         self.accumulation_steps = config.data.batch_size // config.data.micro_batch_size
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -88,6 +94,9 @@ class RLTrainer(BaseTrainer):
             self.config.data,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+        if isinstance(self.dataset, PackedRLDataset):
+            self.accumulation_steps = self.dataset.micro_batch_count()
+        self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
 
     def setup(self) -> None:
         super().setup()
@@ -138,6 +147,7 @@ class RLTrainer(BaseTrainer):
                 )
             self.step = trainer_state.step
             self._micro_step = trainer_state.micro_step
+            self._accumulated_micro_batches = 0
 
         self.monitor.start_run(
             run_config=self.config.model_dump(mode="json", exclude_none=True),
@@ -301,18 +311,20 @@ class RLTrainer(BaseTrainer):
             raise RuntimeError("Tokenizer must be set up before sample logging.")
 
         record = _normalize_rl_record(payload, self.config.data)
-        tokenized = build_sample(
-            Example(
-                prompt=record.prompt,
-                completion=record.completion,
-                tools=record.tools,
-                chat_template_kwargs=record.chat_template_kwargs,
-                source=record.source,
-            ),
-            self.tokenizer,
-            seq_len=self.config.data.seq_len,
-            loss_mask_config=self.config.data.loss_mask,
-        )
+        tokenized = _pretokenized_sample(record, self.config.data.seq_len)
+        if tokenized is None:
+            tokenized = build_sample(
+                Example(
+                    prompt=record.prompt,
+                    completion=record.completion,
+                    tools=record.tools,
+                    chat_template_kwargs=record.chat_template_kwargs,
+                    source=record.source,
+                ),
+                self.tokenizer,
+                seq_len=self.config.data.seq_len,
+                loss_mask_config=self.config.data.loss_mask,
+            )
         if tokenized is None:
             return None
 
@@ -443,6 +455,19 @@ class RLTrainer(BaseTrainer):
             )
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
+    def _estimate_optimizer_batch_loss_scale(self) -> int | None:
+        if self.config.data.num_workers != 0:
+            return None
+        if not isinstance(self.dataset, (RLDataset, PackedRLDataset)):
+            return None
+        records = self.dataset.records
+        if any(
+            record.advantage is None and record.reward is None
+            for record in records
+        ):
+            return None
+        return self.dataset.loss_scale_for_next_local_batch(self.accumulation_steps)
+
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.world is None:
             raise RuntimeError("World not set up")
@@ -476,27 +501,44 @@ class RLTrainer(BaseTrainer):
                 batch["advantages"],
                 batch["loss_mask"],
                 self.config.loss,
+                loss_scale=self._optimizer_batch_loss_scale,
             )
 
             if torch.isnan(loss):
                 logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
                 self._micro_step += 1
-                if self._micro_step % self.accumulation_steps == 0:
+                self._accumulated_micro_batches += 1
+                if self._accumulated_micro_batches >= self.accumulation_steps:
                     self._reward_accum.clear()
                     self._rollout_metric_accum.clear()
+                    self._train_loss_accum.clear()
+                    self._train_metric_accum.clear()
+                    self._accumulated_micro_batches = 0
+                    self._optimizer_batch_loss_scale = (
+                        self._estimate_optimizer_batch_loss_scale()
+                    )
                 return None
 
             sync_context = self._maybe_no_sync()
             with sync_context:
-                (loss / self.accumulation_steps).backward()
+                if self._optimizer_batch_loss_scale is None:
+                    backward_loss = loss / self.accumulation_steps
+                else:
+                    backward_loss = loss
+                backward_loss.backward()
 
         reward_mean = self._reward_mean(batch["rewards"])
         if reward_mean is not None:
             self._reward_accum.append(reward_mean)
         self._rollout_metric_accum.append(self._batch_rollout_metrics(batch))
+        self._train_loss_accum.append(float(loss.detach().item()))
+        self._train_metric_accum.append(
+            {key: float(value.detach().item()) for key, value in raw_metrics.items()}
+        )
 
         self._micro_step += 1
-        if self._micro_step % self.accumulation_steps != 0:
+        self._accumulated_micro_batches += 1
+        if self._accumulated_micro_batches < self.accumulation_steps:
             return None
 
         grad_norm = None
@@ -506,11 +548,16 @@ class RLTrainer(BaseTrainer):
         self.scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.step += 1
+        self._accumulated_micro_batches = 0
 
-        metrics = {
-            "loss": float(loss.detach().item()),
-            **{key: float(value.detach().item()) for key, value in raw_metrics.items()},
-        }
+        if self._optimizer_batch_loss_scale is None:
+            logged_loss = sum(self._train_loss_accum) / len(self._train_loss_accum)
+        else:
+            logged_loss = sum(self._train_loss_accum)
+        metrics = {"loss": logged_loss}
+        metrics.update(self._aggregate_train_metrics(self._train_metric_accum))
+        self._train_loss_accum.clear()
+        self._train_metric_accum.clear()
         if self._reward_accum:
             metrics["reward_mean"] = sum(self._reward_accum) / len(self._reward_accum)
             self._reward_accum.clear()
@@ -521,6 +568,7 @@ class RLTrainer(BaseTrainer):
             metrics["optim/grad_norm"] = grad_norm
         metrics.update(self._prime_style_metric_aliases(metrics))
         metrics = self._sync_metrics(metrics)
+        self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
         return metrics
 
     def _inference_logprobs(
@@ -629,6 +677,20 @@ class RLTrainer(BaseTrainer):
                 aggregated[key] = sum(values) / len(values)
         return aggregated
 
+    def _aggregate_train_metrics(
+        self,
+        micro_metrics: list[dict[str, float]],
+    ) -> dict[str, float]:
+        if not micro_metrics:
+            return {}
+        aggregated: dict[str, float] = {}
+        all_keys = set().union(*(metrics.keys() for metrics in micro_metrics))
+        for key in all_keys:
+            values = [metrics[key] for metrics in micro_metrics if key in metrics]
+            if values:
+                aggregated[key] = sum(values) / len(values)
+        return aggregated
+
     def _prime_style_metric_aliases(
         self, metrics: dict[str, float]
     ) -> dict[str, float]:
@@ -660,7 +722,7 @@ class RLTrainer(BaseTrainer):
     def _maybe_no_sync(self) -> contextlib.AbstractContextManager[None]:
         if self.world is None or self.world.world_size <= 1:
             return contextlib.nullcontext()
-        will_step = (self._micro_step + 1) % self.accumulation_steps == 0
+        will_step = self._accumulated_micro_batches + 1 >= self.accumulation_steps
         if will_step:
             return contextlib.nullcontext()
         no_sync = getattr(self.model, "no_sync", None)

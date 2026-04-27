@@ -37,6 +37,7 @@ def _build_app(config: RLConfig):
     @app.on_event("startup")
     def startup() -> None:
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         if config.lora is not None:
             os.environ.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True")
         engine.setup()
@@ -86,7 +87,7 @@ def _build_app(config: RLConfig):
             )
         adapter_path = Path(raw_adapter_path)
         step = int(payload.get("step", engine.policy_step or 0))
-        engine._load_adapter_policy(adapter_path)  # noqa: SLF001
+        engine._load_adapter_policy(adapter_path, step=step)  # noqa: SLF001
         engine.policy_step = step
         return {"status": "ok", "policy_step": engine.policy_step}
 
@@ -125,6 +126,20 @@ def _build_app(config: RLConfig):
             "policy_step": engine.policy_step,
         }
 
+    @app.post("/v1/chat/completions")
+    def openai_chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
+        return engine.openai_chat_completion(payload)
+
+    @app.post("/v1/chat/completions/tokens")
+    @app.post("/chat/completions/tokens")
+    def openai_chat_completions_tokens(payload: dict[str, Any]) -> dict[str, Any]:
+        return engine.openai_chat_completion(payload)
+
+    @app.post("/v1/tokenize")
+    @app.post("/tokenize")
+    def tokenize(payload: dict[str, Any]) -> dict[str, Any]:
+        return engine.tokenize_messages(payload)
+
     return app
 
 
@@ -146,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
         host=config.inference.http.host,
         port=config.inference.http.port,
         log_level="info",
+        access_log=False,
     )
     return 0
 
