@@ -193,6 +193,8 @@ class WandbConfig(BaseModel):
     project: str | None = None
     entity: str | None = None
     name: str | None = None
+    group: str | None = None
+    tags: list[str] | None = None
     mode: Literal["online", "offline", "disabled"] = "offline"
 
 
