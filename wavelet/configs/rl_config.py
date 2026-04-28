@@ -137,6 +137,89 @@ class RLSamplingConfig(BaseModel):
     seed: int | None = None
 
 
+class RLEvalSamplingConfig(BaseModel):
+    temperature: float | None = Field(default=None, ge=0.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=-1)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    repetition_penalty: float | None = Field(default=None, gt=0.0)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
+    seed: int | None = None
+    extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    def to_sampling_args(self) -> dict[str, Any]:
+        args: dict[str, Any] = {"logprobs": True}
+        if self.temperature is not None:
+            args["temperature"] = self.temperature
+        if self.top_p is not None:
+            args["top_p"] = self.top_p
+        if self.max_completion_tokens is not None:
+            args["max_completion_tokens"] = self.max_completion_tokens
+        if self.seed is not None:
+            args["seed"] = self.seed
+
+        extra_body = dict(self.extra_body)
+        extra_body["return_token_ids"] = True
+        if self.top_k is not None:
+            extra_body["top_k"] = self.top_k
+        if self.min_p is not None:
+            extra_body["min_p"] = self.min_p
+        if self.repetition_penalty is not None:
+            extra_body["repetition_penalty"] = self.repetition_penalty
+        args["extra_body"] = extra_body
+        return args
+
+
+class RLEvalEnvConfig(BaseModel):
+    id: str
+    name: str | None = None
+    args: dict[str, Any] = Field(default_factory=dict)
+    sampling: RLEvalSamplingConfig = RLEvalSamplingConfig()
+    num_examples: int = -1
+    rollouts_per_example: int = Field(default=1, ge=1)
+    interval: int = Field(default=100, ge=1)
+    max_retries: int = Field(default=0, ge=0)
+
+    @property
+    def resolved_name(self) -> str:
+        return self.name or self.id.split("@", 1)[0]
+
+
+class RLEvalConfig(BaseModel):
+    env: list[RLEvalEnvConfig] = Field(default_factory=list)
+    sampling: RLEvalSamplingConfig = RLEvalSamplingConfig()
+    num_examples: int = -1
+    rollouts_per_example: int = Field(default=1, ge=1)
+    interval: int = Field(default=100, ge=1)
+    max_retries: int = Field(default=0, ge=0)
+    eval_base_model: bool = True
+    final_eval: bool = True
+
+    @model_validator(mode="after")
+    def resolve_env_defaults(self) -> "RLEvalConfig":
+        group_sampling = self.sampling.model_dump()
+        for env in self.env:
+            if "sampling" not in env.model_fields_set:
+                env.sampling = RLEvalSamplingConfig(**group_sampling)
+            else:
+                merged = group_sampling | env.sampling.model_dump(exclude_unset=True)
+                env.sampling = RLEvalSamplingConfig(**merged)
+            if "num_examples" not in env.model_fields_set:
+                env.num_examples = self.num_examples
+            if "rollouts_per_example" not in env.model_fields_set:
+                env.rollouts_per_example = self.rollouts_per_example
+            if "interval" not in env.model_fields_set:
+                env.interval = self.interval
+            if "max_retries" not in env.model_fields_set:
+                env.max_retries = self.max_retries
+
+        names = [env.resolved_name for env in self.env]
+        duplicates = {name for name in names if names.count(name) > 1}
+        if duplicates:
+            raise ValueError(f"Duplicate evaluation environment names: {duplicates}")
+        return self
+
+
 class RLVLLMConfig(BaseModel):
     server_backend: Literal["offline", "openai"] = "offline"
     gpu_memory_utilization: float = Field(default=0.35, gt=0.0, le=1.0)
@@ -270,6 +353,7 @@ class RLConfig(BaseModel):
     monitor: MonitorConfig = MonitorConfig()
     fsdp: FSDPConfig = FSDPConfig()
     orchestrator: RLOrchestratorConfig = RLOrchestratorConfig()
+    eval: RLEvalConfig | None = None
     inference: RLInferenceConfig = RLInferenceConfig()
     reward: RLRewardConfig = RLRewardConfig()
     transport: RLTransportConfig = RLTransportConfig()
