@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 from peft import PeftModel
 from torch import Tensor
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
 
 from wavelet.configs.rl_config import RLConfig
@@ -81,7 +82,10 @@ class RLTrainer(BaseTrainer):
             raise RuntimeError("Tokenizer must be set up before data")
         if self.world is None:
             raise RuntimeError("World must be set up before data")
-        self._setup_accumulation_steps()
+        if self.config.data.pack_sequences:
+            self.accumulation_steps = 1
+        else:
+            self._setup_accumulation_steps()
 
         self.dataset = setup_rl_dataset(
             self.tokenizer,
@@ -96,7 +100,29 @@ class RLTrainer(BaseTrainer):
         )
         if isinstance(self.dataset, PackedRLDataset):
             self.accumulation_steps = self.dataset.micro_batch_count()
+            self._validate_packed_rank_has_real_samples(self.dataset)
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
+
+    def _validate_packed_rank_has_real_samples(self, dataset: PackedRLDataset) -> None:
+        local_has_real_samples = float(dataset.local_real_sample_count() > 0)
+        if (
+            self.world is not None
+            and self.world.world_size > 1
+            and torch.distributed.is_initialized()
+        ):
+            flag = torch.tensor(local_has_real_samples, device=self.world.device)
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            all_ranks_have_real_samples = bool(flag.item())
+        else:
+            all_ranks_have_real_samples = bool(local_has_real_samples)
+        if all_ranks_have_real_samples:
+            return
+        raise ValueError(
+            "Packed RL batch has no real trainable samples on at least one data "
+            "rank after filtering. Increase orchestrator.examples_per_step or "
+            "orchestrator.rollouts_per_example, disable zero-advantage filtering, "
+            "or disable data.pack_sequences for this small batch."
+        )
 
     def setup(self) -> None:
         super().setup()
@@ -244,6 +270,28 @@ class RLTrainer(BaseTrainer):
     def load_rollout_path(self, rollout_path: Path) -> None:
         rollout_path = Path(rollout_path)
         rollout_count = _count_rollout_rows(rollout_path)
+        optimizer_batch_size = rollout_count
+        pack_sequences = self.config.data.pack_sequences
+        if self.world is not None and not pack_sequences:
+            global_micro_batch = (
+                self.config.data.micro_batch_size * self.world.world_size
+            )
+            remainder = rollout_count % global_micro_batch
+            if remainder:
+                optimizer_batch_size = rollout_count - remainder
+                if optimizer_batch_size <= 0:
+                    raise ValueError(
+                        "Rollout batch contains fewer rows than one distributed "
+                        "micro-batch "
+                        f"({rollout_count} < {global_micro_batch})."
+                    )
+                logger.warning(
+                    "Trimming rollout optimizer batch from %s to %s rows so it is "
+                    "divisible by distributed micro-batch size %s.",
+                    rollout_count,
+                    optimizer_batch_size,
+                    global_micro_batch,
+                )
         self._maybe_log_rollout_samples(rollout_path)
         self.config = self.config.model_copy(
             update={
@@ -251,7 +299,8 @@ class RLTrainer(BaseTrainer):
                     update={
                         "source": "local",
                         "path": rollout_path,
-                        "batch_size": rollout_count,
+                        "batch_size": optimizer_batch_size,
+                        "pack_sequences": pack_sequences,
                     }
                 )
             }
@@ -375,11 +424,29 @@ class RLTrainer(BaseTrainer):
         from wavelet.trainer.model import (
             export_model_for_save,
             save_lora_adapter_snapshot,
+            save_lora_adapter_snapshot_from_fsdp,
             save_model,
         )
 
-        export_model, state_dict = export_model_for_save(self.model)
-        if self.world.is_main:
+        export_model = None
+        state_dict = None
+        if (
+            self.config.policy_transfer.lightweight_lora
+            and isinstance(self.model, FSDP)
+        ):
+            if tmp_dir.exists() and self.world.is_main:
+                shutil.rmtree(tmp_dir)
+            if step_dir.exists() and self.world.is_main:
+                shutil.rmtree(step_dir)
+            if self.world.is_main:
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+            saved_path = save_lora_adapter_snapshot_from_fsdp(
+                self.model,
+                tmp_dir,
+                is_main_process=self.world.is_main,
+            )
+        else:
+            export_model, state_dict = export_model_for_save(self.model)
             if tmp_dir.exists():
                 shutil.rmtree(tmp_dir)
             if step_dir.exists():
@@ -402,6 +469,7 @@ class RLTrainer(BaseTrainer):
                     state_dict=state_dict,
                     is_main_process=True,
                 )
+        if self.world.is_main:
             meta = {
                 "format_version": 1,
                 "step": export_step,
@@ -455,7 +523,7 @@ class RLTrainer(BaseTrainer):
             )
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
-    def _estimate_optimizer_batch_loss_scale(self) -> int | None:
+    def _estimate_optimizer_batch_loss_scale(self) -> float | None:
         if self.config.data.num_workers != 0:
             return None
         if not isinstance(self.dataset, (RLDataset, PackedRLDataset)):
@@ -492,17 +560,24 @@ class RLTrainer(BaseTrainer):
             )
             scaled_logits = outputs.logits / batch["temperatures"].unsqueeze(-1)
             trainer_logprobs = selective_log_softmax(scaled_logits, batch["target_ids"])
-            inference_logprobs = self._inference_logprobs(batch, attention_mask)
-            teacher_logprobs = self._teacher_logprobs(batch)
-            loss, raw_metrics = compute_loss(
-                trainer_logprobs,
-                inference_logprobs,
-                teacher_logprobs,
-                batch["advantages"],
-                batch["loss_mask"],
-                self.config.loss,
-                loss_scale=self._optimizer_batch_loss_scale,
-            )
+            if not batch["loss_mask"].bool().any():
+                # Dummy packed batches keep FSDP ranks aligned after filtering.
+                # Make the zero loss explicitly depend on this rank's forward pass
+                # so backward still traverses the sharded graph with zero grads.
+                loss = trainer_logprobs.sum() * 0.0
+                raw_metrics = self._zero_loss_metrics(loss)
+            else:
+                inference_logprobs = self._inference_logprobs(batch, attention_mask)
+                teacher_logprobs = self._teacher_logprobs(batch)
+                loss, raw_metrics = compute_loss(
+                    trainer_logprobs,
+                    inference_logprobs,
+                    teacher_logprobs,
+                    batch["advantages"],
+                    batch["loss_mask"],
+                    self.config.loss,
+                    loss_scale=self._optimizer_batch_loss_scale,
+                )
 
             if torch.isnan(loss):
                 logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
@@ -571,6 +646,20 @@ class RLTrainer(BaseTrainer):
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
         return metrics
 
+    def _zero_loss_metrics(self, loss: Tensor) -> dict[str, Tensor]:
+        zero = loss.detach() * 0.0
+        return {
+            "mismatch_kl": zero,
+            "masked_mismatch_kl": zero,
+            "unmasked_mismatch_kl": zero,
+            "is_masked": zero,
+            "is_masked_low": zero,
+            "is_masked_high": zero,
+            "policy_loss": zero,
+            "kl_loss": zero,
+            "advantage_mean": zero,
+        }
+
     def _inference_logprobs(
         self, batch: dict[str, Tensor], attention_mask: Tensor | None
     ) -> Tensor:
@@ -624,8 +713,15 @@ class RLTrainer(BaseTrainer):
     def _batch_rollout_metrics(self, batch: dict[str, Tensor]) -> dict[str, float]:
         loss_mask = batch["loss_mask"].bool()
         seq_lens = loss_mask.sum(dim=1).float()
+        sample_counts = batch.get("sample_counts")
+        rollout_count = (
+            float(sample_counts.sum().item())
+            if sample_counts is not None
+            else float(batch["input_ids"].shape[0])
+        )
         metrics: dict[str, float] = {
-            "rollout/count": float(batch["input_ids"].shape[0]),
+            "rollout/count": rollout_count,
+            "micro_batch/count": float(batch["input_ids"].shape[0]),
             "tokens/train": float(loss_mask.sum().item()),
             "seq_len/all/mean": float(seq_lens.mean().item()),
             "seq_len/all/max": float(seq_lens.max().item()),
@@ -647,6 +743,9 @@ class RLTrainer(BaseTrainer):
         if advantages.numel() > 0:
             metrics.update(
                 {
+                    "_advantage_sum": float(advantages.sum().item()),
+                    "_advantage_sumsq": float(advantages.square().sum().item()),
+                    "_advantage_count": float(advantages.numel()),
                     "advantage/all/mean": float(advantages.mean().item()),
                     "advantage/all/max": float(advantages.max().item()),
                     "advantage/all/min": float(advantages.min().item()),
@@ -664,6 +763,8 @@ class RLTrainer(BaseTrainer):
         aggregated: dict[str, float] = {}
         all_keys = set().union(*(metrics.keys() for metrics in micro_metrics))
         for key in all_keys:
+            if key.startswith("_"):
+                continue
             values = [metrics[key] for metrics in micro_metrics if key in metrics]
             if not values:
                 continue
@@ -671,10 +772,27 @@ class RLTrainer(BaseTrainer):
                 aggregated[key] = max(values)
             elif key.endswith("/min"):
                 aggregated[key] = min(values)
-            elif key in {"tokens/train", "rollout/count"}:
+            elif key in {"tokens/train", "rollout/count", "micro_batch/count"}:
                 aggregated[key] = sum(values)
             else:
                 aggregated[key] = sum(values) / len(values)
+        advantage_count = sum(
+            metrics.get("_advantage_count", 0.0) for metrics in micro_metrics
+        )
+        if advantage_count > 0:
+            advantage_sum = sum(
+                metrics.get("_advantage_sum", 0.0) for metrics in micro_metrics
+            )
+            advantage_sumsq = sum(
+                metrics.get("_advantage_sumsq", 0.0) for metrics in micro_metrics
+            )
+            advantage_mean = advantage_sum / advantage_count
+            advantage_var = max(
+                advantage_sumsq / advantage_count - advantage_mean**2,
+                0.0,
+            )
+            aggregated["advantage/all/mean"] = advantage_mean
+            aggregated["advantage/all/std"] = advantage_var**0.5
         return aggregated
 
     def _aggregate_train_metrics(
@@ -763,7 +881,7 @@ class RLTrainer(BaseTrainer):
             elif key.endswith("/min"):
                 torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MIN)
                 synced[key] = float(value.item())
-            elif key in {"rollout/count", "tokens/train"}:
+            elif key in {"rollout/count", "micro_batch/count", "tokens/train"}:
                 torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
                 synced[key] = float(value.item())
             else:

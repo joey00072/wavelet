@@ -5,6 +5,7 @@ import importlib
 import json
 import math
 import random
+from dataclasses import replace
 from pathlib import Path
 from collections.abc import Callable
 
@@ -50,7 +51,7 @@ class RLOrchestrator:
                 "check the reward/model output format."
             )
         scored_records = last_scored_records
-        output_path = self._resolve_output_path()
+        output_path = self._resolve_output_path(step=step)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists() and not self.config.orchestrator.overwrite:
             raise FileExistsError(
@@ -87,6 +88,11 @@ class RLOrchestrator:
         limit = self.config.orchestrator.examples_per_step
         if limit is None or len(records) <= limit:
             return records
+        if self.config.orchestrator.custom_rollout_function is not None:
+            limit = min(
+                len(records),
+                math.ceil(limit * self.config.orchestrator.oversampling_factor),
+            )
         rng = random.Random(seed)
         start = rng.randrange(len(records))
         return [records[(start + offset) % len(records)] for offset in range(limit)]
@@ -101,8 +107,10 @@ class RLOrchestrator:
             custom_rollout = self._load_custom_rollout_function(
                 self.config.orchestrator.custom_rollout_function
             )
-            return self._assign_advantages(
-                custom_rollout(self, records, inference_engine)
+            return self.trim_to_step_examples(
+                self._assign_advantages(
+                    custom_rollout(self, records, inference_engine)
+                )
             )
 
         inference = RLInference(self.config)
@@ -137,10 +145,16 @@ class RLOrchestrator:
             published.append(self.publish(step=start_step + offset))
         return published
 
-    def _resolve_output_path(self) -> Path:
+    def _resolve_output_path(self, *, step: int | None = None) -> Path:
         configured = self.config.orchestrator.materialize_path
         if configured is not None:
             return Path(configured)
+        if step is not None:
+            return (
+                self.config.output_dir
+                / "rollouts"
+                / f"materialized-step-{step:06d}.jsonl"
+            )
         return (
             self.config.output_dir / "rollouts" / self.config.transport.rollout_filename
         )
@@ -203,6 +217,21 @@ class RLOrchestrator:
             metadata=record.metadata,
             source=record.source,
         )
+
+    def trim_to_step_examples(self, records: list[RLExample]) -> list[RLExample]:
+        limit = self.config.orchestrator.examples_per_step
+        if limit is None:
+            return records
+        selected_keys: set[str] = set()
+        trimmed: list[RLExample] = []
+        for record in records:
+            key = self._group_key(record)
+            if key not in selected_keys:
+                if len(selected_keys) >= limit:
+                    break
+                selected_keys.add(key)
+            trimmed.append(record)
+        return trimmed
 
     def _assign_advantages(self, records: list[RLExample]) -> list[RLExample]:
         mode = self.config.orchestrator.advantage_mode
@@ -269,23 +298,7 @@ class RLOrchestrator:
         record: RLExample,
         advantage: float | None,
     ) -> RLExample:
-        return RLExample(
-            prompt=record.prompt,
-            completion=record.completion,
-            advantage=advantage,
-            reward=record.reward,
-            input_ids=record.input_ids,
-            target_ids=record.target_ids,
-            loss_mask=record.loss_mask,
-            target_completion=record.target_completion,
-            inference_logprobs=record.inference_logprobs,
-            teacher_logprobs=record.teacher_logprobs,
-            temperatures=record.temperatures,
-            tools=record.tools,
-            chat_template_kwargs=record.chat_template_kwargs,
-            metadata=record.metadata,
-            source=record.source,
-        )
+        return replace(record, advantage=advantage)
 
     def _group_key(self, record: RLExample) -> str:
         if record.metadata is not None and "group_key" in record.metadata:

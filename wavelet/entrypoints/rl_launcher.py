@@ -6,6 +6,7 @@ import time
 import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from time import perf_counter
 
 from wavelet.configs.rl_config import RLConfig
@@ -61,6 +62,12 @@ def _write_subconfigs(config: RLConfig, trainer_config: RLConfig | None = None) 
     )
 
 
+def _config_path_for_role(config: RLConfig, name: str, role_config: RLConfig) -> Path:
+    config_path = get_config_dir(config.output_dir) / f"{name}.yaml"
+    dump_yaml(config_path, role_config.model_dump(mode="json", exclude_none=True))
+    return config_path
+
+
 def _trainer_config_for_rollouts(config: RLConfig, rollout_path) -> RLConfig:
     return config.model_copy(
         update={
@@ -70,6 +77,85 @@ def _trainer_config_for_rollouts(config: RLConfig, rollout_path) -> RLConfig:
                     "path": rollout_path,
                 }
             )
+        }
+    )
+
+
+def _as_device_groups(value: str | list[str] | None, count: int) -> list[str | None]:
+    if isinstance(value, list):
+        groups = [str(item) for item in value]
+    elif value is None:
+        groups = [None]
+    else:
+        separator = ";" if ";" in value else "|"
+        groups = [item.strip() for item in value.split(separator) if item.strip()]
+        if not groups:
+            groups = [value]
+    if len(groups) == 1:
+        return groups * count
+    if len(groups) != count:
+        raise ValueError(
+            "Expected one CUDA device group or exactly "
+            f"{count} groups, got {len(groups)}."
+        )
+    return groups
+
+
+def _http_ports(config: RLConfig, count: int) -> list[int]:
+    configured = config.inference.http.ports
+    if configured is not None:
+        if len(configured) != count:
+            raise ValueError(
+                "inference.http.ports must have exactly "
+                f"{count} entries when launcher.inference_num_replicas={count}."
+            )
+        return configured
+    return [config.inference.http.port + offset for offset in range(count)]
+
+
+def _vllm_base_urls(config: RLConfig, ports: list[int]) -> list[str]:
+    return [
+        f"http://{config.inference.http.host}:{port}/v1"
+        for port in ports
+    ]
+
+
+def _inference_replica_config(config: RLConfig, *, port: int) -> RLConfig:
+    return config.model_copy(
+        update={
+            "inference": config.inference.model_copy(
+                update={
+                    "http": config.inference.http.model_copy(update={"port": port}),
+                }
+            ),
+            "launcher": config.launcher.model_copy(
+                update={"inference_num_replicas": 1}
+            ),
+        }
+    )
+
+
+def _rollout_client_config(config: RLConfig, *, ports: list[int]) -> RLConfig:
+    inference = config.inference.model_copy(
+        update={
+            "http": config.inference.http.model_copy(update={"ports": ports}),
+        }
+    )
+    orchestrator = config.orchestrator
+    if config.inference.vllm.server_backend == "openai" and config.lora is not None:
+        orchestrator = orchestrator.model_copy(
+            update={"verifier_model": config.policy_transfer.adapter_name}
+        )
+    if config.orchestrator.verifier_base_url is not None:
+        return config.model_copy(
+            update={"inference": inference, "orchestrator": orchestrator}
+        )
+    return config.model_copy(
+        update={
+            "inference": inference,
+            "orchestrator": orchestrator.model_copy(
+                update={"verifier_base_url": _vllm_base_urls(config, ports)}
+            ),
         }
     )
 
@@ -244,23 +330,48 @@ def _run_process_launcher(config: RLConfig) -> int:
             "the trainer ranks."
         )
 
-    _write_subconfigs(config, config)
+    inference_replicas = config.launcher.inference_num_replicas
+    inference_ports = _http_ports(config, inference_replicas)
+    rollout_config = _rollout_client_config(config, ports=inference_ports)
+
+    _write_subconfigs(rollout_config, config)
     config_dir = get_config_dir(config.output_dir)
     trainer_config_path = config_dir / "rl_trainer.yaml"
     inference_config_path = config_dir / "rl_inference.yaml"
+    dump_yaml(
+        inference_config_path,
+        rollout_config.model_dump(mode="json", exclude_none=True),
+    )
 
     roles: list[RoleSpec] = []
     if config.inference.mode == "vllm_http":
-        roles.append(
-            RoleSpec(
-                name="vllm_server",
-                command="rl-vllm-server",
-                config_path=inference_config_path,
-                log_name="rl_vllm_server",
-                cuda_visible_devices=config.launcher.inference_cuda_visible_devices,
-                service=True,
-            )
+        inference_devices = _as_device_groups(
+            config.launcher.inference_cuda_visible_devices,
+            inference_replicas,
         )
+        for replica, (port, cuda_visible_devices) in enumerate(
+            zip(inference_ports, inference_devices, strict=True)
+        ):
+            replica_config = _inference_replica_config(config, port=port)
+            replica_config_path = _config_path_for_role(
+                config,
+                f"rl_vllm_server_{replica}",
+                replica_config,
+            )
+            roles.append(
+                RoleSpec(
+                    name=f"vllm_server_{replica}",
+                    command=(
+                        "rl-vllm-openai-server"
+                        if config.inference.vllm.server_backend == "openai"
+                        else "rl-vllm-server"
+                    ),
+                    config_path=replica_config_path,
+                    log_name=f"rl_vllm_server_{replica}",
+                    cuda_visible_devices=cuda_visible_devices,
+                    service=True,
+                )
+            )
     roles.extend(
         [
             RoleSpec(
@@ -268,14 +379,18 @@ def _run_process_launcher(config: RLConfig) -> int:
                 command="rl-trainer",
                 config_path=trainer_config_path,
                 log_name="rl_trainer",
-                cuda_visible_devices=config.launcher.trainer_cuda_visible_devices,
+                cuda_visible_devices=_as_device_groups(
+                    config.launcher.trainer_cuda_visible_devices,
+                    1,
+                )[0],
+                torchrun_nproc_per_node=config.launcher.trainer_num_processes,
             ),
             RoleSpec(
                 name="inference",
                 command="rl-inference",
                 config_path=inference_config_path,
                 log_name="rl_inference",
-                cuda_visible_devices=config.launcher.inference_cuda_visible_devices,
+                cuda_visible_devices=None,
             ),
         ]
     )
@@ -287,7 +402,8 @@ def _run_process_launcher(config: RLConfig) -> int:
         job_roles = [role for role in roles if not role.service]
         handles = [launcher.start(role) for role in service_roles]
         if config.inference.mode == "vllm_http":
-            _wait_for_vllm_http_server(config)
+            for port in inference_ports:
+                _wait_for_vllm_http_server(config, port=port)
         handles.extend(launcher.start(role) for role in job_roles)
         wait_for_roles(
             handles,
@@ -300,8 +416,9 @@ def _run_process_launcher(config: RLConfig) -> int:
     return 0
 
 
-def _wait_for_vllm_http_server(config: RLConfig) -> None:
-    url = f"http://{config.inference.http.host}:{config.inference.http.port}/health"
+def _wait_for_vllm_http_server(config: RLConfig, *, port: int | None = None) -> None:
+    port = config.inference.http.port if port is None else port
+    url = f"http://{config.inference.http.host}:{port}/health"
     deadline = time.monotonic() + config.inference.http.startup_timeout_seconds
     last_error: Exception | None = None
     while time.monotonic() < deadline:
