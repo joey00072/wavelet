@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
 import torch
 import torch.distributed
-from functools import partial
 
 from peft import LoraConfig as PeftLoraConfig
 from peft import (
@@ -407,6 +407,134 @@ def save_lora_adapter_snapshot(
     }
     save_safetensors(cpu_state, target / "adapter_model.safetensors")
     return target
+
+
+def _lora_parameter_shapes(model: PeftModel) -> dict[str, tuple[int, ...]]:
+    shapes: dict[str, tuple[int, ...]] = {}
+    for module_name, module in model.named_modules():
+        for attr in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
+            container = getattr(module, attr, None)
+            if container is None:
+                continue
+            for adapter_name, child in container.items():
+                weight = getattr(child, "weight", child)
+                if not isinstance(weight, nn.Parameter):
+                    continue
+                if isinstance(child, nn.Linear):
+                    shape = (child.out_features, child.in_features)
+                else:
+                    shape = tuple(weight.shape)
+                shapes[f"{module_name}.{attr}.{adapter_name}.weight"] = shape
+    return shapes
+
+
+def _peft_adapter_state_key(name: str) -> str:
+    prefix = "_fsdp_wrapped_module."
+    if name.startswith(prefix):
+        name = name[len(prefix) :]
+    return name.replace(".default.weight", ".weight")
+
+
+def _gather_fsdp_lora_state_dict(
+    model: FSDP,
+    unwrapped: PeftModel,
+) -> dict[str, torch.Tensor] | None:
+    if not torch.distributed.is_initialized():
+        return {
+            _peft_adapter_state_key(name): value.detach().cpu().contiguous()
+            for name, value in model.named_parameters()
+            if "lora_" in name and value.numel() > 0
+        }
+
+    expected_shapes = _lora_parameter_shapes(unwrapped)
+    local_state = {
+        name.removeprefix("_fsdp_wrapped_module."): value.detach().cpu().reshape(-1)
+        for name, value in model.named_parameters()
+        if name.removeprefix("_fsdp_wrapped_module.") in expected_shapes
+        and value.numel() > 0
+    }
+
+    gathered: list[dict[str, torch.Tensor] | None] | None
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        gathered = [None for _ in range(torch.distributed.get_world_size())]
+    else:
+        gathered = None
+    torch.distributed.gather_object(local_state, gathered, dst=0)
+    if rank != 0:
+        return None
+    if gathered is None:
+        raise RuntimeError("FSDP LoRA gather returned no state on rank 0.")
+
+    state: dict[str, torch.Tensor] = {}
+    for name, shape in expected_shapes.items():
+        parts = [
+            shard[name]
+            for shard in gathered
+            if shard is not None and name in shard and shard[name].numel() > 0
+        ]
+        if not parts:
+            raise RuntimeError(f"FSDP LoRA gather found no shards for {name}.")
+        flat = torch.cat(parts, dim=0)
+        expected_numel = 1
+        for dim in shape:
+            expected_numel *= dim
+        if flat.numel() != expected_numel:
+            raise RuntimeError(
+                "FSDP LoRA gather produced the wrong size for "
+                f"{name}: {flat.numel()} != {expected_numel}."
+            )
+        state[_peft_adapter_state_key(name)] = flat.reshape(shape).contiguous()
+    return state
+
+
+def save_lora_adapter_snapshot_from_fsdp(
+    model: FSDP,
+    output_dir: Path,
+    *,
+    is_main_process: bool = True,
+) -> Path:
+    """Save a PEFT LoRA adapter from an FSDP-wrapped model without a full state dict."""
+    unwrapped = unwrap_model(model)
+    if not isinstance(unwrapped, PeftModel):
+        raise TypeError("FSDP lightweight policy snapshots require a wrapped PeftModel.")
+
+    adapter_name = _active_adapter_name(unwrapped)
+    target = output_dir / "adapter"
+    state = _gather_fsdp_lora_state_dict(model, unwrapped)
+    if not is_main_process:
+        return target
+
+    target.mkdir(parents=True, exist_ok=True)
+    unwrapped.peft_config[adapter_name].save_pretrained(target)
+    if state is None:
+        raise RuntimeError("Rank 0 did not receive gathered FSDP LoRA state.")
+    save_safetensors(state, target / "adapter_model.safetensors")
+    return target
+
+
+def _save_lora_adapter_snapshot_from_fsdp_full_params(
+    model: FSDP,
+    output_dir: Path,
+    *,
+    is_main_process: bool = True,
+) -> Path:
+    unwrapped = unwrap_model(model)
+    if not isinstance(unwrapped, PeftModel):
+        raise TypeError("FSDP lightweight policy snapshots require a wrapped PeftModel.")
+    with FSDP.summon_full_params(
+        model,
+        recurse=True,
+        writeback=False,
+        rank0_only=True,
+        offload_to_cpu=True,
+    ):
+        return save_lora_adapter_snapshot(
+            unwrapped,
+            output_dir,
+            state_dict=None,
+            is_main_process=is_main_process,
+        )
 
 
 def maybe_wrap_fsdp(

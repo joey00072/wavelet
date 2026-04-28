@@ -138,9 +138,13 @@ class RLSamplingConfig(BaseModel):
 
 
 class RLVLLMConfig(BaseModel):
+    server_backend: Literal["offline", "openai"] = "offline"
     gpu_memory_utilization: float = Field(default=0.35, gt=0.0, le=1.0)
     max_model_len: int | None = Field(default=None, ge=8)
     tensor_parallel_size: int = Field(default=1, ge=1)
+    data_parallel_size: int = Field(default=1, ge=1)
+    data_parallel_size_local: int | None = Field(default=None, ge=1)
+    data_parallel_rpc_port: int | None = Field(default=None, ge=1, le=65535)
     enforce_eager: bool = True
     max_loras: int = Field(default=8, ge=1)
     max_cpu_loras: int = Field(default=100, ge=1)
@@ -149,11 +153,15 @@ class RLVLLMConfig(BaseModel):
     dtype: Literal["auto", "float32", "float16", "bfloat16"] | None = None
     use_generation_logprobs: bool = True
     openai_batch_wait_seconds: float = Field(default=0.01, ge=0.0)
+    openai_batch_min_size: int = Field(default=1, ge=1)
+    openai_batch_max_wait_seconds: float = Field(default=0.01, ge=0.0)
+    openai_batch_max_size: int | None = Field(default=None, ge=1)
 
 
 class RLVLLMHTTPConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
+    ports: list[int] | None = None
     request_timeout_seconds: float = Field(default=300.0, gt=0.0)
     startup_timeout_seconds: float = Field(default=300.0, gt=0.0)
 
@@ -215,7 +223,7 @@ class RLOrchestratorConfig(BaseModel):
     verifier_env_id: str | None = None
     verifier_env_args: dict[str, Any] = Field(default_factory=dict)
     verifier_model: str | None = None
-    verifier_base_url: str | None = None
+    verifier_base_url: str | list[str] | None = None
     verifier_api_key_var: str = "PRIME_API_KEY"
     verifier_client_type: Literal[
         "openai_chat_completions",
@@ -229,6 +237,7 @@ class RLOrchestratorConfig(BaseModel):
     advantage_epsilon: float = Field(default=1e-6, gt=0.0)
     examples_per_step: int | None = Field(default=None, ge=1)
     rollouts_per_example: int | None = Field(default=None, ge=1)
+    oversampling_factor: float = Field(default=1.0, ge=1.0)
     filter_zero_advantage: bool = False
     zero_advantage_max_retries: int = Field(default=8, ge=0)
     max_async_level: int = Field(default=0, ge=0)
@@ -238,8 +247,10 @@ class RLOrchestratorConfig(BaseModel):
 class RLLauncherConfig(BaseModel):
     mode: Literal["integrated", "process"] = "integrated"
     backend: Literal["local", "ray"] = "local"
-    trainer_cuda_visible_devices: str | None = None
-    inference_cuda_visible_devices: str | None = None
+    trainer_cuda_visible_devices: str | list[str] | None = None
+    inference_cuda_visible_devices: str | list[str] | None = None
+    trainer_num_processes: int = Field(default=1, ge=1)
+    inference_num_replicas: int = Field(default=1, ge=1)
     ray_address: str | None = None
     ray_runtime_env: dict[str, Any] | None = None
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
