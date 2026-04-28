@@ -274,6 +274,8 @@ class RunMonitor:
             project=self.wandb.project or "wavelet",
             entity=self.wandb.entity,
             name=self.wandb.name,
+            group=self.wandb.group,
+            tags=self.wandb.tags,
             mode=self.wandb.mode,
             dir=str(self.output_dir),
             config=run_config,
