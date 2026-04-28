@@ -7,6 +7,7 @@ from time import perf_counter
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.policy import create_policy_inference_engine
+from wavelet.orchestrator.eval_utils import compute_eval_policy_step
 from wavelet.orchestrator.queue import FileSystemPolicyReceiver, FileSystemRolloutSender
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.utils.config import load_config
@@ -87,6 +88,10 @@ def main(argv: list[str] | None = None) -> int:
     target_step = config.max_steps or 1
     _preload_rollout_resources(config)
     loaded_policy_step: int | None = None
+    last_eval_steps = {
+        env.resolved_name: -1
+        for env in config.eval.env
+    } if config.eval is not None else {}
     prefetch_steps = max(1, min(4, config.orchestrator.max_async_level, target_step))
     next_step_to_submit = 0
     next_step_to_publish = 0
@@ -126,6 +131,13 @@ def main(argv: list[str] | None = None) -> int:
                     inference_engine.load_policy(policy.step_dir, step=policy.step)
                     load_policy_seconds = perf_counter() - load_started_at
                     loaded_policy_step = policy.step
+                    _maybe_run_evals(
+                        config,
+                        orchestrator,
+                        policy_step=policy.step,
+                        rollout_step=step,
+                        last_eval_steps=last_eval_steps,
+                    )
                 else:
                     wait_policy_seconds = 0.0
                     load_policy_seconds = 0.0
@@ -160,6 +172,21 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
                 print(batch.path)
+    if config.eval is not None and config.eval.final_eval:
+        final_policy_step = _final_eval_policy_step(config, target_step)
+        if final_policy_step is None:
+            return 0
+        if loaded_policy_step is None or loaded_policy_step < final_policy_step:
+            policy = policy_receiver.wait_for_step(final_policy_step)
+            inference_engine.load_policy(policy.step_dir, step=policy.step)
+            loaded_policy_step = policy.step
+        _run_evals(
+            config,
+            orchestrator,
+            policy_step=loaded_policy_step,
+            rollout_step=target_step,
+            envs=config.eval.env,
+        )
     return 0
 
 
@@ -175,6 +202,82 @@ def _publish_step(
     )
     materialize_seconds = perf_counter() - materialize_started_at
     return step, materialized_path, materialize_seconds
+
+
+def _final_eval_policy_step(config: RLConfig, target_step: int) -> int | None:
+    if target_step <= 0:
+        return 0 if config.policy_transfer.export_initial else None
+    interval = config.policy_transfer.export_every_steps
+    final_step = (target_step // interval) * interval
+    if final_step > 0:
+        return final_step
+    return 0 if config.policy_transfer.export_initial else None
+
+
+def _maybe_run_evals(
+    config: RLConfig,
+    orchestrator: RLOrchestrator,
+    *,
+    policy_step: int,
+    rollout_step: int,
+    last_eval_steps: dict[str, int],
+) -> None:
+    if config.eval is None:
+        return
+
+    envs = []
+    for env in config.eval.env:
+        eval_step = compute_eval_policy_step(
+            policy_step=policy_step,
+            last_eval_step=last_eval_steps[env.resolved_name],
+            interval=env.interval,
+            eval_base_model=config.eval.eval_base_model,
+        )
+        if eval_step is None:
+            continue
+        last_eval_steps[env.resolved_name] = eval_step
+        envs.append(env)
+    _run_evals(
+        config,
+        orchestrator,
+        policy_step=policy_step,
+        rollout_step=rollout_step,
+        envs=envs,
+    )
+
+
+def _run_evals(
+    config: RLConfig,
+    orchestrator: RLOrchestrator,
+    *,
+    policy_step: int,
+    rollout_step: int,
+    envs,
+) -> None:
+    if not envs:
+        return
+    if (
+        config.orchestrator.custom_rollout_function
+        != "wavelet.orchestrator.verifiers:generate_rollouts"
+    ):
+        raise ValueError("RL eval is currently supported for verifier rollouts only.")
+
+    from wavelet.orchestrator.verifiers import evaluate_env
+
+    for env in envs:
+        metrics = evaluate_env(
+            orchestrator,
+            env,
+            step=rollout_step,
+            policy_step=policy_step,
+        )
+        print(json_dumps_compact(metrics), flush=True)
+
+
+def json_dumps_compact(payload) -> str:
+    import json
+
+    return json.dumps(payload, sort_keys=True)
 
 
 if __name__ == "__main__":

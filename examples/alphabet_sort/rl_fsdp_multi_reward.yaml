@@ -44,6 +44,27 @@ orchestrator:
   max_async_level: 8
   max_off_policy_steps: 8
 
+eval:
+  interval: 20
+  num_examples: 32
+  rollouts_per_example: 4
+  eval_base_model: true
+  final_eval: true
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 768
+  env:
+    - id: alphabet-sort
+      name: alphabet-sort
+      args:
+        min_turns: 3
+        max_turns: 5
+        power_per_turn: false
+
 inference:
   enabled: true
   mode: vllm_http
