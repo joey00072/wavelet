@@ -1,0 +1,142 @@
+model:
+  name: "Qwen/Qwen3-4B-Instruct-2507"
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  load_in_4bit: false
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: local
+  path: outputs/alphabet_sort_data/rl_train.jsonl
+  batch_size: 512
+  micro_batch_size: 1
+  pack_sequences: true
+  pad_to_multiple_of: 1
+  seq_len: 2048
+  max_examples: null
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 0.001
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: alphabet-sort
+  verifier_env_args:
+    min_turns: 3
+    max_turns: 5
+    power_per_turn: false
+  verifier_model: Qwen/Qwen3-4B-Instruct-2507
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: group_reward
+  normalize_group_advantages: false
+  examples_per_step: 64
+  rollouts_per_example: 8
+  filter_zero_advantage: true
+  zero_advantage_max_retries: 8
+  max_async_level: 1
+  max_off_policy_steps: 8
+
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 1.0
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 768
+    do_sample: true
+    num_generations: 1
+    seed: null
+  vllm:
+    gpu_memory_utilization: 0.9
+    max_model_len: 2048
+    enforce_eager: false
+    max_loras: 8
+    max_cpu_loras: 100
+    max_lora_rank: 32
+  http:
+    port: 8000
+    request_timeout_seconds: 900.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  export_initial: true
+
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: -1
+  cp: 1
+  tp: 1
+  ep: 1
+  cpu_offload: false
+  reshard_after_forward: true
+
+optim:
+  type: adamw
+  implementation: for-loop
+  lr: 1e-5
+  weight_decay: 0.01
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 32
+  alpha: 64.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - experts
+    - fc1_latent_proj
+    - fc2_latent_proj
+
+max_grad_norm: 1.0
+max_steps: 200
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 10
+    sample_ratio: 0.25
+    max_samples: 8
+  wandb:
+    enabled: false
+    project: wavelet-alphabet-sort
+    name: wavelet-alphabet-sort-4b-lora-fsdp-multi
+    mode: offline
+
+launcher:
+  mode: process
+  backend: local
+  inference_num_replicas: 2
+  inference_cuda_visible_devices:
+    - "0"
+    - "1"
+  trainer_num_processes: 2
+  trainer_cuda_visible_devices: "2,3"
+
+output_dir: outputs/alphabet_sort_rl_fsdp_multi
+clean_output_dir: true

@@ -271,15 +271,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             with self._openai_batch_condition:
                 while not self._openai_batch:
                     self._openai_batch_condition.wait()
-                # Give concurrent verifier calls a short window to coalesce into
-                # fewer vLLM generate calls. Prime-RL's token client relies on
-                # continuous batching; this approximates that for our in-process
-                # compatibility server.
-                self._openai_batch_condition.wait(
-                    timeout=self.config.inference.vllm.openai_batch_wait_seconds,
-                )
-                batch = self._openai_batch
-                self._openai_batch = []
+                batch = self._collect_openai_batch_locked()
 
             try:
                 results = self._openai_chat_completion_batch(
@@ -294,6 +286,32 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             for request, result in zip(batch, results, strict=True):
                 request.result = result
                 request.done.set()
+
+    def _collect_openai_batch_locked(self) -> list[_OpenAIBatchRequest]:
+        vllm_config = self.config.inference.vllm
+        min_size = vllm_config.openai_batch_min_size
+        max_size = vllm_config.openai_batch_max_size
+        first_wait = vllm_config.openai_batch_wait_seconds
+        max_wait = max(first_wait, vllm_config.openai_batch_max_wait_seconds)
+        started_at = perf_counter()
+        if first_wait > 0:
+            self._openai_batch_condition.wait(timeout=first_wait)
+
+        while len(self._openai_batch) < min_size:
+            remaining = (started_at + max_wait) - perf_counter()
+            if remaining <= 0:
+                break
+            self._openai_batch_condition.wait(timeout=remaining)
+
+        if max_size is not None and len(self._openai_batch) > max_size:
+            batch = self._openai_batch[:max_size]
+            self._openai_batch = self._openai_batch[max_size:]
+            self._openai_batch_condition.notify()
+            return batch
+
+        batch = self._openai_batch
+        self._openai_batch = []
+        return batch
 
     def _openai_chat_completion_batch(
         self,
