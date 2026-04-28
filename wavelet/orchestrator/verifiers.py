@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+from wavelet.configs.rl_config import RLEvalEnvConfig
 from wavelet.data.rl_dataset import RLExample
+from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
 
@@ -34,13 +37,7 @@ def generate_rollouts(
     env_id = config.orchestrator.verifier_env_id
     if env_id is None:
         raise ValueError("orchestrator.verifier_env_id is required.")
-    base_urls = config.orchestrator.verifier_base_url
-    if base_urls is None:
-        http = config.inference.http
-        ports = http.ports or [http.port]
-        base_urls = [f"http://{http.host}:{port}/v1" for port in ports]
-    elif isinstance(base_urls, str):
-        base_urls = [base_urls]
+    base_urls = _verifier_base_urls(config)
     model = config.orchestrator.verifier_model or config.model.name
     env_started_at = perf_counter()
     env, env_cache_hit = _load_cached_env(
@@ -102,6 +99,182 @@ def generate_rollouts(
     return records
 
 
+def evaluate_env(
+    orchestrator: RLOrchestrator,
+    env_config: RLEvalEnvConfig,
+    *,
+    step: int,
+    policy_step: int,
+) -> dict[str, float]:
+    try:
+        import verifiers as vf
+    except ImportError as exc:
+        raise ImportError(
+            "Verifier evals require the 'verifiers' extra. Install with "
+            "`uv sync --extra verifiers`."
+        ) from exc
+
+    config = orchestrator.config
+    env, _env_cache_hit = _load_cached_env(vf, env_config.id, env_config.args)
+    examples = env.get_eval_dataset(n=env_config.num_examples).to_list()
+    base_urls = _verifier_base_urls(config)
+    os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
+    clients = [
+        vf.ClientConfig(
+            client_idx=client_index,
+            client_type="openai_chat_completions",
+            api_base_url=base_url,
+            api_key_var=config.orchestrator.verifier_api_key_var,
+            extra_headers=extra_headers,
+        )
+        for client_index, (base_url, extra_headers) in enumerate(
+            _verifier_client_routes(base_urls, config.inference.vllm.data_parallel_size)
+        )
+    ]
+    if not clients:
+        raise ValueError("At least one verifier eval client is required.")
+
+    started_at = perf_counter()
+    outputs = asyncio.run(
+        _run_eval_examples(
+            vf,
+            env,
+            examples,
+            clients=clients,
+            model=config.orchestrator.verifier_model or config.model.name,
+            sampling_args=env_config.sampling.to_sampling_args(),
+            rollouts_per_example=env_config.rollouts_per_example,
+            max_retries=env_config.max_retries,
+        )
+    )
+    elapsed = perf_counter() - started_at
+    env_name = env_config.resolved_name
+    output_path = (
+        config.output_dir
+        / "evals"
+        / f"step-{step:06d}"
+        / f"{env_name}.jsonl"
+    )
+    _write_eval_rollouts(output_path, outputs)
+    metrics = _eval_metrics(
+        env_name,
+        outputs,
+        total_rollouts=len(examples) * env_config.rollouts_per_example,
+        elapsed_seconds=elapsed,
+        rollouts_per_example=env_config.rollouts_per_example,
+    )
+    metrics["progress/policy_step"] = float(policy_step)
+    metrics["step"] = float(step)
+    _append_eval_metrics(config.output_dir / "eval_metrics.jsonl", metrics)
+    return metrics
+
+
+async def _run_eval_examples(
+    vf,
+    env,
+    examples: list[dict[str, Any]],
+    *,
+    clients: list[Any],
+    model: str,
+    sampling_args: dict[str, Any],
+    rollouts_per_example: int,
+    max_retries: int,
+) -> list[dict[str, Any]]:
+    tasks = []
+    for example_index, example in enumerate(examples):
+        client = clients[example_index % len(clients)]
+        for _ in range(rollouts_per_example):
+            tasks.append(
+                env.run_rollout(
+                    vf.RolloutInput(**example),
+                    client=client,
+                    model=model,
+                    sampling_args=sampling_args,
+                    max_retries=max_retries,
+                    state_columns=["trajectory", "sampling_args"],
+                )
+            )
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    outputs: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        outputs.append(dict(result))
+    return outputs
+
+
+def _eval_metrics(
+    env_name: str,
+    outputs: list[dict[str, Any]],
+    *,
+    total_rollouts: int,
+    elapsed_seconds: float,
+    rollouts_per_example: int,
+) -> dict[str, float]:
+    prefix = f"eval/{env_name}"
+    failed = max(total_rollouts - len(outputs), 0)
+    metrics = {
+        f"{prefix}/failed_rollouts": failed / max(total_rollouts, 1),
+        f"{prefix}/time": elapsed_seconds,
+    }
+    if not outputs:
+        return metrics
+
+    rewards = [float(output["reward"]) for output in outputs if "reward" in output]
+    completion_lengths = [_completion_len(output) for output in outputs]
+    truncations = [bool(output.get("is_truncated")) for output in outputs]
+    no_responses = [not bool(output.get("completion")) for output in outputs]
+    if rewards:
+        metrics[f"{prefix}/avg@{rollouts_per_example}"] = sum(rewards) / len(rewards)
+    if completion_lengths:
+        metrics[f"{prefix}/completion_len/mean"] = sum(completion_lengths) / len(
+            completion_lengths
+        )
+        metrics[f"{prefix}/completion_len/min"] = float(min(completion_lengths))
+        metrics[f"{prefix}/completion_len/max"] = float(max(completion_lengths))
+    metrics[f"{prefix}/is_truncated/mean"] = sum(truncations) / len(truncations)
+    metrics[f"{prefix}/no_response/mean"] = sum(no_responses) / len(no_responses)
+    if rewards and set(rewards).issubset({0.0, 1.0}):
+        by_example: dict[str, list[float]] = {}
+        for output in outputs:
+            by_example.setdefault(str(output.get("example_id")), []).append(
+                float(output["reward"])
+            )
+        pass_metrics: dict[str, list[float]] = {}
+        for group_rewards in by_example.values():
+            for key, value in pass_at_k(group_rewards).items():
+                pass_metrics.setdefault(key, []).append(value)
+        for key, values in pass_metrics.items():
+            metrics[f"{prefix}/{key}"] = sum(values) / len(values)
+    return metrics
+
+
+def _completion_len(output: dict[str, Any]) -> float:
+    trajectory = output.get("trajectory") or []
+    if trajectory:
+        return float(
+            sum(
+                len((step.get("tokens") or {}).get("completion_ids") or [])
+                for step in trajectory
+            )
+        )
+    completion = output.get("completion") or []
+    return float(len(str(completion).split()))
+
+
+def _write_eval_rollouts(path: Path, outputs: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for output in outputs:
+            handle.write(json.dumps(output, default=str) + "\n")
+
+
+def _append_eval_metrics(path: Path, metrics: dict[str, float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(metrics) + "\n")
+
+
 def _verifier_client_routes(
     base_urls: list[str],
     data_parallel_size: int,
@@ -116,6 +289,17 @@ def _verifier_client_routes(
             )
             routes.append((base_url, headers))
     return routes
+
+
+def _verifier_base_urls(config) -> list[str]:
+    base_urls = config.orchestrator.verifier_base_url
+    if base_urls is None:
+        http = config.inference.http
+        ports = http.ports or [http.port]
+        return [f"http://{http.host}:{port}/v1" for port in ports]
+    if isinstance(base_urls, str):
+        return [base_urls]
+    return list(base_urls)
 
 
 def _load_cached_env(vf, env_id: str, env_args: dict[str, Any]) -> tuple[Any, bool]:
