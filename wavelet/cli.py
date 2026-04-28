@@ -6,6 +6,7 @@ import wavelet.entrypoints.rl_launcher
 import wavelet.entrypoints.rl_inference
 import wavelet.entrypoints.rl_orchestrator
 import wavelet.entrypoints.rl_trainer
+import wavelet.entrypoints.rl_vllm_openai_server
 import wavelet.entrypoints.rl_vllm_server
 import wavelet.entrypoints.sft
 
@@ -19,6 +20,7 @@ def main() -> int:
         print("  rl-orchestrator  Run RL orchestrator")
         print("  rl-inference     Run RL inference annotation stage")
         print("  rl-vllm-server   Run persistent vLLM HTTP rollout server")
+        print("  rl-vllm-openai-server Run vLLM OpenAI rollout server")
         print("  sft    Run supervised fine-tuning")
         return 1
 
@@ -34,6 +36,8 @@ def main() -> int:
         return wavelet.entrypoints.rl_inference.main(sys.argv[2:])
     if command == "rl-vllm-server":
         return wavelet.entrypoints.rl_vllm_server.main(sys.argv[2:])
+    if command == "rl-vllm-openai-server":
+        return wavelet.entrypoints.rl_vllm_openai_server.main(sys.argv[2:])
     if command == "sft":
         return wavelet.entrypoints.sft.main(sys.argv[2:])
     else:

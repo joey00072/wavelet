@@ -20,6 +20,7 @@ class RoleSpec:
     log_name: str
     cuda_visible_devices: str | None = None
     service: bool = False
+    torchrun_nproc_per_node: int = 1
 
 
 def _role_env(cuda_visible_devices: str | None) -> dict[str, str]:
@@ -35,6 +36,36 @@ def _log_path(output_dir: Path, log_name: str) -> Path:
     return log_dir / f"{log_name}.log"
 
 
+def _role_command(
+    command: str,
+    config_path: str | Path,
+    *,
+    torchrun_nproc_per_node: int = 1,
+) -> list[str]:
+    if torchrun_nproc_per_node <= 1:
+        return [
+            sys.executable,
+            "-m",
+            "wavelet",
+            command,
+            "@",
+            str(config_path),
+        ]
+    return [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node",
+        str(torchrun_nproc_per_node),
+        "-m",
+        "wavelet",
+        command,
+        "@",
+        str(config_path),
+    ]
+
+
 def _run_role_subprocess(
     *,
     command: str,
@@ -42,17 +73,16 @@ def _run_role_subprocess(
     cwd: str,
     log_path: str,
     cuda_visible_devices: str | None,
+    torchrun_nproc_per_node: int = 1,
 ) -> int:
     with Path(log_path).open("w", encoding="utf-8") as log_file:
+        command_args = _role_command(
+            command,
+            config_path,
+            torchrun_nproc_per_node=torchrun_nproc_per_node,
+        )
         process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "wavelet",
-                command,
-                "@",
-                config_path,
-            ],
+            command_args,
             cwd=cwd,
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -114,15 +144,13 @@ class LocalRoleLauncher:
     def start(self, spec: RoleSpec) -> LocalRoleHandle:
         log_path = _log_path(self.output_dir, spec.log_name)
         log_file = log_path.open("w", encoding="utf-8")
+        command_args = _role_command(
+            spec.command,
+            spec.config_path,
+            torchrun_nproc_per_node=spec.torchrun_nproc_per_node,
+        )
         process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "wavelet",
-                spec.command,
-                "@",
-                str(spec.config_path),
-            ],
+            command_args,
             cwd=Path.cwd(),
             stdout=log_file,
             stderr=subprocess.STDOUT,
@@ -157,6 +185,7 @@ class RayRoleLauncher:
             cwd=str(Path.cwd()),
             log_path=str(log_path),
             cuda_visible_devices=spec.cuda_visible_devices,
+            torchrun_nproc_per_node=spec.torchrun_nproc_per_node,
         )
         return RayRoleHandle(spec, ref, self.ray, log_path)
 

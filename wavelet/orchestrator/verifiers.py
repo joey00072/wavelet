@@ -34,10 +34,13 @@ def generate_rollouts(
     env_id = config.orchestrator.verifier_env_id
     if env_id is None:
         raise ValueError("orchestrator.verifier_env_id is required.")
-    base_url = config.orchestrator.verifier_base_url
-    if base_url is None:
+    base_urls = config.orchestrator.verifier_base_url
+    if base_urls is None:
         http = config.inference.http
-        base_url = f"http://{http.host}:{http.port}/v1"
+        ports = http.ports or [http.port]
+        base_urls = [f"http://{http.host}:{port}/v1" for port in ports]
+    elif isinstance(base_urls, str):
+        base_urls = [base_urls]
     model = config.orchestrator.verifier_model or config.model.name
     env_started_at = perf_counter()
     env, env_cache_hit = _load_cached_env(
@@ -47,11 +50,18 @@ def generate_rollouts(
     )
     env_load_seconds = perf_counter() - env_started_at
     os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
-    client = vf.ClientConfig(
-        client_type=config.orchestrator.verifier_client_type,
-        api_base_url=base_url,
-        api_key_var=config.orchestrator.verifier_api_key_var,
-    )
+    clients = [
+        vf.ClientConfig(
+            client_idx=client_index,
+            client_type=config.orchestrator.verifier_client_type,
+            api_base_url=base_url,
+            api_key_var=config.orchestrator.verifier_api_key_var,
+            extra_headers=extra_headers,
+        )
+        for client_index, (base_url, extra_headers) in enumerate(
+            _verifier_client_routes(base_urls, config.inference.vllm.data_parallel_size)
+        )
+    ]
     sampling_args = _sampling_args(config)
     rollout_count = config.orchestrator.rollouts_per_example or 1
 
@@ -61,11 +71,15 @@ def generate_rollouts(
             vf,
             env,
             records,
-            client=client,
+            clients=clients,
             model=model,
             sampling_args=sampling_args,
             rollout_count=rollout_count,
             max_retries=config.orchestrator.verifier_max_retries,
+            target_groups=config.orchestrator.examples_per_step,
+            filter_zero_advantage=config.orchestrator.filter_zero_advantage,
+            advantage_epsilon=config.orchestrator.advantage_epsilon,
+            normalize_group_advantages=config.orchestrator.normalize_group_advantages,
         )
     )
     rollout_seconds = perf_counter() - rollout_started_at
@@ -88,6 +102,22 @@ def generate_rollouts(
     return records
 
 
+def _verifier_client_routes(
+    base_urls: list[str],
+    data_parallel_size: int,
+) -> list[tuple[str, dict[str, str]]]:
+    routes: list[tuple[str, dict[str, str]]] = []
+    for base_url in base_urls:
+        for dp_rank in range(data_parallel_size):
+            headers = (
+                {"X-data-parallel-rank": str(dp_rank)}
+                if data_parallel_size > 1
+                else {}
+            )
+            routes.append((base_url, headers))
+    return routes
+
+
 def _load_cached_env(vf, env_id: str, env_args: dict[str, Any]) -> tuple[Any, bool]:
     cache_key = (
         env_id,
@@ -107,27 +137,145 @@ async def _run_all(
     env,
     records: list[RLExample],
     *,
-    client,
+    clients: list[Any],
     model: str,
     sampling_args: dict[str, Any],
     rollout_count: int,
     max_retries: int,
+    target_groups: int | None,
+    filter_zero_advantage: bool,
+    advantage_epsilon: float,
+    normalize_group_advantages: bool,
 ) -> list[dict[str, Any]]:
-    tasks = []
-    for record in records:
-        example = _verifier_example(record)
-        for _ in range(rollout_count):
-            tasks.append(
-                env.run_rollout(
-                    vf.RolloutInput(**example),
-                    client=client,
-                    model=model,
-                    sampling_args=sampling_args,
-                    max_retries=max_retries,
-                    state_columns=["trajectory", "sampling_args"],
+    if not clients:
+        raise ValueError("At least one verifier client is required.")
+    if target_groups is None or len(records) <= target_groups:
+        tasks = []
+        for record_index, record in enumerate(records):
+            example = _verifier_example(record)
+            client = clients[record_index % len(clients)]
+            for _ in range(rollout_count):
+                tasks.append(
+                    env.run_rollout(
+                        vf.RolloutInput(**example),
+                        client=client,
+                        model=model,
+                        sampling_args=sampling_args,
+                        max_retries=max_retries,
+                        state_columns=["trajectory", "sampling_args"],
+                    )
                 )
+        return await asyncio.gather(*tasks)
+
+    group_tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
+    for record_index, record in enumerate(records):
+        example = _verifier_example(record)
+        client = clients[record_index % len(clients)]
+        task = asyncio.create_task(
+            _run_group(
+                vf,
+                env,
+                example,
+                client=client,
+                model=model,
+                sampling_args=sampling_args,
+                rollout_count=rollout_count,
+                max_retries=max_retries,
+                normalize_group_advantages=normalize_group_advantages,
             )
-    return await asyncio.gather(*tasks)
+        )
+        group_tasks.append(task)
+
+    outputs: list[dict[str, Any]] = []
+    accepted_groups = 0
+    pending = set(group_tasks)
+    try:
+        while pending and accepted_groups < target_groups:
+            done, pending = await asyncio.wait(
+                pending,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                group_outputs = task.result()
+                if _has_trainable_advantage(
+                    group_outputs,
+                    filter_zero_advantage=filter_zero_advantage,
+                    advantage_epsilon=advantage_epsilon,
+                ):
+                    outputs.extend(group_outputs)
+                    accepted_groups += 1
+                    if accepted_groups >= target_groups:
+                        break
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return outputs
+
+
+async def _run_group(
+    vf,
+    env,
+    example: dict[str, Any],
+    *,
+    client: Any,
+    model: str,
+    sampling_args: dict[str, Any],
+    rollout_count: int,
+    max_retries: int,
+    normalize_group_advantages: bool,
+) -> list[dict[str, Any]]:
+    tasks = [
+        env.run_rollout(
+            vf.RolloutInput(**example),
+            client=client,
+            model=model,
+            sampling_args=sampling_args,
+            max_retries=max_retries,
+            state_columns=["trajectory", "sampling_args"],
+        )
+        for _ in range(rollout_count)
+    ]
+    outputs = await asyncio.gather(*tasks)
+    _assign_group_advantages(
+        outputs,
+        normalize_group_advantages=normalize_group_advantages,
+    )
+    return outputs
+
+
+def _assign_group_advantages(
+    outputs: list[dict[str, Any]],
+    *,
+    normalize_group_advantages: bool,
+) -> None:
+    if not outputs:
+        return
+    rewards = [float(output["reward"]) for output in outputs]
+    mean = sum(rewards) / len(rewards)
+    variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
+    std = variance**0.5
+    for output, reward in zip(outputs, rewards, strict=True):
+        advantage = reward - mean
+        if normalize_group_advantages and std > 0.0:
+            advantage /= std
+        output["advantage"] = advantage
+
+
+def _has_trainable_advantage(
+    outputs: list[dict[str, Any]],
+    *,
+    filter_zero_advantage: bool,
+    advantage_epsilon: float,
+) -> bool:
+    if not filter_zero_advantage:
+        return True
+    return any(
+        output.get("advantage") is not None
+        and abs(float(output["advantage"])) > advantage_epsilon
+        for output in outputs
+    )
 
 
 def _patch_env_response_messages(vf, env) -> None:
