@@ -65,3 +65,7 @@ This launches four vLLM replicas on GPUs `0,1,2,3` and a four-rank FSDP trainer
 on GPUs `4,5,6,7`. It uses enforced zero-advantage filtering, 128 rollouts per
 step, packed training, `max_completion_tokens=768`, and `lr=1e-5` for a stable
 multi-GPU alphabet-sort reward run.
+
+The reward recipe also runs verifier evals every 20 exported policy steps and at
+the end of training. Eval metrics are written to `eval_metrics.jsonl`, and raw
+eval rollouts are written under `evals/step-*`.
