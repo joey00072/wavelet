@@ -128,7 +128,17 @@ def main(argv: list[str] | None = None) -> int:
                     policy = policy_receiver.wait_for_step(policy_step)
                     wait_policy_seconds = perf_counter() - wait_started_at
                     load_started_at = perf_counter()
+                    _wake_for_colocated_sleep(
+                        config,
+                        inference_engine,
+                        tags=["weights"],
+                    )
                     inference_engine.load_policy(policy.step_dir, step=policy.step)
+                    _wake_for_colocated_sleep(
+                        config,
+                        inference_engine,
+                        tags=["kv_cache"],
+                    )
                     load_policy_seconds = perf_counter() - load_started_at
                     loaded_policy_step = policy.step
                     _maybe_run_evals(
@@ -141,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     wait_policy_seconds = 0.0
                     load_policy_seconds = 0.0
+                    _wake_for_colocated_sleep(config, inference_engine)
                 submit_step(pool, step)
                 if _perf_enabled():
                     print(
@@ -160,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
                 publish_started_at = perf_counter()
                 batch = rollout_sender.publish(materialized_path, step=step)
                 publish_seconds = perf_counter() - publish_started_at
+                _sleep_for_colocated_sleep(config, inference_engine)
                 if _perf_enabled():
                     print(
                         "WAVELET_PERF inference_step "
@@ -178,8 +190,20 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if loaded_policy_step is None or loaded_policy_step < final_policy_step:
             policy = policy_receiver.wait_for_step(final_policy_step)
+            _wake_for_colocated_sleep(
+                config,
+                inference_engine,
+                tags=["weights"],
+            )
             inference_engine.load_policy(policy.step_dir, step=policy.step)
+            _wake_for_colocated_sleep(
+                config,
+                inference_engine,
+                tags=["kv_cache"],
+            )
             loaded_policy_step = policy.step
+        else:
+            _wake_for_colocated_sleep(config, inference_engine)
         _run_evals(
             config,
             orchestrator,
@@ -187,6 +211,7 @@ def main(argv: list[str] | None = None) -> int:
             rollout_step=target_step,
             envs=config.eval.env,
         )
+        _sleep_for_colocated_sleep(config, inference_engine)
     return 0
 
 
@@ -272,6 +297,21 @@ def _run_evals(
             policy_step=policy_step,
         )
         print(json_dumps_compact(metrics), flush=True)
+
+
+def _sleep_for_colocated_sleep(config: RLConfig, inference_engine) -> None:
+    if config.launcher.mode == "colocate_sleep":
+        inference_engine.sleep()
+
+
+def _wake_for_colocated_sleep(
+    config: RLConfig,
+    inference_engine,
+    *,
+    tags: list[str] | None = None,
+) -> None:
+    if config.launcher.mode == "colocate_sleep":
+        inference_engine.wake(tags=tags)
 
 
 def json_dumps_compact(payload) -> str:

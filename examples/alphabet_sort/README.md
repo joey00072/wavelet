@@ -43,6 +43,28 @@ Run training on a GPU host:
 uv run python -m wavelet rl @ examples/alphabet_sort/rl.yaml
 ```
 
+Run a colocated job when training and inference must share one GPU:
+
+```bash
+uv run python -m wavelet rl @ examples/alphabet_sort/rl_colocate.yaml
+```
+
+The colocated recipe launches vLLM and the trainer as separate processes with
+the same `CUDA_VISIBLE_DEVICES`. It caps `inference.vllm.gpu_memory_utilization`
+at `0.5`; tune that value for the available GPU memory.
+
+Run sleep-colocated training when vLLM and trainer should alternate ownership of
+the same GPU:
+
+```bash
+uv run python -m wavelet rl @ examples/alphabet_sort/rl_colocate_sleep.yaml
+```
+
+This starts vLLM, sleeps it before trainer startup, wakes it for rollout
+generation and policy loading, sleeps it after each rollout batch, then reloads
+the trainer model and optimizer for the training step. Because memory ownership
+alternates, this mode requires synchronous rollouts.
+
 Run a local multi-role job with two independent inference replicas
 and a two-rank FSDP trainer:
 

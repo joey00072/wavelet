@@ -328,7 +328,7 @@ class RLOrchestratorConfig(BaseModel):
 
 
 class RLLauncherConfig(BaseModel):
-    mode: Literal["integrated", "process"] = "integrated"
+    mode: Literal["integrated", "process", "colocate", "colocate_sleep"] = "integrated"
     backend: Literal["local", "ray"] = "local"
     trainer_cuda_visible_devices: str | list[str] | None = None
     inference_cuda_visible_devices: str | list[str] | None = None
@@ -408,4 +408,26 @@ class RLConfig(BaseModel):
                 )
             }
         )
+        return self
+
+    @model_validator(mode="after")
+    def validate_sleep_colocation(self) -> "RLConfig":
+        if self.launcher.mode != "colocate_sleep":
+            return self
+        if self.launcher.inference_num_replicas != 1:
+            raise ValueError(
+                "launcher.mode='colocate_sleep' currently supports one inference "
+                "replica."
+            )
+        if self.launcher.trainer_num_processes != 1:
+            raise ValueError(
+                "launcher.mode='colocate_sleep' currently supports one trainer "
+                "process."
+            )
+        if self.orchestrator.max_async_level > 0 or self.orchestrator.max_off_policy_steps > 0:
+            raise ValueError(
+                "launcher.mode='colocate_sleep' requires synchronous rollouts; set "
+                "orchestrator.max_async_level=0 and "
+                "orchestrator.max_off_policy_steps=0."
+            )
         return self

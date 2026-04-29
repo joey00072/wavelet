@@ -54,6 +54,13 @@ class PolicyInferenceEngine(ABC):
     def close(self) -> None:
         """Release inference resources."""
 
+    def sleep(self) -> None:
+        """Release inference-side GPU memory when supported."""
+
+    def wake(self, *, tags: list[str] | None = None) -> None:
+        """Restore inference-side GPU memory when supported."""
+        del tags
+
 
 class RLInference:
     def __init__(self, config: RLConfig) -> None:
