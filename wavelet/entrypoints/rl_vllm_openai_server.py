@@ -210,6 +210,10 @@ def _models(request: Request) -> OpenAIServingModels:
     return request.app.state.openai_serving_models
 
 
+def _engine_client(request: Request) -> EngineClient:
+    return request.app.state.engine_client
+
+
 def _chat_with_tokens(request: Request) -> OpenAIServingChatWithTokens | None:
     return request.app.state.openai_serving_chat_with_tokens
 
@@ -309,7 +313,54 @@ async def health(request: Request) -> dict[str, Any]:
     return {
         "status": "ok",
         "policy_step": getattr(request.app.state, "policy_step", None),
+        "asleep": getattr(request.app.state, "asleep", False),
     }
+
+
+@router.post("/sleep")
+async def sleep(payload: dict[str, Any], raw_request: Request) -> dict[str, Any]:
+    level = int(payload.get("level", 1))
+    client = _engine_client(raw_request)
+    if hasattr(client, "reset_prefix_cache"):
+        await client.reset_prefix_cache()
+    if hasattr(client, "reset_mm_cache"):
+        await client.reset_mm_cache()
+    if hasattr(client, "sleep"):
+        await client.sleep(level=level)
+        status = "slept"
+    elif hasattr(client, "pause_generation"):
+        await client.pause_generation(mode="keep", clear_cache=True)
+        status = "paused"
+    else:
+        try:
+            await client.collective_rpc("sleep", kwargs={"level": level})
+        except TypeError:
+            await client.collective_rpc("sleep", args=())
+        status = "slept"
+    raw_request.app.state.asleep = True
+    return {"status": status}
+
+
+@router.post("/wake")
+async def wake(payload: dict[str, Any], raw_request: Request) -> dict[str, Any]:
+    tags = payload.get("tags")
+    client = _engine_client(raw_request)
+    if hasattr(client, "wake_up"):
+        kwargs = {"tags": tags} if tags is not None else {}
+        await client.wake_up(**kwargs)
+        status = "woke"
+    elif hasattr(client, "resume_generation"):
+        await client.resume_generation()
+        status = "resumed"
+    else:
+        kwargs = {"tags": tags} if tags is not None else {}
+        try:
+            await client.collective_rpc("wake_up", kwargs=kwargs)
+        except TypeError:
+            await client.collective_rpc("wake_up", args=())
+        status = "woke"
+    raw_request.app.state.asleep = False
+    return {"status": status}
 
 
 @router.post("/load_policy")
@@ -449,6 +500,8 @@ def _serve_args(config: RLConfig) -> Namespace:
         argv.append("--trust-remote-code")
     if vllm_config.enforce_eager:
         argv.append("--enforce-eager")
+    if config.launcher.mode == "colocate_sleep":
+        argv.append("--enable-sleep-mode")
     if config.lora is not None:
         argv.append("--enable-lora")
 

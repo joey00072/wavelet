@@ -65,6 +65,15 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                     future.result()
         self.policy_step = step
 
+    def sleep(self) -> None:
+        self._request_all("POST", "/sleep", {"level": 1})
+
+    def wake(self, *, tags: list[str] | None = None) -> None:
+        payload: dict[str, Any] = {}
+        if tags is not None:
+            payload["tags"] = tags
+        self._request_all("POST", "/wake", payload)
+
     def annotate(self, records: list[RLExample]) -> list[RLExample]:
         if len(self.base_urls) == 1 or len(records) <= 1:
             response = self._request(
@@ -121,6 +130,29 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
 
     def close(self) -> None:
         return None
+
+    def _request_all(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if len(self.base_urls) == 1:
+            self._request(method, path, payload, base_url=self.base_url)
+            return
+        with ThreadPoolExecutor(max_workers=len(self.base_urls)) as executor:
+            futures = [
+                executor.submit(
+                    self._request,
+                    method,
+                    path,
+                    payload,
+                    base_url=base_url,
+                )
+                for base_url in self.base_urls
+            ]
+            for future in futures:
+                future.result()
 
     def _request(
         self,

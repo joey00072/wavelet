@@ -25,6 +25,15 @@ Guidance for coding agents working in this repository.
 - Run commands from repository root: `/home/joey/workspace/fuchsia`.
 - Prefer deterministic CLI invocations that can run in CI.
 
+## Git and Credentials
+
+- Source `.env` before commit or push commands so local identity and tokens are
+  available without hard-coding them in git config or command history.
+- Use `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_NAME`, and
+  `GIT_COMMITTER_EMAIL` from `.env` for commits when present.
+- Use GitHub token variables from `.env` for push authentication when needed.
+- Never print, commit, or otherwise expose `.env` contents.
+
 ## Build, Run, Lint, and Test Commands
 
 ### Environment Setup
