@@ -425,7 +425,7 @@ def _run_process_launcher(config: RLConfig) -> int:
             for port in inference_ports:
                 _wait_for_vllm_http_server(config, port=port)
             if config.launcher.mode == "colocate_sleep":
-                _sleep_vllm_http_server(config, port=inference_ports[0])
+                _sleep_vllm_http_servers(config, ports=inference_ports)
         handles.extend(launcher.start(role) for role in job_roles)
         wait_for_roles(
             handles,
@@ -470,6 +470,19 @@ def _sleep_vllm_http_server(config: RLConfig, *, port: int | None = None) -> Non
         timeout=config.inference.http.request_timeout_seconds,
     ):
         return None
+
+
+def _sleep_vllm_http_servers(config: RLConfig, *, ports: list[int]) -> None:
+    if len(ports) == 1:
+        _sleep_vllm_http_server(config, port=ports[0])
+        return
+    with ThreadPoolExecutor(max_workers=len(ports)) as executor:
+        futures = [
+            executor.submit(_sleep_vllm_http_server, config, port=port)
+            for port in ports
+        ]
+        for future in futures:
+            future.result()
 
 
 def _run_integrated_launcher(config: RLConfig) -> int:

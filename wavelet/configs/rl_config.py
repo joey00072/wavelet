@@ -337,6 +337,9 @@ class RLLauncherConfig(BaseModel):
     ray_address: str | None = None
     ray_runtime_env: dict[str, Any] | None = None
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
+    colocate_memory_wait_timeout_seconds: float = Field(default=120.0, ge=0.0)
+    colocate_memory_wait_poll_seconds: float = Field(default=0.5, gt=0.0)
+    colocate_memory_wait_margin: float = Field(default=0.05, ge=0.0, le=0.5)
 
 
 class RLConfig(BaseModel):
@@ -414,16 +417,6 @@ class RLConfig(BaseModel):
     def validate_sleep_colocation(self) -> "RLConfig":
         if self.launcher.mode != "colocate_sleep":
             return self
-        if self.launcher.inference_num_replicas != 1:
-            raise ValueError(
-                "launcher.mode='colocate_sleep' currently supports one inference "
-                "replica."
-            )
-        if self.launcher.trainer_num_processes != 1:
-            raise ValueError(
-                "launcher.mode='colocate_sleep' currently supports one trainer "
-                "process."
-            )
         if self.orchestrator.max_async_level > 0 or self.orchestrator.max_off_policy_steps > 0:
             raise ValueError(
                 "launcher.mode='colocate_sleep' requires synchronous rollouts; set "

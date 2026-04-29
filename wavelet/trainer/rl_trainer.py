@@ -480,6 +480,8 @@ class RLTrainer(BaseTrainer):
             }
             (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
         self.offload_after_refit()
+        if self.world.world_size > 1:
+            torch.distributed.barrier()
         if self.world.is_main:
             (tmp_dir / STABLE_BATCH_MARKER).touch()
             tmp_dir.replace(step_dir)
@@ -492,7 +494,7 @@ class RLTrainer(BaseTrainer):
             return
         self.monitor.finish(status=status, step=self.step)
         self._run_closed = True
-        if status == "completed":
+        if status == "completed" and not self._uses_sleep_colocation():
             self._save_model()
 
     def _validate_reference_policy_support(self) -> None:
@@ -904,7 +906,24 @@ class RLTrainer(BaseTrainer):
         if self.model is None or self.tokenizer is None:
             return
 
-        from wavelet.trainer.model import export_model_for_save, save_model
+        from wavelet.trainer.model import (
+            export_model_for_save,
+            save_lora_adapter_snapshot_from_fsdp,
+            save_model,
+        )
+
+        if self.config.policy_transfer.lightweight_lora and isinstance(
+            self.model, FSDP
+        ):
+            saved_path = save_lora_adapter_snapshot_from_fsdp(
+                self.model,
+                self.output_dir,
+                is_main_process=self.world.is_main,
+            )
+            if self.world.is_main:
+                self.tokenizer.save_pretrained(saved_path)
+                logger.info(f"Model saved to {self.output_dir}")
+            return
 
         saveable_model, state_dict = export_model_for_save(self.model)
         save_model(

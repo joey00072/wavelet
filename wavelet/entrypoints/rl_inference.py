@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from time import perf_counter
+from time import perf_counter, sleep
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.policy import create_policy_inference_engine
@@ -311,7 +312,93 @@ def _wake_for_colocated_sleep(
     tags: list[str] | None = None,
 ) -> None:
     if config.launcher.mode == "colocate_sleep":
+        if tags is None or "weights" in tags:
+            _wait_for_colocated_training_memory(config)
         inference_engine.wake(tags=tags)
+
+
+def _wait_for_colocated_training_memory(config: RLConfig) -> None:
+    timeout = config.launcher.colocate_memory_wait_timeout_seconds
+    if timeout <= 0:
+        return
+    devices = _colocated_trainer_device_ids(config)
+    if not devices:
+        return
+
+    required_free_fraction = max(
+        config.inference.vllm.gpu_memory_utilization
+        - config.launcher.colocate_memory_wait_margin,
+        0.0,
+    )
+    deadline = perf_counter() + timeout
+    last_stats: dict[str, tuple[int, int]] = {}
+    while True:
+        stats = _query_gpu_memory_mib(devices)
+        if not stats:
+            return
+        last_stats = stats
+        if all(
+            (total - used) >= int(total * required_free_fraction)
+            for total, used in stats.values()
+        ):
+            return
+        if perf_counter() >= deadline:
+            break
+        sleep(config.launcher.colocate_memory_wait_poll_seconds)
+
+    details = ", ".join(
+        f"gpu{idx}: used={used}MiB free={total - used}MiB total={total}MiB"
+        for idx, (total, used) in sorted(last_stats.items(), key=lambda item: item[0])
+    )
+    raise RuntimeError(
+        "Timed out waiting for colocated trainer GPU memory to be released before "
+        f"waking vLLM. Required free fraction is {required_free_fraction:.2f}; "
+        f"last observed: {details}"
+    )
+
+
+def _colocated_trainer_device_ids(config: RLConfig) -> set[str]:
+    value = (
+        config.launcher.trainer_cuda_visible_devices
+        or config.launcher.inference_cuda_visible_devices
+    )
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        raw_parts = value.replace(";", ",").replace("|", ",").split(",")
+    else:
+        raw_parts = []
+        for item in value:
+            raw_parts.extend(item.split(","))
+    return {part.strip() for part in raw_parts if part.strip().isdigit()}
+
+
+def _query_gpu_memory_mib(devices: set[str]) -> dict[str, tuple[int, int]]:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.total,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+    stats: dict[str, tuple[int, int]] = {}
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 3 or parts[0] not in devices:
+            continue
+        try:
+            stats[parts[0]] = (int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+    return stats
 
 
 def json_dumps_compact(payload) -> str:
