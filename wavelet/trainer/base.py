@@ -296,8 +296,7 @@ class BaseTrainer:
             self.model.to(self.world.device)
             self.model.train()
         self._move_optimizer_state("cuda")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._flush_cuda_allocator()
 
     def offload_after_refit(self) -> None:
         if not self._uses_sleep_colocation():
@@ -306,9 +305,14 @@ class BaseTrainer:
             self.model.to("cpu")
             self.model.eval()
         self._move_optimizer_state("cpu")
+        self._flush_cuda_allocator()
+
+    def _flush_cuda_allocator(self) -> None:
         gc.collect()
         if torch.cuda.is_available():
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     def _uses_sleep_colocation(self) -> bool:
         launcher = getattr(self.config, "launcher", None)
@@ -321,7 +325,7 @@ class BaseTrainer:
         for state in self.optimizer.state.values():
             for key, value in list(state.items()):
                 if torch.is_tensor(value):
-                    state[key] = value.to(target, non_blocking=True)
+                    state[key] = value.to(target, non_blocking=target.type == "cuda")
 
     def _compute_total_steps(self) -> int:
         if self.config.max_steps is not None:
