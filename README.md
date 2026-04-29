@@ -1,5 +1,9 @@
 # Wavelet
 
+<p align="center">
+  <img src="assets/wavelet-logo.png" alt="Wavelet logo" width="360">
+</p>
+
 Minimal post-training scaffolding for SFT and RL experiments.
 
 ## RL Quick Start
