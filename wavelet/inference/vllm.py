@@ -153,6 +153,8 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "max_cpu_loras": vllm_config.max_cpu_loras,
             "max_lora_rank": max_lora_rank,
         }
+        if self.config.launcher.mode == "colocate_sleep":
+            kwargs["enable_sleep_mode"] = True
         self.llm = LLM(**kwargs)
         self.tokenizer = setup_tokenizer(self.config.model)
         self._openai_batch_worker = threading.Thread(
@@ -194,6 +196,28 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         if self.llm is None:
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
         self.llm.update_weights({"update_info": update_info})
+
+    def sleep(self) -> None:
+        if self.llm is None:
+            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        if hasattr(self.llm, "llm_engine") and hasattr(
+            self.llm.llm_engine,
+            "reset_prefix_cache",
+        ):
+            self.llm.llm_engine.reset_prefix_cache()
+        if hasattr(self.llm, "reset_mm_cache"):
+            self.llm.reset_mm_cache()
+        self.llm.sleep(level=1)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def wake(self, *, tags: list[str] | None = None) -> None:
+        if self.llm is None:
+            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        kwargs = {}
+        if tags is not None:
+            kwargs["tags"] = tags
+        self.llm.wake_up(**kwargs)
 
     def annotate(self, records: list[RLExample]) -> list[RLExample]:
         if self.llm is None or self.tokenizer is None:

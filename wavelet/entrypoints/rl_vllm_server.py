@@ -70,6 +70,18 @@ def _build_app(config: RLConfig):
     def resume() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.post("/sleep")
+    def sleep(payload: dict[str, Any] | None = None) -> dict[str, str]:
+        del payload
+        engine.sleep()
+        return {"status": "slept"}
+
+    @app.post("/wake")
+    def wake(payload: dict[str, Any] | None = None) -> dict[str, str]:
+        tags = None if payload is None else payload.get("tags")
+        engine.wake(tags=tags)
+        return {"status": "woke"}
+
     @app.post("/load_policy")
     def load_policy(payload: dict[str, Any]) -> dict[str, Any]:
         policy_dir = Path(payload["policy_dir"])
