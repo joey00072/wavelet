@@ -25,6 +25,7 @@ def main(argv: list[str] | None = None) -> int:
         trainer.setup()
         if config.orchestrator.enabled:
             trainer.export_policy(step=trainer.step)
+            trainer.offload_after_refit()
             receiver = FileSystemRolloutReceiver(
                 config.output_dir,
                 config.transport,
@@ -41,10 +42,12 @@ def main(argv: list[str] | None = None) -> int:
                     trainer.load_rollout_path(batch.path)
                     load_seconds = perf_counter() - load_started_at
                     train_started_at = perf_counter()
+                    trainer.prepare_for_training()
                     trainer.train_until(trainer.step + 1)
                     train_seconds = perf_counter() - train_started_at
                     export_started_at = perf_counter()
                     trainer.export_policy(step=trainer.step)
+                    trainer.offload_after_refit()
                     export_seconds = perf_counter() - export_started_at
                     total_seconds = perf_counter() - loop_started_at
                     if _perf_enabled():

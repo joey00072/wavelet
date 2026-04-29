@@ -101,6 +101,29 @@ def _as_device_groups(value: str | list[str] | None, count: int) -> list[str | N
     return groups
 
 
+def _trainer_device_group(config: RLConfig) -> str | None:
+    if config.launcher.mode in {"colocate", "colocate_sleep"}:
+        if config.launcher.trainer_cuda_visible_devices is not None:
+            return _as_device_groups(
+                config.launcher.trainer_cuda_visible_devices,
+                1,
+            )[0]
+        if config.launcher.inference_num_replicas != 1:
+            raise ValueError(
+                f"launcher.mode='{config.launcher.mode}' requires "
+                "launcher.trainer_cuda_visible_devices when using multiple "
+                "inference replicas."
+            )
+        return _as_device_groups(
+            config.launcher.inference_cuda_visible_devices,
+            1,
+        )[0]
+    return _as_device_groups(
+        config.launcher.trainer_cuda_visible_devices,
+        1,
+    )[0]
+
+
 def _http_ports(config: RLConfig, count: int) -> list[int]:
     configured = config.inference.http.ports
     if configured is not None:
@@ -379,10 +402,7 @@ def _run_process_launcher(config: RLConfig) -> int:
                 command="rl-trainer",
                 config_path=trainer_config_path,
                 log_name="rl_trainer",
-                cuda_visible_devices=_as_device_groups(
-                    config.launcher.trainer_cuda_visible_devices,
-                    1,
-                )[0],
+                cuda_visible_devices=_trainer_device_group(config),
                 torchrun_nproc_per_node=config.launcher.trainer_num_processes,
             ),
             RoleSpec(
@@ -404,6 +424,8 @@ def _run_process_launcher(config: RLConfig) -> int:
         if config.inference.mode == "vllm_http":
             for port in inference_ports:
                 _wait_for_vllm_http_server(config, port=port)
+            if config.launcher.mode == "colocate_sleep":
+                _sleep_vllm_http_server(config, port=inference_ports[0])
         handles.extend(launcher.start(role) for role in job_roles)
         wait_for_roles(
             handles,
@@ -431,6 +453,23 @@ def _wait_for_vllm_http_server(config: RLConfig, *, port: int | None = None) -> 
     raise TimeoutError(
         f"Timed out waiting for vLLM HTTP server at {url}"
     ) from last_error
+
+
+def _sleep_vllm_http_server(config: RLConfig, *, port: int | None = None) -> None:
+    port = config.inference.http.port if port is None else port
+    url = f"http://{config.inference.http.host}:{port}/sleep"
+    data = b'{"level": 1}'
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(
+        request,
+        timeout=config.inference.http.request_timeout_seconds,
+    ):
+        return None
 
 
 def _run_integrated_launcher(config: RLConfig) -> int:
@@ -546,7 +585,10 @@ def main(argv: list[str] | None = None) -> int:
         print(config.model_dump_json(indent=2))
         return 0
 
-    if config.launcher.mode == "process" and config.orchestrator.enabled:
+    if (
+        config.launcher.mode in {"process", "colocate", "colocate_sleep"}
+        and config.orchestrator.enabled
+    ):
         return _run_process_launcher(config)
     return _run_integrated_launcher(config)
 

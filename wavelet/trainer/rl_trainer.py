@@ -469,6 +469,8 @@ class RLTrainer(BaseTrainer):
                     state_dict=state_dict,
                     is_main_process=True,
                 )
+        export_model = None
+        state_dict = None
         if self.world.is_main:
             meta = {
                 "format_version": 1,
@@ -477,6 +479,8 @@ class RLTrainer(BaseTrainer):
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
             (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
+        self.offload_after_refit()
+        if self.world.is_main:
             (tmp_dir / STABLE_BATCH_MARKER).touch()
             tmp_dir.replace(step_dir)
         if self.world.world_size > 1:

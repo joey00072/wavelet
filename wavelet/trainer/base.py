@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import os
 import random
 import tempfile
@@ -287,6 +288,40 @@ class BaseTrainer:
             total_steps=total_steps,
             lr=self.config.optim.lr,
         )
+
+    def prepare_for_training(self) -> None:
+        if not self._uses_sleep_colocation():
+            return
+        if self.model is not None and self.world is not None:
+            self.model.to(self.world.device)
+            self.model.train()
+        self._move_optimizer_state("cuda")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def offload_after_refit(self) -> None:
+        if not self._uses_sleep_colocation():
+            return
+        if self.model is not None:
+            self.model.to("cpu")
+            self.model.eval()
+        self._move_optimizer_state("cpu")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _uses_sleep_colocation(self) -> bool:
+        launcher = getattr(self.config, "launcher", None)
+        return getattr(launcher, "mode", None) == "colocate_sleep"
+
+    def _move_optimizer_state(self, device: str) -> None:
+        if self.optimizer is None:
+            return
+        target = torch.device(device)
+        for state in self.optimizer.state.values():
+            for key, value in list(state.items()):
+                if torch.is_tensor(value):
+                    state[key] = value.to(target, non_blocking=True)
 
     def _compute_total_steps(self) -> int:
         if self.config.max_steps is not None:
