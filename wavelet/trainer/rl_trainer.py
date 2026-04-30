@@ -72,7 +72,7 @@ class RLTrainer(BaseTrainer):
         self._train_loss_accum: list[float] = []
         self._train_metric_accum: list[dict[str, float]] = []
         self._optimizer_batch_loss_scale: int | None = None
-        self.accumulation_steps = config.data.batch_size // config.data.micro_batch_size
+        self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
         self._run_closed = False
