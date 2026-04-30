@@ -26,7 +26,7 @@ class SFTTrainer(BaseTrainer):
         self.monitor: RunMonitor | None = None
         self.step = 0  # optimizer step counter; max_steps is in optimizer-step units
         self._micro_step = 0  # internal micro-batch counter for accumulation tracking
-        self.accumulation_steps = config.data.batch_size // config.data.micro_batch_size
+        self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
 
@@ -34,12 +34,25 @@ class SFTTrainer(BaseTrainer):
         super()._setup_data()
         if not self.tokenizer:
             raise RuntimeError("Tokenizer must be set up before data")
+        self._setup_accumulation_steps()
 
         self.dataloader = setup_dataloader(
             self.dataset,
             self.config.data,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+
+    def _setup_accumulation_steps(self) -> None:
+        if self.world is None:
+            raise RuntimeError("World must be set up before accumulation steps")
+        global_micro_batch = self.config.data.micro_batch_size * self.world.world_size
+        if self.config.data.batch_size % global_micro_batch != 0:
+            raise ValueError(
+                "SFT data.batch_size is the global optimizer batch size and must be "
+                "divisible by data.micro_batch_size * world_size "
+                f"({self.config.data.micro_batch_size} * {self.world.world_size})."
+            )
+        self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
     def setup(self) -> None:
         super().setup()
