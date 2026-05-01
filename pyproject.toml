@@ -34,11 +34,15 @@ verifiers = [
 ]
 envs = [
     "alphabet-sort",
+    "aime2025",
+    "math-env",
 ]
 
 [tool.uv.sources]
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "77a9f28" }
 alphabet-sort = { index = "primeintellect" }
+aime2025 = { index = "primeintellect" }
+math-env = { index = "primeintellect" }
 
 [[tool.uv.index]]
 name = "primeintellect"

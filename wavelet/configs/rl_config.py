@@ -135,6 +135,7 @@ class RLSamplingConfig(BaseModel):
     do_sample: bool = True
     num_generations: int = Field(default=1, ge=1)
     seed: int | None = None
+    extra_body: dict[str, Any] = Field(default_factory=dict)
 
 
 class RLEvalSamplingConfig(BaseModel):
@@ -321,6 +322,7 @@ class RLOrchestratorConfig(BaseModel):
     examples_per_step: int | None = Field(default=None, ge=1)
     rollouts_per_example: int | None = Field(default=None, ge=1)
     oversampling_factor: float = Field(default=1.0, ge=1.0)
+    rollout_chunk_examples: int | None = Field(default=None, ge=1)
     filter_zero_advantage: bool = False
     zero_advantage_max_retries: int = Field(default=8, ge=0)
     max_async_level: int = Field(default=0, ge=0)
@@ -403,6 +405,8 @@ class RLConfig(BaseModel):
     def resolve_rollouts_per_example(self) -> "RLConfig":
         rollouts_per_example = self.orchestrator.rollouts_per_example
         if rollouts_per_example is None or self.orchestrator.custom_rollout_function:
+            return self
+        if "num_generations" in self.inference.sampling.model_fields_set:
             return self
         self.inference = self.inference.model_copy(
             update={

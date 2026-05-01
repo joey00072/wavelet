@@ -67,3 +67,23 @@ def test_packed_rl_dataset_counts_real_local_samples() -> None:
     )
 
     assert dataset.local_real_sample_count() == 1
+
+
+def test_packed_rl_dataset_allows_dummy_only_distributed_ranks() -> None:
+    dataset = PackedRLDataset(
+        records=[_record(0)],
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=RLDataConfig(pack_sequences=True, seq_len=8),
+        data_rank=3,
+        data_world_size=4,
+    )
+
+    bins = dataset._bins_for_epoch(0)  # noqa: SLF001
+
+    assert len(bins) == 1
+    assert sum(bins[0]["loss_mask"]) == 0
+    assert bins[0]["advantages"] == []
+    assert bins[0]["sample_count"] == 0
+    assert dataset.local_real_sample_count() == 0
+    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(1.5)

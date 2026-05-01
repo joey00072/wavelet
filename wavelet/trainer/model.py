@@ -282,6 +282,10 @@ def setup_model(
             for name, module in model.named_modules():
                 if name.endswith(module_name):
                     module.to(compute_dtype)
+    if config.fused_lm_head_token_chunk_size != "disabled":
+        from wavelet.trainer.lm_head import maybe_inject_chunked_lm_head
+
+        maybe_inject_chunked_lm_head(model, config.fused_lm_head_token_chunk_size)
     if config.adapter_path is not None:
         model = PeftModel.from_pretrained(
             model,

@@ -239,12 +239,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             for record in records
         ]
         sampling_params = self._sampling_params()
+        lora_request = self._lora_request
         with self._generate_lock:
             request_outputs = self.llm.generate(
                 prompts,
                 sampling_params,
                 use_tqdm=False,
-                lora_request=self._lora_request,
+                lora_request=lora_request,
             )
         self._mark_lora_loaded()
 
@@ -376,12 +377,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             sampling_params.append(SamplingParams(**sampling_kwargs))
 
         prefill_tokens = sum(len(row) for row in prompt_id_rows)
+        lora_request = self._lora_request
         with self._generate_lock:
             outputs = self.llm.generate(
                 prompts,
                 sampling_params,
                 use_tqdm=False,
-                lora_request=self._lora_request,
+                lora_request=lora_request,
             )
         self._mark_lora_loaded()
         results: list[dict[str, Any]] = []
@@ -716,12 +718,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             full_token_ids = list(sample["input_ids"]) + [sample["target_ids"][-1]]
             prompts.append({"prompt_token_ids": full_token_ids})
 
+        lora_request = self._lora_request
         with self._generate_lock:
             scoring_outputs = self.llm.generate(
                 prompts,
                 self._prompt_logprob_params(),
                 use_tqdm=False,
-                lora_request=self._lora_request,
+                lora_request=lora_request,
             )
         self._mark_lora_loaded()
 

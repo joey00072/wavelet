@@ -72,6 +72,7 @@ class RLTrainer(BaseTrainer):
         self._train_loss_accum: list[float] = []
         self._train_metric_accum: list[dict[str, float]] = []
         self._optimizer_batch_loss_scale: int | None = None
+        self._loaded_micro_batch_count = 0
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -100,29 +101,7 @@ class RLTrainer(BaseTrainer):
         )
         if isinstance(self.dataset, PackedRLDataset):
             self.accumulation_steps = self.dataset.micro_batch_count()
-            self._validate_packed_rank_has_real_samples(self.dataset)
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
-
-    def _validate_packed_rank_has_real_samples(self, dataset: PackedRLDataset) -> None:
-        local_has_real_samples = float(dataset.local_real_sample_count() > 0)
-        if (
-            self.world is not None
-            and self.world.world_size > 1
-            and torch.distributed.is_initialized()
-        ):
-            flag = torch.tensor(local_has_real_samples, device=self.world.device)
-            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
-            all_ranks_have_real_samples = bool(flag.item())
-        else:
-            all_ranks_have_real_samples = bool(local_has_real_samples)
-        if all_ranks_have_real_samples:
-            return
-        raise ValueError(
-            "Packed RL batch has no real trainable samples on at least one data "
-            "rank after filtering. Increase orchestrator.examples_per_step or "
-            "orchestrator.rollouts_per_example, disable zero-advantage filtering, "
-            "or disable data.pack_sequences for this small batch."
-        )
 
     def setup(self) -> None:
         super().setup()
@@ -306,7 +285,42 @@ class RLTrainer(BaseTrainer):
             }
         )
         self._setup_data()
+        self._loaded_micro_batch_count = self._current_micro_batch_count(
+            optimizer_batch_size
+        )
         self._validate_reference_policy_support()
+
+    def _current_micro_batch_count(self, optimizer_batch_size: int) -> int:
+        if isinstance(self.dataset, PackedRLDataset):
+            return self.dataset.micro_batch_count()
+        if self.world is None:
+            raise RuntimeError("World must be set up before computing micro-batches")
+        global_micro_batch = self.config.data.micro_batch_size * self.world.world_size
+        return max(optimizer_batch_size // global_micro_batch, 1)
+
+    def train_loaded_rollouts_once(self) -> dict[str, float] | None:
+        if self.dataloader is None:
+            raise RuntimeError("Trainer dataloader is not set up.")
+        if self.monitor is None:
+            raise RuntimeError("Monitor not set up. Call setup() first.")
+        if self._run_closed:
+            raise RuntimeError("Trainer run has already been finalized.")
+
+        self.model.train()
+        metrics: dict[str, float] | None = None
+        for index, batch in enumerate(self.dataloader):
+            if index >= self._loaded_micro_batch_count:
+                break
+            batch = self._prepare_batch(batch)
+            metrics = self._train_step(batch)
+            if metrics is not None:
+                progress = tqdm(total=1, disable=not self.world.is_main)
+                self._log_train_metrics(metrics, progress)
+                self._maybe_checkpoint()
+                progress.update(1)
+                progress.close()
+                return metrics
+        return metrics
 
     def _maybe_log_rollout_samples(self, rollout_path: Path) -> None:
         if self.monitor is None:
@@ -390,10 +404,24 @@ class RLTrainer(BaseTrainer):
             ),
             "task": str(payload.get("task", "")),
             "example_id": str(payload.get("example_id", fallback_example_id)),
+            "prompt": self._messages_text(record.prompt),
+            "completion": self._messages_text(record.completion),
             "messages": self.tokenizer.decode(input_ids),
             "input_ids": json.dumps(input_ids),
             "reward": _scalar_or_json(payload.get(self.config.data.reward_column)),
         }
+
+    def _messages_text(self, messages: list[dict[str, str]]) -> str:
+        try:
+            return str(
+                self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            )
+        except Exception:
+            return json.dumps(messages, ensure_ascii=False)
 
     def should_export_policy(self, step: int) -> bool:
         if step == 0:
@@ -559,13 +587,7 @@ class RLTrainer(BaseTrainer):
             attention_mask = None
 
         with self.act_offload_ctx:
-            outputs = self.model(
-                input_ids=batch["input_ids"],
-                attention_mask=attention_mask,
-                position_ids=batch["position_ids"],
-            )
-            scaled_logits = outputs.logits / batch["temperatures"].unsqueeze(-1)
-            trainer_logprobs = selective_log_softmax(scaled_logits, batch["target_ids"])
+            trainer_logprobs = self._model_logprobs(batch, attention_mask)
             if not batch["loss_mask"].bool().any():
                 # Dummy packed batches keep FSDP ranks aligned after filtering.
                 # Make the zero loss explicitly depend on this rank's forward pass
@@ -688,18 +710,32 @@ class RLTrainer(BaseTrainer):
         try:
             with torch.no_grad():
                 with disable_adapter():
-                    outputs = self.model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=attention_mask,
-                        position_ids=batch["position_ids"],
-                    )
+                    computed_inference = self._model_logprobs(batch, attention_mask)
         finally:
             if training:
                 self.model.train()
-        scaled_logits = outputs.logits / batch["temperatures"].unsqueeze(-1)
-        computed_inference = selective_log_softmax(scaled_logits, batch["target_ids"])
         inference_logprobs[~has_inference] = computed_inference[~has_inference]
         return inference_logprobs
+
+    def _model_logprobs(
+        self,
+        batch: dict[str, Tensor],
+        attention_mask: Tensor | None,
+    ) -> Tensor:
+        if self.model is None:
+            raise RuntimeError("Model not set up")
+        outputs = self.model(
+            input_ids=batch["input_ids"],
+            attention_mask=attention_mask,
+            position_ids=batch["position_ids"],
+            labels=batch["target_ids"],
+            temperature=batch["temperatures"],
+        )
+        if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
+            return outputs["logprobs"]
+        logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+        scaled_logits = logits / batch["temperatures"].unsqueeze(-1)
+        return selective_log_softmax(scaled_logits, batch["target_ids"])
 
     def _teacher_logprobs(self, batch: dict[str, Tensor]) -> Tensor | None:
         if not batch["has_teacher_logprobs"].bool().any():

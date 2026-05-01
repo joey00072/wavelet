@@ -5,9 +5,9 @@ import importlib
 import json
 import math
 import random
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from collections.abc import Callable
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample, load_rl_records
@@ -50,19 +50,44 @@ class RLOrchestrator:
                 "orchestrator.zero_advantage_max_retries, relax filtering, or "
                 "check the reward/model output format."
             )
-        scored_records = last_scored_records
-        output_path = self._resolve_output_path(step=step)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        if output_path.exists() and not self.config.orchestrator.overwrite:
-            raise FileExistsError(
-                f"Rollout file '{output_path}' already exists and overwrite is disabled."
+        return self._write_records(last_scored_records, step=step)
+
+    def materialize_native_chunk(
+        self,
+        *,
+        optimizer_step: int,
+        chunk_index: int,
+        queue_step: int,
+        chunk_examples: int,
+        inference_engine=None,
+    ) -> Path:
+        if self.config.orchestrator.custom_rollout_function is not None:
+            raise ValueError("Native rollout chunks require native rollouts.")
+        attempts = self.config.orchestrator.zero_advantage_max_retries + 1
+        last_scored_records: list[RLExample] = []
+        for retry in range(attempts):
+            records = self._load_native_chunk_records(
+                optimizer_step=optimizer_step,
+                chunk_index=chunk_index,
+                chunk_examples=chunk_examples,
+                retry=retry,
             )
-        with output_path.open("w", encoding="utf-8") as handle:
-            for record in scored_records:
-                if record.temperatures is None:
-                    raise ValueError("Rollout record is missing temperatures.")
-                handle.write(json.dumps(self._serialize_record(record)) + "\n")
-        return output_path
+            scored_records = self._generate_and_score(
+                records,
+                inference_engine=inference_engine,
+            )
+            trainable_records = self._filter_zero_advantage_records(scored_records)
+            last_scored_records = trainable_records
+            if trainable_records:
+                break
+        else:
+            raise RuntimeError(
+                "All rollout groups in the native chunk were filtered after "
+                f"{attempts} generation attempt(s). Increase "
+                "orchestrator.zero_advantage_max_retries, relax filtering, or "
+                "check the reward/model output format."
+            )
+        return self._write_records(last_scored_records, step=queue_step)
 
     def _load_step_records(
         self,
@@ -70,22 +95,58 @@ class RLOrchestrator:
         step: int | None,
         retry: int,
     ) -> list[RLExample]:
+        records = load_rl_records(self.config.data)
+        return self._select_step_records(
+            records,
+            seed=self._step_seed(step=step, retry=retry),
+        )
+
+    def _load_native_chunk_records(
+        self,
+        *,
+        optimizer_step: int,
+        chunk_index: int,
+        chunk_examples: int,
+        retry: int,
+    ) -> list[RLExample]:
+        examples_per_step = self.config.orchestrator.examples_per_step
+        if examples_per_step is None:
+            raise ValueError("orchestrator.examples_per_step is required.")
+        if chunk_examples < 1:
+            raise ValueError("chunk_examples must be at least 1.")
+        records = load_rl_records(self.config.data)
+        selected = self._select_step_records(
+            records,
+            seed=self._step_seed(step=optimizer_step, retry=retry),
+            limit=examples_per_step,
+        )
+        start = chunk_index * chunk_examples
+        chunk_records = selected[start : start + chunk_examples]
+        if not chunk_records:
+            raise RuntimeError(
+                f"Native rollout chunk {chunk_index} for optimizer step "
+                f"{optimizer_step} is empty."
+            )
+        return chunk_records
+
+    def _step_seed(self, *, step: int | None, retry: int) -> int:
         data_config = self.config.data
         step_seed = data_config.seed
         if step is not None:
             step_seed += step
         if retry:
             step_seed += retry * 1_000_003
-        records = load_rl_records(data_config)
-        return self._select_step_records(records, seed=step_seed)
+        return step_seed
 
     def _select_step_records(
         self,
         records: list[RLExample],
         *,
         seed: int,
+        limit: int | None = None,
     ) -> list[RLExample]:
-        limit = self.config.orchestrator.examples_per_step
+        if limit is None:
+            limit = self.config.orchestrator.examples_per_step
         if limit is None or len(records) <= limit:
             return records
         if self.config.orchestrator.custom_rollout_function is not None:
@@ -108,20 +169,35 @@ class RLOrchestrator:
                 self.config.orchestrator.custom_rollout_function
             )
             return self.trim_to_step_examples(
-                self._assign_advantages(
-                    custom_rollout(self, records, inference_engine)
-                )
+                self._assign_advantages(custom_rollout(self, records, inference_engine))
             )
 
         inference = RLInference(self.config)
+        rollout_records = self._expand_native_rollout_records(records)
         if inference_engine is not None:
-            annotated = inference_engine.annotate(records)
+            annotated = inference_engine.annotate(rollout_records)
         else:
-            annotated = inference.annotate(records)
+            annotated = inference.annotate(rollout_records)
         scorer = RLRewardScorer(self.config.reward)
         return self._assign_advantages(
             [self._score_record(record, scorer) for record in annotated]
         )
+
+    def _expand_native_rollout_records(
+        self,
+        records: list[RLExample],
+    ) -> list[RLExample]:
+        rollouts_per_example = self.config.orchestrator.rollouts_per_example
+        if rollouts_per_example <= 1:
+            return records
+
+        expanded: list[RLExample] = []
+        for record in records:
+            for rollout_index in range(rollouts_per_example):
+                metadata = dict(record.metadata or {})
+                metadata.setdefault("rollout_index", rollout_index)
+                expanded.append(replace(record, metadata=metadata))
+        return expanded
 
     def publish(
         self,
@@ -158,6 +234,27 @@ class RLOrchestrator:
         return (
             self.config.output_dir / "rollouts" / self.config.transport.rollout_filename
         )
+
+    def _write_records(
+        self,
+        records: list[RLExample],
+        *,
+        step: int | None,
+    ) -> Path:
+        if not records:
+            raise RuntimeError("Rollout materialization produced no trainable records.")
+        output_path = self._resolve_output_path(step=step)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path.exists() and not self.config.orchestrator.overwrite:
+            raise FileExistsError(
+                f"Rollout file '{output_path}' already exists and overwrite is disabled."
+            )
+        with output_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                if record.temperatures is None:
+                    raise ValueError("Rollout record is missing temperatures.")
+                handle.write(json.dumps(self._serialize_record(record)) + "\n")
+        return output_path
 
     def _serialize_record(self, record: RLExample) -> dict[str, object]:
         payload: dict[str, object] = {
