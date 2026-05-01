@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 from wavelet.configs.rl_config import RLEvalEnvConfig
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl_dataset import RLExample, load_rl_records
 from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
@@ -99,6 +100,183 @@ def generate_rollouts(
     return records
 
 
+class VerifierRolloutScheduler:
+    """Persistent verifier rollout scheduler for process-mode async RL."""
+
+    def __init__(self, orchestrator: RLOrchestrator) -> None:
+        try:
+            import verifiers as vf
+        except ImportError as exc:
+            raise ImportError(
+                "Verifier rollouts require the 'verifiers' extra. Install with "
+                "`uv sync --extra verifiers`."
+            ) from exc
+
+        config = orchestrator.config
+        env_id = config.orchestrator.verifier_env_id
+        if env_id is None:
+            raise ValueError("orchestrator.verifier_env_id is required.")
+
+        self.vf = vf
+        self.orchestrator = orchestrator
+        self.config = config
+        self.env, _ = _load_cached_env(
+            vf,
+            env_id,
+            config.orchestrator.verifier_env_args,
+        )
+        self.model = config.orchestrator.verifier_model or config.model.name
+        self.sampling_args = _sampling_args(config)
+        self.rollout_count = config.orchestrator.rollouts_per_example or 1
+        self.target_groups = config.orchestrator.examples_per_step
+        if self.target_groups is None:
+            raise ValueError(
+                "orchestrator.examples_per_step is required for rolling verifier "
+                "scheduling."
+            )
+        os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
+        base_urls = _verifier_base_urls(config)
+        self.clients = [
+            vf.ClientConfig(
+                client_idx=client_index,
+                client_type=config.orchestrator.verifier_client_type,
+                api_base_url=base_url,
+                api_key_var=config.orchestrator.verifier_api_key_var,
+                extra_headers=extra_headers,
+            )
+            for client_index, (base_url, extra_headers) in enumerate(
+                _verifier_client_routes(
+                    base_urls,
+                    config.inference.vllm.data_parallel_size,
+                )
+            )
+        ]
+        if not self.clients:
+            raise ValueError("At least one verifier client is required.")
+        self.records = load_rl_records(config.data)
+        if not self.records:
+            raise ValueError("Verifier scheduler requires at least one train record.")
+        self.rng = random.Random(config.data.seed)
+        self.record_offset = self.rng.randrange(len(self.records))
+        self.next_group_id = 0
+        self.pending: dict[asyncio.Task[list[dict[str, Any]]], int] = {}
+        self.pending_clients: dict[asyncio.Task[list[dict[str, Any]]], int] = {}
+
+    @property
+    def max_inflight_groups(self) -> int:
+        async_level = max(1, self.config.orchestrator.max_async_level)
+        return max(
+            len(self.clients),
+            self.target_groups * async_level,
+        )
+
+    async def generate_batch(self, *, target_groups: int | None = None) -> list[RLExample]:
+        started_at = perf_counter()
+        target_groups = self.target_groups if target_groups is None else target_groups
+        outputs: list[dict[str, Any]] = []
+        accepted_groups = 0
+        rejected_groups = 0
+        completed_groups = 0
+
+        try:
+            while accepted_groups < target_groups:
+                self._fill_inflight()
+                done, _ = await asyncio.wait(
+                    self.pending,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    self.pending.pop(task, None)
+                    self.pending_clients.pop(task, None)
+                    completed_groups += 1
+                    group_outputs = task.result()
+                    if _has_trainable_advantage(
+                        group_outputs,
+                        filter_zero_advantage=(
+                            self.config.orchestrator.filter_zero_advantage
+                        ),
+                        advantage_epsilon=self.config.orchestrator.advantage_epsilon,
+                    ):
+                        outputs.extend(group_outputs)
+                        accepted_groups += 1
+                        if accepted_groups >= target_groups:
+                            break
+                    else:
+                        rejected_groups += 1
+        except Exception:
+            await self.aclose()
+            raise
+
+        self._fill_inflight()
+        convert_started_at = perf_counter()
+        _assign_rollout_advantages(outputs, self.config)
+        records = [
+            record
+            for output in outputs
+            for record in _records_from_output(output)
+        ]
+        records = self.orchestrator._filter_zero_advantage_records(records)
+        convert_seconds = perf_counter() - convert_started_at
+        if _perf_enabled():
+            print(
+                "WAVELET_PERF verifier_scheduler "
+                f"accepted_groups={accepted_groups} "
+                f"rejected_groups={rejected_groups} "
+                f"completed_groups={completed_groups} "
+                f"inflight_groups={len(self.pending)} "
+                f"records={len(records)} "
+                f"convert={convert_seconds:.3f} "
+                f"total={perf_counter() - started_at:.3f}",
+                flush=True,
+            )
+        return records
+
+    async def aclose(self) -> None:
+        for task in self.pending:
+            task.cancel()
+        if self.pending:
+            await asyncio.gather(*self.pending, return_exceptions=True)
+        self.pending.clear()
+        self.pending_clients.clear()
+
+    def _fill_inflight(self) -> None:
+        while len(self.pending) < self.max_inflight_groups:
+            self._schedule_group()
+
+    def _schedule_group(self) -> None:
+        record = self._next_record()
+        client_index = self._least_loaded_client_index()
+        task = asyncio.create_task(
+            _run_group(
+                self.vf,
+                self.env,
+                _verifier_example(record),
+                client=self.clients[client_index],
+                model=self.model,
+                sampling_args=self.sampling_args,
+                rollout_count=self.rollout_count,
+                max_retries=self.config.orchestrator.verifier_max_retries,
+                normalize_group_advantages=(
+                    self.config.orchestrator.normalize_group_advantages
+                ),
+            )
+        )
+        self.pending[task] = self.next_group_id
+        self.pending_clients[task] = client_index
+        self.next_group_id += 1
+
+    def _next_record(self) -> RLExample:
+        record = self.records[self.record_offset % len(self.records)]
+        self.record_offset += 1
+        return record
+
+    def _least_loaded_client_index(self) -> int:
+        counts = [0] * len(self.clients)
+        for client_index in self.pending_clients.values():
+            counts[client_index] += 1
+        return min(range(len(self.clients)), key=counts.__getitem__)
+
+
 def evaluate_env(
     orchestrator: RLOrchestrator,
     env_config: RLEvalEnvConfig,
@@ -146,6 +324,74 @@ def evaluate_env(
             rollouts_per_example=env_config.rollouts_per_example,
             max_retries=env_config.max_retries,
         )
+    )
+    elapsed = perf_counter() - started_at
+    env_name = env_config.resolved_name
+    output_path = (
+        config.output_dir
+        / "evals"
+        / f"step-{step:06d}"
+        / f"{env_name}.jsonl"
+    )
+    _write_eval_rollouts(output_path, outputs)
+    metrics = _eval_metrics(
+        env_name,
+        outputs,
+        total_rollouts=len(examples) * env_config.rollouts_per_example,
+        elapsed_seconds=elapsed,
+        rollouts_per_example=env_config.rollouts_per_example,
+    )
+    metrics["progress/policy_step"] = float(policy_step)
+    metrics["step"] = float(step)
+    _append_eval_metrics(config.output_dir / "eval_metrics.jsonl", metrics)
+    return metrics
+
+
+async def evaluate_env_async(
+    orchestrator: RLOrchestrator,
+    env_config: RLEvalEnvConfig,
+    *,
+    step: int,
+    policy_step: int,
+) -> dict[str, float]:
+    try:
+        import verifiers as vf
+    except ImportError as exc:
+        raise ImportError(
+            "Verifier evals require the 'verifiers' extra. Install with "
+            "`uv sync --extra verifiers`."
+        ) from exc
+
+    config = orchestrator.config
+    env, _env_cache_hit = _load_cached_env(vf, env_config.id, env_config.args)
+    examples = env.get_eval_dataset(n=env_config.num_examples).to_list()
+    base_urls = _verifier_base_urls(config)
+    os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
+    clients = [
+        vf.ClientConfig(
+            client_idx=client_index,
+            client_type="openai_chat_completions",
+            api_base_url=base_url,
+            api_key_var=config.orchestrator.verifier_api_key_var,
+            extra_headers=extra_headers,
+        )
+        for client_index, (base_url, extra_headers) in enumerate(
+            _verifier_client_routes(base_urls, config.inference.vllm.data_parallel_size)
+        )
+    ]
+    if not clients:
+        raise ValueError("At least one verifier eval client is required.")
+
+    started_at = perf_counter()
+    outputs = await _run_eval_examples(
+        vf,
+        env,
+        examples,
+        clients=clients,
+        model=config.orchestrator.verifier_model or config.model.name,
+        sampling_args=env_config.sampling.to_sampling_args(),
+        rollouts_per_example=env_config.rollouts_per_example,
+        max_retries=env_config.max_retries,
     )
     elapsed = perf_counter() - started_at
     env_name = env_config.resolved_name
@@ -513,7 +759,8 @@ def _sampling_args(config) -> dict[str, Any]:
         "max_completion_tokens": sampling.max_completion_tokens,
         "logprobs": True,
     }
-    extra_body: dict[str, Any] = {"return_token_ids": True}
+    extra_body: dict[str, Any] = dict(sampling.extra_body)
+    extra_body["return_token_ids"] = True
     if sampling.top_k != 0:
         extra_body["top_k"] = sampling.top_k
     extra_body["min_p"] = sampling.min_p

@@ -3,7 +3,7 @@ from __future__ import annotations
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
-from wavelet.orchestrator.verifiers import _records_from_output
+from wavelet.orchestrator.verifiers import _records_from_output, _sampling_args
 
 
 def test_verifier_step_converts_to_trainable_record() -> None:
@@ -66,6 +66,29 @@ def test_custom_verifier_rollout_function_loads_without_env_import() -> None:
     )
 
     assert function.__name__ == "generate_rollouts"
+
+
+def test_verifier_sampling_args_preserve_extra_body() -> None:
+    config = RLConfig(
+        inference={
+            "sampling": {
+                "top_k": -1,
+                "min_p": 0.0,
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "custom": "value",
+                },
+            }
+        }
+    )
+
+    args = _sampling_args(config)
+
+    assert args["extra_body"]["return_token_ids"] is True
+    assert args["extra_body"]["top_k"] == -1
+    assert args["extra_body"]["min_p"] == 0.0
+    assert args["extra_body"]["custom"] == "value"
+    assert args["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
 
 
 def test_pretokenized_rows_match_prime_sequence_window() -> None:

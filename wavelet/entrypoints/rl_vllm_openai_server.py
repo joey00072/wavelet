@@ -369,12 +369,15 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
         raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
     policy_dir = Path(payload["policy_dir"])
     step = int(payload["step"])
+    adapter_name = str(
+        payload.get("adapter_name") or _CONFIG.policy_transfer.adapter_name
+    )
     adapter_dir = policy_dir / "adapter"
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
     response = await _models(raw_request).load_lora_adapter(
         LoadLoRAAdapterRequest(
-            lora_name=_CONFIG.policy_transfer.adapter_name,
+            lora_name=adapter_name,
             lora_path=str(adapter_dir),
         )
     )
@@ -384,7 +387,7 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
             status_code=response.error.code,
         )
     raw_request.app.state.policy_step = step
-    return {"status": "ok", "policy_step": step}
+    return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
 
 
 @router.post(
@@ -498,6 +501,8 @@ def _serve_args(config: RLConfig) -> Namespace:
         )
     if config.model.trust_remote_code or vllm_config.trust_remote_code:
         argv.append("--trust-remote-code")
+    if config.model.chat_template is not None:
+        argv.extend(["--chat-template", config.model.chat_template])
     if vllm_config.enforce_eager:
         argv.append("--enforce-eager")
     if config.launcher.mode == "colocate_sleep":

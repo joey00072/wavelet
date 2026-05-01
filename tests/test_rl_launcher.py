@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.data.rl_dataset import RLExample
 from wavelet.entrypoints.rl_inference import (
     _colocated_trainer_device_ids,
+    _use_streaming_native_scheduler,
     _wait_for_colocated_training_memory,
 )
+from wavelet.entrypoints.rl_trainer import _use_streaming_rollout_chunks
 from wavelet.entrypoints.rl_launcher import (
     _sleep_vllm_http_servers,
     _trainer_device_group,
 )
 from wavelet.entrypoints.rl_vllm_openai_server import _serve_args
-from wavelet.inference.http import HTTPPolicyInferenceEngine
+from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
+from wavelet.orchestrator.rollouts import RLOrchestrator
 
 
 def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
@@ -166,3 +172,174 @@ def test_http_inference_sleep_discards_vllm_gpu_allocations() -> None:
     engine.sleep()
 
     assert calls == [("POST", "/sleep", {"level": 1})]
+
+
+def test_http_openai_load_policy_uses_step_scoped_adapter_name() -> None:
+    config = RLConfig(
+        inference={"vllm": {"server_backend": "openai"}},
+        lora={"rank": 4, "target_modules": ["q_proj"]},
+    )
+    engine = HTTPPolicyInferenceEngine(config)
+    calls = []
+
+    def fake_request(
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        *,
+        base_url: str | None = None,
+    ) -> dict:
+        calls.append((method, path, payload, base_url))
+        return {}
+
+    engine._request = fake_request  # type: ignore[method-assign]
+
+    engine.load_policy(Path("policy"), step=7)
+
+    assert calls == [
+        (
+            "POST",
+            "/load_policy",
+            {
+                "policy_dir": "policy",
+                "step": 7,
+                "adapter_name": "policy-000007",
+            },
+            "http://127.0.0.1:8000",
+        )
+    ]
+    assert engine.policy_model_name == "policy-000007"
+
+
+def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
+    engine = HTTPPolicyInferenceEngine(RLConfig())
+    record = RLExample(
+        prompt=[{"role": "user", "content": "x"}],
+        completion=[{"role": "assistant", "content": "expected"}],
+        reward=None,
+        advantage=0.5,
+    )
+
+    converted = engine._record_from_openai_response(
+        record,
+        prompt_ids=[10, 11],
+        response={
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": "answer"},
+                    "token_ids": [12, 13],
+                    "logprobs": {
+                        "content": [
+                            {"logprob": -0.1},
+                            {"logprob": -0.2},
+                        ]
+                    },
+                }
+            ]
+        },
+    )
+
+    assert converted.completion == [{"role": "assistant", "content": "answer"}]
+    assert converted.target_completion == [{"role": "assistant", "content": "expected"}]
+    assert converted.input_ids == [10, 11, 12]
+    assert converted.target_ids == [11, 12, 13]
+    assert converted.loss_mask == [False, True, True]
+    assert converted.inference_logprobs == [-0.1, -0.2]
+
+
+def test_http_openai_payload_sets_vllm_request_fields() -> None:
+    config = RLConfig(
+        inference={
+            "sampling": {
+                "top_k": 20,
+                "min_p": 0.05,
+                "extra_body": {"return_token_ids": False, "allowed_token_ids": [1, 2]},
+            },
+            "vllm": {"server_backend": "openai"},
+        }
+    )
+    engine = HTTPPolicyInferenceEngine(config)
+    record = RLExample(
+        prompt=[{"role": "user", "content": "x"}],
+        completion=[],
+        reward=None,
+        advantage=0.0,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    payload = engine._openai_payload(
+        record,
+        [10, 11],
+        policy_model_name="policy-000123",
+    )
+
+    assert payload["model"] == "policy-000123"
+    assert payload["return_token_ids"] is True
+    assert payload["top_k"] == 20
+    assert payload["min_p"] == 0.05
+    assert payload["allowed_token_ids"] == [1, 2]
+    assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "extra_body" not in payload
+
+
+def test_shift_completion_sample_masks_only_completion_tokens() -> None:
+    sample = _shift_completion_sample(
+        prompt_ids=[1, 2],
+        completion_ids=[3, 4],
+        completion_logprobs=[-0.3, -0.4],
+        temperature=0.7,
+    )
+
+    assert sample["input_ids"] == [1, 2, 3]
+    assert sample["target_ids"] == [2, 3, 4]
+    assert sample["loss_mask"] == [False, True, True]
+    assert sample["inference_logprobs"] == [0.0, -0.3, -0.4]
+    assert sample["temperatures"] == [0.7, 0.7, 0.7]
+
+
+def test_native_process_rollouts_use_streaming_chunks() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": None,
+            "examples_per_step": 4,
+            "max_async_level": 4,
+        },
+    )
+
+    assert _use_streaming_native_scheduler(config) is True
+    assert _use_streaming_rollout_chunks(config) is True
+
+
+def test_native_rollout_chunks_partition_selected_step_records(monkeypatch) -> None:
+    records = [
+        RLExample(
+            prompt=[{"role": "user", "content": f"p{i}"}],
+            completion=[],
+            advantage=None,
+            reward=None,
+        )
+        for i in range(8)
+    ]
+    config = RLConfig(
+        data={"seed": 123},
+        orchestrator={"examples_per_step": 4, "rollout_chunk_examples": 1},
+    )
+    orchestrator = RLOrchestrator(config)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.rollouts.load_rl_records",
+        lambda _config: records,
+    )
+
+    selected = orchestrator._select_step_records(records, seed=123, limit=4)
+    chunks = [
+        orchestrator._load_native_chunk_records(
+            optimizer_step=0,
+            chunk_index=index,
+            chunk_examples=1,
+            retry=0,
+        )
+        for index in range(4)
+    ]
+
+    assert [chunk[0] for chunk in chunks] == selected

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import subprocess
 import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from math import ceil
+from pathlib import Path
 from time import perf_counter, sleep
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step
 from wavelet.orchestrator.queue import FileSystemPolicyReceiver, FileSystemRolloutSender
@@ -88,35 +93,138 @@ def main(argv: list[str] | None = None) -> int:
     orchestrator = RLOrchestrator(config)
     target_step = config.max_steps or 1
     _preload_rollout_resources(config)
+    if _use_rolling_verifier_scheduler(config):
+        return asyncio.run(
+            _run_rolling_verifier_inference(
+                config=config,
+                orchestrator=orchestrator,
+                inference_engine=inference_engine,
+                policy_receiver=policy_receiver,
+                target_step=target_step,
+            )
+        )
+    if _use_streaming_native_scheduler(config):
+        return _run_streaming_native_inference(
+            config=config,
+            orchestrator=orchestrator,
+            inference_engine=inference_engine,
+            policy_receiver=policy_receiver,
+            target_step=target_step,
+        )
     loaded_policy_step: int | None = None
-    last_eval_steps = {
-        env.resolved_name: -1
-        for env in config.eval.env
-    } if config.eval is not None else {}
-    prefetch_steps = max(1, min(4, config.orchestrator.max_async_level, target_step))
+    last_eval_steps = (
+        {env.resolved_name: -1 for env in config.eval.env}
+        if config.eval is not None
+        else {}
+    )
+    prefetch_steps = max(1, min(config.orchestrator.max_async_level, target_step))
     next_step_to_submit = 0
     next_step_to_publish = 0
     rollout_sender = FileSystemRolloutSender(config.output_dir, config.transport)
-    pending: dict[Future[tuple[int, object, float]], int] = {}
+    pending: dict[Future[tuple[int, object, float, float]], int] = {}
+    completed: dict[int, tuple[object, float, float]] = {}
+    pending_policy_load: Future[tuple[int, float, float]] | None = None
 
     def submit_step(
         pool: ThreadPoolExecutor,
         step: int,
     ) -> None:
-        future = pool.submit(_publish_step, orchestrator, step, inference_engine)
+        future = pool.submit(
+            _publish_step,
+            orchestrator,
+            rollout_sender,
+            step,
+            inference_engine,
+        )
         pending[future] = step
 
-    with ThreadPoolExecutor(
-        max_workers=prefetch_steps,
-        thread_name_prefix="wavelet-inference-step",
-    ) as pool:
-        while next_step_to_submit < target_step or pending:
-            while (
-                next_step_to_submit < target_step
-                and len(pending) < prefetch_steps
-            ):
+    def finish_policy_load(*, block: bool = False) -> bool:
+        nonlocal loaded_policy_step, pending_policy_load
+        if pending_policy_load is None:
+            return False
+        if not block and not pending_policy_load.done():
+            return False
+        policy_step, wait_policy_seconds, load_policy_seconds = (
+            pending_policy_load.result()
+        )
+        loaded_policy_step = policy_step
+        pending_policy_load = None
+        _maybe_run_evals(
+            config,
+            orchestrator,
+            policy_step=policy_step,
+            rollout_step=next_step_to_submit,
+            last_eval_steps=last_eval_steps,
+        )
+        if _perf_enabled():
+            print(
+                "WAVELET_PERF policy_load "
+                f"step={policy_step} wait_policy={wait_policy_seconds:.3f} "
+                f"load_policy={load_policy_seconds:.3f}",
+                flush=True,
+            )
+        return True
+
+    def collect_done(done) -> None:
+        for future in done:
+            materialize_step = pending.pop(future)
+            _, batch, materialize_seconds, publish_seconds = future.result()
+            completed[materialize_step] = (
+                batch,
+                materialize_seconds,
+                publish_seconds,
+            )
+
+    def publish_ready() -> bool:
+        nonlocal next_step_to_publish
+        published = False
+        while next_step_to_publish in completed:
+            batch, materialize_seconds, publish_seconds = completed.pop(
+                next_step_to_publish
+            )
+            step = next_step_to_publish
+            next_step_to_publish += 1
+            _sleep_for_colocated_sleep(config, inference_engine)
+            if _perf_enabled():
+                print(
+                    "WAVELET_PERF inference_step "
+                    f"step={step} "
+                    f"wait_policy=0.000 "
+                    f"load_policy=0.000 "
+                    f"publish={publish_seconds:.3f} "
+                    f"materialize={materialize_seconds:.3f} "
+                    f"total={materialize_seconds + publish_seconds:.3f}",
+                    flush=True,
+                )
+            print(batch.path)
+            published = True
+        return published
+
+    def collect_finished_rollouts() -> bool:
+        done = [future for future in pending if future.done()]
+        if not done:
+            return False
+        collect_done(done)
+        return publish_ready()
+
+    with (
+        ThreadPoolExecutor(
+            max_workers=prefetch_steps,
+            thread_name_prefix="wavelet-inference-step",
+        ) as pool,
+        ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="wavelet-policy-load",
+        ) as policy_pool,
+    ):
+        while next_step_to_submit < target_step or pending or pending_policy_load:
+            finish_policy_load()
+            if collect_finished_rollouts():
+                continue
+
+            submitted = False
+            while next_step_to_submit < target_step and len(pending) < prefetch_steps:
                 step = next_step_to_submit
-                next_step_to_submit += 1
                 step_started_at = perf_counter()
                 policy_step = _policy_step_to_load(
                     config,
@@ -125,35 +233,57 @@ def main(argv: list[str] | None = None) -> int:
                     loaded_policy_step=loaded_policy_step,
                 )
                 if policy_step is not None:
-                    wait_started_at = perf_counter()
-                    policy = policy_receiver.wait_for_step(policy_step)
-                    wait_policy_seconds = perf_counter() - wait_started_at
-                    load_started_at = perf_counter()
-                    _wake_for_colocated_sleep(
-                        config,
-                        inference_engine,
-                        tags=["weights"],
+                    required_policy_step = _required_policy_step(config, step)
+                    must_load_before_rollout = (
+                        loaded_policy_step is None
+                        or loaded_policy_step < required_policy_step
                     )
-                    inference_engine.load_policy(policy.step_dir, step=policy.step)
-                    _wake_for_colocated_sleep(
-                        config,
-                        inference_engine,
-                        tags=["kv_cache"],
-                    )
-                    load_policy_seconds = perf_counter() - load_started_at
-                    loaded_policy_step = policy.step
-                    _maybe_run_evals(
-                        config,
-                        orchestrator,
-                        policy_step=policy.step,
-                        rollout_step=step,
-                        last_eval_steps=last_eval_steps,
-                    )
+                    if must_load_before_rollout:
+                        if publish_ready():
+                            continue
+                        if pending:
+                            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                            collect_done(done)
+                            publish_ready()
+                            continue
+                        if pending_policy_load is not None:
+                            finish_policy_load(block=True)
+                            continue
+                        (
+                            loaded_policy_step,
+                            wait_policy_seconds,
+                            load_policy_seconds,
+                        ) = _load_policy_step(
+                            config,
+                            inference_engine,
+                            policy_receiver,
+                            policy_step,
+                        )
+                        _maybe_run_evals(
+                            config,
+                            orchestrator,
+                            policy_step=loaded_policy_step,
+                            rollout_step=step,
+                            last_eval_steps=last_eval_steps,
+                        )
+                    else:
+                        if pending_policy_load is None:
+                            pending_policy_load = policy_pool.submit(
+                                _load_policy_step,
+                                config,
+                                inference_engine,
+                                policy_receiver,
+                                policy_step,
+                            )
+                        wait_policy_seconds = 0.0
+                        load_policy_seconds = 0.0
                 else:
                     wait_policy_seconds = 0.0
                     load_policy_seconds = 0.0
                     _wake_for_colocated_sleep(config, inference_engine)
+                next_step_to_submit += 1
                 submit_step(pool, step)
+                submitted = True
                 if _perf_enabled():
                     print(
                         "WAVELET_PERF inference_submit "
@@ -163,28 +293,14 @@ def main(argv: list[str] | None = None) -> int:
                         flush=True,
                     )
 
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
-            for future in done:
-                materialize_step = pending.pop(future)
-                _, materialized_path, materialize_seconds = future.result()
-                step = next_step_to_publish
-                next_step_to_publish += 1
-                publish_started_at = perf_counter()
-                batch = rollout_sender.publish(materialized_path, step=step)
-                publish_seconds = perf_counter() - publish_started_at
-                _sleep_for_colocated_sleep(config, inference_engine)
-                if _perf_enabled():
-                    print(
-                        "WAVELET_PERF inference_step "
-                        f"step={step} materialize_step={materialize_step} "
-                        f"wait_policy=0.000 "
-                        f"load_policy=0.000 "
-                        f"publish={publish_seconds:.3f} "
-                        f"materialize={materialize_seconds:.3f} "
-                        f"total={materialize_seconds + publish_seconds:.3f}",
-                        flush=True,
-                    )
-                print(batch.path)
+            if submitted or finish_policy_load():
+                continue
+            if pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                collect_done(done)
+                publish_ready()
+            elif pending_policy_load is not None:
+                finish_policy_load(block=True)
     if config.eval is not None and config.eval.final_eval:
         final_policy_step = _final_eval_policy_step(config, target_step)
         if final_policy_step is None:
@@ -216,8 +332,490 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _use_rolling_verifier_scheduler(config: RLConfig) -> bool:
+    return (
+        config.launcher.mode == "process"
+        and config.orchestrator.custom_rollout_function
+        == "wavelet.orchestrator.verifiers:generate_rollouts"
+        and config.orchestrator.max_async_level > 0
+    )
+
+
+def _use_streaming_native_scheduler(config: RLConfig) -> bool:
+    return (
+        config.launcher.mode == "process"
+        and config.orchestrator.custom_rollout_function is None
+        and config.orchestrator.max_async_level > 0
+        and config.orchestrator.examples_per_step is not None
+    )
+
+
+def _run_streaming_native_inference(
+    *,
+    config: RLConfig,
+    orchestrator: RLOrchestrator,
+    inference_engine,
+    policy_receiver: FileSystemPolicyReceiver,
+    target_step: int,
+) -> int:
+    rollout_sender = FileSystemRolloutSender(config.output_dir, config.transport)
+    loaded_policy_step: int | None = None
+    last_eval_steps = (
+        {env.resolved_name: -1 for env in config.eval.env}
+        if config.eval is not None
+        else {}
+    )
+    chunk_examples = _rollout_chunk_examples(config)
+    examples_per_step = config.orchestrator.examples_per_step or chunk_examples
+    chunks_per_step = max(ceil(examples_per_step / chunk_examples), 1)
+    target_chunks = target_step * chunks_per_step
+    max_pending_chunks = max(
+        1,
+        min(config.orchestrator.max_async_level * chunks_per_step, target_chunks),
+    )
+    next_queue_step_to_submit = 0
+    next_queue_step_to_publish = 0
+    pending: dict[Future[tuple[int, object, float, float]], int] = {}
+    completed: dict[int, tuple[object, float, float]] = {}
+    pending_policy_load: Future[tuple[int, float, float]] | None = None
+
+    def submit_chunk(pool: ThreadPoolExecutor, queue_step: int) -> None:
+        optimizer_step = queue_step // chunks_per_step
+        chunk_index = queue_step % chunks_per_step
+        future = pool.submit(
+            _publish_native_chunk,
+            orchestrator,
+            rollout_sender,
+            optimizer_step,
+            chunk_index,
+            queue_step,
+            chunk_examples,
+            inference_engine,
+        )
+        pending[future] = queue_step
+
+    def finish_policy_load(*, block: bool = False) -> bool:
+        nonlocal loaded_policy_step, pending_policy_load
+        if pending_policy_load is None:
+            return False
+        if not block and not pending_policy_load.done():
+            return False
+        policy_step, wait_policy_seconds, load_policy_seconds = (
+            pending_policy_load.result()
+        )
+        loaded_policy_step = policy_step
+        pending_policy_load = None
+        _maybe_run_evals(
+            config,
+            orchestrator,
+            policy_step=policy_step,
+            rollout_step=next_queue_step_to_submit // chunks_per_step,
+            last_eval_steps=last_eval_steps,
+        )
+        if _perf_enabled():
+            print(
+                "WAVELET_PERF policy_load "
+                f"step={policy_step} wait_policy={wait_policy_seconds:.3f} "
+                f"load_policy={load_policy_seconds:.3f}",
+                flush=True,
+            )
+        return True
+
+    def collect_done(done) -> None:
+        for future in done:
+            queue_step = pending.pop(future)
+            _, batch, materialize_seconds, publish_seconds = future.result()
+            completed[queue_step] = (batch, materialize_seconds, publish_seconds)
+
+    def publish_ready() -> bool:
+        nonlocal next_queue_step_to_publish
+        published = False
+        while next_queue_step_to_publish in completed:
+            batch, materialize_seconds, publish_seconds = completed.pop(
+                next_queue_step_to_publish
+            )
+            queue_step = next_queue_step_to_publish
+            optimizer_step = queue_step // chunks_per_step
+            chunk_index = queue_step % chunks_per_step
+            next_queue_step_to_publish += 1
+            _sleep_for_colocated_sleep(config, inference_engine)
+            if _perf_enabled():
+                print(
+                    "WAVELET_PERF inference_native_chunk "
+                    f"queue_step={queue_step} optimizer_step={optimizer_step} "
+                    f"chunk_index={chunk_index} "
+                    f"wait_policy=0.000 load_policy=0.000 "
+                    f"publish={publish_seconds:.3f} "
+                    f"materialize={materialize_seconds:.3f} "
+                    f"total={materialize_seconds + publish_seconds:.3f}",
+                    flush=True,
+                )
+            print(batch.path)
+            published = True
+        return published
+
+    def collect_finished_rollouts() -> bool:
+        done = [future for future in pending if future.done()]
+        if not done:
+            return False
+        collect_done(done)
+        return publish_ready()
+
+    with (
+        ThreadPoolExecutor(
+            max_workers=max_pending_chunks,
+            thread_name_prefix="wavelet-native-chunk",
+        ) as pool,
+        ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="wavelet-policy-load",
+        ) as policy_pool,
+    ):
+        while (
+            next_queue_step_to_submit < target_chunks or pending or pending_policy_load
+        ):
+            finish_policy_load()
+            if collect_finished_rollouts():
+                continue
+
+            submitted = False
+            while (
+                next_queue_step_to_submit < target_chunks
+                and len(pending) < max_pending_chunks
+            ):
+                queue_step = next_queue_step_to_submit
+                optimizer_step = queue_step // chunks_per_step
+                step_started_at = perf_counter()
+                policy_step = _policy_step_to_load(
+                    config,
+                    policy_receiver,
+                    rollout_step=optimizer_step,
+                    loaded_policy_step=loaded_policy_step,
+                )
+                if policy_step is not None:
+                    required_policy_step = _required_policy_step(
+                        config,
+                        optimizer_step,
+                    )
+                    must_load_before_rollout = (
+                        loaded_policy_step is None
+                        or loaded_policy_step < required_policy_step
+                    )
+                    if must_load_before_rollout:
+                        if publish_ready():
+                            continue
+                        if pending:
+                            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                            collect_done(done)
+                            publish_ready()
+                            continue
+                        if pending_policy_load is not None:
+                            finish_policy_load(block=True)
+                            continue
+                        (
+                            loaded_policy_step,
+                            wait_policy_seconds,
+                            load_policy_seconds,
+                        ) = _load_policy_step(
+                            config,
+                            inference_engine,
+                            policy_receiver,
+                            policy_step,
+                        )
+                        _maybe_run_evals(
+                            config,
+                            orchestrator,
+                            policy_step=loaded_policy_step,
+                            rollout_step=optimizer_step,
+                            last_eval_steps=last_eval_steps,
+                        )
+                    else:
+                        if pending_policy_load is None:
+                            pending_policy_load = policy_pool.submit(
+                                _load_policy_step,
+                                config,
+                                inference_engine,
+                                policy_receiver,
+                                policy_step,
+                            )
+                        wait_policy_seconds = 0.0
+                        load_policy_seconds = 0.0
+                else:
+                    wait_policy_seconds = 0.0
+                    load_policy_seconds = 0.0
+                    _wake_for_colocated_sleep(config, inference_engine)
+                next_queue_step_to_submit += 1
+                submit_chunk(pool, queue_step)
+                submitted = True
+                if _perf_enabled():
+                    print(
+                        "WAVELET_PERF inference_native_submit "
+                        f"queue_step={queue_step} optimizer_step={optimizer_step} "
+                        f"chunk_index={queue_step % chunks_per_step} "
+                        f"wait_policy={wait_policy_seconds:.3f} "
+                        f"load_policy={load_policy_seconds:.3f} "
+                        f"submit={perf_counter() - step_started_at:.3f}",
+                        flush=True,
+                    )
+
+            if submitted or finish_policy_load():
+                continue
+            if pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                collect_done(done)
+                publish_ready()
+            elif pending_policy_load is not None:
+                finish_policy_load(block=True)
+
+    if config.eval is not None and config.eval.final_eval:
+        final_policy_step = _final_eval_policy_step(config, target_step)
+        if final_policy_step is None:
+            return 0
+        if loaded_policy_step is None or loaded_policy_step < final_policy_step:
+            policy = policy_receiver.wait_for_step(final_policy_step)
+            _wake_for_colocated_sleep(
+                config,
+                inference_engine,
+                tags=["weights"],
+            )
+            inference_engine.load_policy(policy.step_dir, step=policy.step)
+            _wake_for_colocated_sleep(
+                config,
+                inference_engine,
+                tags=["kv_cache"],
+            )
+            loaded_policy_step = policy.step
+        else:
+            _wake_for_colocated_sleep(config, inference_engine)
+        _run_evals(
+            config,
+            orchestrator,
+            policy_step=loaded_policy_step,
+            rollout_step=target_step,
+            envs=config.eval.env,
+        )
+        _sleep_for_colocated_sleep(config, inference_engine)
+    return 0
+
+
+async def _run_rolling_verifier_inference(
+    *,
+    config: RLConfig,
+    orchestrator: RLOrchestrator,
+    inference_engine,
+    policy_receiver: FileSystemPolicyReceiver,
+    target_step: int,
+) -> int:
+    from wavelet.orchestrator.verifiers import VerifierRolloutScheduler
+
+    scheduler = VerifierRolloutScheduler(orchestrator)
+    rollout_sender = FileSystemRolloutSender(config.output_dir, config.transport)
+    loaded_policy_step: int | None = None
+    pending_policy_update: asyncio.Task[int] | None = None
+    last_eval_steps = (
+        {env.resolved_name: -1 for env in config.eval.env}
+        if config.eval is not None
+        else {}
+    )
+    chunk_groups = _rollout_chunk_examples(config)
+    chunks_per_step = max(
+        ceil((config.orchestrator.examples_per_step or chunk_groups) / chunk_groups),
+        1,
+    )
+    target_chunks = target_step * chunks_per_step
+    try:
+        for queue_step in range(target_chunks):
+            step_started_at = perf_counter()
+            optimizer_step = queue_step // chunks_per_step
+            if pending_policy_update is not None and pending_policy_update.done():
+                loaded_policy_step = pending_policy_update.result()
+                pending_policy_update = None
+                await _maybe_run_evals_async(
+                    config,
+                    orchestrator,
+                    policy_step=loaded_policy_step,
+                    rollout_step=optimizer_step,
+                    last_eval_steps=last_eval_steps,
+                )
+            policy_step = _policy_step_to_load(
+                config,
+                policy_receiver,
+                rollout_step=optimizer_step,
+                loaded_policy_step=loaded_policy_step,
+            )
+            if policy_step is not None and pending_policy_update is None:
+                wait_started_at = perf_counter()
+                if loaded_policy_step is None:
+                    loaded_policy_step = await _load_policy_async(
+                        config,
+                        inference_engine,
+                        policy_receiver,
+                        policy_step,
+                    )
+                    wait_policy_seconds = perf_counter() - wait_started_at
+                    load_policy_seconds = wait_policy_seconds
+                    await _maybe_run_evals_async(
+                        config,
+                        orchestrator,
+                        policy_step=loaded_policy_step,
+                        rollout_step=optimizer_step,
+                        last_eval_steps=last_eval_steps,
+                    )
+                else:
+                    pending_policy_update = asyncio.create_task(
+                        _load_policy_async(
+                            config,
+                            inference_engine,
+                            policy_receiver,
+                            policy_step,
+                        )
+                    )
+                    wait_policy_seconds = 0.0
+                    load_policy_seconds = 0.0
+            else:
+                wait_policy_seconds = 0.0
+                load_policy_seconds = 0.0
+                _wake_for_colocated_sleep(config, inference_engine)
+
+            generate_started_at = perf_counter()
+            records = await scheduler.generate_batch(target_groups=chunk_groups)
+            generate_seconds = perf_counter() - generate_started_at
+            materialize_started_at = perf_counter()
+            materialized_path = _write_materialized_records(
+                orchestrator,
+                records,
+                step=queue_step,
+            )
+            materialize_seconds = perf_counter() - materialize_started_at
+            publish_started_at = perf_counter()
+            batch = rollout_sender.publish(materialized_path, step=queue_step)
+            publish_seconds = perf_counter() - publish_started_at
+            if _perf_enabled():
+                print(
+                    "WAVELET_PERF inference_chunk "
+                    f"queue_step={queue_step} optimizer_step={optimizer_step} "
+                    f"groups={chunk_groups} wait_policy={wait_policy_seconds:.3f} "
+                    f"load_policy={load_policy_seconds:.3f} "
+                    f"generate={generate_seconds:.3f} "
+                    f"materialize={materialize_seconds:.3f} "
+                    f"publish={publish_seconds:.3f} "
+                    f"pending_policy_update={int(pending_policy_update is not None)} "
+                    f"total={perf_counter() - step_started_at:.3f}",
+                    flush=True,
+                )
+            print(batch.path)
+        if pending_policy_update is not None:
+            loaded_policy_step = await pending_policy_update
+            pending_policy_update = None
+        if config.eval is not None and config.eval.final_eval:
+            final_policy_step = _final_eval_policy_step(config, target_step)
+            if final_policy_step is not None:
+                if loaded_policy_step is None or loaded_policy_step < final_policy_step:
+                    policy = await asyncio.to_thread(
+                        policy_receiver.wait_for_step,
+                        final_policy_step,
+                    )
+                    _wake_for_colocated_sleep(
+                        config,
+                        inference_engine,
+                        tags=["weights"],
+                    )
+                    inference_engine.load_policy(policy.step_dir, step=policy.step)
+                    _wake_for_colocated_sleep(
+                        config,
+                        inference_engine,
+                        tags=["kv_cache"],
+                    )
+                    loaded_policy_step = policy.step
+                else:
+                    _wake_for_colocated_sleep(config, inference_engine)
+                await _run_evals_async(
+                    config,
+                    orchestrator,
+                    policy_step=loaded_policy_step,
+                    rollout_step=target_step,
+                    envs=config.eval.env,
+                )
+                _sleep_for_colocated_sleep(config, inference_engine)
+        return 0
+    finally:
+        if pending_policy_update is not None:
+            pending_policy_update.cancel()
+            await asyncio.gather(pending_policy_update, return_exceptions=True)
+        await scheduler.aclose()
+
+
+async def _load_policy_async(
+    config: RLConfig,
+    inference_engine,
+    policy_receiver: FileSystemPolicyReceiver,
+    policy_step: int,
+) -> int:
+    step, _, _ = await asyncio.to_thread(
+        _load_policy_step,
+        config,
+        inference_engine,
+        policy_receiver,
+        policy_step,
+    )
+    return step
+
+
+def _load_policy_step(
+    config: RLConfig,
+    inference_engine,
+    policy_receiver: FileSystemPolicyReceiver,
+    policy_step: int,
+) -> tuple[int, float, float]:
+    wait_started_at = perf_counter()
+    policy = policy_receiver.wait_for_step(policy_step)
+    wait_policy_seconds = perf_counter() - wait_started_at
+    load_started_at = perf_counter()
+    _wake_for_colocated_sleep(config, inference_engine, tags=["weights"])
+    inference_engine.load_policy(policy.step_dir, step=policy.step)
+    _wake_for_colocated_sleep(config, inference_engine, tags=["kv_cache"])
+    load_policy_seconds = perf_counter() - load_started_at
+    return policy.step, wait_policy_seconds, load_policy_seconds
+
+
+def _rollout_chunk_examples(config: RLConfig) -> int:
+    configured = config.orchestrator.rollout_chunk_examples
+    if configured is not None:
+        return configured
+    examples_per_step = config.orchestrator.examples_per_step
+    if examples_per_step is None:
+        return 1
+    async_level = max(config.orchestrator.max_async_level, 1)
+    return max(1, ceil(examples_per_step / async_level))
+
+
+def _write_materialized_records(
+    orchestrator: RLOrchestrator,
+    records: list[RLExample],
+    *,
+    step: int,
+) -> Path:
+    if not records:
+        raise RuntimeError(
+            "Rolling verifier scheduler produced no trainable rollout records."
+        )
+    output_path = orchestrator._resolve_output_path(step=step)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and not orchestrator.config.orchestrator.overwrite:
+        raise FileExistsError(
+            f"Rollout file '{output_path}' already exists and overwrite is disabled."
+        )
+    with output_path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            if record.temperatures is None:
+                raise ValueError("Rollout record is missing temperatures.")
+            handle.write(json.dumps(orchestrator._serialize_record(record)) + "\n")
+    return output_path
+
+
 def _publish_step(
     orchestrator: RLOrchestrator,
+    rollout_sender: FileSystemRolloutSender,
     step: int,
     inference_engine,
 ):
@@ -227,7 +825,34 @@ def _publish_step(
         inference_engine=inference_engine,
     )
     materialize_seconds = perf_counter() - materialize_started_at
-    return step, materialized_path, materialize_seconds
+    publish_started_at = perf_counter()
+    batch = rollout_sender.publish(materialized_path, step=step)
+    publish_seconds = perf_counter() - publish_started_at
+    return step, batch, materialize_seconds, publish_seconds
+
+
+def _publish_native_chunk(
+    orchestrator: RLOrchestrator,
+    rollout_sender: FileSystemRolloutSender,
+    optimizer_step: int,
+    chunk_index: int,
+    queue_step: int,
+    chunk_examples: int,
+    inference_engine,
+):
+    materialize_started_at = perf_counter()
+    materialized_path = orchestrator.materialize_native_chunk(
+        optimizer_step=optimizer_step,
+        chunk_index=chunk_index,
+        queue_step=queue_step,
+        chunk_examples=chunk_examples,
+        inference_engine=inference_engine,
+    )
+    materialize_seconds = perf_counter() - materialize_started_at
+    publish_started_at = perf_counter()
+    batch = rollout_sender.publish(materialized_path, step=queue_step)
+    publish_seconds = perf_counter() - publish_started_at
+    return queue_step, batch, materialize_seconds, publish_seconds
 
 
 def _final_eval_policy_step(config: RLConfig, target_step: int) -> int | None:
@@ -272,6 +897,38 @@ def _maybe_run_evals(
     )
 
 
+async def _maybe_run_evals_async(
+    config: RLConfig,
+    orchestrator: RLOrchestrator,
+    *,
+    policy_step: int,
+    rollout_step: int,
+    last_eval_steps: dict[str, int],
+) -> None:
+    if config.eval is None:
+        return
+
+    envs = []
+    for env in config.eval.env:
+        eval_step = compute_eval_policy_step(
+            policy_step=policy_step,
+            last_eval_step=last_eval_steps[env.resolved_name],
+            interval=env.interval,
+            eval_base_model=config.eval.eval_base_model,
+        )
+        if eval_step is None:
+            continue
+        last_eval_steps[env.resolved_name] = eval_step
+        envs.append(env)
+    await _run_evals_async(
+        config,
+        orchestrator,
+        policy_step=policy_step,
+        rollout_step=rollout_step,
+        envs=envs,
+    )
+
+
 def _run_evals(
     config: RLConfig,
     orchestrator: RLOrchestrator,
@@ -292,6 +949,34 @@ def _run_evals(
 
     for env in envs:
         metrics = evaluate_env(
+            orchestrator,
+            env,
+            step=rollout_step,
+            policy_step=policy_step,
+        )
+        print(json_dumps_compact(metrics), flush=True)
+
+
+async def _run_evals_async(
+    config: RLConfig,
+    orchestrator: RLOrchestrator,
+    *,
+    policy_step: int,
+    rollout_step: int,
+    envs,
+) -> None:
+    if not envs:
+        return
+    if (
+        config.orchestrator.custom_rollout_function
+        != "wavelet.orchestrator.verifiers:generate_rollouts"
+    ):
+        raise ValueError("RL eval is currently supported for verifier rollouts only.")
+
+    from wavelet.orchestrator.verifiers import evaluate_env_async
+
+    for env in envs:
+        metrics = await evaluate_env_async(
             orchestrator,
             env,
             step=rollout_step,

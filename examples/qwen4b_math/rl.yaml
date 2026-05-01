@@ -5,6 +5,7 @@ model:
   load_in_4bit: false
   gradient_checkpointing: true
   allow_tf32: true
+  fused_lm_head_token_chunk_size: auto
 
 data:
   source: local
@@ -13,7 +14,7 @@ data:
   micro_batch_size: 1
   pack_sequences: true
   pad_to_multiple_of: 1
-  seq_len: 8192
+  seq_len: 32768
   max_examples: null
   shuffle: true
   seed: 42
@@ -35,22 +36,26 @@ orchestrator:
   verifier_client_type: openai_chat_completions_token
   advantage_mode: group_reward
   normalize_group_advantages: false
-  examples_per_step: 64
+  examples_per_step: 4
   rollouts_per_example: 8
   oversampling_factor: 2.0
+  rollout_chunk_examples: 1
   filter_zero_advantage: true
   zero_advantage_max_retries: 8
-  max_async_level: 1
+  max_async_level: 4
   max_off_policy_steps: 8
 
 eval:
   interval: 25
   num_examples: 30
   rollouts_per_example: 4
-  eval_base_model: true
-  final_eval: true
+  eval_base_model: false
+  final_eval: false
   sampling:
     max_completion_tokens: 8192
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
   env:
     - id: aime2025
       rollouts_per_example: 4
@@ -69,10 +74,13 @@ inference:
     do_sample: true
     num_generations: 1
     seed: null
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
   vllm:
     server_backend: openai
     gpu_memory_utilization: 0.9
-    max_model_len: 8192
+    max_model_len: 32768
     enforce_eager: false
     max_loras: 8
     max_cpu_loras: 100
@@ -107,8 +115,8 @@ fsdp:
 
 optim:
   type: adamw
-  implementation: for-loop
-  lr: 1e-6
+  implementation: fused
+  lr: 5e-5
   weight_decay: 0.01
 
 scheduler:
@@ -131,7 +139,7 @@ lora:
     - fc2_latent_proj
 
 max_grad_norm: 1.0
-max_steps: 100
+max_steps: 1000
 seed: 42
 
 monitor:
@@ -142,10 +150,10 @@ monitor:
     sample_ratio: 0.25
     max_samples: 8
   wandb:
-    enabled: false
+    enabled: true
     project: wavelet-qwen4b-math
     name: wavelet-qwen4b-math-rl
-    mode: offline
+    mode: online
 
 launcher:
   mode: process

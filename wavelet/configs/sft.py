@@ -43,6 +43,7 @@ class ModelConfig(BaseModel):
     fused_lora_mlp: bool = False  # patch MLP.forward with fused LoRA_MLP kernel
     fused_lora_qkv: bool = False  # patch Qwen3Attention forward with fused LoRA_QKV
     fused_lora_o: bool = False  # patch o_proj.forward with fused LoRA_W kernel
+    fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     smart_gc: bool = False  # sqrt-N gradient checkpointing with CPU offload
 
 
