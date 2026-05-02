@@ -1,0 +1,142 @@
+model:
+  name: "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  load_in_4bit: false
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: local
+  path: outputs/reverse_text_data/rl_train.jsonl
+  batch_size: 128
+  micro_batch_size: 1
+  pack_sequences: true
+  pad_to_multiple_of: 1
+  seq_len: 2048
+  max_examples: null
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 1e-3
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: reverse-text
+  verifier_model: PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: group_reward
+  normalize_group_advantages: false
+  examples_per_step: 8
+  rollouts_per_example: 16
+  filter_zero_advantage: true
+  zero_advantage_max_retries: 8
+  max_async_level: 1
+  max_off_policy_steps: 8
+  state_server:
+    enabled: true
+    host: 0.0.0.0
+    port: 8765
+
+transport:
+  poll_interval_seconds: 0.05
+
+eval:
+  interval: 10
+  num_examples: 20
+  rollouts_per_example: 3
+  eval_base_model: false
+  final_eval: false
+  env:
+    - id: reverse-text
+      name: reverse-text
+
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 1.0
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 128
+    do_sample: true
+    num_generations: 1
+    seed: null
+  vllm:
+    server_backend: openai
+    gpu_memory_utilization: 0.75
+    max_model_len: 2048
+    enforce_eager: false
+    max_loras: 8
+    max_cpu_loras: 100
+    max_lora_rank: 32
+  http:
+    request_timeout_seconds: 300.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+  poll_interval_seconds: 0.05
+
+optim:
+  type: adam
+  implementation: fused
+  lr: 6e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 32
+  alpha: 64.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+max_grad_norm: 1.0
+max_steps: 20
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 5
+    sample_ratio: 0.25
+    max_samples: 8
+  wandb:
+    enabled: true
+    project: wavelet-reverse-text
+    name: wavelet-reverse-text-0.6b-rl
+    mode: online
+
+launcher:
+  mode: process
+  backend: local
+  inference_cuda_visible_devices: "0"
+  trainer_cuda_visible_devices: "1"
+  trainer_num_processes: 1
+  inference_num_replicas: 1
+
+output_dir: outputs/reverse_text_rl

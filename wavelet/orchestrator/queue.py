@@ -93,6 +93,7 @@ class FileSystemRolloutReceiver:
         self.config = config
         self.queue_dir = resolve_queue_dir(output_dir, config)
         self.next_step = start_step
+        self._consumed_steps: set[int] = set()
 
     def can_receive(self) -> bool:
         return self._stable_batch_for_step(self.next_step) is not None
@@ -128,6 +129,23 @@ class FileSystemRolloutReceiver:
                 )
             time.sleep(self.config.poll_interval_seconds)
 
+    def wait_available(self) -> RolloutBatch:
+        """Return the oldest currently stable unconsumed batch at or after next_step."""
+        deadline = None
+        if self.config.idle_timeout_seconds is not None:
+            deadline = time.monotonic() + self.config.idle_timeout_seconds
+        while True:
+            batch = self._oldest_available_batch()
+            if batch is not None:
+                self._mark_consumed(batch)
+                return batch
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for any rollout batch at or after step "
+                    f"{self.next_step} in '{self.queue_dir}'."
+                )
+            time.sleep(self.config.poll_interval_seconds)
+
     def available_steps(self) -> list[int]:
         steps: list[int] = []
         if not self.queue_dir.exists():
@@ -149,6 +167,22 @@ class FileSystemRolloutReceiver:
         if not batch_path.exists():
             return None
         return RolloutBatch(step=step, path=batch_path, step_dir=step_dir)
+
+    def _oldest_available_batch(self) -> RolloutBatch | None:
+        for step in self.available_steps():
+            if step < self.next_step or step in self._consumed_steps:
+                continue
+            return self._stable_batch_for_step(step)
+        return None
+
+    def _mark_consumed(self, batch: RolloutBatch) -> None:
+        self._consumed_steps.add(batch.step)
+        while self.next_step in self._consumed_steps:
+            self._consumed_steps.remove(self.next_step)
+            self.next_step += 1
+        if self.config.cleanup_consumed:
+            marker = batch.step_dir / ".consumed"
+            marker.touch()
 
     @staticmethod
     def _is_stable_step_dir(step_dir: Path) -> bool:

@@ -106,3 +106,30 @@ def test_eval_metrics_include_avg_and_pass_at_k() -> None:
     assert metrics["eval/alphabet/pass@1"] == pytest.approx(0.5)
     assert metrics["eval/alphabet/pass@2"] == pytest.approx(1.0)
     assert metrics["eval/alphabet/failed_rollouts"] == pytest.approx(0.0)
+
+
+def test_eval_metrics_treat_missing_reward_as_failed_rollout() -> None:
+    metrics = _eval_metrics(
+        "alphabet",
+        [
+            {
+                "example_id": "a",
+                "reward": 1.0,
+                "completion": [{"role": "assistant", "content": "x"}],
+                "is_truncated": False,
+            },
+            {
+                "example_id": "a",
+                "error": "timeout",
+                "completion": [],
+                "is_truncated": True,
+            },
+        ],
+        total_rollouts=2,
+        elapsed_seconds=1.5,
+        rollouts_per_example=2,
+    )
+
+    assert metrics["eval/alphabet/avg@2"] == pytest.approx(1.0)
+    assert metrics["eval/alphabet/pass@1"] == pytest.approx(1.0)
+    assert metrics["eval/alphabet/failed_rollouts"] == pytest.approx(0.5)

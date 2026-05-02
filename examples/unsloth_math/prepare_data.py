@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("outputs/unsloth_math_data/rl_train.jsonl"),
     )
-    parser.add_argument("--model", default="unsloth/Qwen3-4B-Base")
+    parser.add_argument("--model", default="unsloth/Qwen3-8B-Base")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--max-thought-tokens", type=int, default=384)
     parser.add_argument("--max-sft-examples", type=int, default=64)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import logging
 import math
 import random
 from collections.abc import Callable
@@ -19,6 +20,18 @@ CustomRolloutFunction = Callable[
     ["RLOrchestrator", list[RLExample], object | None],
     list[RLExample],
 ]
+
+logger = logging.getLogger(__name__)
+
+
+def _assistant_text(messages: list[dict[str, str]] | None) -> str:
+    if messages is None:
+        return ""
+    return "\n".join(
+        str(message.get("content", ""))
+        for message in messages
+        if message.get("role") == "assistant"
+    )
 
 
 class RLOrchestrator:
@@ -179,6 +192,8 @@ class RLOrchestrator:
         else:
             annotated = inference.annotate(rollout_records)
         scorer = RLRewardScorer(self.config.reward)
+        annotated = self._filter_degenerate_native_rollout_records(annotated)
+        annotated = self._drop_incomplete_native_rollout_groups(annotated)
         return self._assign_advantages(
             [self._score_record(record, scorer) for record in annotated]
         )
@@ -388,6 +403,71 @@ class RLOrchestrator:
             record
             for record in records
             if record.advantage is not None and abs(float(record.advantage)) > epsilon
+        ]
+
+    def _filter_degenerate_native_rollout_records(
+        self,
+        records: list[RLExample],
+    ) -> list[RLExample]:
+        valid: list[RLExample] = []
+        dropped_empty = 0
+        dropped_untrainable = 0
+        for record in records:
+            if not _assistant_text(record.completion).strip():
+                dropped_empty += 1
+                continue
+            if (
+                record.loss_mask is not None
+                and sum(bool(item) for item in record.loss_mask) == 0
+            ):
+                dropped_untrainable += 1
+                continue
+            valid.append(record)
+
+        dropped = dropped_empty + dropped_untrainable
+        if dropped:
+            logger.warning(
+                "Dropped %s degenerate native rollout(s) before scoring "
+                "(empty_completion=%s, untrainable=%s).",
+                dropped,
+                dropped_empty,
+                dropped_untrainable,
+            )
+        return valid
+
+    def _drop_incomplete_native_rollout_groups(
+        self,
+        records: list[RLExample],
+    ) -> list[RLExample]:
+        if (
+            self.config.orchestrator.advantage_mode != "group_reward"
+            or self.config.orchestrator.rollouts_per_example <= 1
+        ):
+            return records
+
+        grouped: dict[str, list[RLExample]] = {}
+        for record in records:
+            grouped.setdefault(self._group_key(record), []).append(record)
+
+        expected = self.config.orchestrator.rollouts_per_example
+        complete_group_keys = {
+            key for key, group in grouped.items() if len(group) >= expected
+        }
+        dropped = sum(
+            len(group)
+            for key, group in grouped.items()
+            if key not in complete_group_keys
+        )
+        if dropped:
+            logger.warning(
+                "Dropped %s rollout(s) from incomplete native group(s) before "
+                "group-reward scoring.",
+                dropped,
+            )
+        return [
+            record
+            for record in records
+            if self._group_key(record) in complete_group_keys
         ]
 
     def _replace_advantage(

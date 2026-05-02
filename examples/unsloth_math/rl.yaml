@@ -1,5 +1,5 @@
 model:
-  name: "unsloth/Qwen3-4B-Base"
+  name: "unsloth/Qwen3-8B-Base"
   adapter_path: outputs/unsloth_math_sft/adapter
   torch_dtype: bfloat16
   attn_implementation: sdpa
@@ -19,10 +19,10 @@ data:
   prompt_column: prompt
   completion_column: solution
   batch_size: 16
-  micro_batch_size: 1
-  pack_sequences: true
+  micro_batch_size: 4
+  pack_sequences: false
   pad_to_multiple_of: 1
-  seq_len: 4096
+  seq_len: 8192
   max_examples: 256
   shuffle: true
   seed: 3407
@@ -31,20 +31,28 @@ loss:
   type: dppo
   dppo_mask_high: 0.2
   dppo_mask_low: 0.2
-  kl_tau: 0.1
+  kl_tau: 1e-3
 
 orchestrator:
   enabled: true
+  state_server:
+    enabled: true
+    host: 0.0.0.0
+    port: 8765
   advantage_mode: group_reward
   normalize_group_advantages: false
   examples_per_step: 4
   rollouts_per_example: 8
   oversampling_factor: 2.0
-  rollout_chunk_examples: 1
-  filter_zero_advantage: false
+  rollout_chunk_examples: 2
+  filter_zero_advantage: true
   zero_advantage_max_retries: 8
   max_async_level: 8
   max_off_policy_steps: 8
+  max_pending_rollout_chunks: 64
+
+transport:
+  poll_interval_seconds: 0.05
 
 eval:
   interval: 20
@@ -63,17 +71,22 @@ inference:
     top_k: -1
     min_p: 0.1
     repetition_penalty: 1.0
-    max_completion_tokens: 2048
+    max_prompt_tokens: 512
+    max_completion_tokens: 7680
     do_sample: true
     num_generations: 1
     seed: 3407
+    extra_body:
+      stop:
+        - "</SOLUTION>"
+      include_stop_str_in_output: true
   vllm:
     server_backend: openai
     gpu_memory_utilization: 0.9
-    max_model_len: 4096
+    max_model_len: 8192
     enforce_eager: false
-    max_loras: 16
-    max_cpu_loras: 100
+    max_loras: 1
+    max_cpu_loras: 1
     max_lora_rank: 32
   http:
     request_timeout_seconds: 900.0
@@ -83,25 +96,25 @@ reward:
   mode: math_format
   normalize_whitespace: true
   case_sensitive: true
-  rescale_min: -10.0
-  rescale_max: 13.0
   clamp_min: 0.0
   clamp_max: 1.0
 
 policy_transfer:
   type: filesystem
   export_initial: true
+  export_every_steps: 1
+  poll_interval_seconds: 0.05
 
 optim:
-  type: adamw_8bit
-  implementation: for-loop
-  lr: 5e-6
+  type: adam
+  implementation: fused
+  lr: 6e-5
   weight_decay: 0.001
   betas: [0.9, 0.999]
 
 scheduler:
-  type: linear
-  warmup_steps: 2
+  type: constant
+  warmup_steps: 10
   min_lr: 0.0
 
 lora:
@@ -131,23 +144,20 @@ monitor:
   wandb:
     enabled: true
     project: wavelet-unsloth-math
-    name: wavelet-unsloth-qwen4b-math-rl
+    name: wavelet-unsloth-qwen8b-math-rl
     mode: online
 
 launcher:
   mode: process
   backend: local
-  inference_num_replicas: 7
+  inference_num_replicas: 4
   inference_cuda_visible_devices:
     - "0"
     - "1"
     - "2"
     - "3"
-    - "4"
-    - "5"
-    - "6"
-  trainer_num_processes: 1
-  trainer_cuda_visible_devices: "7"
+  trainer_num_processes: 4
+  trainer_cuda_visible_devices: "4,5,6,7"
 
 output_dir: outputs/unsloth_math_rl
 clean_output_dir: true

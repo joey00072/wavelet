@@ -85,7 +85,7 @@ class RLLossConfig(BaseModel):
     type: Literal["dppo"] = "dppo"
     dppo_mask_high: float = Field(default=0.28, ge=0.0)
     dppo_mask_low: float = Field(default=0.20, ge=0.0)
-    kl_tau: float = Field(default=0.1, ge=0.0)
+    kl_tau: float = Field(default=1e-3, ge=0.0)
     adv_tau: float = Field(default=1.0, ge=0.0)
     teacher_tau: float = Field(default=0.0, ge=0.0)
 
@@ -131,6 +131,7 @@ class RLSamplingConfig(BaseModel):
     top_k: int = Field(default=-1, ge=-1)
     min_p: float = Field(default=0.0, ge=0.0, le=1.0)
     repetition_penalty: float = Field(default=1.0, gt=0.0)
+    max_prompt_tokens: int | None = Field(default=None, ge=1)
     max_completion_tokens: int = Field(default=128, ge=1)
     do_sample: bool = True
     num_generations: int = Field(default=1, ge=1)
@@ -301,6 +302,17 @@ class RLRewardConfig(BaseModel):
         return self
 
 
+class RLStateServerConfig(BaseModel):
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = Field(default=8765, ge=1, le=65535)
+    log_level: Literal["critical", "error", "warning", "info", "debug", "trace"] = (
+        "warning"
+    )
+    cors_allow_origins: list[str] = Field(default_factory=lambda: ["*"])
+    max_events: int = Field(default=2000, ge=100)
+
+
 class RLOrchestratorConfig(BaseModel):
     enabled: bool = True
     custom_rollout_function: str | None = None
@@ -327,6 +339,8 @@ class RLOrchestratorConfig(BaseModel):
     zero_advantage_max_retries: int = Field(default=8, ge=0)
     max_async_level: int = Field(default=0, ge=0)
     max_off_policy_steps: int = Field(default=0, ge=0)
+    max_pending_rollout_chunks: int | None = Field(default=None, ge=1)
+    state_server: RLStateServerConfig = RLStateServerConfig()
 
 
 class RLLauncherConfig(BaseModel):
@@ -421,7 +435,10 @@ class RLConfig(BaseModel):
     def validate_sleep_colocation(self) -> "RLConfig":
         if self.launcher.mode != "colocate_sleep":
             return self
-        if self.orchestrator.max_async_level > 0 or self.orchestrator.max_off_policy_steps > 0:
+        if (
+            self.orchestrator.max_async_level > 0
+            or self.orchestrator.max_off_policy_steps > 0
+        ):
             raise ValueError(
                 "launcher.mode='colocate_sleep' requires synchronous rollouts; set "
                 "orchestrator.max_async_level=0 and "

@@ -270,17 +270,29 @@ class RunMonitor:
             return
         import wandb
 
-        self._wandb_run = wandb.init(
+        init_kwargs = dict(
             project=self.wandb.project or "wavelet",
             entity=self.wandb.entity,
             name=self.wandb.name,
             group=self.wandb.group,
             tags=self.wandb.tags,
-            mode=self.wandb.mode,
             dir=str(self.output_dir),
             config=run_config,
             resume="allow" if resumed_from is not None else None,
+            settings=wandb.Settings(init_timeout=self.wandb.init_timeout_seconds),
         )
+        try:
+            self._wandb_run = wandb.init(mode=self.wandb.mode, **init_kwargs)
+        except Exception:
+            if self.wandb.mode != "online" or not self.wandb.offline_fallback:
+                raise
+            logging.warning(
+                "W&B online initialization failed; falling back to offline W&B "
+                "logging in %s.",
+                self.output_dir,
+                exc_info=True,
+            )
+            self._wandb_run = wandb.init(mode="offline", **init_kwargs)
         self._wandb_run.define_metric("step")
         self._wandb_run.define_metric("*", step_metric="step")
 
@@ -296,6 +308,12 @@ class RunMonitor:
             aliases["rollout/count"] = row["rollout/count"]
         if "loss" in row:
             aliases["train/loss"] = row["loss"]
+        if "lr" in row:
+            aliases["train/lr"] = row["lr"]
+            aliases["scheduler/lr"] = row["lr"]
+        if "optim/lr" in row:
+            aliases.setdefault("train/lr", row["optim/lr"])
+            aliases.setdefault("scheduler/lr", row["optim/lr"])
         return aliases
 
     def _timestamp(self) -> str:

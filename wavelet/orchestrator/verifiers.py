@@ -177,6 +177,9 @@ class VerifierRolloutScheduler:
         accepted_groups = 0
         rejected_groups = 0
         completed_groups = 0
+        max_completed_groups = target_groups * (
+            self.config.orchestrator.zero_advantage_max_retries + 1
+        )
 
         try:
             while accepted_groups < target_groups:
@@ -189,9 +192,10 @@ class VerifierRolloutScheduler:
                     self.pending.pop(task, None)
                     self.pending_clients.pop(task, None)
                     completed_groups += 1
-                    group_outputs = task.result()
-                    if _has_trainable_advantage(
+                    group_outputs = _completed_group_outputs(task)
+                    if _is_usable_training_group(
                         group_outputs,
+                        expected_rollouts=self.rollout_count,
                         filter_zero_advantage=(
                             self.config.orchestrator.filter_zero_advantage
                         ),
@@ -203,6 +207,18 @@ class VerifierRolloutScheduler:
                             break
                     else:
                         rejected_groups += 1
+                    if (
+                        completed_groups >= max_completed_groups
+                        and accepted_groups < target_groups
+                    ):
+                        raise RuntimeError(
+                            "Verifier scheduler could not produce enough trainable "
+                            "rollout groups after "
+                            f"{completed_groups} completed group(s): accepted "
+                            f"{accepted_groups}, rejected {rejected_groups}. "
+                            "Increase orchestrator.zero_advantage_max_retries, "
+                            "relax filtering, or check reward/model behavior."
+                        )
         except Exception:
             await self.aclose()
             raise
@@ -458,7 +474,8 @@ def _eval_metrics(
     rollouts_per_example: int,
 ) -> dict[str, float]:
     prefix = f"eval/{env_name}"
-    failed = max(total_rollouts - len(outputs), 0)
+    rewards = [float(output["reward"]) for output in outputs if "reward" in output]
+    failed = max(total_rollouts - len(rewards), 0)
     metrics = {
         f"{prefix}/failed_rollouts": failed / max(total_rollouts, 1),
         f"{prefix}/time": elapsed_seconds,
@@ -466,7 +483,6 @@ def _eval_metrics(
     if not outputs:
         return metrics
 
-    rewards = [float(output["reward"]) for output in outputs if "reward" in output]
     completion_lengths = [_completion_len(output) for output in outputs]
     truncations = [bool(output.get("is_truncated")) for output in outputs]
     no_responses = [not bool(output.get("completion")) for output in outputs]
@@ -483,6 +499,8 @@ def _eval_metrics(
     if rewards and set(rewards).issubset({0.0, 1.0}):
         by_example: dict[str, list[float]] = {}
         for output in outputs:
+            if "reward" not in output:
+                continue
             by_example.setdefault(str(output.get("example_id")), []).append(
                 float(output["reward"])
             )
@@ -595,7 +613,8 @@ async def _run_all(
                         state_columns=["trajectory", "sampling_args"],
                     )
                 )
-        return await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return _successful_rollout_outputs(results)
 
     group_tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
     for record_index, record in enumerate(records):
@@ -626,9 +645,10 @@ async def _run_all(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for task in done:
-                group_outputs = task.result()
-                if _has_trainable_advantage(
+                group_outputs = _completed_group_outputs(task)
+                if _is_usable_training_group(
                     group_outputs,
+                    expected_rollouts=rollout_count,
                     filter_zero_advantage=filter_zero_advantage,
                     advantage_epsilon=advantage_epsilon,
                 ):
@@ -667,12 +687,39 @@ async def _run_group(
         )
         for _ in range(rollout_count)
     ]
-    outputs = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    outputs = _successful_rollout_outputs(results)
     _assign_group_advantages(
         outputs,
         normalize_group_advantages=normalize_group_advantages,
     )
     return outputs
+
+
+def _successful_rollout_outputs(results: list[Any]) -> list[dict[str, Any]]:
+    outputs: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        try:
+            output = dict(result)
+        except (TypeError, ValueError):
+            continue
+        if output.get("error") is not None:
+            continue
+        if "reward" not in output:
+            continue
+        outputs.append(output)
+    return outputs
+
+
+def _completed_group_outputs(
+    task: asyncio.Task[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    try:
+        return task.result()
+    except Exception:
+        return []
 
 
 def _assign_group_advantages(
@@ -705,6 +752,22 @@ def _has_trainable_advantage(
         output.get("advantage") is not None
         and abs(float(output["advantage"])) > advantage_epsilon
         for output in outputs
+    )
+
+
+def _is_usable_training_group(
+    outputs: list[dict[str, Any]],
+    *,
+    expected_rollouts: int,
+    filter_zero_advantage: bool,
+    advantage_epsilon: float,
+) -> bool:
+    if len(outputs) != expected_rollouts:
+        return False
+    return _has_trainable_advantage(
+        outputs,
+        filter_zero_advantage=filter_zero_advantage,
+        advantage_epsilon=advantage_epsilon,
     )
 
 

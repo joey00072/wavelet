@@ -15,6 +15,9 @@ outputs/
 unsloth_compiled_cache/
 bench_wavelet.log
 *.log
+node_modules/
+webui/node_modules/
+webui/dist/
 
 ref/
 ref*

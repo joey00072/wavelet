@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from wavelet.configs.rl_config import RLDataConfig
-from wavelet.data.rl_dataset import PackedRLDataset, RLExample
+from wavelet.data.rl_dataset import PackedRLDataset, RLExample, prepare_rl_sample
 
 
 def _record(index: int, *, length: int = 6) -> RLExample:
@@ -87,3 +87,26 @@ def test_packed_rl_dataset_allows_dummy_only_distributed_ranks() -> None:
     assert bins[0]["sample_count"] == 0
     assert dataset.local_real_sample_count() == 0
     assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(1.5)
+
+
+def test_pretokenized_dummy_rollout_keeps_zero_loss_sample() -> None:
+    record = _record(0)
+    record.loss_mask = [False] * len(record.loss_mask)
+    record.advantage = 0.0
+    record.reward = None
+    record.inference_logprobs = []
+    record.temperatures = []
+    record.metadata = {"_wavelet_dummy_rollout": True}
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sum(sample["loss_mask"]) == 0
+    assert sample["advantages"] == []
+    assert sample["temperatures"] == []
+    assert sample["sample_count"] == 0

@@ -484,6 +484,14 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         seed = payload.get("seed")
         if seed is not None:
             kwargs["seed"] = int(seed)
+        stop = payload.get("stop") or extra_body.get("stop")
+        if stop is not None:
+            kwargs["stop"] = stop
+        include_stop = payload.get("include_stop_str_in_output")
+        if include_stop is None:
+            include_stop = extra_body.get("include_stop_str_in_output")
+        if include_stop is not None:
+            kwargs["include_stop_str_in_output"] = bool(include_stop)
         if (
             payload.get("logprobs")
             or payload.get("return_token_ids")
@@ -497,11 +505,15 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         prompt_ids: list[int],
         sampling_kwargs: dict[str, Any],
     ) -> tuple[list[int], dict[str, Any]]:
+        fitted_kwargs = dict(sampling_kwargs)
+        max_prompt_tokens = self.config.inference.sampling.max_prompt_tokens
+        if max_prompt_tokens is not None and len(prompt_ids) > max_prompt_tokens:
+            prompt_ids = prompt_ids[-max_prompt_tokens:]
+
         max_model_len = self.config.inference.vllm.max_model_len
         if max_model_len is None or max_model_len <= 0:
-            return prompt_ids, sampling_kwargs
+            return prompt_ids, fitted_kwargs
 
-        fitted_kwargs = dict(sampling_kwargs)
         max_prompt_len = max(max_model_len - 1, 1)
         if len(prompt_ids) > max_prompt_len:
             prompt_ids = prompt_ids[-max_prompt_len:]
@@ -593,6 +605,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         kwargs["min_p"] = sampling.min_p
         if sampling.seed is not None:
             kwargs["seed"] = sampling.seed
+        extra_body = dict(sampling.extra_body)
+        stop = extra_body.get("stop")
+        if stop is not None:
+            kwargs["stop"] = stop
+        include_stop = extra_body.get("include_stop_str_in_output")
+        if include_stop is not None:
+            kwargs["include_stop_str_in_output"] = bool(include_stop)
         return SamplingParams(**kwargs)
 
     def _load_adapter_policy(self, adapter_dir: Path, *, step: int | None = None) -> None:
@@ -606,10 +625,12 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             raise ImportError("vLLM LoRARequest import failed.") from exc
 
         adapter_id = self.config.policy_transfer.adapter_id
+        adapter_name = self.config.policy_transfer.adapter_name
         if step is not None:
             adapter_id += step
+            adapter_name = f"{adapter_name}-{step:06d}"
         self._lora_request = LoRARequest(
-            self.config.policy_transfer.adapter_name,
+            adapter_name,
             adapter_id,
             str(adapter_dir),
             load_inplace=False,
@@ -776,8 +797,8 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             raise ImportError("vLLM LoRARequest import failed.") from exc
 
         self._lora_request = LoRARequest(
-            self.config.policy_transfer.adapter_name,
-            self.config.policy_transfer.adapter_id,
+            self._lora_request.lora_name,
+            self._lora_request.lora_int_id,
             str(self._lora_request.lora_path),
             load_inplace=False,
         )

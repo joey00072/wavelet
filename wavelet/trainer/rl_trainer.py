@@ -58,6 +58,131 @@ def _scalar_or_json(value: object) -> object:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _packed_causal_attention_mask(
+    attention_mask: Tensor,
+    position_ids: Tensor,
+) -> Tensor | None:
+    """Build a block-causal mask for packed samples when position ids reset."""
+    if attention_mask.ndim != 2 or position_ids.ndim != 2:
+        return attention_mask
+
+    valid_tokens = attention_mask.bool()
+    starts = (position_ids == 0) & valid_tokens
+    if not (starts.sum(dim=1) > 1).any():
+        return None if valid_tokens.all() else attention_mask
+
+    batch_size, seq_len = position_ids.shape
+    segment_ids = starts.long().cumsum(dim=1) - 1
+    segment_ids = torch.where(valid_tokens, segment_ids, torch.full_like(segment_ids, -1))
+
+    query_segments = segment_ids.unsqueeze(2)
+    key_segments = segment_ids.unsqueeze(1)
+    same_segment = query_segments == key_segments
+
+    positions = torch.arange(seq_len, device=position_ids.device)
+    causal = positions.view(1, seq_len, 1) >= positions.view(1, 1, seq_len)
+    key_valid = valid_tokens.unsqueeze(1)
+    query_valid = valid_tokens.unsqueeze(2)
+    allow = same_segment & causal & key_valid
+
+    # Fully masked padded queries can produce NaNs in attention. They do not
+    # contribute to the loss, so let padded queries attend to themselves only.
+    diagonal = torch.eye(
+        seq_len,
+        dtype=torch.bool,
+        device=position_ids.device,
+    ).unsqueeze(0)
+    allow = torch.where(query_valid, allow, diagonal)
+
+    mask = torch.full(
+        (batch_size, seq_len, seq_len),
+        torch.finfo(torch.float32).min,
+        dtype=torch.float32,
+        device=position_ids.device,
+    )
+    mask = mask.masked_fill(allow, 0.0)
+    return mask.unsqueeze(1)
+
+
+def _has_packed_position_resets(attention_mask: Tensor, position_ids: Tensor) -> bool:
+    if attention_mask.ndim != 2 or position_ids.ndim != 2:
+        return False
+    valid_tokens = attention_mask.bool()
+    starts = (position_ids == 0) & valid_tokens
+    return bool((starts.sum(dim=1) > 1).any().item())
+
+
+def _model_attn_implementation(model: object) -> str | None:
+    current = model
+    seen: set[int] = set()
+    for _ in range(8):
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        config = getattr(current, "config", None)
+        implementation = getattr(config, "_attn_implementation", None)
+        if implementation is None:
+            implementation = getattr(config, "attn_implementation", None)
+        if implementation is not None:
+            return str(implementation)
+        next_model = (
+            getattr(current, "module", None)
+            or getattr(current, "_fsdp_wrapped_module", None)
+            or getattr(current, "base_model", None)
+            or getattr(current, "model", None)
+        )
+        if next_model is None or next_model is current:
+            break
+        current = next_model
+    return None
+
+
+def _packed_training_attention_mask(
+    model: object,
+    attention_mask: Tensor,
+    position_ids: Tensor,
+) -> Tensor | None:
+    """Select the mask path for packed RL training.
+
+    PrimeRL-style packing uses reset position ids as sequence boundaries. HF's
+    FlashAttention 2 implementation consumes those position ids directly and
+    dispatches to flash_attn_varlen_func, but only when no explicit attention
+    mask is passed. Non-flash attention still needs an explicit block-causal
+    mask to prevent packed samples from attending across boundaries.
+    """
+    if not _has_packed_position_resets(attention_mask, position_ids):
+        valid_tokens = attention_mask.bool()
+        return None if valid_tokens.all() else attention_mask
+
+    implementation = _model_attn_implementation(model)
+    if implementation in {"flash_attention_2", "flash_attention_3"}:
+        if position_ids.shape[0] != 1:
+            raise ValueError(
+                "Packed FlashAttention varlen training requires one packed row per "
+                "micro-batch. Set data.micro_batch_size=1 or use "
+                "model.attn_implementation='sdpa'."
+            )
+        if not attention_mask.bool().all():
+            raise ValueError(
+                "Packed FlashAttention varlen training requires pad-free packed rows. "
+                "Set data.pad_to_multiple_of=1 and data.micro_batch_size=1 or use "
+                "model.attn_implementation='sdpa'."
+            )
+        return None
+
+    return _packed_causal_attention_mask(attention_mask, position_ids)
+
+
+def _torch_dtype_from_name(name: str) -> torch.dtype | None:
+    if name == "bfloat16":
+        return torch.bfloat16
+    if name == "float16":
+        return torch.float16
+    if name == "float32":
+        return torch.float32
+    return None
+
+
 class RLTrainer(BaseTrainer):
     def __init__(self, config: RLConfig) -> None:
         super().__init__(config)
@@ -216,6 +341,7 @@ class RLTrainer(BaseTrainer):
         progress.set_postfix(
             loss=f"{metrics['loss']:.4f}",
             kl=f"{metrics['mismatch_kl']:.4f}",
+            lr=f"{metrics['lr']:.2e}",
         )
 
     def _maybe_checkpoint(self) -> None:
@@ -475,11 +601,12 @@ class RLTrainer(BaseTrainer):
             )
         else:
             export_model, state_dict = export_model_for_save(self.model)
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-            if step_dir.exists():
-                shutil.rmtree(step_dir)
-            tmp_dir.mkdir(parents=True, exist_ok=True)
+            if self.world.is_main:
+                if tmp_dir.exists():
+                    shutil.rmtree(tmp_dir)
+                if step_dir.exists():
+                    shutil.rmtree(step_dir)
+                tmp_dir.mkdir(parents=True, exist_ok=True)
             if self.config.policy_transfer.lightweight_lora and isinstance(
                 export_model, PeftModel
             ):
@@ -487,7 +614,7 @@ class RLTrainer(BaseTrainer):
                     export_model,
                     tmp_dir,
                     state_dict=state_dict,
-                    is_main_process=True,
+                    is_main_process=self.world.is_main,
                 )
             else:
                 saved_path = save_model(
@@ -495,7 +622,7 @@ class RLTrainer(BaseTrainer):
                     self.tokenizer,
                     tmp_dir,
                     state_dict=state_dict,
-                    is_main_process=True,
+                    is_main_process=self.world.is_main,
                 )
         export_model = None
         state_dict = None
@@ -582,9 +709,15 @@ class RLTrainer(BaseTrainer):
         if self.model is None or self.optimizer is None:
             raise RuntimeError("Trainer not set up")
 
-        attention_mask = batch["attention_mask"]
-        if attention_mask.all():
-            attention_mask = None
+        attention_mask = _packed_training_attention_mask(
+            self.model,
+            batch["attention_mask"],
+            batch["position_ids"],
+        )
+        if attention_mask is not None and attention_mask.is_floating_point():
+            mask_dtype = _torch_dtype_from_name(self.config.model.torch_dtype)
+            if mask_dtype is not None:
+                attention_mask = attention_mask.to(dtype=mask_dtype)
 
         with self.act_offload_ctx:
             trainer_logprobs = self._model_logprobs(batch, attention_mask)
@@ -630,7 +763,10 @@ class RLTrainer(BaseTrainer):
                     backward_loss = loss
                 backward_loss.backward()
 
-        reward_mean = self._reward_mean(batch["rewards"])
+        reward_mean = self._reward_mean(
+            batch["rewards"],
+            sample_counts=batch.get("sample_counts"),
+        )
         if reward_mean is not None:
             self._reward_accum.append(reward_mean)
         self._rollout_metric_accum.append(self._batch_rollout_metrics(batch))
@@ -746,10 +882,22 @@ class RLTrainer(BaseTrainer):
             )
         return batch["teacher_logprobs"]
 
-    def _reward_mean(self, rewards: Tensor) -> float | None:
+    def _reward_mean(
+        self,
+        rewards: Tensor,
+        *,
+        sample_counts: Tensor | None = None,
+    ) -> float | None:
         valid = ~torch.isnan(rewards)
         if not valid.any():
             return None
+        if sample_counts is not None:
+            weights = sample_counts[valid].float().clamp_min(0)
+            if weights.sum() > 0:
+                return float(
+                    (rewards[valid].float() * weights).sum().item()
+                    / weights.sum().item()
+                )
         return float(rewards[valid].mean().item())
 
     def _batch_rollout_metrics(self, batch: dict[str, Tensor]) -> dict[str, float]:
@@ -773,9 +921,21 @@ class RLTrainer(BaseTrainer):
         rewards = batch["rewards"]
         valid_rewards = rewards[~torch.isnan(rewards)]
         if valid_rewards.numel() > 0:
+            if sample_counts is not None:
+                valid = ~torch.isnan(rewards)
+                weights = sample_counts[valid].float().clamp_min(0)
+                if weights.sum() > 0:
+                    reward_mean = float(
+                        (rewards[valid].float() * weights).sum().item()
+                        / weights.sum().item()
+                    )
+                else:
+                    reward_mean = float(valid_rewards.mean().item())
+            else:
+                reward_mean = float(valid_rewards.mean().item())
             metrics.update(
                 {
-                    "reward/all/mean": float(valid_rewards.mean().item()),
+                    "reward/all/mean": reward_mean,
                     "reward/all/max": float(valid_rewards.max().item()),
                     "reward/all/min": float(valid_rewards.min().item()),
                 }

@@ -499,22 +499,11 @@ def save_lora_adapter_snapshot_from_fsdp(
     is_main_process: bool = True,
 ) -> Path:
     """Save a PEFT LoRA adapter from an FSDP-wrapped model without a full state dict."""
-    unwrapped = unwrap_model(model)
-    if not isinstance(unwrapped, PeftModel):
-        raise TypeError("FSDP lightweight policy snapshots require a wrapped PeftModel.")
-
-    adapter_name = _active_adapter_name(unwrapped)
-    target = output_dir / "adapter"
-    state = _gather_fsdp_lora_state_dict(model, unwrapped)
-    if not is_main_process:
-        return target
-
-    target.mkdir(parents=True, exist_ok=True)
-    unwrapped.peft_config[adapter_name].save_pretrained(target)
-    if state is None:
-        raise RuntimeError("Rank 0 did not receive gathered FSDP LoRA state.")
-    save_safetensors(state, target / "adapter_model.safetensors")
-    return target
+    return _save_lora_adapter_snapshot_from_fsdp_full_params(
+        model,
+        output_dir,
+        is_main_process=is_main_process,
+    )
 
 
 def _save_lora_adapter_snapshot_from_fsdp_full_params(

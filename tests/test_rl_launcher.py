@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -11,13 +12,18 @@ from wavelet.entrypoints.rl_inference import (
     _use_streaming_native_scheduler,
     _wait_for_colocated_training_memory,
 )
-from wavelet.entrypoints.rl_trainer import _use_streaming_rollout_chunks
 from wavelet.entrypoints.rl_launcher import (
     _sleep_vllm_http_servers,
     _trainer_device_group,
 )
+from wavelet.entrypoints.rl_trainer import (
+    _chunks_per_step,
+    _dummy_rollout_row,
+    _use_streaming_rollout_chunks,
+)
 from wavelet.entrypoints.rl_vllm_openai_server import _serve_args
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
+from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
 
@@ -74,6 +80,20 @@ def test_sleep_colocate_requires_synchronous_rollouts() -> None:
             launcher={"mode": "colocate_sleep"},
             orchestrator={"max_async_level": 1},
         )
+
+
+def test_streaming_chunk_resume_uses_chunk_index_space() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        orchestrator={
+            "examples_per_step": 16,
+            "rollout_chunk_examples": 4,
+            "max_async_level": 8,
+        },
+    )
+
+    assert _use_streaming_rollout_chunks(config) is True
+    assert _chunks_per_step(config) == 4
 
 
 def test_sleep_colocate_allows_multi_process_trainer() -> None:
@@ -174,7 +194,7 @@ def test_http_inference_sleep_discards_vllm_gpu_allocations() -> None:
     assert calls == [("POST", "/sleep", {"level": 1})]
 
 
-def test_http_openai_load_policy_uses_step_scoped_adapter_name() -> None:
+def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
     config = RLConfig(
         inference={"vllm": {"server_backend": "openai"}},
         lora={"rank": 4, "target_modules": ["q_proj"]},
@@ -203,12 +223,56 @@ def test_http_openai_load_policy_uses_step_scoped_adapter_name() -> None:
             {
                 "policy_dir": "policy",
                 "step": 7,
-                "adapter_name": "policy-000007",
+                "adapter_name": "policy",
+                "load_inplace": True,
             },
             "http://127.0.0.1:8000",
         )
     ]
-    assert engine.policy_model_name == "policy-000007"
+    assert engine.policy_model_name == "policy"
+
+
+def test_http_openai_load_policy_stages_adapter_in_tmpfs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_root = tmp_path / "cache"
+    monkeypatch.setenv("WAVELET_POLICY_CACHE_DIR", str(cache_root))
+    policy_dir = tmp_path / "policy"
+    adapter_dir = policy_dir / "adapter"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    config = RLConfig(
+        inference={"vllm": {"server_backend": "openai"}},
+        lora={"rank": 4, "target_modules": ["q_proj"]},
+        output_dir=tmp_path / "out",
+    )
+    engine = HTTPPolicyInferenceEngine(config)
+    calls = []
+
+    def fake_request(
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        *,
+        base_url: str | None = None,
+    ) -> dict:
+        calls.append((method, path, payload, base_url))
+        return {}
+
+    engine._request = fake_request  # type: ignore[method-assign]
+
+    engine.load_policy(policy_dir, step=7)
+
+    payload = calls[0][2]
+    assert payload is not None
+    cached_policy_dir = Path(payload["policy_dir"])
+    assert cached_policy_dir != policy_dir
+    assert cached_policy_dir.parent.parent == cache_root / f"wavelet-policy-cache-{os.getuid()}"
+    assert (cached_policy_dir / "adapter" / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert payload["adapter_name"] == "policy"
+    assert payload["load_inplace"] is True
 
 
 def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
@@ -282,6 +346,32 @@ def test_http_openai_payload_sets_vllm_request_fields() -> None:
     assert "extra_body" not in payload
 
 
+def test_openai_sampling_kwargs_passes_stop_strings() -> None:
+    config = RLConfig(
+        inference={
+            "sampling": {
+                "extra_body": {
+                    "stop": ["</SOLUTION>"],
+                    "include_stop_str_in_output": True,
+                }
+            },
+            "vllm": {"server_backend": "openai"},
+        }
+    )
+    engine = VLLMPolicyInferenceEngine(config)
+
+    kwargs = engine._openai_sampling_kwargs(  # noqa: SLF001
+        {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "extra_body": config.inference.sampling.extra_body,
+        }
+    )
+
+    assert kwargs["stop"] == ["</SOLUTION>"]
+    assert kwargs["include_stop_str_in_output"] is True
+
+
 def test_shift_completion_sample_masks_only_completion_tokens() -> None:
     sample = _shift_completion_sample(
         prompt_ids=[1, 2],
@@ -295,6 +385,27 @@ def test_shift_completion_sample_masks_only_completion_tokens() -> None:
     assert sample["loss_mask"] == [False, True, True]
     assert sample["inference_logprobs"] == [0.0, -0.3, -0.4]
     assert sample["temperatures"] == [0.7, 0.7, 0.7]
+
+
+def test_dummy_rollout_row_does_not_add_missing_teacher_logprobs() -> None:
+    row = {
+        "loss_mask": [False, True],
+        "advantage": 0.5,
+        "reward": 1.0,
+        "inference_logprobs": [-0.1],
+        "temperature": [1.0],
+        "metadata": {"source": "test"},
+    }
+
+    dummy = _dummy_rollout_row(RLConfig(), row)
+
+    assert dummy["loss_mask"] == [False, False]
+    assert dummy["inference_logprobs"] == []
+    assert "teacher_logprobs" not in dummy
+    assert dummy["metadata"] == {
+        "source": "test",
+        "_wavelet_dummy_rollout": True,
+    }
 
 
 def test_native_process_rollouts_use_streaming_chunks() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from argparse import Namespace
 from http import HTTPStatus
 from pathlib import Path
@@ -236,7 +237,9 @@ def _patch_load_lora_adapter() -> None:
                     lora_name=lora_name,
                     lora_int_id=self.lora_id_counter.inc(1),
                     lora_path=request.lora_path,
+                    load_inplace=request.load_inplace,
                 )
+            lora_request.load_inplace = request.load_inplace
             if base_model_name is not None and self.is_base_model(base_model_name):
                 lora_request.base_model_name = base_model_name
             try:
@@ -288,24 +291,165 @@ def _patch_lru_cache_worker_lora_manager() -> None:
         lora_request: LoRARequest,
         force_load: bool = True,
     ) -> bool:
-        if lora_request.lora_int_id not in self.list_adapters() or force_load:
+        started_at = time.perf_counter()
+        loaded_paths = getattr(self, "_wavelet_loaded_lora_paths", None)
+        if loaded_paths is None:
+            loaded_paths = {}
+            self._wavelet_loaded_lora_paths = loaded_paths
+        loaded_path = loaded_paths.get(lora_request.lora_int_id)
+        should_load = (
+            lora_request.lora_int_id not in self.list_adapters()
+            or force_load
+            or (
+                loaded_path is not None
+                and loaded_path != lora_request.lora_path
+            )
+        )
+        if should_load:
+            load_started_at = time.perf_counter()
             lora = self._load_adapter(lora_request)
+            load_elapsed = time.perf_counter() - load_started_at
+
             self._adapter_manager.remove_adapter(lora.id)
 
             if len(self._adapter_manager) + 1 > self._adapter_manager.capacity:
                 assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
                 self._adapter_manager.remove_oldest_adapter()
+            add_started_at = time.perf_counter()
             loaded = self._adapter_manager.add_adapter(lora)
+            add_elapsed = time.perf_counter() - add_started_at
+            if loaded:
+                loaded_paths[lora_request.lora_int_id] = lora_request.lora_path
         else:
+            load_elapsed = 0.0
+            add_elapsed = 0.0
             loaded = (
                 self._adapter_manager.get_adapter(lora_request.lora_int_id)
                 is not None
             )
+        activate_started_at = time.perf_counter()
         self._adapter_manager.activate_adapter(lora_request.lora_int_id)
+        _log_lora_add_adapter_perf(
+            lora_request,
+            lora_id=lora_request.lora_int_id,
+            mode="load" if should_load else "touch",
+            load_elapsed=load_elapsed,
+            add_elapsed=add_elapsed,
+            activate_elapsed=time.perf_counter() - activate_started_at,
+            total_elapsed=time.perf_counter() - started_at,
+        )
         return loaded
 
     LRUCacheWorkerLoRAManager._apply_adapters = patched_apply_adapters
     LRUCacheWorkerLoRAManager.add_adapter = patched_add_adapter
+
+
+def _log_lora_add_adapter_perf(
+    lora_request: Any,
+    *,
+    lora_id: int,
+    mode: str,
+    load_elapsed: float,
+    add_elapsed: float,
+    activate_elapsed: float,
+    total_elapsed: float,
+) -> None:
+    if lora_request.lora_name != "policy" or mode == "touch":
+        return
+    print(
+        "WAVELET_PERF lora_add_adapter "
+        f"name={lora_request.lora_name} id={lora_id} mode={mode} "
+        f"load={load_elapsed:.3f} add={add_elapsed:.3f} "
+        f"activate={activate_elapsed:.3f} total={total_elapsed:.3f}",
+        flush=True,
+    )
+
+
+def _patch_lora_cpu_pin_memory() -> None:
+    import vllm.lora.lora_model as lora_model
+    import vllm.lora.model_manager as model_manager
+
+    def pin_memory_unavailable() -> bool:
+        return False
+
+    lora_model.is_pin_memory_available = pin_memory_unavailable
+    model_manager.is_pin_memory_available = pin_memory_unavailable
+
+
+def _replace_active_adapter_inplace(adapter_manager: Any, lora: Any) -> bool:
+    try:
+        index = adapter_manager.lora_index_to_id.index(lora.id)
+    except ValueError:
+        return False
+
+    adapter_manager._create_merged_loras_inplace(lora)
+    adapter_manager._registered_adapters[lora.id] = lora
+    adapter_manager._active_adapters[lora.id] = None
+    for module_name, module in adapter_manager.modules.items():
+        module_lora = adapter_manager._get_lora_layer_weights(lora, module_name)
+        if not module_lora:
+            module.reset_lora(index)
+            continue
+        module.set_lora(index, module_lora.lora_a, module_lora.lora_b)
+    return True
+
+
+def _patch_skip_lora_module_warnings() -> None:
+    from vllm.exceptions import LoRAAdapterNotFoundError
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+    from vllm.lora.request import LoRARequest
+    from vllm.lora.utils import get_adapter_absolute_path
+    from vllm.lora.worker_manager import WorkerLoRAManager
+
+    def patched_load_adapter(
+        self: WorkerLoRAManager,
+        lora_request: LoRARequest,
+    ) -> LoRAModel:
+        try:
+            supported_lora_modules = self._adapter_manager.supported_lora_modules
+            packed_modules_mapping = self._adapter_manager.packed_modules_mapping
+            expected_lora_list: list[str] = []
+            for module in supported_lora_modules:
+                if module in packed_modules_mapping:
+                    expected_lora_list.extend(packed_modules_mapping[module])
+                else:
+                    expected_lora_list.append(module)
+                if module == "experts":
+                    expected_lora_list.append(module)
+            expected_lora_modules = set(expected_lora_list)
+            lora_path = get_adapter_absolute_path(lora_request.lora_path)
+
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                self.max_position_embeddings,
+                lora_request.tensorizer_config_dict,
+            )
+            peft_helper.validate_legal(self.lora_config)
+
+            model = self._adapter_manager.model
+            weights_mapper = getattr(model, "hf_to_vllm_mapper", None)
+            skip_prefixes = getattr(model, "lora_skip_prefixes", None)
+
+            return self._lora_model_cls.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",
+                dtype=self.lora_config.lora_dtype,
+                model_vocab_size=self.vocab_size,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=weights_mapper,
+                skip_prefixes=skip_prefixes,
+            )
+        except FileNotFoundError as exc:
+            raise LoRAAdapterNotFoundError(
+                lora_request.lora_name,
+                lora_request.lora_path,
+            ) from exc
+
+    WorkerLoRAManager._load_adapter = patched_load_adapter
 
 
 @router.get("/health")
@@ -375,10 +519,18 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
     adapter_dir = policy_dir / "adapter"
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
+    adapter_path = str(adapter_dir.resolve())
+    if (
+        getattr(raw_request.app.state, "policy_step", None) == step
+        and getattr(raw_request.app.state, "policy_adapter_name", None) == adapter_name
+        and getattr(raw_request.app.state, "policy_adapter_path", None) == adapter_path
+    ):
+        return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
     response = await _models(raw_request).load_lora_adapter(
         LoadLoRAAdapterRequest(
             lora_name=adapter_name,
-            lora_path=str(adapter_dir),
+            lora_path=adapter_path,
+            load_inplace=bool(payload.get("load_inplace", False)),
         )
     )
     if isinstance(response, ErrorResponse):
@@ -387,6 +539,8 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
             status_code=response.error.code,
         )
     raw_request.app.state.policy_step = step
+    raw_request.app.state.policy_adapter_name = adapter_name
+    raw_request.app.state.policy_adapter_path = adapter_path
     return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
 
 
@@ -428,6 +582,8 @@ async def custom_init_app_state(
 ) -> None:
     await init_app_state(engine_client, state, args, supported_tasks)
     state.policy_step = None
+    state.policy_adapter_name = None
+    state.policy_adapter_path = None
     if "generate" in supported_tasks and state.openai_serving_chat is not None:
         serving_chat = object.__new__(OpenAIServingChatWithTokens)
         serving_chat.__dict__.update(state.openai_serving_chat.__dict__)
@@ -529,6 +685,8 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True")
     _patch_load_lora_adapter()
     _patch_lru_cache_worker_lora_manager()
+    _patch_skip_lora_module_warnings()
+    _patch_lora_cpu_pin_memory()
     _patch_build_app()
 
     from vllm.entrypoints.openai.api_server import run_server
