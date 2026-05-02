@@ -4349,6 +4349,17 @@ wheels = [
 ]
 
 [[package]]
+name = "reverse-text"
+version = "0.1.5"
+source = { registry = "https://hub.primeintellect.ai/primeintellect/simple/" }
+dependencies = [
+    { name = "verifiers" },
+]
+wheels = [
+    { url = "https://hub.primeintellect.ai/primeintellect/reverse-text/@e3cd3fe4/reverse_text-0.1.5-py2.py3-none-any.whl", hash = "sha256:f48c5a203603551219df30f734ff5f74b825ea2a29fec05c7a6b2cd4bb657a34" },
+]
+
+[[package]]
 name = "rich"
 version = "14.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -5639,7 +5650,9 @@ dependencies = [
     { name = "accelerate" },
     { name = "bitsandbytes" },
     { name = "datasets" },
+    { name = "fastapi" },
     { name = "liger-kernel" },
+    { name = "math-verify" },
     { name = "peft" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -5648,6 +5661,7 @@ dependencies = [
     { name = "torchdata" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "uvicorn" },
     { name = "vllm" },
     { name = "wandb" },
     { name = "xformers" },
@@ -5664,6 +5678,7 @@ envs = [
     { name = "aime2025" },
     { name = "alphabet-sort" },
     { name = "math-env" },
+    { name = "reverse-text" },
 ]
 verifiers = [
     { name = "verifiers" },
@@ -5676,20 +5691,24 @@ requires-dist = [
     { name = "alphabet-sort", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "bitsandbytes", specifier = ">=0.43" },
     { name = "datasets", specifier = ">=2.18" },
+    { name = "fastapi", specifier = ">=0.115" },
     { name = "liger-kernel", specifier = ">=0.7.0" },
     { name = "math-env", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
+    { name = "math-verify", specifier = ">=0.9.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8" },
     { name = "peft", specifier = ">=0.10" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "reverse-text", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3" },
     { name = "tensorboard", specifier = ">=2.15" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "torchdata", specifier = ">=0.7" },
     { name = "tqdm", specifier = ">=4.66" },
     { name = "transformers", specifier = ">=4.40" },
+    { name = "uvicorn", specifier = ">=0.30" },
     { name = "verifiers", marker = "extra == 'verifiers'", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=77a9f28" },
     { name = "vllm", specifier = ">=0.8.0" },
     { name = "wandb", specifier = ">=0.16" },

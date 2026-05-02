@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
+from functools import lru_cache
+from typing import Any
 
 from wavelet.configs.rl_config import RLRewardConfig
 from wavelet.data.rl_dataset import RLExample
+
+
+_NUMBER_RE = re.compile(
+    r"[-+]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:/\d+(?:\.\d+)?)?"
+)
 
 
 def _assistant_text(messages: list[dict[str, str]] | None) -> str:
@@ -18,10 +27,46 @@ def _assistant_text(messages: list[dict[str, str]] | None) -> str:
 
 
 def _first_numeric_text(value: str) -> str | None:
-    match = re.search(r"[-]?[\d.,]+", value)
-    if match is None:
+    for match in _NUMBER_RE.finditer(value):
+        text = match.group(0).replace(",", "")
+        if text and text not in {"+", "-", ".", "+.", "-."}:
+            return text
+    return None
+
+
+def _compact_answer_text(value: str) -> str:
+    text = value.strip()
+    text = re.sub(r"\\boxed\{([^{}]+)\}", r"\1", text)
+    text = re.sub(r"\\(?:text|mathrm)\{([^{}]+)\}", r"\1", text)
+    text = text.replace("$", "")
+    text = text.replace(",", "")
+    text = re.sub(r"\s+", "", text)
+    return text.strip(" .,:;")
+
+
+def _parse_numeric_answer(value: str) -> Decimal | None:
+    text = _compact_answer_text(value)
+    text = text.strip("()[]{}")
+    if not text:
         return None
-    return match.group(0).replace(",", "")
+    try:
+        if "/" in text and re.fullmatch(r"[-+]?\d+(?:\.\d+)?/[-+]?\d+(?:\.\d+)?", text):
+            fraction = Fraction(text.replace("+", ""))
+            return Decimal(fraction.numerator) / Decimal(fraction.denominator)
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+            return Decimal(text)
+    except (InvalidOperation, ValueError, ZeroDivisionError):
+        return None
+    return None
+
+
+@lru_cache(maxsize=1)
+def _math_verify_api() -> tuple[Any, Any] | None:
+    try:
+        from math_verify import parse, verify
+    except ImportError:
+        return None
+    return parse, verify
 
 
 class RLRewardScorer:
@@ -80,11 +125,13 @@ class RLRewardScorer:
             )
         extracted = self._extract_math_solution(response)
 
-        score = self._score_math_exact_format(response)
-        score += self._score_math_approx_format(response)
-        score += self._score_math_answer(extracted, expected)
-        score += self._score_math_number(extracted, expected)
-        return score
+        answer_score = self._score_math_answer(extracted, expected)
+        format_score = self._score_math_format_bonus(response)
+        if answer_score >= 1.0:
+            return min(1.0, 0.9 + format_score)
+        if answer_score > 0.0:
+            return min(0.6, answer_score + min(format_score, 0.05))
+        return min(0.05, format_score)
 
     def _math_solution_regex(self) -> re.Pattern[str]:
         solution_end = (
@@ -99,47 +146,91 @@ class RLRewardScorer:
 
     def _extract_math_solution(self, response: str) -> str | None:
         match = self._math_solution_regex().search(response)
-        if match is None:
-            return None
-        return match.group(1)
+        if match is not None:
+            return match.group(1)
+        tagged = re.findall(
+            rf"{re.escape(self.config.solution_start)}(.+?){re.escape(self.config.solution_end)}",
+            response,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+        if tagged:
+            return tagged[-1]
+        for start_tag, end_tag in (
+            ("<start_solution>", "</start_solution>"),
+            ("<answer>", "</answer>"),
+            ("<final_answer>", "</final_answer>"),
+        ):
+            tagged = re.findall(
+                rf"{re.escape(start_tag)}(.+?){re.escape(end_tag)}",
+                response,
+                flags=re.MULTILINE | re.DOTALL | re.IGNORECASE,
+            )
+            if tagged:
+                return tagged[-1]
+        boxed = re.findall(r"\\boxed\{([^{}]+)\}", response)
+        if boxed:
+            return boxed[-1]
+        answer_match = re.search(
+            r"(?:answer|solution|therefore|so)[^\n:=]*[:=]?\s*([^\n]+)$",
+            response.strip(),
+            flags=re.IGNORECASE,
+        )
+        if answer_match is not None:
+            return answer_match.group(1)
+        guess = _first_numeric_text(response.splitlines()[-1] if response else "")
+        if guess is not None:
+            return guess
+        return None
 
-    def _score_math_exact_format(self, response: str) -> float:
-        return 3.0 if self._math_solution_regex().search(response) is not None else 0.0
-
-    def _score_math_approx_format(self, response: str) -> float:
-        score = 0.0
-        score += 0.5 if response.count(self.config.reasoning_end) == 1 else -1.0
-        score += 0.5 if response.count(self.config.solution_start) == 1 else -1.0
-        score += 0.5 if response.count(self.config.solution_end) == 1 else -1.0
-        return score
+    def _score_math_format_bonus(self, response: str) -> float:
+        if self._math_solution_regex().search(response) is not None:
+            return 0.10
+        if (
+            response.count(self.config.solution_start) == 1
+            and response.count(self.config.solution_end) == 1
+        ):
+            return 0.06
+        if self.config.solution_start in response or self.config.solution_end in response:
+            return 0.02
+        return 0.0
 
     def _score_math_answer(self, extracted: str | None, expected: str) -> float:
         if extracted is None:
-            return -2.0
-        guess = self._normalize(extracted)
-        if guess == expected:
-            return 5.0
-        if guess.strip() == expected.strip():
-            return 3.5
-        try:
-            ratio = float(guess) / float(expected)
-        except (TypeError, ValueError, ZeroDivisionError):
-            return -4.5
-        if 0.9 <= ratio <= 1.1:
-            return 2.0
-        if 0.8 <= ratio <= 1.2:
-            return 1.5
-        return -2.5
-
-    def _score_math_number(self, extracted: str | None, expected: str) -> float:
-        if extracted is None:
-            return -2.5
-        guess = _first_numeric_text(extracted)
-        if guess is None:
-            return -2.5
-        try:
-            expected_number = float(expected.strip())
-            guess_number = float(guess.strip())
-        except ValueError:
             return 0.0
-        return 3.5 if guess_number == expected_number else -1.5
+        guess = self._normalize(extracted)
+        if _compact_answer_text(guess) == _compact_answer_text(expected):
+            return 1.0
+        if self._math_verify_equivalent(guess, expected):
+            return 1.0
+
+        guess_number = _parse_numeric_answer(guess)
+        expected_number = _parse_numeric_answer(expected)
+        if guess_number is None:
+            numeric_guess = _first_numeric_text(guess)
+            guess_number = (
+                _parse_numeric_answer(numeric_guess) if numeric_guess is not None else None
+            )
+        if expected_number is None or guess_number is None:
+            return 0.0
+        if guess_number == expected_number:
+            return 1.0
+        if expected_number == 0:
+            return 0.0
+        relative_error = abs((guess_number - expected_number) / expected_number)
+        if relative_error <= Decimal("0.01"):
+            return 0.35
+        if relative_error <= Decimal("0.05"):
+            return 0.20
+        return 0.0
+
+    def _math_verify_equivalent(self, guess: str, expected: str) -> bool:
+        api = _math_verify_api()
+        if api is None:
+            return False
+        parse, verify = api
+        try:
+            parsed_expected = parse(expected)
+            parsed_guess = parse(guess)
+            return bool(parsed_expected and parsed_guess and verify(parsed_expected, parsed_guess))
+        except Exception:
+            return False

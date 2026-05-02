@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 from math import ceil
+from pathlib import Path
 from time import perf_counter
 
 import torch
@@ -27,14 +29,14 @@ def main(argv: list[str] | None = None) -> int:
         if config.orchestrator.enabled:
             trainer.export_policy(step=trainer.step)
             trainer.offload_after_refit()
-            receiver = FileSystemRolloutReceiver(
-                config.output_dir,
-                config.transport,
-                start_step=trainer.step,
-            )
             try:
                 target_step = config.max_steps or 1
                 if _use_streaming_rollout_chunks(config):
+                    receiver = FileSystemRolloutReceiver(
+                        config.output_dir,
+                        config.transport,
+                        start_step=trainer.step * _chunks_per_step(config),
+                    )
                     _run_streaming_rollout_training(
                         config,
                         trainer,
@@ -43,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     trainer.finalize(status="completed")
                     return 0
+                receiver = FileSystemRolloutReceiver(
+                    config.output_dir,
+                    config.transport,
+                    start_step=trainer.step,
+                )
                 while trainer.step < target_step:
                     loop_started_at = perf_counter()
                     wait_started_at = perf_counter()
@@ -107,27 +114,51 @@ def _run_streaming_rollout_training(
         raise ValueError("orchestrator.examples_per_step is required.")
     rollouts_per_example = config.orchestrator.rollouts_per_example or 1
     target_rollout_rows = examples_per_step * rollouts_per_example
-    chunk_examples = _rollout_chunk_examples(config)
-    chunks_per_step = max(ceil(examples_per_step / chunk_examples), 1)
+    chunks_per_step = _chunks_per_step(config)
+    min_loadable_rows = _min_loadable_rollout_rows(config, trainer)
     accumulated_rows = 0
     chunk_index = 0
+    pending_paths: list[Path] = []
+    pending_rows = 0
 
     while trainer.step < target_step:
         loop_started_at = perf_counter()
         wait_started_at = perf_counter()
-        batch = receiver.wait()
+        batch = receiver.wait_available()
         wait_seconds = perf_counter() - wait_started_at
-        load_started_at = perf_counter()
         row_count = _count_rollout_rows(batch.path)
-        trainer.load_rollout_path(batch.path)
-        accumulated_rows += row_count
         chunk_index += 1
+        pending_paths.append(batch.path)
+        pending_rows += row_count
+        force_partial_load = accumulated_rows > 0 and pending_rows > 0
+        if pending_rows < min_loadable_rows and not force_partial_load:
+            if _perf_enabled():
+                print(
+                    "WAVELET_PERF trainer_chunk_buffered "
+                    f"queue_step={batch.step} trainer_step={trainer.step} "
+                    f"rows={row_count} pending_rows={pending_rows} "
+                    f"min_loadable_rows={min_loadable_rows} "
+                    f"wait_batch={wait_seconds:.3f}",
+                    flush=True,
+                )
+            continue
+
+        load_started_at = perf_counter()
+        rollout_path = _combined_rollout_path(
+            config,
+            trainer=trainer,
+            paths=pending_paths,
+            chunk_index=chunk_index,
+            min_rows=min_loadable_rows,
+        )
+        row_count = _count_rollout_rows(rollout_path)
+        pending_paths = []
+        pending_rows = 0
+        trainer.load_rollout_path(rollout_path)
+        accumulated_rows += row_count
         chunks_into_step = (chunk_index - 1) % chunks_per_step
         remaining_chunks = max(chunks_per_step - chunks_into_step - 1, 0)
-        should_step = (
-            accumulated_rows >= target_rollout_rows
-            or chunk_index % chunks_per_step == 0
-        )
+        should_step = accumulated_rows >= target_rollout_rows
         loaded_micro_batches = trainer._loaded_micro_batch_count
         if should_step:
             trainer.accumulation_steps = (
@@ -136,13 +167,14 @@ def _run_streaming_rollout_training(
         else:
             trainer.accumulation_steps = (
                 trainer._accumulated_micro_batches
-                + loaded_micro_batches * (remaining_chunks + 1)
+                + loaded_micro_batches * max(remaining_chunks + 1, 2)
             )
         trainer._optimizer_batch_loss_scale = None
         load_seconds = perf_counter() - load_started_at
         train_started_at = perf_counter()
         trainer.prepare_for_training()
         metrics = trainer.train_loaded_rollouts_once()
+        _validate_distributed_step_sync(trainer, metrics is not None)
         train_seconds = perf_counter() - train_started_at
 
         export_seconds = 0.0
@@ -195,6 +227,96 @@ def _log_step_perf_metrics(
     trainer.monitor.log(perf_metrics, step=trainer.step)
 
 
+def _validate_distributed_step_sync(trainer: RLTrainer, stepped: bool) -> None:
+    if not torch.distributed.is_initialized():
+        return
+    if trainer.world is None:
+        raise RuntimeError("World must be set up before distributed step sync.")
+    flag = torch.tensor(int(stepped), device=trainer.world.device)
+    min_flag = flag.clone()
+    max_flag = flag.clone()
+    torch.distributed.all_reduce(min_flag, op=torch.distributed.ReduceOp.MIN)
+    torch.distributed.all_reduce(max_flag, op=torch.distributed.ReduceOp.MAX)
+    if int(min_flag.item()) != int(max_flag.item()):
+        raise RuntimeError(
+            "Distributed trainer ranks disagreed on optimizer-step completion for "
+            "the current rollout chunk. Increase orchestrator.rollout_chunk_examples "
+            "or disable sequence packing for smaller chunks."
+        )
+
+
+def _min_loadable_rollout_rows(config: RLConfig, trainer: RLTrainer) -> int:
+    if trainer.world is None or config.data.pack_sequences:
+        return 1
+    return config.data.micro_batch_size * trainer.world.world_size
+
+
+def _combined_rollout_path(
+    config: RLConfig,
+    *,
+    trainer: RLTrainer,
+    paths: list[Path],
+    chunk_index: int,
+    min_rows: int,
+) -> Path:
+    row_count = sum(_count_rollout_rows(path) for path in paths)
+    target_rows = _padded_row_count(row_count, multiple=min_rows)
+    if len(paths) == 1 and row_count == target_rows:
+        return paths[0]
+
+    output_dir = config.output_dir / "rollouts" / "combined"
+    path = output_dir / f"trainer-step-{trainer.step:06d}-chunk-{chunk_index:06d}.jsonl"
+    world = trainer.world
+    if world is None or world.is_main:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".jsonl.tmp")
+        first_row: dict[str, object] | None = None
+        written = 0
+        with tmp_path.open("w", encoding="utf-8") as output:
+            for source_path in paths:
+                with source_path.open("r", encoding="utf-8") as source:
+                    for line in source:
+                        if not line.strip():
+                            continue
+                        if first_row is None:
+                            first_row = json.loads(line)
+                        output.write(line)
+                        written += 1
+            if first_row is None:
+                raise ValueError("Cannot pad an empty rollout chunk.")
+            for _ in range(target_rows - written):
+                output.write(json.dumps(_dummy_rollout_row(config, first_row)) + "\n")
+        tmp_path.replace(path)
+    if world is not None and world.world_size > 1:
+        torch.distributed.barrier()
+    return path
+
+
+def _padded_row_count(row_count: int, *, multiple: int) -> int:
+    if multiple <= 1:
+        return row_count
+    return ((row_count + multiple - 1) // multiple) * multiple
+
+
+def _dummy_rollout_row(config: RLConfig, source: dict[str, object]) -> dict[str, object]:
+    row = dict(source)
+    loss_mask = row.get("loss_mask")
+    if not isinstance(loss_mask, list):
+        raise ValueError("Cannot create a dummy rollout row without a loss_mask.")
+    row["loss_mask"] = [False] * len(loss_mask)
+    row[config.data.advantage_column] = 0.0
+    row[config.data.reward_column] = None
+    row[config.data.temperature_column] = []
+    if config.data.inference_logprobs_column in source:
+        row[config.data.inference_logprobs_column] = []
+    if config.data.teacher_logprobs_column in source:
+        row[config.data.teacher_logprobs_column] = []
+    metadata = dict(row.get(config.data.metadata_column) or {})
+    metadata["_wavelet_dummy_rollout"] = True
+    row[config.data.metadata_column] = metadata
+    return row
+
+
 def _rollout_chunk_examples(config: RLConfig) -> int:
     configured = config.orchestrator.rollout_chunk_examples
     if configured is not None:
@@ -204,6 +326,13 @@ def _rollout_chunk_examples(config: RLConfig) -> int:
         return 1
     async_level = max(config.orchestrator.max_async_level, 1)
     return max(1, ceil(examples_per_step / async_level))
+
+
+def _chunks_per_step(config: RLConfig) -> int:
+    examples_per_step = config.orchestrator.examples_per_step
+    if examples_per_step is None:
+        raise ValueError("orchestrator.examples_per_step is required.")
+    return max(ceil(examples_per_step / _rollout_chunk_examples(config)), 1)
 
 
 def _count_rollout_rows(path) -> int:

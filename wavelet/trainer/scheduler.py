@@ -60,7 +60,14 @@ def setup_scheduler(
     )
 
     if scheduler_config.type == "constant":
-        return ConstantLR(optimizer, factor=1.0)
+        return setup_constant_scheduler(
+            optimizer,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            lr=lr,
+            min_lr=scheduler_config.min_lr,
+            min_lr_factor=scheduler_config.min_lr_factor,
+        )
     if scheduler_config.type == "linear":
         return setup_linear_scheduler(
             optimizer,
@@ -92,6 +99,55 @@ def setup_scheduler(
             min_lr_factor=scheduler_config.min_lr_factor,
         )
     raise ValueError(f"Invalid scheduler type: {scheduler_config.type}")
+
+
+def setup_constant_scheduler(
+    optimizer: Optimizer,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    lr: float,
+    min_lr: float,
+    min_lr_factor: float | None = None,
+) -> LRScheduler:
+    min_lr_factor = _resolve_min_lr_factor(
+        SchedulerConfig(
+            type="constant",
+            min_lr=min_lr,
+            min_lr_factor=min_lr_factor,
+            warmup_ratio=0.0,
+            warmup_steps=0,
+            decay_ratio=1.0,
+        ),
+        lr=lr,
+    )
+
+    if total_steps <= 0:
+        raise ValueError("Constant scheduler requires total_steps > 0")
+    if warmup_steps <= 0:
+        return ConstantLR(optimizer, factor=1.0)
+
+    warmup_steps = min(warmup_steps, total_steps)
+    schedulers: list[LRScheduler] = [
+        LinearLR(
+            optimizer,
+            start_factor=min_lr_factor,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+    ]
+    milestones: list[int] = [warmup_steps]
+
+    constant_steps = max(total_steps - warmup_steps, 1)
+    schedulers.append(
+        LinearLR(
+            optimizer,
+            start_factor=1.0,
+            end_factor=1.0,
+            total_iters=constant_steps,
+        )
+    )
+    return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
 
 
 def setup_linear_scheduler(

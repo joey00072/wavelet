@@ -48,3 +48,10 @@ def test_wandb_group_and_tags_are_forwarded(monkeypatch, tmp_path) -> None:
     assert captured["name"] == "test-run"
     assert captured["group"] == "test-group"
     assert captured["tags"] == ["rl", "multi-gpu"]
+
+
+def test_wandb_alias_metrics_include_lr() -> None:
+    aliases = RunMonitor._wandb_alias_metrics({"lr": 1e-6})
+
+    assert aliases["train/lr"] == 1e-6
+    assert aliases["scheduler/lr"] == 1e-6

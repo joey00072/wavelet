@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+from types import MethodType
+
+import pytest
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
-from wavelet.orchestrator.verifiers import _records_from_output, _sampling_args
+from wavelet.orchestrator.verifiers import (
+    VerifierRolloutScheduler,
+    _completed_group_outputs,
+    _is_usable_training_group,
+    _records_from_output,
+    _sampling_args,
+    _successful_rollout_outputs,
+)
 
 
 def test_verifier_step_converts_to_trainable_record() -> None:
@@ -157,3 +169,83 @@ def test_verifier_multiturn_interleave_preserves_turn_boundary() -> None:
     assert record.target_ids == [2, 3, 4, 5, 6]
     assert record.loss_mask == [False, True, True, False, True]
     assert record.inference_logprobs == [-0.3, -0.4, -0.6]
+
+
+def test_successful_rollout_outputs_skip_exceptions_errors_and_missing_rewards() -> None:
+    outputs = _successful_rollout_outputs(
+        [
+            RuntimeError("boom"),
+            {"example_id": 0, "error": "timeout", "reward": 0.0},
+            {"example_id": 1, "completion": []},
+            object(),
+            {"example_id": 2, "reward": 1.0, "error": None},
+        ]
+    )
+
+    assert outputs == [{"example_id": 2, "reward": 1.0, "error": None}]
+
+
+def test_completed_group_outputs_treat_task_exception_as_empty_group() -> None:
+    async def fail() -> list[dict[str, float]]:
+        raise RuntimeError("boom")
+
+    async def run() -> list[dict[str, float]]:
+        task = asyncio.create_task(fail())
+        await asyncio.gather(task, return_exceptions=True)
+        return _completed_group_outputs(task)
+
+    assert asyncio.run(run()) == []
+
+
+def test_incomplete_verifier_groups_are_not_trainable() -> None:
+    outputs = [
+        {"example_id": 0, "reward": 0.0, "advantage": -0.5},
+        {"example_id": 0, "reward": 1.0, "advantage": 0.5},
+    ]
+
+    assert _is_usable_training_group(
+        outputs,
+        expected_rollouts=2,
+        filter_zero_advantage=True,
+        advantage_epsilon=1e-6,
+    )
+    assert not _is_usable_training_group(
+        outputs[:1],
+        expected_rollouts=2,
+        filter_zero_advantage=True,
+        advantage_epsilon=1e-6,
+    )
+
+
+def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
+    config = RLConfig(
+        orchestrator={
+            "examples_per_step": 1,
+            "rollouts_per_example": 1,
+            "filter_zero_advantage": True,
+            "zero_advantage_max_retries": 1,
+        }
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.orchestrator = RLOrchestrator(config)
+    scheduler.rollout_count = 1
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler._scheduled = 0
+
+    async def zero_advantage_group() -> list[dict[str, float]]:
+        return [{"reward": 1.0, "advantage": 0.0}]
+
+    def fill_inflight(self) -> None:
+        if self.pending:
+            return
+        task = asyncio.create_task(zero_advantage_group())
+        self.pending[task] = self._scheduled
+        self.pending_clients[task] = 0
+        self._scheduled += 1
+
+    scheduler._fill_inflight = MethodType(fill_inflight, scheduler)
+
+    with pytest.raises(RuntimeError, match="could not produce enough trainable"):
+        asyncio.run(scheduler.generate_batch(target_groups=1))

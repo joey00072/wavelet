@@ -74,6 +74,8 @@ def _coerce_advantages(
     fallback_reward: float | None,
     num_trainable_tokens: int,
 ) -> list[float]:
+    if num_trainable_tokens == 0:
+        return []
     if value is None:
         if fallback_reward is None:
             raise ValueError("Each RL row must provide either advantage or reward.")
@@ -145,7 +147,8 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
             f"lengths ({len(input_ids)}, {len(target_ids)}, {len(loss_mask)})."
         )
     if sum(loss_mask) == 0:
-        return None
+        if not (record.metadata or {}).get("_wavelet_dummy_rollout"):
+            return None
     return {
         "input_ids": input_ids,
         "position_ids": list(range(len(input_ids))),
@@ -217,6 +220,8 @@ def prepare_rl_sample(
         "temperatures": temperatures,
         "reward": record.reward,
     }
+    if (record.metadata or {}).get("_wavelet_dummy_rollout"):
+        sample["sample_count"] = 0
     if inference_logprobs is not None:
         sample["inference_logprobs"] = inference_logprobs
     if teacher_logprobs is not None:

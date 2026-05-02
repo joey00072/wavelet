@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +36,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         self.base_url = self.base_urls[0]
         self.tokenizer = None
         self.policy_model_name = config.model.name
+        self._policy_cache_root = self._default_policy_cache_root()
 
     def setup(self) -> None:
         deadline = time.monotonic() + self.config.inference.http.startup_timeout_seconds
@@ -52,9 +57,12 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         ) from last_error
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
+        if self._uses_openai_rollouts() and self.config.lora is not None:
+            policy_dir = self._cache_lora_policy_dir(policy_dir, step=step)
         payload: dict[str, Any] = {"policy_dir": str(policy_dir), "step": step}
-        if self._uses_dynamic_openai_policy_names():
-            payload["adapter_name"] = self._policy_model_name_for_step(step)
+        if self._uses_openai_rollouts() and self.config.lora is not None:
+            payload["adapter_name"] = self.config.policy_transfer.adapter_name
+            payload["load_inplace"] = True
         if len(self.base_urls) == 1:
             self._request("POST", "/load_policy", payload, base_url=self.base_url)
         else:
@@ -73,11 +81,58 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                     future.result()
         self.policy_step = step
         if self.config.lora is not None:
-            self.policy_model_name = (
-                payload["adapter_name"]
-                if "adapter_name" in payload
-                else self.config.policy_transfer.adapter_name
-            )
+            self.policy_model_name = self.config.policy_transfer.adapter_name
+
+    def _default_policy_cache_root(self) -> Path:
+        configured = os.environ.get("WAVELET_POLICY_CACHE_DIR")
+        if configured:
+            base_dir = Path(configured)
+        else:
+            shm_dir = Path("/dev/shm")
+            base_dir = shm_dir if shm_dir.is_dir() else Path(tempfile.gettempdir())
+        output_hash = sha1(
+            str(self.config.output_dir.resolve()).encode("utf-8")
+        ).hexdigest()[:12]
+        return base_dir / f"wavelet-policy-cache-{os.getuid()}" / f"{os.getpid()}-{output_hash}"
+
+    def _cache_lora_policy_dir(self, policy_dir: Path, *, step: int) -> Path:
+        adapter_dir = policy_dir / "adapter"
+        tensor_path = adapter_dir / "adapter_model.safetensors"
+        if not tensor_path.is_file():
+            return policy_dir
+
+        cached_policy_dir = self._policy_cache_root / f"step-{step:06d}"
+        marker_path = cached_policy_dir / ".complete"
+        if marker_path.is_file():
+            return cached_policy_dir
+
+        tmp_policy_dir = cached_policy_dir.with_name(
+            f"{cached_policy_dir.name}.tmp-{time.monotonic_ns()}"
+        )
+        try:
+            shutil.rmtree(tmp_policy_dir, ignore_errors=True)
+            tmp_adapter_dir = tmp_policy_dir / "adapter"
+            tmp_adapter_dir.mkdir(parents=True, exist_ok=True)
+            for source in adapter_dir.iterdir():
+                if source.is_file():
+                    shutil.copy2(source, tmp_adapter_dir / source.name)
+            (tmp_policy_dir / ".complete").write_text("ok\n", encoding="utf-8")
+            if cached_policy_dir.exists():
+                shutil.rmtree(cached_policy_dir)
+            os.replace(tmp_policy_dir, cached_policy_dir)
+            self._prune_policy_cache(keep_steps={step, step - 1})
+        except OSError:
+            shutil.rmtree(tmp_policy_dir, ignore_errors=True)
+            return policy_dir
+        return cached_policy_dir
+
+    def _prune_policy_cache(self, *, keep_steps: set[int]) -> None:
+        if not self._policy_cache_root.is_dir():
+            return
+        keep_names = {f"step-{step:06d}" for step in keep_steps if step >= 0}
+        for child in self._policy_cache_root.iterdir():
+            if child.is_dir() and child.name.startswith("step-") and child.name not in keep_names:
+                shutil.rmtree(child, ignore_errors=True)
 
     def sleep(self) -> None:
         self._request_all("POST", "/sleep", {"level": 1})
@@ -194,6 +249,9 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 self.tokenizer,
                 record,
             )
+            max_prompt_tokens = self.config.inference.sampling.max_prompt_tokens
+            if max_prompt_tokens is not None and len(prompt_ids) > max_prompt_tokens:
+                prompt_ids = prompt_ids[-max_prompt_tokens:]
             response = self._request(
                 "POST",
                 "/chat/completions/tokens",
@@ -369,12 +427,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
             self.config.inference.vllm.server_backend == "openai"
             and self.config.orchestrator.custom_rollout_function is None
         )
-
-    def _uses_dynamic_openai_policy_names(self) -> bool:
-        return self._uses_openai_rollouts() and self.config.lora is not None
-
-    def _policy_model_name_for_step(self, step: int) -> str:
-        return f"{self.config.policy_transfer.adapter_name}-{step:06d}"
 
 
 def _shift_completion_sample(

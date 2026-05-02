@@ -197,6 +197,8 @@ class WandbConfig(BaseModel):
     group: str | None = None
     tags: list[str] | None = None
     mode: Literal["online", "offline", "disabled"] = "offline"
+    init_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    offline_fallback: bool = True
 
 
 class SampleLogConfig(BaseModel):

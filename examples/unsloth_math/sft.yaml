@@ -1,5 +1,5 @@
 model:
-  name: "unsloth/Qwen3-4B-Base"
+  name: "unsloth/Qwen3-8B-Base"
   torch_dtype: bfloat16
   attn_implementation: sdpa
   load_in_4bit: false
@@ -24,7 +24,7 @@ data:
 optim:
   type: adamw_8bit
   implementation: for-loop
-  lr: 2e-5
+  lr: 3e-5
   weight_decay: 0.001
   betas: [0.9, 0.999]
 
@@ -49,7 +49,7 @@ lora:
 loss_impl: torch
 
 max_grad_norm: 1.0
-max_steps: 20
+max_steps: 100
 seed: 3407
 
 monitor:
@@ -57,7 +57,7 @@ monitor:
   wandb:
     enabled: true
     project: wavelet-unsloth-math
-    name: wavelet-unsloth-qwen4b-math-sft
+    name: wavelet-unsloth-qwen8b-math-sft
     mode: online
 
 output_dir: outputs/unsloth_math_sft
