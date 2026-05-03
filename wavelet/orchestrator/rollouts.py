@@ -13,6 +13,10 @@ from pathlib import Path
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample, load_rl_records
 from wavelet.inference.policy import RLInference
+from wavelet.orchestrator.advantage import (
+    group_reward_advantages,
+    length_penalty_cost_for_record,
+)
 from wavelet.orchestrator.reward import RLRewardScorer
 from wavelet.orchestrator.queue import FileSystemRolloutSender, RolloutBatch
 
@@ -366,26 +370,37 @@ class RLOrchestrator:
             grouped.setdefault(self._group_key(record), []).append(record)
 
         updated: list[RLExample] = []
-        for record in records:
-            group = grouped[self._group_key(record)]
+        group_advantages: dict[str, dict[int, float]] = {}
+        for key, group in grouped.items():
             rewards = [item.reward for item in group]
             if any(reward is None for reward in rewards):
                 raise ValueError(
                     "group_reward advantages require rewards for all rollouts."
                 )
             reward_values = [float(reward) for reward in rewards if reward is not None]
-            mean = sum(reward_values) / len(reward_values)
-            advantage = (
-                float(record.reward) - mean if record.reward is not None else 0.0
+            penalty = self.config.orchestrator.length_penalty
+            costs = (
+                [length_penalty_cost_for_record(item, penalty) for item in group]
+                if penalty is not None
+                else None
             )
-            if self.config.orchestrator.normalize_group_advantages:
-                variance = sum((reward - mean) ** 2 for reward in reward_values) / len(
-                    reward_values
+            advantages = group_reward_advantages(
+                reward_values,
+                costs=costs,
+                normalize=self.config.orchestrator.normalize_group_advantages,
+                epsilon=self.config.orchestrator.advantage_epsilon,
+            )
+            group_advantages[key] = {
+                id(item): advantage for item, advantage in zip(group, advantages)
+            }
+
+        for record in records:
+            updated.append(
+                self._replace_advantage(
+                    record,
+                    group_advantages[self._group_key(record)][id(record)],
                 )
-                std = math.sqrt(variance)
-                if std > self.config.orchestrator.advantage_epsilon:
-                    advantage /= std
-            updated.append(self._replace_advantage(record, advantage))
+            )
         return updated
 
     def _should_retry_zero_advantage(self, records: list[RLExample]) -> bool:

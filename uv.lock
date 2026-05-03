@@ -1131,6 +1131,16 @@ wheels = [
 ]
 
 [[package]]
+name = "flash-attn"
+version = "2.8.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "einops", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "torch", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3b/b2/8d76c41ad7974ee264754709c22963447f7f8134613fd9ce80984ed0dab7/flash_attn-2.8.3.tar.gz", hash = "sha256:1e71dd64a9e0280e0447b8a0c2541bad4bf6ac65bdeaa2f90e51a9e57de0370d", size = 8447812, upload-time = "2025-08-15T08:28:12.911Z" }
+
+[[package]]
 name = "flashinfer-cubin"
 version = "0.6.6"
 source = { registry = "https://pypi.org/simple" }
@@ -5680,6 +5690,9 @@ envs = [
     { name = "math-env" },
     { name = "reverse-text" },
 ]
+flash-attn = [
+    { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
 verifiers = [
     { name = "verifiers" },
 ]
@@ -5692,6 +5705,7 @@ requires-dist = [
     { name = "bitsandbytes", specifier = ">=0.43" },
     { name = "datasets", specifier = ">=2.18" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "flash-attn", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'flash-attn'", specifier = ">=2.8.3" },
     { name = "liger-kernel", specifier = ">=0.7.0" },
     { name = "math-env", marker = "extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "math-verify", specifier = ">=0.9.0" },
@@ -5714,7 +5728,7 @@ requires-dist = [
     { name = "wandb", specifier = ">=0.16" },
     { name = "xformers", specifier = ">=0.0.35" },
 ]
-provides-extras = ["dev", "verifiers", "envs"]
+provides-extras = ["dev", "verifiers", "envs", "flash-attn"]
 
 [[package]]
 name = "websockets"

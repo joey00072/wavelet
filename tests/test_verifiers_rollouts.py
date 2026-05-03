@@ -10,6 +10,7 @@ from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.verifiers import (
     VerifierRolloutScheduler,
+    _assign_rollout_advantages,
     _completed_group_outputs,
     _is_usable_training_group,
     _records_from_output,
@@ -59,6 +60,9 @@ def test_verifier_step_converts_to_trainable_record() -> None:
         "rollout_key": "7:0",
         "stop_condition": "done",
         "is_truncated": False,
+        "completion_token_count": 2,
+        "tool_response_token_count": 0,
+        "turn_count": 1,
     }
     assert record.prompt[1]["step_loss_mask"] == 0
     assert record.source == "alphabet-sort"
@@ -169,6 +173,75 @@ def test_verifier_multiturn_interleave_preserves_turn_boundary() -> None:
     assert record.target_ids == [2, 3, 4, 5, 6]
     assert record.loss_mask == [False, True, True, False, True]
     assert record.inference_logprobs == [-0.3, -0.4, -0.6]
+
+
+def test_verifier_records_include_length_metadata() -> None:
+    output = {
+        "example_id": 7,
+        "task": "tool-env",
+        "reward": 1.0,
+        "advantage": 0.5,
+        "sampling_args": {"temperature": 1.0},
+        "metrics": {"rlm_total_tool_response_tokens": 12},
+        "trajectory": [
+            {
+                "prompt": [{"role": "user", "content": "a"}],
+                "completion": [{"role": "assistant", "content": "b"}],
+                "tokens": {
+                    "prompt_ids": [1, 2],
+                    "prompt_mask": [0, 0],
+                    "completion_ids": [3, 4, 5],
+                    "completion_mask": [1, 1, 1],
+                    "completion_logprobs": [-0.3, -0.4, -0.5],
+                },
+            }
+        ],
+    }
+
+    record = _records_from_output(output)[0]
+
+    assert record.metadata["completion_token_count"] == 3
+    assert record.metadata["tool_response_token_count"] == 12
+    assert record.metadata["turn_count"] == 1
+
+
+def test_verifier_tool_response_length_penalty_shapes_advantages() -> None:
+    config = RLConfig(
+        orchestrator={
+            "advantage_mode": "group_reward",
+            "length_penalty": {
+                "type": "tokens",
+                "completion_weight": 0.0,
+                "tool_response_weight": 1.0,
+            },
+        }
+    )
+    outputs = [
+        {
+            "example_id": 1,
+            "reward": 1.0,
+            "trajectory": [{"tokens": {"completion_ids": [1]}}],
+            "metrics": {"rlm_total_tool_response_tokens": 100},
+        },
+        {
+            "example_id": 1,
+            "reward": 1.0,
+            "trajectory": [{"tokens": {"completion_ids": [1]}}],
+            "metrics": {"rlm_total_tool_response_tokens": 0},
+        },
+        {
+            "example_id": 1,
+            "reward": 0.0,
+            "trajectory": [{"tokens": {"completion_ids": [1]}}],
+            "metrics": {"rlm_total_tool_response_tokens": 50},
+        },
+    ]
+
+    _assign_rollout_advantages(outputs, config)
+
+    assert outputs[1]["advantage"] > outputs[0]["advantage"]
+    assert outputs[0]["advantage"] > outputs[2]["advantage"]
+    assert sum(float(output["advantage"]) for output in outputs) == pytest.approx(0.0)
 
 
 def test_successful_rollout_outputs_skip_exceptions_errors_and_missing_rewards() -> None:

@@ -10,6 +10,12 @@ from typing import Any
 
 from wavelet.configs.rl_config import RLEvalEnvConfig
 from wavelet.data.rl_dataset import RLExample, load_rl_records
+from wavelet.orchestrator.advantage import (
+    group_reward_advantages,
+    length_penalty_cost_for_output,
+    output_completion_token_count,
+    output_tool_response_token_count,
+)
 from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
@@ -78,6 +84,7 @@ def generate_rollouts(
             filter_zero_advantage=config.orchestrator.filter_zero_advantage,
             advantage_epsilon=config.orchestrator.advantage_epsilon,
             normalize_group_advantages=config.orchestrator.normalize_group_advantages,
+            length_penalty=config.orchestrator.length_penalty,
         )
     )
     rollout_seconds = perf_counter() - rollout_started_at
@@ -275,6 +282,8 @@ class VerifierRolloutScheduler:
                 normalize_group_advantages=(
                     self.config.orchestrator.normalize_group_advantages
                 ),
+                advantage_epsilon=self.config.orchestrator.advantage_epsilon,
+                length_penalty=self.config.orchestrator.length_penalty,
             )
         )
         self.pending[task] = self.next_group_id
@@ -594,6 +603,7 @@ async def _run_all(
     filter_zero_advantage: bool,
     advantage_epsilon: float,
     normalize_group_advantages: bool,
+    length_penalty: object | None,
 ) -> list[dict[str, Any]]:
     if not clients:
         raise ValueError("At least one verifier client is required.")
@@ -631,6 +641,8 @@ async def _run_all(
                 rollout_count=rollout_count,
                 max_retries=max_retries,
                 normalize_group_advantages=normalize_group_advantages,
+                advantage_epsilon=advantage_epsilon,
+                length_penalty=length_penalty,
             )
         )
         group_tasks.append(task)
@@ -675,6 +687,8 @@ async def _run_group(
     rollout_count: int,
     max_retries: int,
     normalize_group_advantages: bool,
+    advantage_epsilon: float,
+    length_penalty: object | None,
 ) -> list[dict[str, Any]]:
     tasks = [
         env.run_rollout(
@@ -692,6 +706,8 @@ async def _run_group(
     _assign_group_advantages(
         outputs,
         normalize_group_advantages=normalize_group_advantages,
+        advantage_epsilon=advantage_epsilon,
+        length_penalty=length_penalty,
     )
     return outputs
 
@@ -726,17 +742,24 @@ def _assign_group_advantages(
     outputs: list[dict[str, Any]],
     *,
     normalize_group_advantages: bool,
+    advantage_epsilon: float,
+    length_penalty: object | None,
 ) -> None:
     if not outputs:
         return
     rewards = [float(output["reward"]) for output in outputs]
-    mean = sum(rewards) / len(rewards)
-    variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
-    std = variance**0.5
-    for output, reward in zip(outputs, rewards, strict=True):
-        advantage = reward - mean
-        if normalize_group_advantages and std > 0.0:
-            advantage /= std
+    costs = (
+        [length_penalty_cost_for_output(output, length_penalty) for output in outputs]
+        if length_penalty is not None
+        else None
+    )
+    advantages = group_reward_advantages(
+        rewards,
+        costs=costs,
+        normalize=normalize_group_advantages,
+        epsilon=advantage_epsilon,
+    )
+    for output, advantage in zip(outputs, advantages, strict=True):
         output["advantage"] = advantage
 
 
@@ -848,18 +871,19 @@ def _assign_rollout_advantages(outputs: list[dict[str, Any]], config) -> None:
         grouped.setdefault(str(output.get("example_id", "unknown")), []).append(output)
     for group in grouped.values():
         rewards = [float(output["reward"]) for output in group]
-        mean = sum(rewards) / len(rewards)
-        std = 0.0
-        if config.orchestrator.normalize_group_advantages:
-            variance = sum((reward - mean) ** 2 for reward in rewards) / len(rewards)
-            std = variance**0.5
-        for output, reward in zip(group, rewards, strict=True):
-            advantage = reward - mean
-            if (
-                config.orchestrator.normalize_group_advantages
-                and std > config.orchestrator.advantage_epsilon
-            ):
-                advantage /= std
+        penalty = config.orchestrator.length_penalty
+        costs = (
+            [length_penalty_cost_for_output(output, penalty) for output in group]
+            if penalty is not None
+            else None
+        )
+        advantages = group_reward_advantages(
+            rewards,
+            costs=costs,
+            normalize=config.orchestrator.normalize_group_advantages,
+            epsilon=config.orchestrator.advantage_epsilon,
+        )
+        for output, advantage in zip(group, advantages, strict=True):
             output["advantage"] = advantage
 
 
@@ -901,6 +925,11 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                     "rollout_key": f"{example_id}:{sample_index}",
                     "stop_condition": output.get("stop_condition"),
                     "is_truncated": output.get("is_truncated"),
+                    "completion_token_count": output_completion_token_count(output),
+                    "tool_response_token_count": output_tool_response_token_count(
+                        output
+                    ),
+                    "turn_count": len(output.get("trajectory") or []),
                 },
                 source=str(output.get("env_name") or output.get("task") or "verifier"),
             )
