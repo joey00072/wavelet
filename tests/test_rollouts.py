@@ -184,3 +184,65 @@ def test_native_rollout_materialization_fails_on_repeated_empty_completions(
             chunk_examples=1,
             inference_engine=EmptyEngine(),
         )
+
+
+def test_group_reward_token_length_penalty_prefers_short_correct_rollouts() -> None:
+    config = RLConfig(
+        orchestrator={
+            "advantage_mode": "group_reward",
+            "length_penalty": {
+                "type": "tokens",
+                "completion_weight": 1.0,
+                "tool_response_weight": 0.0,
+            },
+        }
+    )
+    orchestrator = RLOrchestrator(config)
+    records = [
+        replace(
+            _example(),
+            reward=1.0,
+            metadata={"group_key": "a", "completion_token_count": 10},
+        ),
+        replace(
+            _example(),
+            reward=1.0,
+            metadata={"group_key": "a", "completion_token_count": 30},
+        ),
+        replace(
+            _example(),
+            reward=0.0,
+            metadata={"group_key": "a", "completion_token_count": 20},
+        ),
+    ]
+
+    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+
+    assert updated[0].advantage > updated[1].advantage
+    assert updated[1].advantage > updated[2].advantage
+    assert sum(float(record.advantage) for record in updated) == pytest.approx(0.0)
+
+
+def test_group_reward_zero_length_cost_falls_back_to_plain_reward() -> None:
+    config = RLConfig(
+        orchestrator={
+            "advantage_mode": "group_reward",
+            "length_penalty": {
+                "type": "tokens",
+                "completion_weight": 0.0,
+                "tool_response_weight": 1.0,
+            },
+        }
+    )
+    orchestrator = RLOrchestrator(config)
+    records = [
+        replace(_example(), reward=1.0, metadata={"group_key": "a"}),
+        replace(_example(), reward=1.0, metadata={"group_key": "a"}),
+        replace(_example(), reward=0.0, metadata={"group_key": "a"}),
+    ]
+
+    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+
+    assert [record.advantage for record in updated] == pytest.approx(
+        [1 / 3, 1 / 3, -2 / 3]
+    )

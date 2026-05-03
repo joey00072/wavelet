@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -138,6 +138,15 @@ class RLSamplingConfig(BaseModel):
     seed: int | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_sampling_fields(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        if "max_tokens" in value and "max_completion_tokens" not in value:
+            value["max_completion_tokens"] = value.pop("max_tokens")
+        return value
+
 
 class RLEvalSamplingConfig(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0)
@@ -148,6 +157,15 @@ class RLEvalSamplingConfig(BaseModel):
     max_completion_tokens: int | None = Field(default=None, ge=1)
     seed: int | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_sampling_fields(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        if "max_tokens" in value and "max_completion_tokens" not in value:
+            value["max_completion_tokens"] = value.pop("max_tokens")
+        return value
 
     def to_sampling_args(self) -> dict[str, Any]:
         args: dict[str, Any] = {"logprobs": True}
@@ -313,6 +331,22 @@ class RLStateServerConfig(BaseModel):
     max_events: int = Field(default=2000, ge=100)
 
 
+class TokensLengthPenaltyConfig(BaseModel):
+    type: Literal["tokens"] = "tokens"
+    completion_weight: float = Field(default=1.0, ge=0.0)
+    tool_response_weight: float = Field(default=1.0, ge=0.0)
+
+
+class TurnsLengthPenaltyConfig(BaseModel):
+    type: Literal["turns"] = "turns"
+
+
+LengthPenaltyConfig = Annotated[
+    TokensLengthPenaltyConfig | TurnsLengthPenaltyConfig,
+    Field(discriminator="type"),
+]
+
+
 class RLOrchestratorConfig(BaseModel):
     enabled: bool = True
     custom_rollout_function: str | None = None
@@ -340,7 +374,18 @@ class RLOrchestratorConfig(BaseModel):
     max_async_level: int = Field(default=0, ge=0)
     max_off_policy_steps: int = Field(default=0, ge=0)
     max_pending_rollout_chunks: int | None = Field(default=None, ge=1)
+    length_penalty: LengthPenaltyConfig | None = None
     state_server: RLStateServerConfig = RLStateServerConfig()
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_orchestrator_fields(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        penalty = value.get("length_penalty")
+        if isinstance(penalty, str) and penalty in {"tokens", "turns"}:
+            value["length_penalty"] = {"type": penalty}
+        return value
 
 
 class RLLauncherConfig(BaseModel):

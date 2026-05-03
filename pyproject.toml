@@ -41,6 +41,15 @@ envs = [
     "math-env",
     "reverse-text",
 ]
+flash-attn = [
+    "flash-attn>=2.8.3; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [tool.uv.sources]
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "77a9f28" }
@@ -53,6 +62,13 @@ reverse-text = { index = "primeintellect" }
 name = "primeintellect"
 url = "https://hub.primeintellect.ai/primeintellect/simple/"
 explicit = true
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
 
 [build-system]
 requires = ["hatchling"]

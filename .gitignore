@@ -1,6 +1,10 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
 build/
 dist/
 wheels/
@@ -12,6 +16,7 @@ wheels/
 
 # Outputs and caches
 outputs/
+wandb/
 unsloth_compiled_cache/
 bench_wavelet.log
 *.log
