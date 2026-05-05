@@ -9,7 +9,7 @@ model:
 data:
   source: local
   path: outputs/alphabet_sort_data/rl_train.jsonl
-  batch_size: 128
+  batch_size: 512
   micro_batch_size: 1
   pack_sequences: true
   pad_to_multiple_of: 1
@@ -36,8 +36,8 @@ orchestrator:
   verifier_client_type: openai_chat_completions_token
   advantage_mode: group_reward
   normalize_group_advantages: false
-  examples_per_step: 32
-  rollouts_per_example: 4
+  examples_per_step: 64
+  rollouts_per_example: 8
   oversampling_factor: 2.0
   filter_zero_advantage: true
   zero_advantage_max_retries: 8
@@ -46,8 +46,8 @@ orchestrator:
 
 eval:
   interval: 20
-  num_examples: 32
-  rollouts_per_example: 4
+  num_examples: 64
+  rollouts_per_example: 8
   eval_base_model: true
   final_eval: true
   sampling:
@@ -103,7 +103,7 @@ reward:
 
 policy_transfer:
   export_initial: true
-  export_every_steps: 4
+  export_every_steps: 1
 
 fsdp:
   enabled: true

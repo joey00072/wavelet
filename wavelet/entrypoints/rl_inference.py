@@ -35,12 +35,20 @@ def _preload_rollout_resources(config: RLConfig) -> None:
     except ImportError:
         return
 
-    from wavelet.orchestrator.verifiers import _load_cached_env
+    from wavelet.orchestrator.verifiers import (
+        _load_cached_env,
+        _verifier_extra_env_kwargs,
+    )
 
     env_id = config.orchestrator.verifier_env_id
     if env_id is None:
         return
-    _load_cached_env(vf, env_id, config.orchestrator.verifier_env_args)
+    _load_cached_env(
+        vf,
+        env_id,
+        config.orchestrator.verifier_env_args,
+        _verifier_extra_env_kwargs(config),
+    )
 
 
 def _required_policy_step(config: RLConfig, rollout_step: int) -> int:

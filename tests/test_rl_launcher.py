@@ -19,6 +19,7 @@ from wavelet.entrypoints.rl_launcher import (
 from wavelet.entrypoints.rl_trainer import (
     _chunks_per_step,
     _dummy_rollout_row,
+    _should_step_streaming_rollouts,
     _use_streaming_rollout_chunks,
 )
 from wavelet.entrypoints.rl_vllm_openai_server import _serve_args
@@ -94,6 +95,34 @@ def test_streaming_chunk_resume_uses_chunk_index_space() -> None:
 
     assert _use_streaming_rollout_chunks(config) is True
     assert _chunks_per_step(config) == 4
+
+
+def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
+    counts = [16] * 800
+    counts[32] = 17
+    counts[389] = 17
+    counts[584] = 14
+    counts[639] = 18
+
+    steps = 0
+    accumulated_rows = 0
+    accumulated_chunks = 0
+    for row_count in counts:
+        accumulated_rows += row_count
+        accumulated_chunks += 1
+        if _should_step_streaming_rollouts(
+            accumulated_rows=accumulated_rows,
+            accumulated_chunks=accumulated_chunks,
+            target_rollout_rows=128,
+            chunks_per_step=8,
+        ):
+            steps += 1
+            accumulated_rows = 0
+            accumulated_chunks = 0
+
+    assert steps == 100
+    assert accumulated_rows == 0
+    assert accumulated_chunks == 0
 
 
 def test_sleep_colocate_allows_multi_process_trainer() -> None:

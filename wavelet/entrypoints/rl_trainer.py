@@ -117,6 +117,7 @@ def _run_streaming_rollout_training(
     chunks_per_step = _chunks_per_step(config)
     min_loadable_rows = _min_loadable_rollout_rows(config, trainer)
     accumulated_rows = 0
+    accumulated_chunks = 0
     chunk_index = 0
     pending_paths: list[Path] = []
     pending_rows = 0
@@ -152,13 +153,19 @@ def _run_streaming_rollout_training(
             min_rows=min_loadable_rows,
         )
         row_count = _count_rollout_rows(rollout_path)
+        loaded_chunks = len(pending_paths)
         pending_paths = []
         pending_rows = 0
         trainer.load_rollout_path(rollout_path)
         accumulated_rows += row_count
-        chunks_into_step = (chunk_index - 1) % chunks_per_step
-        remaining_chunks = max(chunks_per_step - chunks_into_step - 1, 0)
-        should_step = accumulated_rows >= target_rollout_rows
+        accumulated_chunks += loaded_chunks
+        should_step = _should_step_streaming_rollouts(
+            accumulated_rows=accumulated_rows,
+            accumulated_chunks=accumulated_chunks,
+            target_rollout_rows=target_rollout_rows,
+            chunks_per_step=chunks_per_step,
+        )
+        remaining_chunks = max(chunks_per_step - accumulated_chunks, 0)
         loaded_micro_batches = trainer._loaded_micro_batch_count
         if should_step:
             trainer.accumulation_steps = (
@@ -186,6 +193,7 @@ def _run_streaming_rollout_training(
                 loop_seconds=perf_counter() - loop_started_at,
             )
             accumulated_rows = 0
+            accumulated_chunks = 0
             export_started_at = perf_counter()
             trainer.export_policy(step=trainer.step)
             trainer.offload_after_refit()
@@ -196,6 +204,7 @@ def _run_streaming_rollout_training(
                 "WAVELET_PERF trainer_chunk "
                 f"queue_step={batch.step} trainer_step={trainer.step} "
                 f"rows={row_count} accumulated_rows={accumulated_rows} "
+                f"accumulated_chunks={accumulated_chunks} "
                 f"wait_batch={wait_seconds:.3f} "
                 f"load_rollout={load_seconds:.3f} "
                 f"train={train_seconds:.3f} "
@@ -204,6 +213,19 @@ def _run_streaming_rollout_training(
                 f"total={total_seconds:.3f}",
                 flush=True,
             )
+
+
+def _should_step_streaming_rollouts(
+    *,
+    accumulated_rows: int,
+    accumulated_chunks: int,
+    target_rollout_rows: int,
+    chunks_per_step: int,
+) -> bool:
+    return (
+        accumulated_rows >= target_rollout_rows
+        or accumulated_chunks >= chunks_per_step
+    )
 
 
 def _log_step_perf_metrics(
