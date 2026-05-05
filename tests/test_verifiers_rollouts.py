@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import MethodType
+from typing import Any
 
 import pytest
 
@@ -13,9 +14,11 @@ from wavelet.orchestrator.verifiers import (
     _assign_rollout_advantages,
     _completed_group_outputs,
     _is_usable_training_group,
+    _load_cached_env,
     _records_from_output,
     _sampling_args,
     _successful_rollout_outputs,
+    _verifier_extra_env_kwargs,
 )
 
 
@@ -105,6 +108,47 @@ def test_verifier_sampling_args_preserve_extra_body() -> None:
     assert args["extra_body"]["min_p"] == 0.0
     assert args["extra_body"]["custom"] == "value"
     assert args["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_verifier_env_gets_sequence_budget_kwargs() -> None:
+    config = RLConfig(data={"seq_len": 2048})
+
+    assert _verifier_extra_env_kwargs(config) == {
+        "max_seq_len": 2048,
+        "max_total_completion_tokens": -1,
+    }
+
+
+def test_load_cached_env_applies_extra_env_kwargs() -> None:
+    class DummyEnv:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
+
+        def set_kwargs(self, **kwargs: Any) -> None:
+            self.kwargs.update(kwargs)
+
+    class DummyVerifierModule:
+        def __init__(self) -> None:
+            self.env = DummyEnv()
+
+        def load_environment(self, env_id: str, **env_args: Any) -> DummyEnv:
+            assert env_id == "alphabet-sort"
+            assert env_args == {"min_turns": 3}
+            return self.env
+
+    vf = DummyVerifierModule()
+    env, cache_hit = _load_cached_env(
+        vf,
+        "alphabet-sort",
+        {"min_turns": 3},
+        {"max_seq_len": 2048, "max_total_completion_tokens": -1},
+    )
+
+    assert not cache_hit
+    assert env.kwargs == {
+        "max_seq_len": 2048,
+        "max_total_completion_tokens": -1,
+    }
 
 
 def test_pretokenized_rows_match_prime_sequence_window() -> None:

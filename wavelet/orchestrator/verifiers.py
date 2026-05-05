@@ -51,6 +51,7 @@ def generate_rollouts(
         vf,
         env_id,
         config.orchestrator.verifier_env_args,
+        _verifier_extra_env_kwargs(config),
     )
     env_load_seconds = perf_counter() - env_started_at
     os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
@@ -131,6 +132,7 @@ class VerifierRolloutScheduler:
             vf,
             env_id,
             config.orchestrator.verifier_env_args,
+            _verifier_extra_env_kwargs(config),
         )
         self.model = config.orchestrator.verifier_model or config.model.name
         self.sampling_args = _sampling_args(config)
@@ -318,7 +320,12 @@ def evaluate_env(
         ) from exc
 
     config = orchestrator.config
-    env, _env_cache_hit = _load_cached_env(vf, env_config.id, env_config.args)
+    env, _env_cache_hit = _load_cached_env(
+        vf,
+        env_config.id,
+        env_config.args,
+        _verifier_extra_env_kwargs(config),
+    )
     examples = env.get_eval_dataset(n=env_config.num_examples).to_list()
     base_urls = _verifier_base_urls(config)
     os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
@@ -388,7 +395,12 @@ async def evaluate_env_async(
         ) from exc
 
     config = orchestrator.config
-    env, _env_cache_hit = _load_cached_env(vf, env_config.id, env_config.args)
+    env, _env_cache_hit = _load_cached_env(
+        vf,
+        env_config.id,
+        env_config.args,
+        _verifier_extra_env_kwargs(config),
+    )
     examples = env.get_eval_dataset(n=env_config.num_examples).to_list()
     base_urls = _verifier_base_urls(config)
     os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
@@ -575,15 +587,36 @@ def _verifier_base_urls(config) -> list[str]:
     return list(base_urls)
 
 
-def _load_cached_env(vf, env_id: str, env_args: dict[str, Any]) -> tuple[Any, bool]:
+def _verifier_extra_env_kwargs(config) -> dict[str, Any]:
+    return {
+        "max_seq_len": config.data.seq_len,
+        "max_total_completion_tokens": -1,
+    }
+
+
+def _load_cached_env(
+    vf,
+    env_id: str,
+    env_args: dict[str, Any],
+    extra_env_kwargs: dict[str, Any] | None = None,
+) -> tuple[Any, bool]:
+    extra_env_kwargs = extra_env_kwargs or {}
     cache_key = (
         env_id,
         json.dumps(env_args, sort_keys=True, default=str),
+        json.dumps(extra_env_kwargs, sort_keys=True, default=str),
     )
     cached = _ENV_CACHE.get(cache_key)
     if cached is not None:
         return cached, True
     env = vf.load_environment(env_id, **env_args)
+    if extra_env_kwargs:
+        set_kwargs = getattr(env, "set_kwargs", None)
+        if callable(set_kwargs):
+            set_kwargs(**extra_env_kwargs)
+        else:
+            for key, value in extra_env_kwargs.items():
+                setattr(env, key, value)
     _patch_env_response_messages(vf, env)
     _ENV_CACHE[cache_key] = env
     return env, False
