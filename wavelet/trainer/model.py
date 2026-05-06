@@ -34,6 +34,7 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
+from transformers.utils import logging as transformers_logging
 
 from wavelet.configs.sft import FSDPConfig, LoRAConfig, ModelConfig
 from wavelet.distributed.parallel_dims import ParallelDims
@@ -263,7 +264,18 @@ def setup_model(
         if not distributed:
             model_kwargs["device_map"] = "auto"
 
-    model = AutoModelForCausalLM.from_pretrained(config.name, **model_kwargs)
+    previous_transformers_verbosity = transformers_logging.get_verbosity()
+    suppress_float32_flash_warning = (
+        config.torch_dtype == "float32"
+        and attn_implementation in {"flash_attention_2", "flash_attention_3"}
+    )
+    if suppress_float32_flash_warning:
+        transformers_logging.set_verbosity_error()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(config.name, **model_kwargs)
+    finally:
+        if suppress_float32_flash_warning:
+            transformers_logging.set_verbosity(previous_transformers_verbosity)
     model.config.use_cache = False
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(
@@ -708,6 +720,12 @@ def _fsdp_mixed_precision(model_config: ModelConfig) -> MixedPrecision | None:
         return None
     if not torch.cuda.is_available() and dtype is not torch.float32:
         return None
+    if dtype is torch.float32 and torch.cuda.is_available():
+        return MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.bfloat16,
+        )
     return MixedPrecision(
         param_dtype=dtype,
         reduce_dtype=dtype,

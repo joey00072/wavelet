@@ -286,12 +286,15 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
             "temperature": sampling.temperature if sampling.do_sample else 0.0,
             "top_p": sampling.top_p,
             "min_p": sampling.min_p,
-            "max_completion_tokens": sampling.max_completion_tokens,
             "logprobs": True,
             "return_token_ids": True,
         }
+        if sampling.max_completion_tokens is not None:
+            payload["max_completion_tokens"] = sampling.max_completion_tokens
         if sampling.top_k != 0:
             payload["top_k"] = sampling.top_k
+        if sampling.min_tokens > 0:
+            payload["min_tokens"] = sampling.min_tokens
         if sampling.seed is not None:
             payload["seed"] = sampling.seed
         if sampling.repetition_penalty != 1.0:
@@ -301,6 +304,8 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         if record.chat_template_kwargs is not None:
             payload["chat_template_kwargs"] = record.chat_template_kwargs
         payload.update(sampling.extra_body)
+        if self.policy_step is not None:
+            payload.setdefault("cache_salt", str(self.policy_step))
         payload["return_token_ids"] = True
         return payload
 

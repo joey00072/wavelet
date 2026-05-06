@@ -15,6 +15,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.distributed.world import barrier
 from wavelet.data.loading import Example
 from wavelet.data.rl_dataset import (
     PackedRLDataset,
@@ -73,7 +74,9 @@ def _packed_causal_attention_mask(
 
     batch_size, seq_len = position_ids.shape
     segment_ids = starts.long().cumsum(dim=1) - 1
-    segment_ids = torch.where(valid_tokens, segment_ids, torch.full_like(segment_ids, -1))
+    segment_ids = torch.where(
+        valid_tokens, segment_ids, torch.full_like(segment_ids, -1)
+    )
 
     query_segments = segment_ids.unsqueeze(2)
     key_segments = segment_ids.unsqueeze(1)
@@ -144,7 +147,7 @@ def _packed_training_attention_mask(
 ) -> Tensor | None:
     """Select the mask path for packed RL training.
 
-    PrimeRL-style packing uses reset position ids as sequence boundaries. HF's
+    Packed examples use reset position ids as sequence boundaries. HF's
     FlashAttention 2 implementation consumes those position ids directly and
     dispatches to flash_attn_varlen_func, but only when no explicit attention
     mask is passed. Non-flash attention still needs an explicit block-causal
@@ -155,7 +158,12 @@ def _packed_training_attention_mask(
         return None if valid_tokens.all() else attention_mask
 
     implementation = _model_attn_implementation(model)
-    if implementation in {"flash_attention_2", "flash_attention_3"}:
+    if implementation in {
+        "flash_attention_2",
+        "flash_attention_3",
+        "flash_attention_4",
+        "fa4",
+    }:
         if position_ids.shape[0] != 1:
             raise ValueError(
                 "Packed FlashAttention varlen training requires one packed row per "
@@ -196,7 +204,8 @@ class RLTrainer(BaseTrainer):
         self._rollout_metric_accum: list[dict[str, float]] = []
         self._train_loss_accum: list[float] = []
         self._train_metric_accum: list[dict[str, float]] = []
-        self._optimizer_batch_loss_scale: int | None = None
+        self._optimizer_batch_loss_scale: float | None = None
+        self._gradient_accumulation_loss_scale: float | None = None
         self._loaded_micro_batch_count = 0
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
@@ -584,9 +593,8 @@ class RLTrainer(BaseTrainer):
 
         export_model = None
         state_dict = None
-        if (
-            self.config.policy_transfer.lightweight_lora
-            and isinstance(self.model, FSDP)
+        if self.config.policy_transfer.lightweight_lora and isinstance(
+            self.model, FSDP
         ):
             if tmp_dir.exists() and self.world.is_main:
                 shutil.rmtree(tmp_dir)
@@ -636,12 +644,12 @@ class RLTrainer(BaseTrainer):
             (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
         self.offload_after_refit()
         if self.world.world_size > 1:
-            torch.distributed.barrier()
+            barrier(self.world)
         if self.world.is_main:
             (tmp_dir / STABLE_BATCH_MARKER).touch()
             tmp_dir.replace(step_dir)
         if self.world.world_size > 1:
-            torch.distributed.barrier()
+            barrier(self.world)
         return step_dir
 
     def finalize(self, *, status: str = "completed") -> None:
@@ -691,8 +699,7 @@ class RLTrainer(BaseTrainer):
             return None
         records = self.dataset.records
         if any(
-            record.advantage is None and record.reward is None
-            for record in records
+            record.advantage is None and record.reward is None for record in records
         ):
             return None
         return self.dataset.loss_scale_for_next_local_batch(self.accumulation_steps)
@@ -738,6 +745,7 @@ class RLTrainer(BaseTrainer):
                     batch["loss_mask"],
                     self.config.loss,
                     loss_scale=self._optimizer_batch_loss_scale,
+                    position_ids=batch["position_ids"],
                 )
 
             if torch.isnan(loss):
@@ -781,6 +789,7 @@ class RLTrainer(BaseTrainer):
             return None
 
         grad_norm = None
+        self._apply_gradient_accumulation_loss_scale()
         if self.config.max_grad_norm > 0:
             grad_norm = self._clip_grad_norm()
         self.optimizer.step()
@@ -789,7 +798,12 @@ class RLTrainer(BaseTrainer):
         self.step += 1
         self._accumulated_micro_batches = 0
 
-        if self._optimizer_batch_loss_scale is None:
+        if self._gradient_accumulation_loss_scale is not None:
+            logged_loss = sum(self._train_loss_accum) / max(
+                self._gradient_accumulation_loss_scale,
+                1.0,
+            )
+        elif self._optimizer_batch_loss_scale is None:
             logged_loss = sum(self._train_loss_accum) / len(self._train_loss_accum)
         else:
             logged_loss = sum(self._train_loss_accum)
@@ -807,8 +821,20 @@ class RLTrainer(BaseTrainer):
             metrics["optim/grad_norm"] = grad_norm
         metrics.update(self._prime_style_metric_aliases(metrics))
         metrics = self._sync_metrics(metrics)
+        metrics = self._finalize_synced_metrics(metrics)
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
+        self._gradient_accumulation_loss_scale = None
         return metrics
+
+    def _apply_gradient_accumulation_loss_scale(self) -> None:
+        if self._gradient_accumulation_loss_scale is None:
+            return
+        if self.model is None:
+            raise RuntimeError("Trainer not set up")
+        scale = max(float(self._gradient_accumulation_loss_scale), 1.0)
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.div_(scale)
 
     def _zero_loss_metrics(self, loss: Tensor) -> dict[str, Tensor]:
         zero = loss.detach() * 0.0
@@ -868,9 +894,9 @@ class RLTrainer(BaseTrainer):
             temperature=batch["temperatures"],
         )
         if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
-            return outputs["logprobs"]
+            return outputs["logprobs"].float().contiguous()
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-        scaled_logits = logits / batch["temperatures"].unsqueeze(-1)
+        scaled_logits = logits.float() / batch["temperatures"].float().unsqueeze(-1)
         return selective_log_softmax(scaled_logits, batch["target_ids"])
 
     def _teacher_logprobs(self, batch: dict[str, Tensor]) -> Tensor | None:
@@ -974,6 +1000,21 @@ class RLTrainer(BaseTrainer):
                 aggregated[key] = max(values)
             elif key.endswith("/min"):
                 aggregated[key] = min(values)
+            elif key == "reward/all/mean":
+                weighted_sum = 0.0
+                total_weight = 0.0
+                for metrics in micro_metrics:
+                    if key not in metrics:
+                        continue
+                    weight = metrics.get("rollout/count", 1.0)
+                    weighted_sum += metrics[key] * weight
+                    total_weight += weight
+                if total_weight > 0:
+                    aggregated[key] = weighted_sum / total_weight
+                else:
+                    aggregated[key] = sum(values) / len(values)
+                aggregated["_reward_weighted_sum"] = weighted_sum
+                aggregated["_reward_weight"] = total_weight
             elif key in {"tokens/train", "rollout/count", "micro_batch/count"}:
                 aggregated[key] = sum(values)
             else:
@@ -1083,13 +1124,25 @@ class RLTrainer(BaseTrainer):
             elif key.endswith("/min"):
                 torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MIN)
                 synced[key] = float(value.item())
-            elif key in {"rollout/count", "micro_batch/count", "tokens/train"}:
+            elif key.startswith("_") or key in {
+                "rollout/count",
+                "micro_batch/count",
+                "tokens/train",
+            }:
                 torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
                 synced[key] = float(value.item())
             else:
                 torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
                 synced[key] = float(value.item() / self.world.world_size)
         return synced
+
+    def _finalize_synced_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
+        reward_sum = metrics.pop("_reward_weighted_sum", None)
+        reward_weight = metrics.pop("_reward_weight", None)
+        if reward_sum is not None and reward_weight is not None and reward_weight > 0:
+            metrics["reward/all/mean"] = reward_sum / reward_weight
+            metrics["reward_mean"] = metrics["reward/all/mean"]
+        return metrics
 
     def _get_lr(self) -> float:
         if self.optimizer is None:

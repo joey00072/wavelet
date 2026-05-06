@@ -1,0 +1,108 @@
+model:
+  name: "zai-org/GLM-5"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  trust_remote_code: true
+  gradient_checkpointing: true
+  allow_tf32: true
+  fused_lm_head_token_chunk_size: 2048
+
+data:
+  source: local
+  path: outputs/glm5_pd_disag_data/rl_train.jsonl
+  batch_size: 4096
+  micro_batch_size: 1
+  pack_sequences: true
+  seq_len: 32768
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: mini-swe-agent-plus
+  verifier_env_args:
+    dataset_name: PrimeIntellect/SWE-Bench-Verified-Quick
+    max_turns: 200
+    cpu_cores: 2
+    memory_gb: 4
+    disk_size_gb: 4
+    labels: ["mini-swe-agent-plus"]
+    total_timeout_minutes: 720
+    sandbox_client_max_workers: 256
+    max_command_timeouts: 3
+    sandbox_command_timeout: 30
+  verifier_model: zai-org/GLM-5-FP8
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: group_reward
+  examples_per_step: 256
+  rollouts_per_example: 16
+  oversampling_factor: 3.0
+  max_async_level: 8
+  max_off_policy_steps: 16
+
+inference:
+  enabled: true
+  mode: vllm_http
+  sampling:
+    max_completion_tokens: 32768
+  vllm:
+    server_backend: openai
+    gpu_memory_utilization: 0.8
+    max_model_len: 32768
+    tensor_parallel_size: 8
+    data_parallel_size: 1
+    data_parallel_size_local: 1
+    enforce_eager: false
+  http:
+    request_timeout_seconds: 7200.0
+    startup_timeout_seconds: 1800.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: -1
+  ep: 8
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1e-6
+  weight_decay: 0.1
+
+scheduler:
+  type: constant
+
+lora: null
+max_steps: 500
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-glm5-pd-disag
+    name: wavelet-glm5-pd-disag-config
+    mode: online
+
+launcher:
+  mode: process
+  backend: local
+  inference_cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  trainer_cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  trainer_num_processes: 8
+
+output_dir: outputs/glm5_pd_disag_rl
+clean_output_dir: true

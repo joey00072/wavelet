@@ -1,0 +1,43 @@
+model:
+  name: "PrimeIntellect/Qwen3-1.7B"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: hf
+  hf_name: willcb/V3-wordle
+  batch_size: 64
+  micro_batch_size: 1
+  seq_len: 1024
+  shuffle: true
+  seed: 42
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1e-5
+  weight_decay: 0.0
+
+scheduler:
+  type: constant
+
+max_grad_norm: 1.0
+max_steps: 20
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-wordle
+    name: wavelet-wordle-1.7b-sft
+    mode: online
+
+deployment:
+  type: single_node
+  num_gpus: 1
+
+output_dir: outputs/wordle_sft
+clean_output_dir: true

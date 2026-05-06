@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--examples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--env-id", default="alphabet-sort")
+    parser.add_argument("--env-id", default="primeintellect/alphabet-sort")
     parser.add_argument("--min-turns", type=int, default=3)
     parser.add_argument("--max-turns", type=int, default=5)
     parser.add_argument("--min-names-per-turn", type=int, default=None)
@@ -43,7 +43,7 @@ def main() -> int:
         import verifiers as vf
     except ImportError as exc:
         raise SystemExit(
-            "The Alphabet Sort example uses the Prime verifier environment. "
+            "The Alphabet Sort example uses a verifier environment. "
             "Install it with `uv sync --extra verifiers --extra envs`."
         ) from exc
 

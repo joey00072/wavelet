@@ -3,7 +3,7 @@
 This example trains `Qwen/Qwen3-4B-Instruct-2507` with LoRA rank 32 / alpha 64
 to maintain a cumulative alphabetically sorted list across turns.
 
-Wavelet loads `alphabet-sort` through `verifiers`, runs multi-turn rollouts
+Wavelet loads `primeintellect/alphabet-sort` through `verifiers`, runs multi-turn rollouts
 against an OpenAI-compatible vLLM endpoint, consumes verifier rewards, and
 trains on the model-generated assistant turns.
 

@@ -1,0 +1,43 @@
+model:
+  name: "PrimeIntellect/Qwen3-0.6B"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: hf
+  hf_name: willcb/R1-reverse-wikipedia-paragraphs-v1-1000
+  batch_size: 32
+  micro_batch_size: 1
+  seq_len: 4096
+  shuffle: true
+  seed: 42
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 2e-5
+  weight_decay: 0.0
+
+scheduler:
+  type: constant
+
+max_grad_norm: 1.0
+max_steps: 100
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-reverse-text
+    name: wavelet-reverse-text-0.6b-sft
+    mode: online
+
+deployment:
+  type: single_node
+  num_gpus: 1
+
+output_dir: outputs/reverse_text_sft
+clean_output_dir: true

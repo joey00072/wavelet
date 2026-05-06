@@ -137,17 +137,20 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
     if record.input_ids is None or record.target_ids is None or record.loss_mask is None:
         return None
 
-    shifted_seq_len = max(seq_len - 1, 0)
-    input_ids = [int(token_id) for token_id in record.input_ids[:shifted_seq_len]]
-    target_ids = [int(token_id) for token_id in record.target_ids[:shifted_seq_len]]
-    loss_mask = [bool(value) for value in record.loss_mask[:shifted_seq_len]]
+    input_ids = [int(token_id) for token_id in record.input_ids[:seq_len]]
+    target_ids = [int(token_id) for token_id in record.target_ids[:seq_len]]
+    loss_mask = [bool(value) for value in record.loss_mask[:seq_len]]
     if not (len(input_ids) == len(target_ids) == len(loss_mask)):
         raise ValueError(
             "Pretokenized RL row has mismatched input_ids, target_ids, and loss_mask "
             f"lengths ({len(input_ids)}, {len(target_ids)}, {len(loss_mask)})."
         )
     if sum(loss_mask) == 0:
-        if not (record.metadata or {}).get("_wavelet_dummy_rollout"):
+        metadata = record.metadata or {}
+        if not (
+            metadata.get("_wavelet_dummy_rollout")
+            or metadata.get("_wavelet_filtered_rollout")
+        ):
             return None
     return {
         "input_ids": input_ids,
@@ -220,8 +223,11 @@ def prepare_rl_sample(
         "temperatures": temperatures,
         "reward": record.reward,
     }
-    if (record.metadata or {}).get("_wavelet_dummy_rollout"):
+    metadata = record.metadata or {}
+    if metadata.get("_wavelet_dummy_rollout"):
         sample["sample_count"] = 0
+    elif "_wavelet_rollout_count" in metadata:
+        sample["sample_count"] = int(metadata["_wavelet_rollout_count"])
     if inference_logprobs is not None:
         sample["inference_logprobs"] = inference_logprobs
     if teacher_logprobs is not None:
@@ -582,12 +588,11 @@ class PackedRLDataset(IterableDataset[RLSample]):
         )
 
     def loss_scale_for_next_local_batch(self, _local_batch_size: int) -> float:
-        global_tokens = sum(
+        local_tokens = sum(
             _sample_trainable_count(sample)
-            for sample in self._global_bins_for_epoch(self.epoch)
+            for sample in self._bins_for_epoch(self.epoch)
         )
-        scale = global_tokens / max(self.data_world_size, 1)
-        return max(scale, 1.0)
+        return max(float(local_tokens), 1.0)
 
     def __iter__(self) -> Iterator[RLSample]:
         while True:

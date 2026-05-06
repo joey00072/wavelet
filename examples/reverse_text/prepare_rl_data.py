@@ -29,7 +29,7 @@ def main() -> int:
         import verifiers as vf
     except ImportError as exc:
         raise SystemExit(
-            "The Reverse Text example uses Prime verifier environments. "
+            "The Reverse Text example uses verifier environments. "
             "Install them with `uv sync --extra verifiers --extra envs`."
         ) from exc
 

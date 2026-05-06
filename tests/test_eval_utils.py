@@ -35,6 +35,14 @@ def test_compute_eval_policy_step_runs_base_and_intervals() -> None:
         )
         is None
     )
+    assert (
+        compute_eval_policy_step(
+            policy_step=9,
+            last_eval_step=4,
+            interval=4,
+        )
+        == 8
+    )
 
 
 def test_compute_eval_policy_step_can_skip_base_model() -> None:

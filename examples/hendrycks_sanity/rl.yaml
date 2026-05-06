@@ -1,0 +1,130 @@
+model:
+  name: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+  torch_dtype: float32
+  attn_implementation: auto
+  gradient_checkpointing: true
+  allow_tf32: true
+  fused_lm_head_token_chunk_size: auto
+
+data:
+  source: local
+  path: outputs/hendrycks_sanity_data/rl_train.jsonl
+  batch_size: 512
+  micro_batch_size: 1
+  pack_sequences: true
+  seq_len: 16384
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 0.001
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: math-env
+  verifier_env_args:
+    dataset_name: mikasenghaas/Sanity-Test-R1D-1.5B
+    dataset_subset: default
+  verifier_model: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: group_reward
+  normalize_group_advantages: false
+  examples_per_step: 64
+  rollouts_per_example: 8
+  oversampling_factor: 1.0
+  filter_zero_advantage: true
+  zero_advantage_max_retries: 8
+  max_async_level: 8
+  max_off_policy_steps: 8
+
+eval:
+  interval: 50
+  num_examples: 30
+  rollouts_per_example: 8
+  eval_base_model: true
+  final_eval: true
+  sampling:
+    max_completion_tokens: 8192
+  env:
+    - id: primeintellect/aime2024
+      name: aime2024
+      rollouts_per_example: 32
+
+inference:
+  enabled: true
+  mode: vllm_http
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_completion_tokens: null
+    do_sample: true
+  vllm:
+    server_backend: openai
+    dtype: bfloat16
+    gpu_memory_utilization: 0.9
+    max_model_len: 8192
+    data_parallel_size: 4
+    data_parallel_size_local: 4
+    enforce_eager: false
+    openai_batch_wait_seconds: 0.05
+    openai_batch_min_size: 16
+    openai_batch_max_wait_seconds: 0.2
+  http:
+    port: 8000
+    request_timeout_seconds: 1800.0
+    startup_timeout_seconds: 1800.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: -1
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1e-6
+  weight_decay: 0.01
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 32
+  alpha: 64.0
+  dropout: 0.0
+
+max_grad_norm: 1.0
+max_steps: 5000
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-hendrycks-sanity
+    name: wavelet-hendrycks-sanity-1.5b-rl
+    mode: online
+
+launcher:
+  mode: process
+  backend: local
+  inference_cuda_visible_devices: "4,5,6,7"
+  trainer_cuda_visible_devices: "0,1,2,3"
+  trainer_num_processes: 4
+  inference_num_replicas: 1
+
+output_dir: outputs/hendrycks_sanity_rl
+clean_output_dir: true

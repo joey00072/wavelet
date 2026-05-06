@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
-import json
 from math import ceil
 from pathlib import Path
 from time import perf_counter
@@ -10,6 +10,7 @@ from time import perf_counter
 import torch
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.distributed.world import barrier
 from wavelet.orchestrator.queue import FileSystemRolloutReceiver
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.utils.config import load_config
@@ -118,6 +119,7 @@ def _run_streaming_rollout_training(
     min_loadable_rows = _min_loadable_rollout_rows(config, trainer)
     accumulated_rows = 0
     accumulated_chunks = 0
+    accumulated_loss_scale = 0.0
     chunk_index = 0
     pending_paths: list[Path] = []
     pending_rows = 0
@@ -157,8 +159,11 @@ def _run_streaming_rollout_training(
         pending_paths = []
         pending_rows = 0
         trainer.load_rollout_path(rollout_path)
+        chunk_loss_scale = trainer._optimizer_batch_loss_scale
         accumulated_rows += row_count
         accumulated_chunks += loaded_chunks
+        if chunk_loss_scale is not None:
+            accumulated_loss_scale += float(chunk_loss_scale)
         should_step = _should_step_streaming_rollouts(
             accumulated_rows=accumulated_rows,
             accumulated_chunks=accumulated_chunks,
@@ -176,7 +181,16 @@ def _run_streaming_rollout_training(
                 trainer._accumulated_micro_batches
                 + loaded_micro_batches * max(remaining_chunks + 1, 2)
             )
-        trainer._optimizer_batch_loss_scale = None
+        if accumulated_loss_scale > 0.0:
+            # Normalize the whole optimizer step by the exact local unmasked
+            # token count. Streaming chunks arrive one at a time, so backprop
+            # raw chunk losses and divide accumulated gradients once before the
+            # optimizer step, when the exact denominator is known.
+            trainer._optimizer_batch_loss_scale = 1.0
+            trainer._gradient_accumulation_loss_scale = accumulated_loss_scale
+        else:
+            trainer._optimizer_batch_loss_scale = None
+            trainer._gradient_accumulation_loss_scale = None
         load_seconds = perf_counter() - load_started_at
         train_started_at = perf_counter()
         trainer.prepare_for_training()
@@ -194,6 +208,7 @@ def _run_streaming_rollout_training(
             )
             accumulated_rows = 0
             accumulated_chunks = 0
+            accumulated_loss_scale = 0.0
             export_started_at = perf_counter()
             trainer.export_policy(step=trainer.step)
             trainer.offload_after_refit()
@@ -222,10 +237,8 @@ def _should_step_streaming_rollouts(
     target_rollout_rows: int,
     chunks_per_step: int,
 ) -> bool:
-    return (
-        accumulated_rows >= target_rollout_rows
-        or accumulated_chunks >= chunks_per_step
-    )
+    _ = accumulated_rows, target_rollout_rows
+    return accumulated_chunks >= chunks_per_step
 
 
 def _log_step_perf_metrics(
@@ -310,7 +323,7 @@ def _combined_rollout_path(
                 output.write(json.dumps(_dummy_rollout_row(config, first_row)) + "\n")
         tmp_path.replace(path)
     if world is not None and world.world_size > 1:
-        torch.distributed.barrier()
+        barrier(world)
     return path
 
 

@@ -887,6 +887,13 @@ async def _run_rolling_verifier_inference(
                     rollout_step=optimizer_step,
                     last_eval_steps=last_eval_steps,
                 )
+                if _perf_enabled():
+                    print(
+                        "WAVELET_PERF policy_load "
+                        f"step={loaded_policy_step} wait_policy=0.000 "
+                        "load_policy=async",
+                        flush=True,
+                    )
             policy_step = _policy_step_to_load(
                 config,
                 policy_receiver,
@@ -901,6 +908,10 @@ async def _run_rolling_verifier_inference(
                         inference_engine,
                         policy_receiver,
                         policy_step,
+                    )
+                    scheduler.set_policy_step(
+                        loaded_policy_step,
+                        model_name=_current_policy_model_name(inference_engine),
                     )
                     if state is not None:
                         state.update_policy(
@@ -920,11 +931,12 @@ async def _run_rolling_verifier_inference(
                     )
                 else:
                     pending_policy_update = asyncio.create_task(
-                        _load_policy_async(
+                        _load_policy_and_update_scheduler(
                             config,
                             inference_engine,
                             policy_receiver,
                             policy_step,
+                            scheduler,
                         )
                     )
                     if state is not None:
@@ -1020,6 +1032,10 @@ async def _run_rolling_verifier_inference(
                         tags=["kv_cache"],
                     )
                     loaded_policy_step = policy.step
+                    scheduler.set_policy_step(
+                        loaded_policy_step,
+                        model_name=_current_policy_model_name(inference_engine),
+                    )
                 else:
                     _wake_for_colocated_sleep(config, inference_engine)
                 await _run_evals_async(
@@ -1054,6 +1070,32 @@ async def _load_policy_async(
         policy_step,
     )
     return step
+
+
+async def _load_policy_and_update_scheduler(
+    config: RLConfig,
+    inference_engine,
+    policy_receiver: FileSystemPolicyReceiver,
+    policy_step: int,
+    scheduler,
+) -> int:
+    loaded_step = await _load_policy_async(
+        config,
+        inference_engine,
+        policy_receiver,
+        policy_step,
+    )
+    scheduler.set_policy_step(
+        loaded_step,
+        model_name=_current_policy_model_name(inference_engine),
+    )
+    await scheduler.mark_policy_update()
+    return loaded_step
+
+
+def _current_policy_model_name(inference_engine) -> str | None:
+    model_name = getattr(inference_engine, "policy_model_name", None)
+    return model_name if isinstance(model_name, str) and model_name else None
 
 
 def _load_policy_step(

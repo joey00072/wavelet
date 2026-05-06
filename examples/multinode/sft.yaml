@@ -1,0 +1,54 @@
+model:
+  name: "Qwen/Qwen3-30B-A3B-Thinking-2507"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  trust_remote_code: true
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: hf
+  hf_name: PrimeIntellect/Hendrycks-Math
+  hf_subsets: [default]
+  batch_size: 512
+  micro_batch_size: 1
+  seq_len: 2048
+  shuffle: true
+  seed: 42
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1e-5
+
+scheduler:
+  type: constant
+
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: -1
+
+lora:
+  rank: 32
+  alpha: 64.0
+  dropout: 0.0
+
+max_steps: 500
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-hendrycks-math-debug
+    name: wavelet-hendrycks-math-sft-single-node
+    mode: online
+
+deployment:
+  type: single_node
+  num_gpus: 8
+
+output_dir: outputs/multinode_math_sft
+clean_output_dir: true

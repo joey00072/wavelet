@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_inference import (
     _latest_exported_policy_step_at_or_before,
+    _load_policy_and_update_scheduler,
     _next_exported_policy_step,
     _policy_step_to_load,
     _required_policy_step,
@@ -97,9 +100,57 @@ def test_policy_selection_waits_for_next_exported_step() -> None:
 
     assert _next_exported_policy_step(config, 1) == 2
     assert _latest_exported_policy_step_at_or_before(config, 3) == 2
-    assert _policy_step_to_load(
+    assert (
+        _policy_step_to_load(
+            config,
+            _PolicyReceiver([0]),  # type: ignore[arg-type]
+            rollout_step=3,
+            loaded_policy_step=0,
+        )
+        == 2
+    )
+
+
+def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
+    calls: list[tuple[str, int | str | None]] = []
+
+    async def fake_load_policy_async(
         config,
-        _PolicyReceiver([0]),  # type: ignore[arg-type]
-        rollout_step=3,
-        loaded_policy_step=0,
-    ) == 2
+        inference_engine,
+        policy_receiver,
+        policy_step: int,
+    ) -> int:
+        calls.append(("load", policy_step))
+        return 5
+
+    class Scheduler:
+        def set_policy_step(
+            self,
+            policy_step: int,
+            *,
+            model_name: str | None = None,
+        ) -> None:
+            calls.append(("set", policy_step))
+            calls.append(("model", model_name))
+
+        async def mark_policy_update(self) -> int:
+            calls.append(("mark", 0))
+            return 0
+
+    monkeypatch.setattr(
+        "wavelet.entrypoints.rl_inference._load_policy_async",
+        fake_load_policy_async,
+    )
+
+    loaded_step = asyncio.run(
+        _load_policy_and_update_scheduler(
+            _config(),
+            inference_engine=type("Engine", (), {"policy_model_name": "policy"})(),
+            policy_receiver=object(),  # type: ignore[arg-type]
+            policy_step=4,
+            scheduler=Scheduler(),
+        )
+    )
+
+    assert loaded_step == 5
+    assert calls == [("load", 4), ("set", 5), ("model", "policy"), ("mark", 0)]

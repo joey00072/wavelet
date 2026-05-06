@@ -24,6 +24,8 @@ class LoRAConfig(BaseModel):
             "up_proj",
             "down_proj",
             "experts",
+            "fc1_latent_proj",
+            "fc2_latent_proj",
         ]
     )
     modules_to_save: list[str] = Field(default_factory=list)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from argparse import Namespace
 from http import HTTPStatus
+from logging import CRITICAL
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +50,125 @@ from wavelet.utils.config import load_config
 _CONFIG: RLConfig | None = None
 router = APIRouter()
 
+MODEL_TOOL_CALL_PARSER: dict[str, str] = {
+    "zai-org/GLM-4.5": "glm45",
+    "zai-org/GLM-4.5-FP8": "glm45",
+    "zai-org/GLM-4.5-Base": "glm45",
+    "zai-org/GLM-4.5-Air": "glm45",
+    "zai-org/GLM-4.5-Air-FP8": "glm45",
+    "zai-org/GLM-4.5-Air-Base": "glm45",
+    "zai-org/GLM-4.5V": "glm45",
+    "zai-org/GLM-4.5V-FP8": "glm45",
+    "zai-org/GLM-4.7": "glm47",
+    "zai-org/GLM-4.7-FP8": "glm47",
+    "zai-org/GLM-4.7-Flash": "glm47",
+    "zai-org/GLM-5": "glm47",
+    "zai-org/GLM-5-FP8": "glm47",
+    "zai-org/GLM-5.1": "glm47",
+    "zai-org/GLM-5.1-FP8": "glm47",
+    "MiniMaxAI/MiniMax-M2": "minimax_m2",
+    "MiniMaxAI/MiniMax-M2.1": "minimax_m2",
+    "MiniMaxAI/MiniMax-M2.5": "minimax_m2",
+    "PrimeIntellect/INTELLECT-3": "hermes",
+    "PrimeIntellect/INTELLECT-3-FP8": "hermes",
+    "PrimeIntellect/INTELLECT-3.1": "hermes",
+    "Qwen/Qwen3-0.6B": "hermes",
+    "Qwen/Qwen3-0.6B-Base": "hermes",
+    "Qwen/Qwen3-0.6B-FP8": "hermes",
+    "Qwen/Qwen3-1.7B": "hermes",
+    "Qwen/Qwen3-1.7B-Base": "hermes",
+    "Qwen/Qwen3-1.7B-FP8": "hermes",
+    "Qwen/Qwen3-4B": "hermes",
+    "Qwen/Qwen3-4B-Base": "hermes",
+    "Qwen/Qwen3-4B-FP8": "hermes",
+    "Qwen/Qwen3-8B": "hermes",
+    "Qwen/Qwen3-8B-Base": "hermes",
+    "Qwen/Qwen3-8B-FP8": "hermes",
+    "Qwen/Qwen3-14B": "hermes",
+    "Qwen/Qwen3-14B-Base": "hermes",
+    "Qwen/Qwen3-14B-FP8": "hermes",
+    "Qwen/Qwen3-32B": "hermes",
+    "Qwen/Qwen3-32B-FP8": "hermes",
+    "Qwen/Qwen3-30B-A3B": "hermes",
+    "Qwen/Qwen3-30B-A3B-Base": "hermes",
+    "Qwen/Qwen3-30B-A3B-FP8": "hermes",
+    "Qwen/Qwen3-235B-A22B": "hermes",
+    "Qwen/Qwen3-235B-A22B-FP8": "hermes",
+    "Qwen/Qwen3-4B-Instruct-2507": "hermes",
+    "Qwen/Qwen3-4B-Thinking-2507": "hermes",
+    "Qwen/Qwen3-4B-Instruct-2507-FP8": "hermes",
+    "Qwen/Qwen3-4B-Thinking-2507-FP8": "hermes",
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": "hermes",
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": "hermes",
+    "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8": "hermes",
+    "Qwen/Qwen3-30B-A3B-Thinking-2507-FP8": "hermes",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": "hermes",
+    "Qwen/Qwen3-235B-A22B-Thinking-2507": "hermes",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": "hermes",
+    "Qwen/Qwen3-235B-A22B-Thinking-2507-FP8": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Instruct": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Thinking": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Thinking-FP8": "hermes",
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct": "hermes",
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8": "hermes",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct": "hermes",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8": "hermes",
+    "Qwen/Qwen3-Coder-Next": "hermes",
+    "Qwen/Qwen3-Coder-Next-Base": "hermes",
+    "Qwen/Qwen3-Coder-Next-FP8": "hermes",
+    "Qwen/Qwen3.5-0.8B": "qwen3_coder",
+    "Qwen/Qwen3.5-0.8B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-2B": "qwen3_coder",
+    "Qwen/Qwen3.5-2B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-4B": "qwen3_coder",
+    "Qwen/Qwen3.5-4B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-9B": "qwen3_coder",
+    "Qwen/Qwen3.5-9B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-27B": "qwen3_coder",
+    "Qwen/Qwen3.5-27B-FP8": "qwen3_coder",
+    "Qwen/Qwen3.5-35B-A3B": "qwen3_coder",
+    "Qwen/Qwen3.5-35B-A3B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-35B-A3B-FP8": "qwen3_coder",
+    "Qwen/Qwen3.5-122B-A10B": "qwen3_coder",
+    "Qwen/Qwen3.5-122B-A10B-FP8": "qwen3_coder",
+    "Qwen/Qwen3.5-397B-A17B": "qwen3_coder",
+    "Qwen/Qwen3.5-397B-A17B-FP8": "qwen3_coder",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "qwen3_coder",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "qwen3_coder",
+}
+
+
+def _resolve_tool_call_parser(
+    model_name: str, tool_call_parser: str | None
+) -> str | None:
+    if tool_call_parser == "auto":
+        return MODEL_TOOL_CALL_PARSER.get(model_name)
+    return tool_call_parser
+
 
 class ChatCompletionRequestWithTokens(ChatCompletionRequest):
     tokens: list[int] = Field(description="Prompt tokens to use for the request.")
 
 
 class OpenAIServingChatWithTokens(OpenAIServingChat):
+    async def create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None = None,
+    ):
+        try:
+            return await super().create_chat_completion(request, raw_request)
+        except VLLMValidationError as exc:
+            fitted_request = _fit_chat_request_to_context(
+                request,
+                max_model_len=self.model_config.max_model_len,
+                error=exc,
+            )
+            if fitted_request is request:
+                raise
+            return await super().create_chat_completion(fitted_request, raw_request)
+
     async def create_chat_completion_with_tokens(
         self,
         request: ChatCompletionRequestWithTokens,
@@ -80,7 +195,9 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
             return rendered
         conversation, engine_prompts = rendered
         engine_prompts[0]["prompt_token_ids"] = request.tokens
-        request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
@@ -203,6 +320,55 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
             return self.create_error_response(exc)
 
 
+def _fit_chat_request_to_context(
+    request: ChatCompletionRequest,
+    *,
+    max_model_len: int,
+    error: VLLMValidationError,
+) -> ChatCompletionRequest:
+    prompt_tokens = _prompt_tokens_from_validation_error(error)
+    if prompt_tokens is None or prompt_tokens >= max_model_len:
+        return request
+    remaining_tokens = max(max_model_len - prompt_tokens, 1)
+    requested_tokens = (
+        request.max_completion_tokens
+        if request.max_completion_tokens is not None
+        else request.max_tokens
+    )
+    if requested_tokens is None or requested_tokens <= remaining_tokens:
+        return request
+
+    updates: dict[str, Any] = {}
+    if request.max_completion_tokens is not None:
+        updates["max_completion_tokens"] = remaining_tokens
+    elif request.max_tokens is not None:
+        updates["max_tokens"] = remaining_tokens
+    if _perf_enabled():
+        print(
+            "WAVELET_PERF fit_chat_context "
+            f"prompt_tokens={prompt_tokens} requested_tokens={requested_tokens} "
+            f"max_model_len={max_model_len} fitted_tokens={remaining_tokens}",
+            flush=True,
+        )
+    return request.model_copy(update=updates)
+
+
+def _prompt_tokens_from_validation_error(error: VLLMValidationError) -> int | None:
+    value = getattr(error, "value", None)
+    if isinstance(value, int):
+        return value
+    match = re.search(r"prompt contains at least (\\d+) input tokens", str(error))
+    if match is None:
+        match = re.search(r"request has (\\d+) input tokens", str(error))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _perf_enabled() -> bool:
+    return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
+
+
 def _base(request: Request) -> OpenAIServing:
     return request.app.state.openai_serving_tokenization
 
@@ -300,10 +466,7 @@ def _patch_lru_cache_worker_lora_manager() -> None:
         should_load = (
             lora_request.lora_int_id not in self.list_adapters()
             or force_load
-            or (
-                loaded_path is not None
-                and loaded_path != lora_request.lora_path
-            )
+            or (loaded_path is not None and loaded_path != lora_request.lora_path)
         )
         if should_load:
             load_started_at = time.perf_counter()
@@ -324,8 +487,7 @@ def _patch_lru_cache_worker_lora_manager() -> None:
             load_elapsed = 0.0
             add_elapsed = 0.0
             loaded = (
-                self._adapter_manager.get_adapter(lora_request.lora_int_id)
-                is not None
+                self._adapter_manager.get_adapter(lora_request.lora_int_id) is not None
             )
         activate_started_at = time.perf_counter()
         self._adapter_manager.activate_adapter(lora_request.lora_int_id)
@@ -374,6 +536,15 @@ def _patch_lora_cpu_pin_memory() -> None:
 
     lora_model.is_pin_memory_available = pin_memory_unavailable
     model_manager.is_pin_memory_available = pin_memory_unavailable
+
+
+def _patch_noisy_tool_parser_errors() -> None:
+    try:
+        import vllm.tool_parsers.hermes_tool_parser as hermes_tool_parser
+    except ImportError:
+        return
+
+    hermes_tool_parser.logger.setLevel(CRITICAL)
 
 
 def _replace_active_adapter_inplace(adapter_manager: Any, lora: Any) -> bool:
@@ -659,6 +830,15 @@ def _serve_args(config: RLConfig) -> Namespace:
         argv.append("--trust-remote-code")
     if config.model.chat_template is not None:
         argv.extend(["--chat-template", config.model.chat_template])
+    tool_call_parser = _resolve_tool_call_parser(
+        config.model.name,
+        vllm_config.tool_call_parser,
+    )
+    if tool_call_parser is not None:
+        argv.extend(["--tool-call-parser", tool_call_parser])
+        argv.append("--enable-auto-tool-choice")
+    if vllm_config.reasoning_parser is not None:
+        argv.extend(["--reasoning-parser", vllm_config.reasoning_parser])
     if vllm_config.enforce_eager:
         argv.append("--enforce-eager")
     if config.launcher.mode == "colocate_sleep":
@@ -682,11 +862,15 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     config = load_config(RLConfig, argv)
     _CONFIG = config
+    from wavelet.inference.patches import transformers_v5_compat
+
+    transformers_v5_compat()
     os.environ.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True")
     _patch_load_lora_adapter()
     _patch_lru_cache_worker_lora_manager()
     _patch_skip_lora_module_warnings()
     _patch_lora_cpu_pin_memory()
+    _patch_noisy_tool_parser_errors()
     _patch_build_app()
 
     from vllm.entrypoints.openai.api_server import run_server

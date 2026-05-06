@@ -23,6 +23,8 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "math-verify>=0.9.0",
+    "urllib3<2.6",
+    "chardet<6",
 ]
 
 [project.optional-dependencies]
@@ -38,12 +40,25 @@ verifiers = [
 envs = [
     "alphabet-sort",
     "aime2025",
+    "aime2024",
+    "code-env; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
+    "deepdive; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
+    "logic-env; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
     "math-env",
+    "math-python; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
+    "math500; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
+    "mini_swe_agent_plus; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
     "reverse-text",
+    "science-env; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
+    "wiki-search; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version >= '3.12'",
 ]
 flash-attn = [
-    "flash-attn>=2.8.3; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.0/flash_attn-2.8.3%2Bcu128torch2.10-cp312-cp312-linux_x86_64.whl ; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version == '3.12'",
+    "flash-attn>=2.8.3; platform_system == 'Linux' and platform_machine == 'x86_64' and python_version != '3.12'",
 ]
+
+[project.entry-points."vllm.general_plugins"]
+wavelet = "wavelet.inference.patches:transformers_v5_compat"
 
 [tool.uv]
 no-build-isolation-package = ["flash-attn"]
@@ -55,8 +70,17 @@ flash-attn = [{ requirement = "torch", match-runtime = true }]
 verifiers = { git = "https://github.com/PrimeIntellect-ai/verifiers.git", rev = "77a9f28" }
 alphabet-sort = { index = "primeintellect" }
 aime2025 = { index = "primeintellect" }
+aime2024 = { index = "primeintellect" }
+code-env = { index = "primeintellect" }
+deepdive = { index = "primeintellect" }
+logic-env = { index = "primeintellect" }
 math-env = { index = "primeintellect" }
+math-python = { index = "primeintellect" }
+math500 = { index = "primeintellect" }
+mini_swe_agent_plus = { index = "primeintellect" }
 reverse-text = { index = "primeintellect" }
+science-env = { index = "primeintellect" }
+wiki-search = { index = "primeintellect" }
 
 [[tool.uv.index]]
 name = "primeintellect"
@@ -69,6 +93,9 @@ filterwarnings = [
     "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
     "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [build-system]
 requires = ["hatchling"]

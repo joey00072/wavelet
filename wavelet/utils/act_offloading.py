@@ -12,8 +12,7 @@ from wavelet.configs.sft import ActivationOffloadingConfig
 class OffloadActivations(saved_tensors_hooks):
     """Offload large saved activations to CPU during forward.
 
-    This is adapted from the approach used in Prime-RL/Torchtune, but keeps the
-    implementation intentionally conservative here:
+    This keeps the implementation intentionally conservative:
     - single-stream only
     - only offload non-parameter tensors
     - only offload tensors above a small size threshold
