@@ -1,7 +1,7 @@
 model:
   name: "Qwen/Qwen3-4B-Instruct-2507"
   torch_dtype: bfloat16
-  attn_implementation: sdpa
+  attn_implementation: auto
   load_in_4bit: false
   gradient_checkpointing: true
   allow_tf32: true
@@ -27,7 +27,7 @@ loss:
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
-  verifier_env_id: alphabet-sort
+  verifier_env_id: primeintellect/alphabet-sort
   verifier_env_args:
     min_turns: 3
     max_turns: 5
@@ -111,10 +111,10 @@ monitor:
     sample_ratio: 0.25
     max_samples: 8
   wandb:
-    enabled: false
+    enabled: true
     project: wavelet-alphabet-sort
     name: wavelet-alphabet-sort-4b-lora
-    mode: offline
+    mode: online
 
 launcher:
   mode: process

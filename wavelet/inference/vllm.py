@@ -468,8 +468,9 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "n": 1,
             "temperature": float(payload.get("temperature", 1.0)),
             "top_p": float(payload.get("top_p", 1.0)),
-            "max_tokens": int(max_tokens),
         }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = int(max_tokens)
         repetition_penalty = payload.get("repetition_penalty") or extra_body.get(
             "repetition_penalty"
         )
@@ -596,8 +597,9 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "temperature": sampling.temperature if sampling.do_sample else 0.0,
             "top_p": sampling.top_p,
             "repetition_penalty": sampling.repetition_penalty,
-            "max_tokens": sampling.max_completion_tokens,
         }
+        if sampling.max_completion_tokens is not None:
+            kwargs["max_tokens"] = sampling.max_completion_tokens
         if self.config.inference.vllm.use_generation_logprobs:
             kwargs["logprobs"] = 1
         if sampling.top_k != 0:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from wavelet.configs.rl_config import RLConfig, TokensLengthPenaltyConfig
 
 
@@ -22,3 +24,13 @@ def test_legacy_rl_aliases_map_silently() -> None:
 
     config = RLConfig(loss={"advantage_scale": 0.5})
     assert config.loss.adv_tau == 0.5
+
+
+def test_max_inflight_rollouts_must_cover_one_group() -> None:
+    with pytest.raises(ValueError, match="max_inflight_rollouts"):
+        RLConfig(
+            orchestrator={
+                "rollouts_per_example": 8,
+                "max_inflight_rollouts": 4,
+            }
+        )

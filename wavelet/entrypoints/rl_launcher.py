@@ -12,6 +12,7 @@ from time import perf_counter
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.launcher import (
+    RoleHandle,
     RoleSpec,
     close_handles,
     create_role_launcher,
@@ -422,8 +423,8 @@ def _run_process_launcher(config: RLConfig) -> int:
         job_roles = [role for role in roles if not role.service]
         handles = [launcher.start(role) for role in service_roles]
         if config.inference.mode == "vllm_http":
-            for port in inference_ports:
-                _wait_for_vllm_http_server(config, port=port)
+            for port, handle in zip(inference_ports, handles, strict=True):
+                _wait_for_vllm_http_server(config, port=port, handle=handle)
             if config.launcher.mode == "colocate_sleep":
                 _sleep_vllm_http_servers(config, ports=inference_ports)
         handles.extend(launcher.start(role) for role in job_roles)
@@ -438,12 +439,24 @@ def _run_process_launcher(config: RLConfig) -> int:
     return 0
 
 
-def _wait_for_vllm_http_server(config: RLConfig, *, port: int | None = None) -> None:
+def _wait_for_vllm_http_server(
+    config: RLConfig,
+    *,
+    port: int | None = None,
+    handle: RoleHandle | None = None,
+) -> None:
     port = config.inference.http.port if port is None else port
     url = f"http://{config.inference.http.host}:{port}/health"
     deadline = time.monotonic() + config.inference.http.startup_timeout_seconds
     last_error: Exception | None = None
     while time.monotonic() < deadline:
+        if handle is not None:
+            code = handle.poll()
+            if code is not None:
+                raise RuntimeError(
+                    f"vLLM HTTP server exited with code {code} before {url} "
+                    f"became healthy. Check '{handle.log_path}'."
+                )
         try:
             with urllib.request.urlopen(url, timeout=5.0):
                 return

@@ -12,11 +12,14 @@ def compute_eval_policy_step(
 ) -> int | None:
     if policy_step <= last_eval_step:
         return None
-    if policy_step == 0:
-        return 0 if eval_base_model and last_eval_step < 0 else None
-    if policy_step % interval == 0:
-        return policy_step
-    return None
+    highest_interval_step = (policy_step // interval) * interval
+    if highest_interval_step <= last_eval_step:
+        return None
+    if highest_interval_step == 0:
+        if policy_step == 0 and eval_base_model and last_eval_step < 0:
+            return 0
+        return None
+    return highest_interval_step
 
 
 def pass_at_k(rewards: list[float]) -> dict[str, float]:

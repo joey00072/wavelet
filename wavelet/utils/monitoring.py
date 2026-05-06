@@ -279,8 +279,12 @@ class RunMonitor:
             dir=str(self.output_dir),
             config=run_config,
             resume="allow" if resumed_from is not None else None,
-            settings=wandb.Settings(init_timeout=self.wandb.init_timeout_seconds),
         )
+        settings_factory = getattr(wandb, "Settings", None)
+        if callable(settings_factory):
+            init_kwargs["settings"] = settings_factory(
+                init_timeout=self.wandb.init_timeout_seconds
+            )
         try:
             self._wandb_run = wandb.init(mode=self.wandb.mode, **init_kwargs)
         except Exception:

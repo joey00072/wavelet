@@ -120,6 +120,7 @@ def test_native_rollout_materialization_retries_incomplete_groups(
             "examples_per_step": 1,
             "rollouts_per_example": 2,
             "advantage_mode": "group_reward",
+            "filter_zero_advantage": False,
             "zero_advantage_max_retries": 1,
         },
     )

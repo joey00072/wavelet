@@ -53,7 +53,7 @@ def test_packed_rl_dataset_pads_incomplete_distributed_tail_with_zero_loss() -> 
     assert sum(bins[-1]["loss_mask"]) == 0
     assert bins[-1]["advantages"] == []
     assert bins[-1]["sample_count"] == 0
-    assert dataset.loss_scale_for_next_local_batch(2) == pytest.approx(7.5)
+    assert dataset.loss_scale_for_next_local_batch(2) == pytest.approx(6.0)
 
 
 def test_packed_rl_dataset_counts_real_local_samples() -> None:
@@ -86,7 +86,7 @@ def test_packed_rl_dataset_allows_dummy_only_distributed_ranks() -> None:
     assert bins[0]["advantages"] == []
     assert bins[0]["sample_count"] == 0
     assert dataset.local_real_sample_count() == 0
-    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(1.5)
+    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(1.0)
 
 
 def test_pretokenized_dummy_rollout_keeps_zero_loss_sample() -> None:
@@ -109,4 +109,42 @@ def test_pretokenized_dummy_rollout_keeps_zero_loss_sample() -> None:
     assert sum(sample["loss_mask"]) == 0
     assert sample["advantages"] == []
     assert sample["temperatures"] == []
+    assert sample["sample_count"] == 0
+
+
+def test_pretokenized_filtered_rollout_keeps_metric_sample() -> None:
+    record = _record(0)
+    record.loss_mask = [False] * len(record.loss_mask)
+    record.advantage = 0.0
+    record.inference_logprobs = []
+    record.temperatures = []
+    record.metadata = {"_wavelet_filtered_rollout": True}
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sum(sample["loss_mask"]) == 0
+    assert sample["advantages"] == []
+    assert sample["temperatures"] == []
+    assert sample["reward"] == 0.0
+    assert sample.get("sample_count", 1) == 1
+
+
+def test_pretokenized_rollout_count_metadata_sets_sample_count() -> None:
+    record = _record(0)
+    record.metadata = {"_wavelet_rollout_count": 0}
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
     assert sample["sample_count"] == 0

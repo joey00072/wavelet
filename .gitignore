@@ -1,33 +1,60 @@
-# Python-generated files
+# Python generated files
 __pycache__/
 *.py[oc]
+.coverage
+.coverage.*
+.hypothesis/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .pyright/
+.pytype/
 build/
 dist/
 wheels/
 *.egg-info
 
-# Virtual environments
-.venv
+# Virtual environments and local secrets
+.venv/
+.venvs/
+venv/
+env/
 .env
+.env.*
+!.env.example
 
-# Outputs and caches
+# Local outputs, caches, and run state
 outputs/
+logs/
 wandb/
 unsloth_compiled_cache/
-bench_wavelet.log
+checkpoint*/
+checkpoints/
+.chroma_db/
+*.sqlite
+*.sqlite3
+*.db
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.jsonl.tmp
+bench*
+dev*
+tmp/
+temp/
+*.tmp
 *.log
+
+# Frontend artifacts
 node_modules/
 webui/node_modules/
 webui/dist/
 
+# External reference checkouts and local notes
 ref/
 ref*
-bench*
-dev*
-.vscode
+.vscode/
 AGENT.md
 progress.md
+tools/prime_rl_compat/

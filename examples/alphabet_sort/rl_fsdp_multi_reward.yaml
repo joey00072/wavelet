@@ -27,7 +27,7 @@ loss:
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
-  verifier_env_id: alphabet-sort
+  verifier_env_id: primeintellect/alphabet-sort
   verifier_env_args:
     min_turns: 3
     max_turns: 5
@@ -58,7 +58,7 @@ eval:
     repetition_penalty: 1.0
     max_completion_tokens: 768
   env:
-    - id: alphabet-sort
+    - id: primeintellect/alphabet-sort
       name: alphabet-sort
       args:
         min_turns: 3

@@ -1,0 +1,99 @@
+model:
+  name: "Qwen/Qwen3-30B-A3B-Thinking-2507"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  trust_remote_code: true
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: local
+  path: outputs/multinode_math_data/rl_train.jsonl
+  batch_size: 512
+  micro_batch_size: 1
+  pack_sequences: true
+  seq_len: 2048
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: math-env
+  verifier_env_args:
+    dataset_name: PrimeIntellect/Hendrycks-Math
+    dataset_subset: default
+    math_verify_max_workers: 128
+    math_verify_timeout: 60
+  verifier_model: Qwen/Qwen3-30B-A3B-Thinking-2507
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: group_reward
+  examples_per_step: 32
+  rollouts_per_example: 16
+  max_async_level: 8
+  max_off_policy_steps: 8
+
+inference:
+  enabled: true
+  mode: vllm_http
+  sampling:
+    max_completion_tokens: 2048
+  vllm:
+    server_backend: openai
+    gpu_memory_utilization: 0.9
+    max_model_len: 2048
+    tensor_parallel_size: 4
+    data_parallel_size: 2
+    data_parallel_size_local: 2
+    enforce_eager: false
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: -1
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1e-6
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 32
+  alpha: 64.0
+  dropout: 0.0
+
+max_steps: 500
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-hendrycks-math-debug
+    name: wavelet-hendrycks-math-single-node
+    mode: online
+
+launcher:
+  mode: process
+  backend: local
+  inference_cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  trainer_cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  trainer_num_processes: 8
+
+output_dir: outputs/multinode_math_rl
+clean_output_dir: true

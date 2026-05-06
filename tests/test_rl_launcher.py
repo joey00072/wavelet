@@ -15,6 +15,7 @@ from wavelet.entrypoints.rl_inference import (
 from wavelet.entrypoints.rl_launcher import (
     _sleep_vllm_http_servers,
     _trainer_device_group,
+    _wait_for_vllm_http_server,
 )
 from wavelet.entrypoints.rl_trainer import (
     _chunks_per_step,
@@ -23,6 +24,7 @@ from wavelet.entrypoints.rl_trainer import (
     _use_streaming_rollout_chunks,
 )
 from wavelet.entrypoints.rl_vllm_openai_server import _serve_args
+from wavelet.entrypoints.rl_vllm_openai_server import _fit_chat_request_to_context
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -83,6 +85,26 @@ def test_sleep_colocate_requires_synchronous_rollouts() -> None:
         )
 
 
+def test_wait_for_vllm_http_server_fails_when_service_exits(tmp_path) -> None:
+    class ExitedHandle:
+        log_path = tmp_path / "vllm.log"
+
+        def poll(self) -> int:
+            return 1
+
+    config = RLConfig(
+        inference={
+            "http": {
+                "port": 65530,
+                "startup_timeout_seconds": 10.0,
+            }
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        _wait_for_vllm_http_server(config, handle=ExitedHandle())  # type: ignore[arg-type]
+
+
 def test_streaming_chunk_resume_uses_chunk_index_space() -> None:
     config = RLConfig(
         launcher={"mode": "process"},
@@ -125,6 +147,21 @@ def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
     assert accumulated_chunks == 0
 
 
+def test_streaming_rollout_waits_for_full_chunk_group_when_rows_overshoot() -> None:
+    assert not _should_step_streaming_rollouts(
+        accumulated_rows=1200,
+        accumulated_chunks=7,
+        target_rollout_rows=1024,
+        chunks_per_step=8,
+    )
+    assert _should_step_streaming_rollouts(
+        accumulated_rows=1300,
+        accumulated_chunks=8,
+        target_rollout_rows=1024,
+        chunks_per_step=8,
+    )
+
+
 def test_sleep_colocate_allows_multi_process_trainer() -> None:
     config = RLConfig(
         launcher={
@@ -158,6 +195,45 @@ def test_sleep_colocate_enables_vllm_sleep_allocator() -> None:
     args = _serve_args(config)
 
     assert args.enable_sleep_mode is True
+
+
+def test_vllm_openai_server_auto_enables_qwen_tool_parser() -> None:
+    config = RLConfig(model={"name": "Qwen/Qwen3-4B-Instruct-2507"})
+
+    args = _serve_args(config)
+
+    assert args.tool_call_parser == "hermes"
+    assert args.enable_auto_tool_choice is True
+
+
+def test_vllm_openai_server_auto_detects_qwen35_tool_parser() -> None:
+    config = RLConfig(model={"name": "Qwen/Qwen3.5-397B-A17B"})
+
+    args = _serve_args(config)
+
+    assert args.tool_call_parser == "qwen3_coder"
+    assert args.enable_auto_tool_choice is True
+
+
+def test_vllm_openai_server_unknown_auto_tool_parser_disabled() -> None:
+    config = RLConfig(model={"name": "some/unknown-model"})
+
+    args = _serve_args(config)
+
+    assert args.tool_call_parser is None
+    assert args.enable_auto_tool_choice is False
+
+
+def test_vllm_openai_server_allows_disabling_tool_parser() -> None:
+    config = RLConfig(
+        model={"name": "Qwen/Qwen3-4B-Instruct-2507"},
+        inference={"vllm": {"tool_call_parser": None}},
+    )
+
+    args = _serve_args(config)
+
+    assert args.tool_call_parser is None
+    assert args.enable_auto_tool_choice is False
 
 
 def test_sleep_colocate_resolves_memory_wait_devices() -> None:
@@ -298,8 +374,13 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
     assert payload is not None
     cached_policy_dir = Path(payload["policy_dir"])
     assert cached_policy_dir != policy_dir
-    assert cached_policy_dir.parent.parent == cache_root / f"wavelet-policy-cache-{os.getuid()}"
-    assert (cached_policy_dir / "adapter" / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert (
+        cached_policy_dir.parent.parent
+        == cache_root / f"wavelet-policy-cache-{os.getuid()}"
+    )
+    assert (
+        cached_policy_dir / "adapter" / "adapter_model.safetensors"
+    ).read_bytes() == b"weights"
     assert payload["adapter_name"] == "policy"
     assert payload["load_inplace"] is True
 
@@ -352,6 +433,7 @@ def test_http_openai_payload_sets_vllm_request_fields() -> None:
         }
     )
     engine = HTTPPolicyInferenceEngine(config)
+    engine.policy_step = 123
     record = RLExample(
         prompt=[{"role": "user", "content": "x"}],
         completion=[],
@@ -371,8 +453,36 @@ def test_http_openai_payload_sets_vllm_request_fields() -> None:
     assert payload["top_k"] == 20
     assert payload["min_p"] == 0.05
     assert payload["allowed_token_ids"] == [1, 2]
+    assert payload["cache_salt"] == "123"
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
     assert "extra_body" not in payload
+
+
+def test_vllm_openai_server_fits_overlong_chat_completion_request() -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+    from vllm.exceptions import VLLMValidationError
+
+    request = ChatCompletionRequest(
+        messages=[{"role": "user", "content": "x"}],
+        model="test-model",
+        max_completion_tokens=1024,
+    )
+    error = VLLMValidationError(
+        "This model's maximum context length is 8192 tokens. However, you "
+        "requested 1024 output tokens and your prompt contains at least 7169 "
+        "input tokens, for a total of at least 8193 tokens.",
+        parameter="input_tokens",
+        value=7169,
+    )
+
+    fitted = _fit_chat_request_to_context(
+        request,
+        max_model_len=8192,
+        error=error,
+    )
+
+    assert fitted is not request
+    assert fitted.max_completion_tokens == 1023
 
 
 def test_openai_sampling_kwargs_passes_stop_strings() -> None:
@@ -399,6 +509,7 @@ def test_openai_sampling_kwargs_passes_stop_strings() -> None:
 
     assert kwargs["stop"] == ["</SOLUTION>"]
     assert kwargs["include_stop_str_in_output"] is True
+    assert "max_tokens" not in kwargs
 
 
 def test_shift_completion_sample_masks_only_completion_tokens() -> None:

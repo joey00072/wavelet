@@ -67,3 +67,14 @@ def get_world() -> World:
 def set_world(world: World) -> None:
     global _world
     _world = world
+
+
+def barrier(world: World | None = None) -> None:
+    if not torch.distributed.is_initialized():
+        return
+    if world is None:
+        world = get_world()
+    if distributed_uses_cuda() and world.device.type == "cuda":
+        torch.distributed.barrier(device_ids=[world.local_rank])
+    else:
+        torch.distributed.barrier()

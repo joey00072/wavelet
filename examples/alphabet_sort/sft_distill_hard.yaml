@@ -1,0 +1,62 @@
+model:
+  name: "Qwen/Qwen3-4B-Instruct-2507"
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: local
+  path: outputs/alphabet_sort_distill_data/sft_train.jsonl
+  batch_size: 256
+  micro_batch_size: 1
+  seq_len: 2048
+  shuffle: true
+  seed: 42
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1e-5
+  weight_decay: 0.0
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: -1
+
+max_grad_norm: 1.0
+max_steps: 24
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-alphabet-sort-sft-distill
+    name: wavelet-qwen3-4b-hard-distill
+    mode: online
+
+deployment:
+  type: single_node
+  num_gpus: 2
+
+output_dir: outputs/alphabet_sort_sft_distill_hard
+clean_output_dir: true

@@ -83,7 +83,7 @@ class RLDataConfig(BaseModel):
 
 class RLLossConfig(BaseModel):
     type: Literal["dppo"] = "dppo"
-    dppo_mask_high: float = Field(default=0.28, ge=0.0)
+    dppo_mask_high: float = Field(default=0.20, ge=0.0)
     dppo_mask_low: float = Field(default=0.20, ge=0.0)
     kl_tau: float = Field(default=1e-3, ge=0.0)
     adv_tau: float = Field(default=1.0, ge=0.0)
@@ -130,9 +130,10 @@ class RLSamplingConfig(BaseModel):
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=-1, ge=-1)
     min_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    min_tokens: int = Field(default=0, ge=0)
     repetition_penalty: float = Field(default=1.0, gt=0.0)
     max_prompt_tokens: int | None = Field(default=None, ge=1)
-    max_completion_tokens: int = Field(default=128, ge=1)
+    max_completion_tokens: int | None = Field(default=None, ge=1)
     do_sample: bool = True
     num_generations: int = Field(default=1, ge=1)
     seed: int | None = None
@@ -153,6 +154,7 @@ class RLEvalSamplingConfig(BaseModel):
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=-1)
     min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_tokens: int | None = Field(default=None, ge=0)
     repetition_penalty: float | None = Field(default=None, gt=0.0)
     max_completion_tokens: int | None = Field(default=None, ge=1)
     seed: int | None = None
@@ -184,6 +186,8 @@ class RLEvalSamplingConfig(BaseModel):
             extra_body["top_k"] = self.top_k
         if self.min_p is not None:
             extra_body["min_p"] = self.min_p
+        if self.min_tokens is not None:
+            extra_body["min_tokens"] = self.min_tokens
         if self.repetition_penalty is not None:
             extra_body["repetition_penalty"] = self.repetition_penalty
         args["extra_body"] = extra_body
@@ -254,6 +258,8 @@ class RLVLLMConfig(BaseModel):
     max_lora_rank: int | None = Field(default=None, ge=1)
     trust_remote_code: bool | None = None
     dtype: Literal["auto", "float32", "float16", "bfloat16"] | None = None
+    tool_call_parser: str | None = "auto"
+    reasoning_parser: str | None = None
     use_generation_logprobs: bool = True
     openai_batch_wait_seconds: float = Field(default=0.01, ge=0.0)
     openai_batch_min_size: int = Field(default=1, ge=1)
@@ -360,6 +366,8 @@ class RLOrchestratorConfig(BaseModel):
         "openai_chat_completions_token",
     ] = "openai_chat_completions"
     verifier_max_retries: int = Field(default=0, ge=0)
+    verifier_timeout_seconds: float | None = Field(default=None, gt=0.0)
+    verifier_max_total_completion_tokens: int = -1
     materialize_path: Path | None = None
     overwrite: bool = True
     advantage_mode: Literal["passthrough", "reward", "group_reward"] = "passthrough"
@@ -368,8 +376,9 @@ class RLOrchestratorConfig(BaseModel):
     examples_per_step: int | None = Field(default=None, ge=1)
     rollouts_per_example: int | None = Field(default=None, ge=1)
     oversampling_factor: float = Field(default=1.0, ge=1.0)
+    max_inflight_rollouts: int | None = Field(default=None, ge=1)
     rollout_chunk_examples: int | None = Field(default=None, ge=1)
-    filter_zero_advantage: bool = False
+    filter_zero_advantage: bool = True
     zero_advantage_max_retries: int = Field(default=8, ge=0)
     max_async_level: int = Field(default=0, ge=0)
     max_off_policy_steps: int = Field(default=0, ge=0)
@@ -386,6 +395,17 @@ class RLOrchestratorConfig(BaseModel):
         if isinstance(penalty, str) and penalty in {"tokens", "turns"}:
             value["length_penalty"] = {"type": penalty}
         return value
+
+    @model_validator(mode="after")
+    def validate_max_inflight_rollouts(self) -> "RLOrchestratorConfig":
+        if self.max_inflight_rollouts is None or self.rollouts_per_example is None:
+            return self
+        if self.max_inflight_rollouts < self.rollouts_per_example:
+            raise ValueError(
+                "orchestrator.max_inflight_rollouts must be at least "
+                "orchestrator.rollouts_per_example"
+            )
+        return self
 
 
 class RLLauncherConfig(BaseModel):

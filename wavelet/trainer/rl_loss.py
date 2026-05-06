@@ -85,6 +85,20 @@ def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput
     return LossOutputs(loss=loss, metrics=metrics)
 
 
+def _sequence_spans(position_ids: Tensor, seq_len: int) -> list[tuple[int, int]]:
+    starts = (position_ids[:seq_len] == 0).nonzero(as_tuple=False).flatten().tolist()
+    if not starts:
+        return [(0, seq_len)]
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    ends = [*starts[1:], seq_len]
+    return [
+        (int(start), int(end))
+        for start, end in zip(starts, ends, strict=True)
+        if end > start
+    ]
+
+
 def compute_loss(
     trainer_logprobs: Tensor,
     inference_logprobs: Tensor,
@@ -94,22 +108,54 @@ def compute_loss(
     loss_config: RLLossConfig,
     *,
     loss_scale: int | float | Tensor | None = None,
+    position_ids: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Any]]:
-    outputs = default_loss_fn(
-        LossInputs(
-            trainer_logprobs=trainer_logprobs,
-            inference_logprobs=inference_logprobs,
-            teacher_logprobs=teacher_logprobs,
-            advantages=advantages,
-            loss_mask=loss_mask,
-        ),
-        loss_config,
-    )
+    total_loss: Tensor | None = None
+    metric_values: dict[str, list[Tensor]] = {}
+
+    if position_ids is None:
+        spans_by_row = [
+            [(0, trainer_logprobs.shape[1])] for _ in range(trainer_logprobs.shape[0])
+        ]
+    else:
+        spans_by_row = [
+            _sequence_spans(row_position_ids, trainer_logprobs.shape[1])
+            for row_position_ids in position_ids
+        ]
+
+    for row_index, spans in enumerate(spans_by_row):
+        for start, end in spans:
+            row_teacher = (
+                None
+                if teacher_logprobs is None
+                else teacher_logprobs[row_index, start:end]
+            )
+            outputs = default_loss_fn(
+                LossInputs(
+                    trainer_logprobs=trainer_logprobs[row_index, start:end],
+                    inference_logprobs=inference_logprobs[row_index, start:end],
+                    teacher_logprobs=row_teacher,
+                    advantages=advantages[row_index, start:end],
+                    loss_mask=loss_mask[row_index, start:end],
+                ),
+                loss_config,
+            )
+            total_loss = outputs.loss if total_loss is None else total_loss + outputs.loss
+            for key, value in outputs.metrics.items():
+                metric_values.setdefault(key, []).append(value)
+
+    if total_loss is None:
+        total_loss = trainer_logprobs.sum() * 0.0
     if loss_scale is None:
         scale = torch.clamp_min(loss_mask.sum(), 1)
     elif isinstance(loss_scale, Tensor):
-        scale = torch.clamp_min(loss_scale.to(outputs.loss.device), 1)
+        scale = torch.clamp_min(loss_scale.to(total_loss.device), 1)
     else:
         scale = max(float(loss_scale), 1.0)
-    scaled_loss = outputs.loss / scale
-    return scaled_loss, outputs.metrics
+    scaled_loss = total_loss / scale
+    metrics = {
+        key: torch.stack(values).mean()
+        for key, values in metric_values.items()
+        if values
+    }
+    return scaled_loss, metrics
