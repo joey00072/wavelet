@@ -6,6 +6,7 @@ import logging
 import random
 import shutil
 from datetime import datetime, timezone
+from math import ceil
 from pathlib import Path
 
 import torch
@@ -34,12 +35,18 @@ from wavelet.orchestrator.queue import (
 )
 from wavelet.trainer.base import BaseTrainer
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
+from wavelet.trainer.lora import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.rl_loss import compute_loss, selective_log_softmax
 from wavelet.utils.monitoring import RunMonitor
 from wavelet.utils.pathing import resolve_resume_checkpoint
 
 
 logger = logging.getLogger(__name__)
+SUM_SYNCED_METRIC_KEYS = {
+    "rollout/count",
+    "micro_batch/count",
+    "tokens/train",
+}
 
 
 def _count_rollout_rows(path: Path) -> int:
@@ -222,11 +229,12 @@ class RLTrainer(BaseTrainer):
         else:
             self._setup_accumulation_steps()
 
+        data_rank, data_world_size = self._data_partition()
         self.dataset = setup_rl_dataset(
             self.tokenizer,
             self.config.data,
-            data_rank=self.world.rank,
-            data_world_size=self.world.world_size,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
         )
         self.dataloader = setup_rl_dataloader(
             self.dataset,
@@ -234,7 +242,7 @@ class RLTrainer(BaseTrainer):
             pad_token_id=self.tokenizer.pad_token_id,
         )
         if isinstance(self.dataset, PackedRLDataset):
-            self.accumulation_steps = self.dataset.micro_batch_count()
+            self.accumulation_steps = self._packed_dataloader_batch_count()
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
 
     def setup(self) -> None:
@@ -387,9 +395,8 @@ class RLTrainer(BaseTrainer):
         optimizer_batch_size = rollout_count
         pack_sequences = self.config.data.pack_sequences
         if self.world is not None and not pack_sequences:
-            global_micro_batch = (
-                self.config.data.micro_batch_size * self.world.world_size
-            )
+            _, data_world_size = self._data_partition()
+            global_micro_batch = self.config.data.micro_batch_size * data_world_size
             remainder = rollout_count % global_micro_batch
             if remainder:
                 optimizer_batch_size = rollout_count - remainder
@@ -427,11 +434,20 @@ class RLTrainer(BaseTrainer):
 
     def _current_micro_batch_count(self, optimizer_batch_size: int) -> int:
         if isinstance(self.dataset, PackedRLDataset):
-            return self.dataset.micro_batch_count()
+            return self._packed_dataloader_batch_count()
         if self.world is None:
             raise RuntimeError("World must be set up before computing micro-batches")
-        global_micro_batch = self.config.data.micro_batch_size * self.world.world_size
+        _, data_world_size = self._data_partition()
+        global_micro_batch = self.config.data.micro_batch_size * data_world_size
         return max(optimizer_batch_size // global_micro_batch, 1)
+
+    def _packed_dataloader_batch_count(self) -> int:
+        if not isinstance(self.dataset, PackedRLDataset):
+            raise RuntimeError("Packed batch count requires a packed RL dataset.")
+        return max(
+            ceil(self.dataset.micro_batch_count() / self.config.data.micro_batch_size),
+            1,
+        )
 
     def train_loaded_rollouts_once(self) -> dict[str, float] | None:
         if self.dataloader is None:
@@ -584,10 +600,12 @@ class RLTrainer(BaseTrainer):
         step_dir = get_policy_step_dir(policy_dir, export_step)
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
 
-        from wavelet.trainer.model import (
-            export_model_for_save,
+        from wavelet.trainer.lora import (
             save_lora_adapter_snapshot,
             save_lora_adapter_snapshot_from_fsdp,
+        )
+        from wavelet.trainer.model import (
+            export_model_for_save,
             save_model,
         )
 
@@ -606,6 +624,7 @@ class RLTrainer(BaseTrainer):
                 self.model,
                 tmp_dir,
                 is_main_process=self.world.is_main,
+                parallel_dims=self.parallel_dims,
             )
         else:
             export_model, state_dict = export_model_for_save(self.model)
@@ -623,6 +642,7 @@ class RLTrainer(BaseTrainer):
                     tmp_dir,
                     state_dict=state_dict,
                     is_main_process=self.world.is_main,
+                    parallel_dims=self.parallel_dims,
                 )
             else:
                 saved_path = save_model(
@@ -683,12 +703,13 @@ class RLTrainer(BaseTrainer):
     def _setup_accumulation_steps(self) -> None:
         if self.world is None:
             raise RuntimeError("World must be set up before accumulation steps")
-        global_micro_batch = self.config.data.micro_batch_size * self.world.world_size
+        _, data_world_size = self._data_partition()
+        global_micro_batch = self.config.data.micro_batch_size * data_world_size
         if self.config.data.batch_size % global_micro_batch != 0:
             raise ValueError(
                 "RL data.batch_size is the global optimizer batch size and must be "
-                "divisible by data.micro_batch_size * world_size "
-                f"({self.config.data.micro_batch_size} * {self.world.world_size})."
+                "divisible by data.micro_batch_size * data_parallel_world_size "
+                f"({self.config.data.micro_batch_size} * {data_world_size})."
             )
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
@@ -790,6 +811,7 @@ class RLTrainer(BaseTrainer):
 
         grad_norm = None
         self._apply_gradient_accumulation_loss_scale()
+        self._sync_tensor_parallel_lora_grads()
         if self.config.max_grad_norm > 0:
             grad_norm = self._clip_grad_norm()
         self.optimizer.step()
@@ -825,6 +847,11 @@ class RLTrainer(BaseTrainer):
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
         self._gradient_accumulation_loss_scale = None
         return metrics
+
+    def _sync_tensor_parallel_lora_grads(self) -> None:
+        if self.model is None:
+            raise RuntimeError("Trainer not set up")
+        sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
 
     def _apply_gradient_accumulation_loss_scale(self) -> None:
         if self._gradient_accumulation_loss_scale is None:
@@ -1114,27 +1141,71 @@ class RLTrainer(BaseTrainer):
         ):
             return metrics
 
+        rank = torch.distributed.get_rank()
+        gathered = self._gather_metric_payloads(
+            {key: float(value) for key, value in metrics.items()}
+            if self._is_data_parallel_metric_leader()
+            else {},
+            rank=rank,
+        )
+        synced = self._reduce_gathered_metrics(gathered) if rank == 0 else {}
+        return self._broadcast_synced_metrics(synced, rank=rank)
+
+    def _gather_metric_payloads(
+        self,
+        metric_payload: dict[str, float],
+        *,
+        rank: int,
+    ) -> list[dict[str, float] | None] | None:
+        if self.world is None:
+            raise RuntimeError("World must be set up before metric synchronization")
+
+        if rank == 0:
+            gathered = [None for _ in range(self.world.world_size)]
+        else:
+            gathered = None
+        torch.distributed.gather_object(
+            metric_payload,
+            gathered,
+            dst=0,
+        )
+        return gathered
+
+    def _reduce_gathered_metrics(
+        self,
+        gathered: list[dict[str, float] | None] | None,
+    ) -> dict[str, float]:
+        if gathered is None:
+            raise RuntimeError("Metric synchronization returned no gathered metrics.")
         synced: dict[str, float] = {}
-        device = self.world.device
-        for key in sorted(metrics):
-            value = torch.tensor(float(metrics[key]), device=device)
-            if key.endswith("/max"):
-                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MAX)
-                synced[key] = float(value.item())
-            elif key.endswith("/min"):
-                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MIN)
-                synced[key] = float(value.item())
-            elif key.startswith("_") or key in {
-                "rollout/count",
-                "micro_batch/count",
-                "tokens/train",
-            }:
-                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
-                synced[key] = float(value.item())
-            else:
-                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.SUM)
-                synced[key] = float(value.item() / self.world.world_size)
+        contributors = [item for item in gathered if item]
+        keys = sorted({key for item in contributors for key in item})
+        for key in keys:
+            values = [float(item[key]) for item in contributors if key in item]
+            if values:
+                synced[key] = self._reduce_metric_values(key, values)
         return synced
+
+    def _reduce_metric_values(self, key: str, values: list[float]) -> float:
+        if key.endswith("/max"):
+            return max(values)
+        if key.endswith("/min"):
+            return min(values)
+        if key.startswith("_") or key in SUM_SYNCED_METRIC_KEYS:
+            return sum(values)
+        return sum(values) / len(values)
+
+    def _broadcast_synced_metrics(
+        self,
+        synced: dict[str, float],
+        *,
+        rank: int,
+    ) -> dict[str, float]:
+        synced_payload: list[dict[str, float] | None] = [synced if rank == 0 else None]
+        torch.distributed.broadcast_object_list(synced_payload, src=0)
+        if synced_payload[0] is None:
+            raise RuntimeError("Metric synchronization broadcast no metrics.")
+        return synced_payload[0]
 
     def _finalize_synced_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
         reward_sum = metrics.pop("_reward_weighted_sum", None)
@@ -1155,11 +1226,8 @@ class RLTrainer(BaseTrainer):
         if self.model is None or self.tokenizer is None:
             return
 
-        from wavelet.trainer.model import (
-            export_model_for_save,
-            save_lora_adapter_snapshot_from_fsdp,
-            save_model,
-        )
+        from wavelet.trainer.lora import save_lora_adapter_snapshot_from_fsdp
+        from wavelet.trainer.model import export_model_for_save, save_model
 
         if self.config.policy_transfer.lightweight_lora and isinstance(
             self.model, FSDP
@@ -1168,6 +1236,7 @@ class RLTrainer(BaseTrainer):
                 self.model,
                 self.output_dir,
                 is_main_process=self.world.is_main,
+                parallel_dims=self.parallel_dims,
             )
             if self.world.is_main:
                 self.tokenizer.save_pretrained(saved_path)

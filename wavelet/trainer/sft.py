@@ -10,10 +10,11 @@ from tqdm import tqdm
 
 from wavelet.configs.sft import SFTConfig
 from wavelet.data.dataloader import setup_dataloader
-from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.base import BaseTrainer
-from wavelet.utils.pathing import resolve_resume_checkpoint
+from wavelet.trainer.ckpt import CheckpointManager, TrainerState
+from wavelet.trainer.lora import sync_hf_tp_lora_replicated_grads
 from wavelet.utils.monitoring import RunMonitor
+from wavelet.utils.pathing import resolve_resume_checkpoint
 
 
 logger = logging.getLogger(__name__)
@@ -218,6 +219,7 @@ class SFTTrainer(BaseTrainer):
 
         self._micro_step += 1
         if self._micro_step % self.accumulation_steps == 0:
+            sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
             if self.config.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
