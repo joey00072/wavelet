@@ -6,16 +6,7 @@ from typing import Any, cast
 
 import torch
 import torch.distributed
-
-from peft import LoraConfig as PeftLoraConfig
-from peft import (
-    PeftModel,
-    TaskType,
-    get_peft_model_state_dict,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-)
-from safetensors.torch import save_file as save_safetensors
+from peft import PeftModel, prepare_model_for_kbit_training
 from torch import nn
 from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import (
@@ -36,27 +27,14 @@ from transformers import (
 )
 from transformers.utils import logging as transformers_logging
 
-from wavelet.configs.sft import FSDPConfig, LoRAConfig, ModelConfig
+from wavelet.configs.sft import FSDPConfig, ModelConfig
 from wavelet.distributed.parallel_dims import ParallelDims
 from wavelet.distributed.world import World
 from wavelet.trainer.debug import (
-    DEBUG_LORA_TARGET_MODULES,
     DEBUG_MODEL_NAME,
     build_debug_model,
     build_debug_tokenizer,
 )
-
-
-DEFAULT_LORA_TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-    "experts",
-]
 
 
 def resolve_dtype(name: str) -> torch.dtype | str:
@@ -307,47 +285,6 @@ def setup_model(
     return cast(PreTrainedModel, model)
 
 
-def apply_lora(
-    model: PreTrainedModel,
-    config: LoRAConfig | None,
-    *,
-    match_base_dtype: bool = False,
-    lora_dtype: torch.dtype | None = None,
-) -> PreTrainedModel:
-    if config is None:
-        return model
-    if isinstance(model, PeftModel):
-        if match_base_dtype:
-            _align_lora_dtypes(model)
-        return model
-    target_modules = _resolve_lora_target_modules(model, config)
-    peft_config = PeftLoraConfig(
-        r=config.rank,
-        lora_alpha=int(config.alpha),
-        lora_dropout=config.dropout,
-        target_modules=target_modules,
-        modules_to_save=config.modules_to_save or None,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM,
-    )
-    model = get_peft_model(model, peft_config)
-    if lora_dtype is not None:
-        # Cast all LoRA adapter weights to the requested dtype. Critical for
-        # QLoRA: bitsandbytes stores weights in 4-bit (uint8) but computes in
-        # bfloat16; flash attention requires bfloat16 inputs. Without this,
-        # flash_attn casts fp32 LoRA outputs at every layer, adding overhead.
-        for name, module in model.named_modules():
-            if _is_lora_wrapped(module):
-                for attr in ("lora_A", "lora_B"):
-                    container = getattr(module, attr, None)
-                    if container:
-                        for child in container.values():
-                            child.to(dtype=lora_dtype)
-    elif match_base_dtype:
-        _align_lora_dtypes(model)
-    return model
-
-
 def save_model(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizerBase,
@@ -390,158 +327,6 @@ def save_model(
     return target
 
 
-def save_lora_adapter_snapshot(
-    model: PreTrainedModel,
-    output_dir: Path,
-    *,
-    state_dict: dict[str, torch.Tensor] | None = None,
-    is_main_process: bool = True,
-) -> Path:
-    """Save only the mutable LoRA adapter files needed for hot policy reload."""
-    if not isinstance(model, PeftModel):
-        raise TypeError("Lightweight policy snapshots require a PeftModel.")
-    if getattr(unwrap_model(model), "_tp_size", None) is not None:
-        raise NotImplementedError(
-            "Saving LoRA adapters from a tensor-parallel model is not implemented yet."
-        )
-
-    target = output_dir / "adapter"
-    if not is_main_process:
-        return target
-
-    target.mkdir(parents=True, exist_ok=True)
-    adapter_name = _active_adapter_name(model)
-    peft_config = model.peft_config[adapter_name]
-    peft_config.save_pretrained(target)
-    lora_state = get_peft_model_state_dict(
-        model,
-        state_dict=state_dict,
-        adapter_name=adapter_name,
-    )
-    cpu_state = {
-        key: value.detach().cpu().contiguous() for key, value in lora_state.items()
-    }
-    save_safetensors(cpu_state, target / "adapter_model.safetensors")
-    return target
-
-
-def _lora_parameter_shapes(model: PeftModel) -> dict[str, tuple[int, ...]]:
-    shapes: dict[str, tuple[int, ...]] = {}
-    for module_name, module in model.named_modules():
-        for attr in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
-            container = getattr(module, attr, None)
-            if container is None:
-                continue
-            for adapter_name, child in container.items():
-                weight = getattr(child, "weight", child)
-                if not isinstance(weight, nn.Parameter):
-                    continue
-                if isinstance(child, nn.Linear):
-                    shape = (child.out_features, child.in_features)
-                else:
-                    shape = tuple(weight.shape)
-                shapes[f"{module_name}.{attr}.{adapter_name}.weight"] = shape
-    return shapes
-
-
-def _peft_adapter_state_key(name: str) -> str:
-    prefix = "_fsdp_wrapped_module."
-    if name.startswith(prefix):
-        name = name[len(prefix) :]
-    return name.replace(".default.weight", ".weight")
-
-
-def _gather_fsdp_lora_state_dict(
-    model: FSDP,
-    unwrapped: PeftModel,
-) -> dict[str, torch.Tensor] | None:
-    if not torch.distributed.is_initialized():
-        return {
-            _peft_adapter_state_key(name): value.detach().cpu().contiguous()
-            for name, value in model.named_parameters()
-            if "lora_" in name and value.numel() > 0
-        }
-
-    expected_shapes = _lora_parameter_shapes(unwrapped)
-    local_state = {
-        name.removeprefix("_fsdp_wrapped_module."): value.detach().cpu().reshape(-1)
-        for name, value in model.named_parameters()
-        if name.removeprefix("_fsdp_wrapped_module.") in expected_shapes
-        and value.numel() > 0
-    }
-
-    gathered: list[dict[str, torch.Tensor] | None] | None
-    rank = torch.distributed.get_rank()
-    if rank == 0:
-        gathered = [None for _ in range(torch.distributed.get_world_size())]
-    else:
-        gathered = None
-    torch.distributed.gather_object(local_state, gathered, dst=0)
-    if rank != 0:
-        return None
-    if gathered is None:
-        raise RuntimeError("FSDP LoRA gather returned no state on rank 0.")
-
-    state: dict[str, torch.Tensor] = {}
-    for name, shape in expected_shapes.items():
-        parts = [
-            shard[name]
-            for shard in gathered
-            if shard is not None and name in shard and shard[name].numel() > 0
-        ]
-        if not parts:
-            raise RuntimeError(f"FSDP LoRA gather found no shards for {name}.")
-        flat = torch.cat(parts, dim=0)
-        expected_numel = 1
-        for dim in shape:
-            expected_numel *= dim
-        if flat.numel() != expected_numel:
-            raise RuntimeError(
-                "FSDP LoRA gather produced the wrong size for "
-                f"{name}: {flat.numel()} != {expected_numel}."
-            )
-        state[_peft_adapter_state_key(name)] = flat.reshape(shape).contiguous()
-    return state
-
-
-def save_lora_adapter_snapshot_from_fsdp(
-    model: FSDP,
-    output_dir: Path,
-    *,
-    is_main_process: bool = True,
-) -> Path:
-    """Save a PEFT LoRA adapter from an FSDP-wrapped model without a full state dict."""
-    return _save_lora_adapter_snapshot_from_fsdp_full_params(
-        model,
-        output_dir,
-        is_main_process=is_main_process,
-    )
-
-
-def _save_lora_adapter_snapshot_from_fsdp_full_params(
-    model: FSDP,
-    output_dir: Path,
-    *,
-    is_main_process: bool = True,
-) -> Path:
-    unwrapped = unwrap_model(model)
-    if not isinstance(unwrapped, PeftModel):
-        raise TypeError("FSDP lightweight policy snapshots require a wrapped PeftModel.")
-    with FSDP.summon_full_params(
-        model,
-        recurse=True,
-        writeback=False,
-        rank0_only=True,
-        offload_to_cpu=True,
-    ):
-        return save_lora_adapter_snapshot(
-            unwrapped,
-            output_dir,
-            state_dict=None,
-            is_main_process=is_main_process,
-        )
-
-
 def maybe_wrap_fsdp(
     model: PreTrainedModel,
     *,
@@ -574,13 +359,12 @@ def maybe_wrap_fsdp(
         model = cast(PreTrainedModel, model.to(world.device))
 
     auto_wrap_policy = None
-    if not isinstance(model, PeftModel):
-        layer_classes = _transformer_layer_classes(model)
-        if layer_classes:
-            auto_wrap_policy = partial(
-                transformer_auto_wrap_policy,
-                transformer_layer_cls=layer_classes,
-            )
+    layer_classes = _transformer_layer_classes(model)
+    if layer_classes:
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=layer_classes,
+        )
 
     mixed_precision = _fsdp_mixed_precision(model_config)
     sharding_strategy = _fsdp_sharding_strategy(parallel_dims)
@@ -651,54 +435,6 @@ def unwrap_model(model: nn.Module) -> PreTrainedModel:
     while hasattr(current, "module"):
         current = cast(nn.Module, getattr(current, "module"))
     return cast(PreTrainedModel, current)
-
-
-def _active_adapter_name(model: PeftModel) -> str:
-    active_adapters = getattr(model, "active_adapters", None)
-    adapters = active_adapters() if callable(active_adapters) else active_adapters
-    if not adapters:
-        return "default"
-    return str(adapters[0])
-
-
-def _is_lora_wrapped(module: nn.Module) -> bool:
-    return hasattr(module, "base_layer") and hasattr(module, "lora_B")
-
-
-def _resolve_lora_target_modules(
-    model: PreTrainedModel,
-    config: LoRAConfig,
-) -> list[str]:
-    configured = list(config.target_modules)
-    if configured != DEFAULT_LORA_TARGET_MODULES:
-        return configured
-    model_type = getattr(getattr(model, "config", None), "model_type", None)
-    if model_type != "gpt2":
-        return configured
-    return DEBUG_LORA_TARGET_MODULES
-
-
-def _align_lora_dtypes(model: nn.Module) -> None:
-    for module in model.modules():
-        if not _is_lora_wrapped(module):
-            continue
-        base_weight = getattr(module.base_layer, "weight", None)
-        if base_weight is None:
-            continue
-        target_dtype = base_weight.dtype
-        target_device = base_weight.device
-        for attr in ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B"):
-            container = getattr(module, attr, None)
-            if container is None:
-                continue
-            for child in container.values():
-                if isinstance(child, nn.Module):
-                    child.to(device=target_device, dtype=target_dtype)
-                elif isinstance(child, nn.Parameter):
-                    child.data = child.data.to(
-                        device=target_device,
-                        dtype=target_dtype,
-                    )
 
 
 def _transformer_layer_classes(model: nn.Module) -> set[type[nn.Module]]:

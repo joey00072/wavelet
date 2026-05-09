@@ -197,6 +197,19 @@ def test_sleep_colocate_enables_vllm_sleep_allocator() -> None:
     assert args.enable_sleep_mode is True
 
 
+def test_vllm_openai_server_enables_fully_sharded_loras() -> None:
+    config = RLConfig(
+        inference={"vllm": {"fully_sharded_loras": True}},
+        lora={"rank": 32, "target_modules": ["q_proj"]},
+    )
+
+    args = _serve_args(config)
+
+    assert args.enable_lora is True
+    assert args.fully_sharded_loras is True
+    assert args.max_lora_rank == 32
+
+
 def test_vllm_openai_server_auto_enables_qwen_tool_parser() -> None:
     config = RLConfig(model={"name": "Qwen/Qwen3-4B-Instruct-2507"})
 

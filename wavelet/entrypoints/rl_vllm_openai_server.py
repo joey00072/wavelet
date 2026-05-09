@@ -845,6 +845,8 @@ def _serve_args(config: RLConfig) -> Namespace:
         argv.append("--enable-sleep-mode")
     if config.lora is not None:
         argv.append("--enable-lora")
+        if vllm_config.fully_sharded_loras:
+            argv.append("--fully-sharded-loras")
 
     parser = FlexibleArgumentParser(
         description="Wavelet vLLM OpenAI-compatible RL server."

@@ -1,0 +1,135 @@
+model:
+  name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  trust_remote_code: true
+  gradient_checkpointing: false
+  allow_tf32: true
+  fused_lm_head_token_chunk_size: auto
+
+data:
+  source: local
+  path: outputs/qwen30b_math_data/rl_train.jsonl
+  batch_size: 1
+  micro_batch_size: 1
+  pack_sequences: true
+  seq_len: 512
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 0.001
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: math-env
+  verifier_model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: reward
+  normalize_group_advantages: false
+  examples_per_step: 1
+  rollouts_per_example: 1
+  oversampling_factor: 1.0
+  filter_zero_advantage: false
+  zero_advantage_max_retries: 0
+  max_async_level: 0
+  max_off_policy_steps: 0
+
+eval:
+  interval: 25
+  num_examples: 0
+  final_eval: false
+  eval_base_model: false
+
+inference:
+  enabled: true
+  mode: vllm_http
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_completion_tokens: 64
+    do_sample: true
+  vllm:
+    server_backend: openai
+    gpu_memory_utilization: 0.35
+    max_model_len: 1024
+    tensor_parallel_size: 8
+    data_parallel_size: 1
+    data_parallel_size_local: 1
+    enforce_eager: true
+    max_lora_rank: 32
+    fully_sharded_loras: true
+  http:
+    port: 8000
+    request_timeout_seconds: 1800.0
+    startup_timeout_seconds: 1800.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: -1
+  ep: 1
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1e-6
+  weight_decay: 0.01
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 32
+  alpha: 64.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+max_grad_norm: 0.0
+max_steps: 1
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 1
+    sample_ratio: 1.0
+    max_samples: 2
+  wandb:
+    enabled: true
+    project: wavelet-qwen30b-math
+    name: wavelet-qwen30b-math-colocate-sleep-smoke
+    mode: online
+
+launcher:
+  mode: colocate_sleep
+  backend: local
+  inference_cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  trainer_cuda_visible_devices: "0,1,2,3,4,5,6,7"
+  trainer_num_processes: 8
+  inference_num_replicas: 1
+  colocate_memory_wait_margin: 0.15
+
+output_dir: outputs/qwen30b_math_rl_colocate_sleep_smoke
+clean_output_dir: true

@@ -153,6 +153,8 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "max_cpu_loras": vllm_config.max_cpu_loras,
             "max_lora_rank": max_lora_rank,
         }
+        if self.config.lora is not None:
+            kwargs["fully_sharded_loras"] = vllm_config.fully_sharded_loras
         if self.config.launcher.mode == "colocate_sleep":
             kwargs["enable_sleep_mode"] = True
         self.llm = LLM(**kwargs)

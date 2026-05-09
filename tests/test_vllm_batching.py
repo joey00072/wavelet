@@ -101,3 +101,29 @@ def test_vllm_policy_load_uses_step_scoped_lora_request(monkeypatch) -> None:
 
     assert engine._lora_request.lora_name == "policy-000007"
     assert engine._lora_request.lora_int_id == 17
+
+
+def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
+    captured_kwargs: dict[str, object] = {}
+    vllm_module = ModuleType("vllm")
+
+    class FakeLLM:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    vllm_module.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setattr("wavelet.inference.vllm.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
+
+    config = RLConfig(
+        inference={"vllm": {"fully_sharded_loras": True}},
+        lora={"rank": 32, "target_modules": ["q_proj"]},
+    )
+    engine = VLLMPolicyInferenceEngine(config)
+
+    engine.setup()
+
+    assert captured_kwargs["enable_lora"] is True
+    assert captured_kwargs["fully_sharded_loras"] is True
+    assert captured_kwargs["max_lora_rank"] == 32

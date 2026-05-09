@@ -147,9 +147,12 @@ class BaseTrainer:
         self._setup_model_standard()
 
     def _setup_model_standard(self) -> None:
+        from wavelet.trainer.lora import (
+            apply_lora,
+            prepare_hf_tp_lora_for_training,
+        )
         from wavelet.trainer.model import (
             apply_liger_kernel,
-            apply_lora,
             maybe_wrap_ddp,
             maybe_wrap_fsdp,
             setup_model,
@@ -168,15 +171,6 @@ class BaseTrainer:
             ),
             parallel_dims=self.parallel_dims,
         )
-        if (
-            self.parallel_dims is not None
-            and self.parallel_dims.tp_enabled
-            and self.config.lora is not None
-        ):
-            raise NotImplementedError(
-                "Tensor parallel training with LoRA/QLoRA adapters is not "
-                "implemented yet."
-            )
         # Cast LoRA adapters to match the model's compute dtype so flash
         # attention doesn't have to upcast fp32 LoRA outputs at every layer.
         # "auto" → align adapters to whatever dtype the base weights loaded as.
@@ -193,6 +187,7 @@ class BaseTrainer:
             lora_dtype=lora_dtype,
             match_base_dtype=(lora_dtype is None and cfg_dtype == "auto"),
         )
+        prepare_hf_tp_lora_for_training(model, self.parallel_dims)
         # Activation offloading: intercepts ALL tensors saved for backward via
         # saved_tensors_hooks and streams them to pinned CPU RAM during forward,
         # fetching them back during backward. Matches TRL's activation_offloading=True.
@@ -233,7 +228,17 @@ class BaseTrainer:
             and not (self.parallel_dims is not None and self.parallel_dims.tp_enabled)
         ):
             model = model.to(self.world.device)
-        if self.world and fsdp_config is not None and fsdp_config.enabled:
+        tp_enabled = self.parallel_dims is not None and self.parallel_dims.tp_enabled
+        fsdp_wrap_enabled = (
+            fsdp_config is not None
+            and fsdp_config.enabled
+            and (
+                self.parallel_dims is None
+                or self.parallel_dims.fsdp_enabled
+                or not tp_enabled
+            )
+        )
+        if self.world and fsdp_wrap_enabled:
             model = maybe_wrap_fsdp(
                 model,
                 model_config=self.config.model,
@@ -241,7 +246,7 @@ class BaseTrainer:
                 world=self.world,
                 parallel_dims=self.parallel_dims,
             )
-        elif self.world and self.world.world_size > 1:
+        elif self.world and self.world.world_size > 1 and not tp_enabled:
             model = maybe_wrap_ddp(
                 model,
                 world=self.world,
@@ -257,12 +262,51 @@ class BaseTrainer:
         if not self.world:
             raise RuntimeError("World must be set up before data")
 
+        data_rank, data_world_size = self._data_partition()
         self.dataset = setup_dataset(
             self.tokenizer,
             self.config.data,
-            data_rank=self.world.rank,
-            data_world_size=self.world.world_size,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
         )
+
+    def _data_partition(self) -> tuple[int, int]:
+        if self.world is None:
+            raise RuntimeError("World must be set up before data partitioning")
+        if self.parallel_dims is None:
+            return self.world.rank, self.world.world_size
+
+        data_world_size = self._data_parallel_world_size()
+        data_rank = self._rank_in_pipeline_stage() // self._model_parallel_size()
+        return data_rank, data_world_size
+
+    def _is_data_parallel_metric_leader(self) -> bool:
+        if self.world is None:
+            raise RuntimeError("World must be set up before metric partitioning")
+        if self.parallel_dims is None:
+            return True
+
+        return self._rank_in_pipeline_stage() % self._model_parallel_size() == 0
+
+    def _data_parallel_world_size(self) -> int:
+        if self.world is None:
+            raise RuntimeError("World must be set up before data partitioning")
+        if self.parallel_dims is None:
+            return self.world.world_size
+        return self.parallel_dims.dp_replicate * self.parallel_dims.dp_shard
+
+    def _model_parallel_size(self) -> int:
+        if self.parallel_dims is None:
+            return 1
+        return self.parallel_dims.cp * self.parallel_dims.tp * self.parallel_dims.ep
+
+    def _rank_in_pipeline_stage(self) -> int:
+        if self.world is None:
+            raise RuntimeError("World must be set up before data partitioning")
+        ranks_per_pipeline_stage = (
+            self._data_parallel_world_size() * self._model_parallel_size()
+        )
+        return self.world.rank % ranks_per_pipeline_stage
 
     def _setup_optimizer(self) -> None:
         from wavelet.trainer.optim import setup_optimizer
