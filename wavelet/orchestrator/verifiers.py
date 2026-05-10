@@ -21,6 +21,10 @@ from wavelet.orchestrator.advantage import (
 from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.patches import apply_verifier_openai_patches
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import (
+    rollout_chunk_examples as _rollout_chunk_examples,
+)
+from wavelet.utils.perf import emit_perf
 
 
 _ENV_CACHE: dict[tuple[str, str], Any] = {}
@@ -55,10 +59,6 @@ class _VerifierGroupState:
     rollouts_to_schedule: int
     completed_outputs: list[dict[str, Any]] = field(default_factory=list)
     pinned_client_index: int | None = None
-
-
-def _perf_enabled() -> bool:
-    return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
 
 
 def generate_rollouts(
@@ -133,14 +133,15 @@ def generate_rollouts(
     _assign_rollout_advantages(outputs, config)
     records = [record for output in outputs for record in _records_from_output(output)]
     convert_seconds = perf_counter() - convert_started_at
-    if _perf_enabled():
-        print(
-            "WAVELET_PERF verifier_rollouts "
-            f"env_load={env_load_seconds:.3f} env_cache_hit={int(env_cache_hit)} "
-            f"rollout={rollout_seconds:.3f} convert={convert_seconds:.3f} "
-            f"outputs={len(outputs)} records={len(records)}",
-            flush=True,
-        )
+    emit_perf(
+        "verifier_rollouts",
+        env_load=env_load_seconds,
+        env_cache_hit=int(env_cache_hit),
+        rollout=rollout_seconds,
+        convert=convert_seconds,
+        outputs=len(outputs),
+        records=len(records),
+    )
     return records
 
 
@@ -394,18 +395,16 @@ class VerifierRolloutScheduler:
         ]
         records = _mark_zero_advantage_records_metric_only(records, self.config)
         convert_seconds = perf_counter() - convert_started_at
-        if _perf_enabled():
-            print(
-                "WAVELET_PERF verifier_scheduler "
-                f"attempts={attempt + 1} "
-                f"accepted_groups={accepted_groups} "
-                f"rejected_groups={rejected_groups} "
-                f"completed_groups={completed_groups} "
-                f"inflight_rollouts={self.inflight_rollout_count} "
-                f"records={len(records)} "
-                f"convert={convert_seconds:.3f} "
-                f"total={perf_counter() - started_at:.3f}",
-                flush=True,
+        emit_perf(
+            "verifier_scheduler",
+            attempts=attempt + 1,
+            accepted_groups=accepted_groups,
+            rejected_groups=rejected_groups,
+            completed_groups=completed_groups,
+            inflight_rollouts=self.inflight_rollout_count,
+            records=len(records),
+            convert=convert_seconds,
+            total=perf_counter() - started_at,
         )
         return records
 
@@ -1467,17 +1466,6 @@ def _sampling_args_with_cache_salt(
     extra_body["cache_salt"] = cache_salt
     copied["extra_body"] = extra_body
     return copied
-
-
-def _rollout_chunk_examples(config) -> int:
-    configured = config.orchestrator.rollout_chunk_examples
-    if configured is not None:
-        return configured
-    examples_per_step = config.orchestrator.examples_per_step
-    if examples_per_step is None:
-        return 1
-    async_level = max(config.orchestrator.max_async_level, 1)
-    return max(1, math.ceil(examples_per_step / async_level))
 
 
 def _assign_rollout_advantages(outputs: list[dict[str, Any]], config) -> None:

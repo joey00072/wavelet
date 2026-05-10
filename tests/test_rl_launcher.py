@@ -20,7 +20,7 @@ from wavelet.entrypoints.rl_launcher import (
     _wait_for_vllm_http_server,
 )
 from wavelet.entrypoints.rl_trainer import (
-    _chunks_per_step,
+    _StreamingChunkAccumulator,
     _dummy_rollout_row,
     _should_step_streaming_rollouts,
     _use_streaming_rollout_chunks,
@@ -29,8 +29,9 @@ from wavelet.entrypoints.rl_vllm_openai_server import _serve_args
 from wavelet.entrypoints.rl_vllm_openai_server import _fit_chat_request_to_context
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
-from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
+from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import chunks_per_step, rollout_chunk_examples
 
 
 def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
@@ -119,7 +120,20 @@ def test_streaming_chunk_resume_uses_chunk_index_space() -> None:
     )
 
     assert _use_streaming_rollout_chunks(config) is True
-    assert _chunks_per_step(config) == 4
+    assert rollout_chunk_examples(config) == 4
+    assert chunks_per_step(config) == 4
+
+
+def test_rollout_chunk_examples_defaults_to_async_split() -> None:
+    config = RLConfig(
+        orchestrator={
+            "examples_per_step": 17,
+            "max_async_level": 8,
+        },
+    )
+
+    assert rollout_chunk_examples(config) == 3
+    assert chunks_per_step(config) == 6
 
 
 def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
@@ -163,6 +177,32 @@ def test_streaming_rollout_waits_for_full_chunk_group_when_rows_overshoot() -> N
         target_rollout_rows=1024,
         chunks_per_step=8,
     )
+
+
+def test_streaming_chunk_accumulator_preserves_chunk_step_boundary(tmp_path) -> None:
+    accumulator = _StreamingChunkAccumulator()
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+
+    accumulator.buffer(first, 2)
+    assert not accumulator.should_load(min_rows=4)
+    accumulator.buffer(second, 3)
+    assert accumulator.should_load(min_rows=4)
+
+    paths, chunks = accumulator.drain_pending_paths()
+    accumulator.mark_loaded(rows=5, chunks=chunks, loss_scale=7.0)
+
+    assert paths == [first, second]
+    assert accumulator.pending_rows == 0
+    assert accumulator.accumulated_rows == 5
+    assert accumulator.accumulated_chunks == 2
+    assert accumulator.accumulated_loss_scale == 7.0
+    assert accumulator.should_step(chunks_per_step=2)
+
+    accumulator.reset_after_optimizer_step()
+    assert accumulator.accumulated_rows == 0
+    assert accumulator.accumulated_chunks == 0
+    assert accumulator.accumulated_loss_scale == 0.0
 
 
 def test_sleep_colocate_allows_multi_process_trainer() -> None:
@@ -262,7 +302,9 @@ def test_publish_adapter_policy_snapshot_copies_adapter(tmp_path: Path) -> None:
     step_dir = publish_adapter_policy_snapshot(output_dir, config, adapter, step=0)
 
     assert (step_dir / "STABLE").exists()
-    assert (step_dir / "adapter" / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert (
+        step_dir / "adapter" / "adapter_model.safetensors"
+    ).read_bytes() == b"weights"
     assert (step_dir / "policy.json").exists()
 
 

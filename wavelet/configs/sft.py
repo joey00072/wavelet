@@ -224,7 +224,7 @@ class MonitorConfig(BaseModel):
 
 
 class GenerateConfig(BaseModel):
-    prompt: str = "fuchsia"
+    prompt: str = "wavelet"
     max_new_tokens: int = Field(default=24, ge=1)
 
 

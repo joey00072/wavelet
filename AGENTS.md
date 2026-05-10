@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## Scope and Intent
 
-- This repository is currently a small Python project scaffold.
+- This repository is a Python post-training library for SFT and RL experiments.
 - Keep changes lightweight, explicit, and easy to review.
 - Prefer practical improvements over speculative architecture.
 - Treat `ref/` as read-only reference material.
@@ -12,17 +12,18 @@ Guidance for coding agents working in this repository.
 
 ## Repository Layout
 
-- `main.py`: temporary scaffold only; do not treat as long-term entry point.
 - `pyproject.toml`: project metadata and Python requirement.
-- `fuchsia/`: package directory; expected home for app code and CLI/module entry points.
-- `README.md`: currently empty.
+- `wavelet/`: package directory for app code, CLI, trainer, inference, and orchestration.
+- `examples/`: runnable example configs and data-preparation helpers.
+- `tests/`: pytest suite.
+- `README.md`: project overview and quick-start notes.
 - `ref/`: external/reference repos for style and workflow inspiration.
 
 ## Tooling Baseline
 
 - Python version: `>=3.11` (from `pyproject.toml`).
 - Use `uv` for environment and command execution.
-- Run commands from repository root: `/home/joey/workspace/fuchsia`.
+- Run commands from repository root: `/mnt/vast/joey/wavelet`.
 - Prefer deterministic CLI invocations that can run in CI.
 
 ## Git and Credentials
@@ -44,9 +45,8 @@ Guidance for coding agents working in this repository.
 
 ### Run / Build
 
-- Preferred app execution path: `uv run python -m fuchsia`
-- If a CLI script is added later: `uv run fuchsia <subcommand>`
-- `main.py` may be used only for temporary local scaffolding.
+- Preferred app execution path: `uv run python -m wavelet`
+- CLI commands use `uv run python -m wavelet <subcommand>`.
 - Build source/wheel packages: `uv build`
 
 ### Lint and Format

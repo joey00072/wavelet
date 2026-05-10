@@ -321,24 +321,7 @@ class RLOrchestrator:
         record: RLExample,
         scorer: RLRewardScorer,
     ) -> RLExample:
-        reward = scorer.score(record)
-        return RLExample(
-            prompt=record.prompt,
-            completion=record.completion,
-            advantage=record.advantage,
-            reward=reward,
-            input_ids=record.input_ids,
-            target_ids=record.target_ids,
-            loss_mask=record.loss_mask,
-            target_completion=record.target_completion,
-            inference_logprobs=record.inference_logprobs,
-            teacher_logprobs=record.teacher_logprobs,
-            temperatures=record.temperatures,
-            tools=record.tools,
-            chat_template_kwargs=record.chat_template_kwargs,
-            metadata=record.metadata,
-            source=record.source,
-        )
+        return replace(record, reward=scorer.score(record))
 
     def trim_to_step_examples(self, records: list[RLExample]) -> list[RLExample]:
         limit = self.config.orchestrator.examples_per_step

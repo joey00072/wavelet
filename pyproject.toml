@@ -88,6 +88,8 @@ url = "https://hub.primeintellect.ai/primeintellect/simple/"
 explicit = true
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["ref"]
 filterwarnings = [
     "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
     "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",

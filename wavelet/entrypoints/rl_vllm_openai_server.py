@@ -45,6 +45,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.utils.config import load_config
+from wavelet.utils.perf import emit_perf
 
 
 _CONFIG: RLConfig | None = None
@@ -343,13 +344,13 @@ def _fit_chat_request_to_context(
         updates["max_completion_tokens"] = remaining_tokens
     elif request.max_tokens is not None:
         updates["max_tokens"] = remaining_tokens
-    if _perf_enabled():
-        print(
-            "WAVELET_PERF fit_chat_context "
-            f"prompt_tokens={prompt_tokens} requested_tokens={requested_tokens} "
-            f"max_model_len={max_model_len} fitted_tokens={remaining_tokens}",
-            flush=True,
-        )
+    emit_perf(
+        "fit_chat_context",
+        prompt_tokens=prompt_tokens,
+        requested_tokens=requested_tokens,
+        max_model_len=max_model_len,
+        fitted_tokens=remaining_tokens,
+    )
     return request.model_copy(update=updates)
 
 
@@ -363,10 +364,6 @@ def _prompt_tokens_from_validation_error(error: VLLMValidationError) -> int | No
     if match is None:
         return None
     return int(match.group(1))
-
-
-def _perf_enabled() -> bool:
-    return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _base(request: Request) -> OpenAIServing:
@@ -518,12 +515,16 @@ def _log_lora_add_adapter_perf(
 ) -> None:
     if lora_request.lora_name != "policy" or mode == "touch":
         return
-    print(
-        "WAVELET_PERF lora_add_adapter "
-        f"name={lora_request.lora_name} id={lora_id} mode={mode} "
-        f"load={load_elapsed:.3f} add={add_elapsed:.3f} "
-        f"activate={activate_elapsed:.3f} total={total_elapsed:.3f}",
-        flush=True,
+    emit_perf(
+        "lora_add_adapter",
+        force=True,
+        name=lora_request.lora_name,
+        id=lora_id,
+        mode=mode,
+        load=load_elapsed,
+        add=add_elapsed,
+        activate=activate_elapsed,
+        total=total_elapsed,
     )
 
 

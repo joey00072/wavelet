@@ -639,7 +639,7 @@ def test_load_cached_env_applies_extra_env_kwargs() -> None:
     }
 
 
-def test_pretokenized_rows_match_prime_sequence_window() -> None:
+def test_pretokenized_rows_preserve_sequence_window() -> None:
     sample = _pretokenized_sample(
         RLExample(
             prompt=[],
