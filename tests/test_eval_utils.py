@@ -5,6 +5,7 @@ import pytest
 from wavelet.configs.rl_config import RLEvalConfig
 from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_inference import _final_eval_policy_step
+from wavelet.entrypoints.rl_inference import _target_steps
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.verifiers import _eval_metrics
 
@@ -86,6 +87,15 @@ def test_final_eval_policy_step_uses_last_exported_step() -> None:
 
     assert _final_eval_policy_step(config, 100) == 100
     assert _final_eval_policy_step(config, 99) == 96
+
+
+def test_rl_config_allows_zero_step_eval_only_runs() -> None:
+    config = RLConfig.model_validate(
+        {"max_steps": 0, "policy_transfer": {"export_initial": True}}
+    )
+
+    assert _target_steps(config) == 0
+    assert _final_eval_policy_step(config, 0) == 0
 
 
 def test_eval_metrics_include_avg_and_pass_at_k() -> None:

@@ -234,7 +234,7 @@ class SFTConfig(BaseModel):
     val: SFTValConfig | None = None
     optim: OptimizerConfig = OptimizerConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
-    max_grad_norm: float = Field(default=1.0, gt=0.0)
+    max_grad_norm: float = Field(default=1.0, ge=0.0)
     loss_impl: Literal["liger", "torch", "liger_fused"] = "torch"
     ckpt: CheckpointConfig | None = None
     lora: LoRAConfig | None = LoRAConfig()

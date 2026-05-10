@@ -14,10 +14,20 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step
-from wavelet.orchestrator.queue import FileSystemPolicyReceiver, FileSystemRolloutSender
+from wavelet.orchestrator.queue import (
+    FileSystemPolicyReceiver,
+    FileSystemRolloutSender,
+    publish_adapter_policy_snapshot,
+)
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.state_server import OrchestratorRunState, maybe_state_server
 from wavelet.utils.config import load_config
+
+
+def _target_steps(config: RLConfig) -> int:
+    if config.max_steps is None:
+        return 1
+    return config.max_steps
 
 
 def _perf_enabled() -> bool:
@@ -119,10 +129,17 @@ def main(argv: list[str] | None = None) -> int:
         config.output_dir,
         config.policy_transfer,
     )
+    if _target_steps(config) == 0 and config.model.adapter_path is not None:
+        publish_adapter_policy_snapshot(
+            config.output_dir,
+            config.policy_transfer,
+            config.model.adapter_path,
+            step=0,
+        )
     inference_engine = create_policy_inference_engine(config)
     inference_engine.setup()
     orchestrator = RLOrchestrator(config)
-    target_step = config.max_steps or 1
+    target_step = _target_steps(config)
     _preload_rollout_resources(config)
     with maybe_state_server(config, target_step=target_step) as state:
         if state is not None:

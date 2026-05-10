@@ -16,6 +16,12 @@ from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.utils.config import load_config
 
 
+def _target_steps(config: RLConfig) -> int:
+    if config.max_steps is None:
+        return 1
+    return config.max_steps
+
+
 def _perf_enabled() -> bool:
     return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
 
@@ -31,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
             trainer.export_policy(step=trainer.step)
             trainer.offload_after_refit()
             try:
-                target_step = config.max_steps or 1
+                target_step = _target_steps(config)
                 if _use_streaming_rollout_chunks(config):
                     receiver = FileSystemRolloutReceiver(
                         config.output_dir,

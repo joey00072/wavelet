@@ -812,6 +812,10 @@ def _serve_args(config: RLConfig) -> Namespace:
         "vllm",
         "--no-enable-log-requests",
     ]
+    if vllm_config.quantization is not None:
+        argv.extend(["--quantization", vllm_config.quantization])
+    if vllm_config.load_format is not None:
+        argv.extend(["--load-format", vllm_config.load_format])
     if vllm_config.data_parallel_size_local is not None:
         argv.extend(
             [

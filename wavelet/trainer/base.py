@@ -162,11 +162,24 @@ class BaseTrainer:
         # are in place when model weights are loaded.
         apply_liger_kernel(self.config.loss_impl, self.config.model.name)
         fsdp_config = getattr(self.config, "fsdp", None)
+        if self.config.model.load_in_4bit and fsdp_config is not None:
+            if fsdp_config.enabled:
+                raise NotImplementedError(
+                    "QLoRA training uses replicated DDP in Wavelet. Disable FSDP "
+                    "for model.load_in_4bit=true."
+                )
+        if self.config.model.load_in_4bit and self._uses_sleep_colocation():
+            raise NotImplementedError(
+                "QLoRA does not support colocate_sleep yet because bitsandbytes "
+                "4-bit modules cannot be moved between CPU and GPU."
+            )
         model = setup_model(
             self.config.model,
             max_seq_length=self.config.data.seq_len,
             distributed=bool(
-                (fsdp_config is not None and fsdp_config.enabled)
+                (self.world is not None and self.world.world_size > 1)
+                or self.config.model.load_in_4bit
+                or (fsdp_config is not None and fsdp_config.enabled)
                 or (self.parallel_dims is not None and self.parallel_dims.tp_enabled)
             ),
             parallel_dims=self.parallel_dims,
@@ -226,6 +239,7 @@ class BaseTrainer:
             self.world
             and (fsdp_config is None or not fsdp_config.enabled)
             and not (self.parallel_dims is not None and self.parallel_dims.tp_enabled)
+            and not self.config.model.load_in_4bit
         ):
             model = model.to(self.world.device)
         tp_enabled = self.parallel_dims is not None and self.parallel_dims.tp_enabled
@@ -249,6 +263,7 @@ class BaseTrainer:
         elif self.world and self.world.world_size > 1 and not tp_enabled:
             model = maybe_wrap_ddp(
                 model,
+                model_config=self.config.model,
                 world=self.world,
                 parallel_dims=self.parallel_dims,
             )

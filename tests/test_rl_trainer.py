@@ -4,6 +4,8 @@ import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import ModelConfig
+from wavelet.distributed.world import World
+from wavelet.trainer import model as model_utils
 from wavelet.trainer.model import _fsdp_mixed_precision
 from wavelet.trainer.rl_trainer import (
     RLTrainer,
@@ -202,3 +204,92 @@ def test_float32_fsdp_config_uses_prime_style_mixed_precision(monkeypatch) -> No
     assert policy.param_dtype is torch.bfloat16
     assert policy.reduce_dtype is torch.float32
     assert policy.buffer_dtype is torch.bfloat16
+
+
+def test_distributed_qlora_uses_current_cuda_device_map(monkeypatch) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeConfig:
+        quantization_config = None
+
+    class FakeModel:
+        def __init__(self) -> None:
+            self.config = type("Config", (), {"use_cache": True})()
+
+        def named_modules(self):
+            return iter(())
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(
+        model_utils.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: FakeConfig(),
+    )
+    monkeypatch.setattr(
+        model_utils,
+        "BitsAndBytesConfig",
+        lambda **kwargs: {"bitsandbytes": kwargs},
+    )
+    monkeypatch.setattr(
+        model_utils,
+        "prepare_model_for_kbit_training",
+        lambda model, **kwargs: model,
+    )
+
+    def fake_from_pretrained(*args, **kwargs):
+        del args
+        captured_kwargs.update(kwargs)
+        return FakeModel()
+
+    monkeypatch.setattr(
+        model_utils.AutoModelForCausalLM,
+        "from_pretrained",
+        fake_from_pretrained,
+    )
+
+    model_utils.setup_model(
+        ModelConfig(
+            name="fake/model",
+            attn_implementation="sdpa",
+            load_in_4bit=True,
+            gradient_checkpointing=False,
+        ),
+        distributed=True,
+    )
+
+    assert captured_kwargs["device_map"] == {"": 2}
+    assert "quantization_config" in captured_kwargs
+
+
+def test_qlora_ddp_does_not_move_quantized_model(monkeypatch) -> None:
+    class FakeModel:
+        def to(self, device: torch.device):
+            raise AssertionError(f"QLoRA model should not be moved with .to({device})")
+
+    calls: dict[str, object] = {}
+
+    def fake_ddp(model, **kwargs):
+        calls["model"] = model
+        calls["kwargs"] = kwargs
+        return model
+
+    monkeypatch.setattr(model_utils.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(model_utils, "DDP", fake_ddp)
+
+    model = FakeModel()
+    wrapped = model_utils.maybe_wrap_ddp(
+        model,  # type: ignore[arg-type]
+        model_config=ModelConfig(load_in_4bit=True),
+        world=World(
+            rank=0,
+            local_rank=1,
+            world_size=2,
+            local_world_size=2,
+            device=torch.device("cuda"),
+        ),
+    )
+
+    assert wrapped is model
+    assert calls["model"] is model
+    assert calls["kwargs"] == {"device_ids": [1], "output_device": 1}

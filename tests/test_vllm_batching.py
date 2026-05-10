@@ -127,3 +127,32 @@ def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
     assert captured_kwargs["enable_lora"] is True
     assert captured_kwargs["fully_sharded_loras"] is True
     assert captured_kwargs["max_lora_rank"] == 32
+
+
+def test_vllm_setup_passes_quantized_load_args(monkeypatch) -> None:
+    captured_kwargs: dict[str, object] = {}
+    vllm_module = ModuleType("vllm")
+
+    class FakeLLM:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    vllm_module.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setattr("wavelet.inference.vllm.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
+
+    config = RLConfig(
+        inference={
+            "vllm": {
+                "quantization": "bitsandbytes",
+                "load_format": "bitsandbytes",
+            }
+        },
+    )
+    engine = VLLMPolicyInferenceEngine(config)
+
+    engine.setup()
+
+    assert captured_kwargs["quantization"] == "bitsandbytes"
+    assert captured_kwargs["load_format"] == "bitsandbytes"
