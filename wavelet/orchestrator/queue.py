@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -255,3 +257,39 @@ class FileSystemPolicyReceiver:
     @staticmethod
     def _is_stable_policy_dir(step_dir: Path) -> bool:
         return step_dir.is_dir() and (step_dir / STABLE_BATCH_MARKER).exists()
+
+
+def publish_adapter_policy_snapshot(
+    output_dir: Path,
+    config: RLPolicyTransferConfig,
+    adapter_path: Path,
+    *,
+    step: int = 0,
+) -> Path:
+    policy_dir = resolve_policy_dir(output_dir, config)
+    step_dir = get_policy_step_dir(policy_dir, step)
+    tmp_dir = step_dir.with_name(f"{step_dir.name}.tmp")
+    adapter_path = Path(adapter_path)
+    if not (adapter_path / "adapter_model.safetensors").is_file():
+        raise FileNotFoundError(
+            f"Adapter snapshot '{adapter_path}' is missing adapter_model.safetensors."
+        )
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    if step_dir.exists():
+        shutil.rmtree(step_dir)
+    tmp_adapter_dir = tmp_dir / "adapter"
+    tmp_adapter_dir.mkdir(parents=True, exist_ok=True)
+    for source in adapter_path.iterdir():
+        if source.is_file():
+            shutil.copy2(source, tmp_adapter_dir / source.name)
+    meta = {
+        "format_version": 1,
+        "step": step,
+        "kind": "adapter",
+        "source_adapter_path": str(adapter_path),
+    }
+    (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
+    (tmp_dir / STABLE_BATCH_MARKER).touch()
+    tmp_dir.replace(step_dir)
+    return step_dir

@@ -234,7 +234,13 @@ class RLOrchestrator:
     def run(
         self, *, start_step: int = 0, max_steps: int | None = None
     ) -> list[RolloutBatch]:
-        total_steps = max_steps or self.config.max_steps or 1
+        total_steps = (
+            max_steps
+            if max_steps is not None
+            else self.config.max_steps
+            if self.config.max_steps is not None
+            else 1
+        )
         published: list[RolloutBatch] = []
         for offset in range(total_steps):
             published.append(self.publish(step=start_step + offset))

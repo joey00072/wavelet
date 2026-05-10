@@ -248,6 +248,8 @@ class RLVLLMConfig(BaseModel):
     server_backend: Literal["offline", "openai"] = "offline"
     gpu_memory_utilization: float = Field(default=0.35, gt=0.0, le=1.0)
     max_model_len: int | None = Field(default=None, ge=8)
+    quantization: str | None = None
+    load_format: str | None = None
     tensor_parallel_size: int = Field(default=1, ge=1)
     data_parallel_size: int = Field(default=1, ge=1)
     data_parallel_size_local: int | None = Field(default=None, ge=1)
@@ -430,7 +432,7 @@ class RLConfig(BaseModel):
     loss: RLLossConfig = RLLossConfig()
     optim: OptimizerConfig = OptimizerConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
-    max_grad_norm: float = Field(default=1.0, gt=0.0)
+    max_grad_norm: float = Field(default=1.0, ge=0.0)
     loss_impl: Literal["liger", "torch", "liger_fused"] = "torch"
     ckpt: CheckpointConfig | None = None
     lora: LoRAConfig | None = LoRAConfig()
@@ -448,7 +450,7 @@ class RLConfig(BaseModel):
     clean_output_dir: bool = False
     dry_run: bool = False
     epochs: int = Field(default=1, ge=1)
-    max_steps: int | None = Field(default=None, ge=1)
+    max_steps: int | None = Field(default=None, ge=0)
     seed: int = 0
     activation_offloading: ActivationOffloadingConfig | None = None
 

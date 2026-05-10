@@ -13,6 +13,8 @@ from wavelet.entrypoints.rl_inference import (
     _wait_for_colocated_training_memory,
 )
 from wavelet.entrypoints.rl_launcher import (
+    _config_path_for_role,
+    _role_specs,
     _sleep_vllm_http_servers,
     _trainer_device_group,
     _wait_for_vllm_http_server,
@@ -28,6 +30,7 @@ from wavelet.entrypoints.rl_vllm_openai_server import _fit_chat_request_to_conte
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
 
 
 def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
@@ -208,6 +211,59 @@ def test_vllm_openai_server_enables_fully_sharded_loras() -> None:
     assert args.enable_lora is True
     assert args.fully_sharded_loras is True
     assert args.max_lora_rank == 32
+
+
+def test_vllm_openai_server_passes_quantized_load_args() -> None:
+    config = RLConfig(
+        inference={
+            "vllm": {
+                "quantization": "bitsandbytes",
+                "load_format": "bitsandbytes",
+            }
+        }
+    )
+
+    args = _serve_args(config)
+
+    assert args.quantization == "bitsandbytes"
+    assert args.load_format == "bitsandbytes"
+
+
+def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
+    config = RLConfig(
+        max_steps=0,
+        output_dir=tmp_path,
+        launcher={"mode": "process", "inference_num_replicas": 1},
+        inference={"mode": "vllm_http"},
+        orchestrator={
+            "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
+        },
+        policy_transfer={"export_initial": True},
+    )
+
+    roles = _role_specs(
+        config,
+        trainer_config_path=_config_path_for_role(config, "trainer", config),
+        inference_config_path=_config_path_for_role(config, "inference", config),
+        inference_ports=[8100],
+    )
+
+    assert [role.name for role in roles] == ["vllm_server_0", "inference"]
+
+
+def test_publish_adapter_policy_snapshot_copies_adapter(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter_source"
+    adapter.mkdir()
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    output_dir = tmp_path / "out"
+    config = RLConfig().policy_transfer
+
+    step_dir = publish_adapter_policy_snapshot(output_dir, config, adapter, step=0)
+
+    assert (step_dir / "STABLE").exists()
+    assert (step_dir / "adapter" / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert (step_dir / "policy.json").exists()
 
 
 def test_vllm_openai_server_auto_enables_qwen_tool_parser() -> None:

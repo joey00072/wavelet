@@ -35,6 +35,12 @@ from wavelet.utils.pathing import (
 from wavelet.utils.serialization import dump_yaml
 
 
+def _target_steps(config: RLConfig) -> int:
+    if config.max_steps is None:
+        return 1
+    return config.max_steps
+
+
 @dataclass(slots=True)
 class StepTimes:
     started_at: float
@@ -222,7 +228,7 @@ def _run_sync_rollout_loop(
     inference_engine,
     orchestrator: RLOrchestrator,
 ) -> None:
-    target_step = config.max_steps or 1
+    target_step = _target_steps(config)
     while trainer.step < target_step:
         timings = StepTimes(started_at=perf_counter())
         timings.update_weights = _load_policy_for_step(
@@ -249,7 +255,7 @@ def _run_async_rollout_loop(
     inference_engine,
     orchestrator: RLOrchestrator,
 ) -> None:
-    target_step = config.max_steps or 1
+    target_step = _target_steps(config)
     with ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="wavelet-rollout"
     ) as pool:
@@ -346,27 +352,15 @@ def _log_step_times(
     )
 
 
-def _run_process_launcher(config: RLConfig) -> int:
-    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
-        raise RuntimeError(
-            "Do not run 'wavelet rl' under torchrun. For distributed RL, run "
-            "'wavelet rl-inference' once and 'torchrun -m wavelet rl-trainer' for "
-            "the trainer ranks."
-        )
-
-    inference_replicas = config.launcher.inference_num_replicas
-    inference_ports = _http_ports(config, inference_replicas)
-    rollout_config = _rollout_client_config(config, ports=inference_ports)
-
-    _write_subconfigs(rollout_config, config)
-    config_dir = get_config_dir(config.output_dir)
-    trainer_config_path = config_dir / "rl_trainer.yaml"
-    inference_config_path = config_dir / "rl_inference.yaml"
-    dump_yaml(
-        inference_config_path,
-        rollout_config.model_dump(mode="json", exclude_none=True),
-    )
-
+def _role_specs(
+    config: RLConfig,
+    *,
+    trainer_config_path: Path,
+    inference_config_path: Path,
+    inference_ports: list[int],
+) -> list[RoleSpec]:
+    inference_replicas = len(inference_ports)
+    eval_only = _target_steps(config) == 0
     roles: list[RoleSpec] = []
     if config.inference.mode == "vllm_http":
         inference_devices = _as_device_groups(
@@ -396,8 +390,8 @@ def _run_process_launcher(config: RLConfig) -> int:
                     service=True,
                 )
             )
-    roles.extend(
-        [
+    if not eval_only:
+        roles.append(
             RoleSpec(
                 name="trainer",
                 command="rl-trainer",
@@ -405,15 +399,45 @@ def _run_process_launcher(config: RLConfig) -> int:
                 log_name="rl_trainer",
                 cuda_visible_devices=_trainer_device_group(config),
                 torchrun_nproc_per_node=config.launcher.trainer_num_processes,
-            ),
-            RoleSpec(
-                name="inference",
-                command="rl-inference",
-                config_path=inference_config_path,
-                log_name="rl_inference",
-                cuda_visible_devices=None,
-            ),
-        ]
+            )
+        )
+    roles.append(
+        RoleSpec(
+            name="inference",
+            command="rl-inference",
+            config_path=inference_config_path,
+            log_name="rl_inference",
+            cuda_visible_devices=None,
+        )
+    )
+    return roles
+
+
+def _run_process_launcher(config: RLConfig) -> int:
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError(
+            "Do not run 'wavelet rl' under torchrun. For distributed RL, run "
+            "'wavelet rl-inference' once and 'torchrun -m wavelet rl-trainer' for "
+            "the trainer ranks."
+        )
+
+    inference_replicas = config.launcher.inference_num_replicas
+    inference_ports = _http_ports(config, inference_replicas)
+    rollout_config = _rollout_client_config(config, ports=inference_ports)
+
+    _write_subconfigs(rollout_config, config)
+    config_dir = get_config_dir(config.output_dir)
+    trainer_config_path = config_dir / "rl_trainer.yaml"
+    inference_config_path = config_dir / "rl_inference.yaml"
+    dump_yaml(
+        inference_config_path,
+        rollout_config.model_dump(mode="json", exclude_none=True),
+    )
+    roles = _role_specs(
+        config,
+        trainer_config_path=trainer_config_path,
+        inference_config_path=inference_config_path,
+        inference_ports=inference_ports,
     )
 
     launcher = create_role_launcher(config)

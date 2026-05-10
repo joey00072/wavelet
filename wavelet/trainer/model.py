@@ -211,6 +211,11 @@ def setup_model(
         "attn_implementation": attn_implementation,
     }
     if parallel_dims is not None and parallel_dims.tp_enabled:
+        if config.load_in_4bit:
+            raise NotImplementedError(
+                "QLoRA with trainer tensor parallelism is not supported. Use "
+                "replicated DDP training for 4-bit LoRA adapters."
+            )
         if config.adapter_path is not None:
             raise NotImplementedError(
                 "Loading PEFT adapters onto a tensor-parallel model is not "
@@ -239,8 +244,7 @@ def setup_model(
                 bnb_4bit_compute_dtype=compute_dtype,
             )
             model_kwargs["quantization_config"] = quantization_config
-        if not distributed:
-            model_kwargs["device_map"] = "auto"
+        model_kwargs["device_map"] = _quantized_device_map(distributed)
 
     previous_transformers_verbosity = transformers_logging.get_verbosity()
     suppress_float32_flash_warning = (
@@ -392,6 +396,7 @@ def maybe_wrap_fsdp(
 def maybe_wrap_ddp(
     model: PreTrainedModel,
     *,
+    model_config: ModelConfig,
     world: World,
     parallel_dims: ParallelDims | None = None,
 ) -> PreTrainedModel:
@@ -410,12 +415,23 @@ def maybe_wrap_ddp(
         )
 
     if world.device.type == "cuda":
-        model = cast(PreTrainedModel, model.to(world.device))
+        if not model_config.load_in_4bit:
+            model = cast(PreTrainedModel, model.to(world.device))
         return cast(
             PreTrainedModel,
             DDP(model, device_ids=[world.local_rank], output_device=world.local_rank),
         )
+    if not model_config.load_in_4bit:
+        model = cast(PreTrainedModel, model.to(world.device))
     return cast(PreTrainedModel, DDP(model))
+
+
+def _quantized_device_map(distributed: bool) -> str | dict[str, int]:
+    if not distributed:
+        return "auto"
+    if not torch.cuda.is_available():
+        return "auto"
+    return {"": torch.cuda.current_device()}
 
 
 def export_model_for_save(
