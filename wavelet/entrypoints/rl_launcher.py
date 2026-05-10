@@ -26,6 +26,7 @@ from wavelet.orchestrator.queue import (
     FileSystemRolloutReceiver,
     RolloutBatch,
 )
+from wavelet.orchestrator.schedule import target_steps as _target_steps
 from wavelet.utils.config import load_config
 from wavelet.utils.pathing import (
     get_config_dir,
@@ -33,12 +34,6 @@ from wavelet.utils.pathing import (
     validate_output_dir,
 )
 from wavelet.utils.serialization import dump_yaml
-
-
-def _target_steps(config: RLConfig) -> int:
-    if config.max_steps is None:
-        return 1
-    return config.max_steps
 
 
 @dataclass(slots=True)
@@ -144,10 +139,7 @@ def _http_ports(config: RLConfig, count: int) -> list[int]:
 
 
 def _vllm_base_urls(config: RLConfig, ports: list[int]) -> list[str]:
-    return [
-        f"http://{config.inference.http.host}:{port}/v1"
-        for port in ports
-    ]
+    return [f"http://{config.inference.http.host}:{port}/v1" for port in ports]
 
 
 def _inference_replica_config(config: RLConfig, *, port: int) -> RLConfig:
@@ -536,22 +528,6 @@ def _run_integrated_launcher(config: RLConfig) -> int:
         _write_subconfigs(config, trainer_config)
         trainer = RLTrainer(trainer_config)
         trainer.setup()
-        if not all(
-            hasattr(trainer, attr)
-            for attr in (
-                "load_rollout_path",
-                "train_until",
-                "finalize",
-                "export_policy",
-            )
-        ):
-            rollout_path = RLOrchestrator(config).materialize()
-            trainer_config = _trainer_config_for_rollouts(config, rollout_path)
-            _write_subconfigs(config, trainer_config)
-            trainer = RLTrainer(trainer_config)
-            trainer.setup()
-            trainer.train()
-            return 0
         receiver = FileSystemRolloutReceiver(
             config.output_dir,
             config.transport,

@@ -2,36 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import subprocess
 import sys
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from math import ceil
 from pathlib import Path
 from time import perf_counter, sleep
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.policy import create_policy_inference_engine
-from wavelet.orchestrator.eval_utils import compute_eval_policy_step
 from wavelet.orchestrator.queue import (
     FileSystemPolicyReceiver,
     FileSystemRolloutSender,
     publish_adapter_policy_snapshot,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import (
+    chunks_per_step as _chunks_per_step,
+    policy_step_to_load as _policy_step_to_load,
+    required_policy_step as _required_policy_step,
+    rollout_chunk_examples as _rollout_chunk_examples,
+    select_due_eval_envs,
+    target_steps as _target_steps,
+)
 from wavelet.orchestrator.state_server import OrchestratorRunState, maybe_state_server
 from wavelet.utils.config import load_config
-
-
-def _target_steps(config: RLConfig) -> int:
-    if config.max_steps is None:
-        return 1
-    return config.max_steps
-
-
-def _perf_enabled() -> bool:
-    return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
+from wavelet.utils.perf import emit_perf
 
 
 def _preload_rollout_resources(config: RLConfig) -> None:
@@ -59,66 +55,6 @@ def _preload_rollout_resources(config: RLConfig) -> None:
         config.orchestrator.verifier_env_args,
         _verifier_extra_env_kwargs(config),
     )
-
-
-def _required_policy_step(config: RLConfig, rollout_step: int) -> int:
-    """Oldest policy step allowed for a rollout under the async window."""
-    async_level = config.orchestrator.max_async_level
-    off_policy_steps = config.orchestrator.max_off_policy_steps
-    if async_level > 0 and off_policy_steps > 0:
-        allowed_lag = min(async_level, off_policy_steps)
-    else:
-        allowed_lag = max(async_level, off_policy_steps)
-    return max(rollout_step - allowed_lag, 0)
-
-
-def _next_exported_policy_step(config: RLConfig, required_step: int) -> int:
-    if required_step <= 0 and config.policy_transfer.export_initial:
-        return 0
-    interval = config.policy_transfer.export_every_steps
-    return ((max(required_step, 1) + interval - 1) // interval) * interval
-
-
-def _latest_exported_policy_step_at_or_before(
-    config: RLConfig, step: int
-) -> int | None:
-    if step <= 0:
-        return 0 if config.policy_transfer.export_initial else None
-    interval = config.policy_transfer.export_every_steps
-    exported_step = (step // interval) * interval
-    if exported_step > 0:
-        return exported_step
-    return 0 if config.policy_transfer.export_initial else None
-
-
-def _policy_step_to_load(
-    config: RLConfig,
-    policy_receiver: FileSystemPolicyReceiver,
-    *,
-    rollout_step: int,
-    loaded_policy_step: int | None,
-) -> int | None:
-    required_step = _required_policy_step(config, rollout_step)
-    available_steps = policy_receiver.available_steps()
-    available_in_window = [
-        step
-        for step in available_steps
-        if step >= required_step
-        and step <= rollout_step
-        and (loaded_policy_step is None or step > loaded_policy_step)
-    ]
-    if available_in_window:
-        return max(available_in_window)
-    if loaded_policy_step is None or loaded_policy_step < required_step:
-        next_step = _next_exported_policy_step(config, required_step)
-        latest_allowed = _latest_exported_policy_step_at_or_before(
-            config,
-            rollout_step,
-        )
-        if latest_allowed is None or latest_allowed < required_step:
-            return next_step
-        return min(next_step, latest_allowed)
-    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -238,13 +174,12 @@ def _run_prefetch_inference(
             rollout_step=next_step_to_submit,
             last_eval_steps=last_eval_steps,
         )
-        if _perf_enabled():
-            print(
-                "WAVELET_PERF policy_load "
-                f"step={policy_step} wait_policy={wait_policy_seconds:.3f} "
-                f"load_policy={load_policy_seconds:.3f}",
-                flush=True,
-            )
+        emit_perf(
+            "policy_load",
+            step=policy_step,
+            wait_policy=wait_policy_seconds,
+            load_policy=load_policy_seconds,
+        )
         return True
 
     def collect_done(done) -> None:
@@ -282,17 +217,15 @@ def _run_prefetch_inference(
                     completed_count=len(completed),
                 )
             _sleep_for_colocated_sleep(config, inference_engine)
-            if _perf_enabled():
-                print(
-                    "WAVELET_PERF inference_step "
-                    f"step={step} "
-                    f"wait_policy=0.000 "
-                    f"load_policy=0.000 "
-                    f"publish={publish_seconds:.3f} "
-                    f"materialize={materialize_seconds:.3f} "
-                    f"total={materialize_seconds + publish_seconds:.3f}",
-                    flush=True,
-                )
+            emit_perf(
+                "inference_step",
+                step=step,
+                wait_policy=0.0,
+                load_policy=0.0,
+                publish=publish_seconds,
+                materialize=materialize_seconds,
+                total=materialize_seconds + publish_seconds,
+            )
             print(batch.path)
             published = True
         return published
@@ -427,14 +360,13 @@ def _run_prefetch_inference(
                         pending_count=len(pending),
                     )
                 submitted = True
-                if _perf_enabled():
-                    print(
-                        "WAVELET_PERF inference_submit "
-                        f"step={step} wait_policy={wait_policy_seconds:.3f} "
-                        f"load_policy={load_policy_seconds:.3f} "
-                        f"submit={perf_counter() - step_started_at:.3f}",
-                        flush=True,
-                    )
+                emit_perf(
+                    "inference_submit",
+                    step=step,
+                    wait_policy=wait_policy_seconds,
+                    load_policy=load_policy_seconds,
+                    submit=perf_counter() - step_started_at,
+                )
 
             if submitted or finish_policy_load():
                 continue
@@ -512,8 +444,7 @@ def _run_streaming_native_inference(
         else {}
     )
     chunk_examples = _rollout_chunk_examples(config)
-    examples_per_step = config.orchestrator.examples_per_step or chunk_examples
-    chunks_per_step = max(ceil(examples_per_step / chunk_examples), 1)
+    chunks_per_step = _chunks_per_step(config)
     target_chunks = target_step * chunks_per_step
     pending_chunk_limit = (
         config.orchestrator.max_pending_rollout_chunks
@@ -567,13 +498,12 @@ def _run_streaming_native_inference(
             rollout_step=next_queue_step_to_submit // chunks_per_step,
             last_eval_steps=last_eval_steps,
         )
-        if _perf_enabled():
-            print(
-                "WAVELET_PERF policy_load "
-                f"step={policy_step} wait_policy={wait_policy_seconds:.3f} "
-                f"load_policy={load_policy_seconds:.3f}",
-                flush=True,
-            )
+        emit_perf(
+            "policy_load",
+            step=policy_step,
+            wait_policy=wait_policy_seconds,
+            load_policy=load_policy_seconds,
+        )
         return True
 
     def collect_done(done) -> None:
@@ -611,17 +541,17 @@ def _run_streaming_native_inference(
                     completed_count=len(completed),
                 )
             _sleep_for_colocated_sleep(config, inference_engine)
-            if _perf_enabled():
-                print(
-                    "WAVELET_PERF inference_native_chunk "
-                    f"queue_step={queue_step} optimizer_step={optimizer_step} "
-                    f"chunk_index={chunk_index} "
-                    f"wait_policy=0.000 load_policy=0.000 "
-                    f"publish={publish_seconds:.3f} "
-                    f"materialize={materialize_seconds:.3f} "
-                    f"total={materialize_seconds + publish_seconds:.3f}",
-                    flush=True,
-                )
+            emit_perf(
+                "inference_native_chunk",
+                queue_step=queue_step,
+                optimizer_step=optimizer_step,
+                chunk_index=chunk_index,
+                wait_policy=0.0,
+                load_policy=0.0,
+                publish=publish_seconds,
+                materialize=materialize_seconds,
+                total=materialize_seconds + publish_seconds,
+            )
             print(batch.path)
             published = True
         return published
@@ -795,16 +725,15 @@ def _run_streaming_native_inference(
                         pending_count=len(pending),
                     )
                 submitted = True
-                if _perf_enabled():
-                    print(
-                        "WAVELET_PERF inference_native_submit "
-                        f"queue_step={queue_step} optimizer_step={optimizer_step} "
-                        f"chunk_index={queue_step % chunks_per_step} "
-                        f"wait_policy={wait_policy_seconds:.3f} "
-                        f"load_policy={load_policy_seconds:.3f} "
-                        f"submit={perf_counter() - step_started_at:.3f}",
-                        flush=True,
-                    )
+                emit_perf(
+                    "inference_native_submit",
+                    queue_step=queue_step,
+                    optimizer_step=optimizer_step,
+                    chunk_index=queue_step % chunks_per_step,
+                    wait_policy=wait_policy_seconds,
+                    load_policy=load_policy_seconds,
+                    submit=perf_counter() - step_started_at,
+                )
 
             if submitted or finish_policy_load():
                 continue
@@ -878,10 +807,7 @@ async def _run_rolling_verifier_inference(
         else {}
     )
     chunk_groups = _rollout_chunk_examples(config)
-    chunks_per_step = max(
-        ceil((config.orchestrator.examples_per_step or chunk_groups) / chunk_groups),
-        1,
-    )
+    chunks_per_step = _chunks_per_step(config)
     target_chunks = target_step * chunks_per_step
     try:
         for queue_step in range(target_chunks):
@@ -904,13 +830,12 @@ async def _run_rolling_verifier_inference(
                     rollout_step=optimizer_step,
                     last_eval_steps=last_eval_steps,
                 )
-                if _perf_enabled():
-                    print(
-                        "WAVELET_PERF policy_load "
-                        f"step={loaded_policy_step} wait_policy=0.000 "
-                        "load_policy=async",
-                        flush=True,
-                    )
+                emit_perf(
+                    "policy_load",
+                    step=loaded_policy_step,
+                    wait_policy=0.0,
+                    load_policy="async",
+                )
             policy_step = _policy_step_to_load(
                 config,
                 policy_receiver,
@@ -1005,19 +930,19 @@ async def _run_rolling_verifier_inference(
                     next_queue_step_to_publish=queue_step + 1,
                     completed_count=0,
                 )
-            if _perf_enabled():
-                print(
-                    "WAVELET_PERF inference_chunk "
-                    f"queue_step={queue_step} optimizer_step={optimizer_step} "
-                    f"groups={chunk_groups} wait_policy={wait_policy_seconds:.3f} "
-                    f"load_policy={load_policy_seconds:.3f} "
-                    f"generate={generate_seconds:.3f} "
-                    f"materialize={materialize_seconds:.3f} "
-                    f"publish={publish_seconds:.3f} "
-                    f"pending_policy_update={int(pending_policy_update is not None)} "
-                    f"total={perf_counter() - step_started_at:.3f}",
-                    flush=True,
-                )
+            emit_perf(
+                "inference_chunk",
+                queue_step=queue_step,
+                optimizer_step=optimizer_step,
+                groups=chunk_groups,
+                wait_policy=wait_policy_seconds,
+                load_policy=load_policy_seconds,
+                generate=generate_seconds,
+                materialize=materialize_seconds,
+                publish=publish_seconds,
+                pending_policy_update=int(pending_policy_update is not None),
+                total=perf_counter() - step_started_at,
+            )
             print(batch.path)
         if pending_policy_update is not None:
             loaded_policy_step = await pending_policy_update
@@ -1132,17 +1057,6 @@ def _load_policy_step(
     return policy.step, wait_policy_seconds, load_policy_seconds
 
 
-def _rollout_chunk_examples(config: RLConfig) -> int:
-    configured = config.orchestrator.rollout_chunk_examples
-    if configured is not None:
-        return configured
-    examples_per_step = config.orchestrator.examples_per_step
-    if examples_per_step is None:
-        return 1
-    async_level = max(config.orchestrator.max_async_level, 1)
-    return max(1, ceil(examples_per_step / async_level))
-
-
 def _write_materialized_records(
     orchestrator: RLOrchestrator,
     records: list[RLExample],
@@ -1173,16 +1087,14 @@ def _publish_step(
     step: int,
     inference_engine,
 ):
-    materialize_started_at = perf_counter()
-    materialized_path = orchestrator.materialize(
+    return _time_materialize_and_publish(
+        lambda: orchestrator.materialize(
+            step=step,
+            inference_engine=inference_engine,
+        ),
+        rollout_sender,
         step=step,
-        inference_engine=inference_engine,
     )
-    materialize_seconds = perf_counter() - materialize_started_at
-    publish_started_at = perf_counter()
-    batch = rollout_sender.publish(materialized_path, step=step)
-    publish_seconds = perf_counter() - publish_started_at
-    return step, batch, materialize_seconds, publish_seconds
 
 
 def _publish_native_chunk(
@@ -1194,19 +1106,32 @@ def _publish_native_chunk(
     chunk_examples: int,
     inference_engine,
 ):
-    materialize_started_at = perf_counter()
-    materialized_path = orchestrator.materialize_native_chunk(
-        optimizer_step=optimizer_step,
-        chunk_index=chunk_index,
-        queue_step=queue_step,
-        chunk_examples=chunk_examples,
-        inference_engine=inference_engine,
+    return _time_materialize_and_publish(
+        lambda: orchestrator.materialize_native_chunk(
+            optimizer_step=optimizer_step,
+            chunk_index=chunk_index,
+            queue_step=queue_step,
+            chunk_examples=chunk_examples,
+            inference_engine=inference_engine,
+        ),
+        rollout_sender,
+        step=queue_step,
     )
+
+
+def _time_materialize_and_publish(
+    materialize,
+    rollout_sender: FileSystemRolloutSender,
+    *,
+    step: int,
+):
+    materialize_started_at = perf_counter()
+    materialized_path = materialize()
     materialize_seconds = perf_counter() - materialize_started_at
     publish_started_at = perf_counter()
-    batch = rollout_sender.publish(materialized_path, step=queue_step)
+    batch = rollout_sender.publish(materialized_path, step=step)
     publish_seconds = perf_counter() - publish_started_at
-    return queue_step, batch, materialize_seconds, publish_seconds
+    return step, batch, materialize_seconds, publish_seconds
 
 
 def _final_eval_policy_step(config: RLConfig, target_step: int) -> int | None:
@@ -1227,21 +1152,11 @@ def _maybe_run_evals(
     rollout_step: int,
     last_eval_steps: dict[str, int],
 ) -> None:
-    if config.eval is None:
-        return
-
-    envs = []
-    for env in config.eval.env:
-        eval_step = compute_eval_policy_step(
-            policy_step=policy_step,
-            last_eval_step=last_eval_steps[env.resolved_name],
-            interval=env.interval,
-            eval_base_model=config.eval.eval_base_model,
-        )
-        if eval_step is None:
-            continue
-        last_eval_steps[env.resolved_name] = eval_step
-        envs.append(env)
+    envs = select_due_eval_envs(
+        config,
+        policy_step=policy_step,
+        last_eval_steps=last_eval_steps,
+    )
     _run_evals(
         config,
         orchestrator,
@@ -1259,21 +1174,11 @@ async def _maybe_run_evals_async(
     rollout_step: int,
     last_eval_steps: dict[str, int],
 ) -> None:
-    if config.eval is None:
-        return
-
-    envs = []
-    for env in config.eval.env:
-        eval_step = compute_eval_policy_step(
-            policy_step=policy_step,
-            last_eval_step=last_eval_steps[env.resolved_name],
-            interval=env.interval,
-            eval_base_model=config.eval.eval_base_model,
-        )
-        if eval_step is None:
-            continue
-        last_eval_steps[env.resolved_name] = eval_step
-        envs.append(env)
+    envs = select_due_eval_envs(
+        config,
+        policy_step=policy_step,
+        last_eval_steps=last_eval_steps,
+    )
     await _run_evals_async(
         config,
         orchestrator,
@@ -1293,11 +1198,7 @@ def _run_evals(
 ) -> None:
     if not envs:
         return
-    if (
-        config.orchestrator.custom_rollout_function
-        != "wavelet.orchestrator.verifiers:generate_rollouts"
-    ):
-        raise ValueError("RL eval is currently supported for verifier rollouts only.")
+    _validate_eval_supported(config)
 
     from wavelet.orchestrator.verifiers import evaluate_env
 
@@ -1321,11 +1222,7 @@ async def _run_evals_async(
 ) -> None:
     if not envs:
         return
-    if (
-        config.orchestrator.custom_rollout_function
-        != "wavelet.orchestrator.verifiers:generate_rollouts"
-    ):
-        raise ValueError("RL eval is currently supported for verifier rollouts only.")
+    _validate_eval_supported(config)
 
     from wavelet.orchestrator.verifiers import evaluate_env_async
 
@@ -1337,6 +1234,14 @@ async def _run_evals_async(
             policy_step=policy_step,
         )
         print(json_dumps_compact(metrics), flush=True)
+
+
+def _validate_eval_supported(config: RLConfig) -> None:
+    if (
+        config.orchestrator.custom_rollout_function
+        != "wavelet.orchestrator.verifiers:generate_rollouts"
+    ):
+        raise ValueError("RL eval is currently supported for verifier rollouts only.")
 
 
 def _sleep_for_colocated_sleep(config: RLConfig, inference_engine) -> None:

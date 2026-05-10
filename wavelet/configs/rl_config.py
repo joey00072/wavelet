@@ -19,6 +19,14 @@ from wavelet.configs.sft import (
 )
 
 
+def _normalize_legacy_sampling_fields(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    if "max_tokens" in value and "max_completion_tokens" not in value:
+        value["max_completion_tokens"] = value.pop("max_tokens")
+    return value
+
+
 class RLDataConfig(BaseModel):
     source: Literal["local", "hf", "fake"] = "local"
     path: Path | list[Path] = Path("outputs/unsloth_math_data/rl_train.jsonl")
@@ -142,11 +150,7 @@ class RLSamplingConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_sampling_fields(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            return value
-        if "max_tokens" in value and "max_completion_tokens" not in value:
-            value["max_completion_tokens"] = value.pop("max_tokens")
-        return value
+        return _normalize_legacy_sampling_fields(value)
 
 
 class RLEvalSamplingConfig(BaseModel):
@@ -163,11 +167,7 @@ class RLEvalSamplingConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_sampling_fields(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            return value
-        if "max_tokens" in value and "max_completion_tokens" not in value:
-            value["max_completion_tokens"] = value.pop("max_tokens")
-        return value
+        return _normalize_legacy_sampling_fields(value)
 
     def to_sampling_args(self) -> dict[str, Any]:
         args: dict[str, Any] = {"logprobs": True}

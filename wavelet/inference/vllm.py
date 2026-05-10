@@ -16,10 +16,7 @@ from wavelet.data.rl_dataset import RLExample
 from wavelet.data.tokenization import build_sample
 from wavelet.inference.policy import PolicyInferenceEngine, RLInference, token_ids
 from wavelet.trainer.model import setup_tokenizer
-
-
-def _perf_enabled() -> bool:
-    return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
+from wavelet.utils.perf import emit_perf, perf_enabled
 
 
 @dataclass
@@ -176,12 +173,12 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         if adapter_dir.exists():
             self._load_adapter_policy(adapter_dir, step=step)
             self.policy_step = step
-            if _perf_enabled():
-                print(
-                    "WAVELET_PERF vllm_load_policy "
-                    f"step={step} kind=adapter seconds={perf_counter() - started_at:.3f}",
-                    flush=True,
-                )
+            emit_perf(
+                "vllm_load_policy",
+                step=step,
+                kind="adapter",
+                seconds=perf_counter() - started_at,
+            )
             return
         model_dir = policy_dir / "model"
         if model_dir.exists():
@@ -444,22 +441,26 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         max_memory = 0
         if torch.cuda.is_available():
             max_memory = torch.cuda.max_memory_reserved()
-        if _perf_enabled():
+        if perf_enabled():
             tokenize_calls = self._tokenize_calls
             tokenize_tokens = self._tokenize_tokens
             tokenize_seconds = self._tokenize_seconds
             self._tokenize_calls = 0
             self._tokenize_tokens = 0
             self._tokenize_seconds = 0.0
-            print(
-                "WAVELET_PERF vllm_openai_batch "
-                f"batch={len(payloads)} prefill_tokens={prefill_tokens} "
-                f"completion_tokens={completion_tokens} seconds={seconds:.3f} "
-                f"tokens_per_s={(prefill_tokens + completion_tokens) / max(seconds, 1e-9):.1f} "
-                f"tokenize_calls={tokenize_calls} tokenize_tokens={tokenize_tokens} "
-                f"tokenize_seconds={tokenize_seconds:.4f} "
-                f"cuda_max_reserved={max_memory}",
-                flush=True,
+            emit_perf(
+                "vllm_openai_batch",
+                batch=len(payloads),
+                prefill_tokens=prefill_tokens,
+                completion_tokens=completion_tokens,
+                seconds=seconds,
+                tokens_per_s=(
+                    f"{(prefill_tokens + completion_tokens) / max(seconds, 1e-9):.1f}"
+                ),
+                tokenize_calls=tokenize_calls,
+                tokenize_tokens=tokenize_tokens,
+                tokenize_seconds=f"{tokenize_seconds:.4f}",
+                cuda_max_reserved=max_memory,
             )
         return results
 
@@ -551,8 +552,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         return {
             "count": len(ids),
             "max_model_len": self.config.inference.vllm.max_model_len
-            or self.config.data.seq_len
-            + 1,
+            or self.config.data.seq_len + 1,
             "tokens": ids,
         }
 
@@ -622,7 +622,9 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             kwargs["include_stop_str_in_output"] = bool(include_stop)
         return SamplingParams(**kwargs)
 
-    def _load_adapter_policy(self, adapter_dir: Path, *, step: int | None = None) -> None:
+    def _load_adapter_policy(
+        self, adapter_dir: Path, *, step: int | None = None
+    ) -> None:
         if self.llm is None:
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
         if self.config.lora is None:

@@ -16,7 +16,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.distributed.world import barrier
+from wavelet.data.jsonl import count_nonempty_jsonl_rows
 from wavelet.data.loading import Example
 from wavelet.data.rl_dataset import (
     PackedRLDataset,
@@ -27,6 +27,7 @@ from wavelet.data.rl_dataset import (
     setup_rl_dataset,
 )
 from wavelet.data.tokenization import build_sample
+from wavelet.distributed.world import barrier
 from wavelet.orchestrator.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
@@ -47,17 +48,29 @@ SUM_SYNCED_METRIC_KEYS = {
     "micro_batch/count",
     "tokens/train",
 }
-
-
-def _count_rollout_rows(path: Path) -> int:
-    rows = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                rows += 1
-    if rows == 0:
-        raise ValueError(f"Rollout batch '{path}' contains no rows.")
-    return rows
+ZERO_LOSS_METRIC_KEYS = (
+    "mismatch_kl",
+    "masked_mismatch_kl",
+    "unmasked_mismatch_kl",
+    "is_masked",
+    "is_masked_low",
+    "is_masked_high",
+    "policy_loss",
+    "kl_loss",
+    "advantage_mean",
+)
+TRAIN_METRIC_ALIASES = {
+    "loss": "train/loss",
+    "policy_loss": "train/policy_loss",
+    "kl_loss": "train/kl_loss",
+    "mismatch_kl": "kl/mismatch",
+    "masked_mismatch_kl": "kl/masked_mismatch",
+    "unmasked_mismatch_kl": "kl/unmasked_mismatch",
+    "is_masked": "dppo/is_masked",
+    "is_masked_low": "dppo/is_masked_low",
+    "is_masked_high": "dppo/is_masked_high",
+    "advantage_mean": "advantage/token/mean",
+}
 
 
 def _scalar_or_json(value: object) -> object:
@@ -391,7 +404,10 @@ class RLTrainer(BaseTrainer):
 
     def load_rollout_path(self, rollout_path: Path) -> None:
         rollout_path = Path(rollout_path)
-        rollout_count = _count_rollout_rows(rollout_path)
+        rollout_count = count_nonempty_jsonl_rows(
+            rollout_path,
+            description="Rollout batch",
+        )
         optimizer_batch_size = rollout_count
         pack_sequences = self.config.data.pack_sequences
         if self.world is not None and not pack_sequences:
@@ -841,7 +857,7 @@ class RLTrainer(BaseTrainer):
             self._rollout_metric_accum.clear()
         if grad_norm is not None:
             metrics["optim/grad_norm"] = grad_norm
-        metrics.update(self._prime_style_metric_aliases(metrics))
+        metrics.update(self._standard_metric_aliases(metrics))
         metrics = self._sync_metrics(metrics)
         metrics = self._finalize_synced_metrics(metrics)
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
@@ -865,17 +881,7 @@ class RLTrainer(BaseTrainer):
 
     def _zero_loss_metrics(self, loss: Tensor) -> dict[str, Tensor]:
         zero = loss.detach() * 0.0
-        return {
-            "mismatch_kl": zero,
-            "masked_mismatch_kl": zero,
-            "unmasked_mismatch_kl": zero,
-            "is_masked": zero,
-            "is_masked_low": zero,
-            "is_masked_high": zero,
-            "policy_loss": zero,
-            "kl_loss": zero,
-            "advantage_mean": zero,
-        }
+        return {key: zero for key in ZERO_LOSS_METRIC_KEYS}
 
     def _inference_logprobs(
         self, batch: dict[str, Tensor], attention_mask: Tensor | None
@@ -1079,30 +1085,14 @@ class RLTrainer(BaseTrainer):
                 aggregated[key] = sum(values) / len(values)
         return aggregated
 
-    def _prime_style_metric_aliases(
+    def _standard_metric_aliases(
         self, metrics: dict[str, float]
     ) -> dict[str, float]:
-        aliases: dict[str, float] = {}
-        if "loss" in metrics:
-            aliases["train/loss"] = metrics["loss"]
-        if "policy_loss" in metrics:
-            aliases["train/policy_loss"] = metrics["policy_loss"]
-        if "kl_loss" in metrics:
-            aliases["train/kl_loss"] = metrics["kl_loss"]
-        if "mismatch_kl" in metrics:
-            aliases["kl/mismatch"] = metrics["mismatch_kl"]
-        if "masked_mismatch_kl" in metrics:
-            aliases["kl/masked_mismatch"] = metrics["masked_mismatch_kl"]
-        if "unmasked_mismatch_kl" in metrics:
-            aliases["kl/unmasked_mismatch"] = metrics["unmasked_mismatch_kl"]
-        if "is_masked" in metrics:
-            aliases["dppo/is_masked"] = metrics["is_masked"]
-        if "is_masked_low" in metrics:
-            aliases["dppo/is_masked_low"] = metrics["is_masked_low"]
-        if "is_masked_high" in metrics:
-            aliases["dppo/is_masked_high"] = metrics["is_masked_high"]
-        if "advantage_mean" in metrics:
-            aliases["advantage/token/mean"] = metrics["advantage_mean"]
+        aliases = {
+            alias: metrics[key]
+            for key, alias in TRAIN_METRIC_ALIASES.items()
+            if key in metrics
+        }
         if "reward_mean" in metrics:
             aliases.setdefault("reward/all/mean", metrics["reward_mean"])
         return aliases

@@ -1,29 +1,71 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
-from math import ceil
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 
 import torch
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.data.jsonl import count_nonempty_jsonl_rows
 from wavelet.distributed.world import barrier
 from wavelet.orchestrator.queue import FileSystemRolloutReceiver
+from wavelet.orchestrator.schedule import (
+    chunks_per_step as _chunks_per_step,
+    target_steps as _target_steps,
+)
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.utils.config import load_config
+from wavelet.utils.perf import emit_perf
 
 
-def _target_steps(config: RLConfig) -> int:
-    if config.max_steps is None:
-        return 1
-    return config.max_steps
+@dataclass
+class _StreamingChunkAccumulator:
+    accumulated_rows: int = 0
+    accumulated_chunks: int = 0
+    accumulated_loss_scale: float = 0.0
+    chunk_index: int = 0
+    pending_paths: list[Path] = field(default_factory=list)
+    pending_rows: int = 0
 
+    def buffer(self, path: Path, rows: int) -> None:
+        self.chunk_index += 1
+        self.pending_paths.append(path)
+        self.pending_rows += rows
 
-def _perf_enabled() -> bool:
-    return os.environ.get("WAVELET_PERF_LOG", "").lower() in {"1", "true", "yes", "on"}
+    def should_load(self, *, min_rows: int) -> bool:
+        if self.pending_rows >= min_rows:
+            return True
+        return self.accumulated_rows > 0 and self.pending_rows > 0
+
+    def drain_pending_paths(self) -> tuple[list[Path], int]:
+        paths = self.pending_paths
+        loaded_chunks = len(paths)
+        self.pending_paths = []
+        self.pending_rows = 0
+        return paths, loaded_chunks
+
+    def mark_loaded(
+        self,
+        *,
+        rows: int,
+        chunks: int,
+        loss_scale: float | None,
+    ) -> None:
+        self.accumulated_rows += rows
+        self.accumulated_chunks += chunks
+        if loss_scale is not None:
+            self.accumulated_loss_scale += float(loss_scale)
+
+    def should_step(self, *, chunks_per_step: int) -> bool:
+        return self.accumulated_chunks >= chunks_per_step
+
+    def reset_after_optimizer_step(self) -> None:
+        self.accumulated_rows = 0
+        self.accumulated_chunks = 0
+        self.accumulated_loss_scale = 0.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,16 +116,15 @@ def main(argv: list[str] | None = None) -> int:
                     trainer.offload_after_refit()
                     export_seconds = perf_counter() - export_started_at
                     total_seconds = perf_counter() - loop_started_at
-                    if _perf_enabled():
-                        print(
-                            "WAVELET_PERF trainer_step "
-                            f"step={trainer.step} wait_batch={wait_seconds:.3f} "
-                            f"load_rollout={load_seconds:.3f} "
-                            f"train={train_seconds:.3f} "
-                            f"export_policy={export_seconds:.3f} "
-                            f"total={total_seconds:.3f}",
-                            flush=True,
-                        )
+                    emit_perf(
+                        "trainer_step",
+                        step=trainer.step,
+                        wait_batch=wait_seconds,
+                        load_rollout=load_seconds,
+                        train=train_seconds,
+                        export_policy=export_seconds,
+                        total=total_seconds,
+                    )
             except Exception:
                 trainer.finalize(status="failed")
                 raise
@@ -119,64 +160,53 @@ def _run_streaming_rollout_training(
     examples_per_step = config.orchestrator.examples_per_step
     if examples_per_step is None:
         raise ValueError("orchestrator.examples_per_step is required.")
-    rollouts_per_example = config.orchestrator.rollouts_per_example or 1
-    target_rollout_rows = examples_per_step * rollouts_per_example
     chunks_per_step = _chunks_per_step(config)
     min_loadable_rows = _min_loadable_rollout_rows(config, trainer)
-    accumulated_rows = 0
-    accumulated_chunks = 0
-    accumulated_loss_scale = 0.0
-    chunk_index = 0
-    pending_paths: list[Path] = []
-    pending_rows = 0
+    accumulator = _StreamingChunkAccumulator()
 
     while trainer.step < target_step:
         loop_started_at = perf_counter()
         wait_started_at = perf_counter()
         batch = receiver.wait_available()
         wait_seconds = perf_counter() - wait_started_at
-        row_count = _count_rollout_rows(batch.path)
-        chunk_index += 1
-        pending_paths.append(batch.path)
-        pending_rows += row_count
-        force_partial_load = accumulated_rows > 0 and pending_rows > 0
-        if pending_rows < min_loadable_rows and not force_partial_load:
-            if _perf_enabled():
-                print(
-                    "WAVELET_PERF trainer_chunk_buffered "
-                    f"queue_step={batch.step} trainer_step={trainer.step} "
-                    f"rows={row_count} pending_rows={pending_rows} "
-                    f"min_loadable_rows={min_loadable_rows} "
-                    f"wait_batch={wait_seconds:.3f}",
-                    flush=True,
-                )
+        row_count = count_nonempty_jsonl_rows(
+            batch.path,
+            description="Rollout chunk",
+        )
+        accumulator.buffer(batch.path, row_count)
+        if not accumulator.should_load(min_rows=min_loadable_rows):
+            emit_perf(
+                "trainer_chunk_buffered",
+                queue_step=batch.step,
+                trainer_step=trainer.step,
+                rows=row_count,
+                pending_rows=accumulator.pending_rows,
+                min_loadable_rows=min_loadable_rows,
+                wait_batch=wait_seconds,
+            )
             continue
 
         load_started_at = perf_counter()
         rollout_path = _combined_rollout_path(
             config,
             trainer=trainer,
-            paths=pending_paths,
-            chunk_index=chunk_index,
+            paths=accumulator.pending_paths,
+            chunk_index=accumulator.chunk_index,
             min_rows=min_loadable_rows,
         )
-        row_count = _count_rollout_rows(rollout_path)
-        loaded_chunks = len(pending_paths)
-        pending_paths = []
-        pending_rows = 0
-        trainer.load_rollout_path(rollout_path)
-        chunk_loss_scale = trainer._optimizer_batch_loss_scale
-        accumulated_rows += row_count
-        accumulated_chunks += loaded_chunks
-        if chunk_loss_scale is not None:
-            accumulated_loss_scale += float(chunk_loss_scale)
-        should_step = _should_step_streaming_rollouts(
-            accumulated_rows=accumulated_rows,
-            accumulated_chunks=accumulated_chunks,
-            target_rollout_rows=target_rollout_rows,
-            chunks_per_step=chunks_per_step,
+        row_count = count_nonempty_jsonl_rows(
+            rollout_path,
+            description="Rollout chunk",
         )
-        remaining_chunks = max(chunks_per_step - accumulated_chunks, 0)
+        _, loaded_chunks = accumulator.drain_pending_paths()
+        trainer.load_rollout_path(rollout_path)
+        accumulator.mark_loaded(
+            rows=row_count,
+            chunks=loaded_chunks,
+            loss_scale=trainer._optimizer_batch_loss_scale,
+        )
+        should_step = accumulator.should_step(chunks_per_step=chunks_per_step)
+        remaining_chunks = max(chunks_per_step - accumulator.accumulated_chunks, 0)
         loaded_micro_batches = trainer._loaded_micro_batch_count
         if should_step:
             trainer.accumulation_steps = (
@@ -187,13 +217,15 @@ def _run_streaming_rollout_training(
                 trainer._accumulated_micro_batches
                 + loaded_micro_batches * max(remaining_chunks + 1, 2)
             )
-        if accumulated_loss_scale > 0.0:
+        if accumulator.accumulated_loss_scale > 0.0:
             # Normalize the whole optimizer step by the exact local unmasked
             # token count. Streaming chunks arrive one at a time, so backprop
             # raw chunk losses and divide accumulated gradients once before the
             # optimizer step, when the exact denominator is known.
             trainer._optimizer_batch_loss_scale = 1.0
-            trainer._gradient_accumulation_loss_scale = accumulated_loss_scale
+            trainer._gradient_accumulation_loss_scale = (
+                accumulator.accumulated_loss_scale
+            )
         else:
             trainer._optimizer_batch_loss_scale = None
             trainer._gradient_accumulation_loss_scale = None
@@ -212,28 +244,26 @@ def _run_streaming_rollout_training(
                 train_seconds=train_seconds,
                 loop_seconds=perf_counter() - loop_started_at,
             )
-            accumulated_rows = 0
-            accumulated_chunks = 0
-            accumulated_loss_scale = 0.0
+            accumulator.reset_after_optimizer_step()
             export_started_at = perf_counter()
             trainer.export_policy(step=trainer.step)
             trainer.offload_after_refit()
             export_seconds = perf_counter() - export_started_at
         total_seconds = perf_counter() - loop_started_at
-        if _perf_enabled():
-            print(
-                "WAVELET_PERF trainer_chunk "
-                f"queue_step={batch.step} trainer_step={trainer.step} "
-                f"rows={row_count} accumulated_rows={accumulated_rows} "
-                f"accumulated_chunks={accumulated_chunks} "
-                f"wait_batch={wait_seconds:.3f} "
-                f"load_rollout={load_seconds:.3f} "
-                f"train={train_seconds:.3f} "
-                f"export_policy={export_seconds:.3f} "
-                f"optimizer_step={int(metrics is not None)} "
-                f"total={total_seconds:.3f}",
-                flush=True,
-            )
+        emit_perf(
+            "trainer_chunk",
+            queue_step=batch.step,
+            trainer_step=trainer.step,
+            rows=row_count,
+            accumulated_rows=accumulator.accumulated_rows,
+            accumulated_chunks=accumulator.accumulated_chunks,
+            wait_batch=wait_seconds,
+            load_rollout=load_seconds,
+            train=train_seconds,
+            export_policy=export_seconds,
+            optimizer_step=int(metrics is not None),
+            total=total_seconds,
+        )
 
 
 def _should_step_streaming_rollouts(
@@ -243,7 +273,6 @@ def _should_step_streaming_rollouts(
     target_rollout_rows: int,
     chunks_per_step: int,
 ) -> bool:
-    _ = accumulated_rows, target_rollout_rows
     return accumulated_chunks >= chunks_per_step
 
 
@@ -300,7 +329,9 @@ def _combined_rollout_path(
     chunk_index: int,
     min_rows: int,
 ) -> Path:
-    row_count = sum(_count_rollout_rows(path) for path in paths)
+    row_count = sum(
+        count_nonempty_jsonl_rows(path, description="Rollout chunk") for path in paths
+    )
     target_rows = _padded_row_count(row_count, multiple=min_rows)
     if len(paths) == 1 and row_count == target_rows:
         return paths[0]
@@ -339,7 +370,9 @@ def _padded_row_count(row_count: int, *, multiple: int) -> int:
     return ((row_count + multiple - 1) // multiple) * multiple
 
 
-def _dummy_rollout_row(config: RLConfig, source: dict[str, object]) -> dict[str, object]:
+def _dummy_rollout_row(
+    config: RLConfig, source: dict[str, object]
+) -> dict[str, object]:
     row = dict(source)
     loss_mask = row.get("loss_mask")
     if not isinstance(loss_mask, list):
@@ -356,35 +389,6 @@ def _dummy_rollout_row(config: RLConfig, source: dict[str, object]) -> dict[str,
     metadata["_wavelet_dummy_rollout"] = True
     row[config.data.metadata_column] = metadata
     return row
-
-
-def _rollout_chunk_examples(config: RLConfig) -> int:
-    configured = config.orchestrator.rollout_chunk_examples
-    if configured is not None:
-        return configured
-    examples_per_step = config.orchestrator.examples_per_step
-    if examples_per_step is None:
-        return 1
-    async_level = max(config.orchestrator.max_async_level, 1)
-    return max(1, ceil(examples_per_step / async_level))
-
-
-def _chunks_per_step(config: RLConfig) -> int:
-    examples_per_step = config.orchestrator.examples_per_step
-    if examples_per_step is None:
-        raise ValueError("orchestrator.examples_per_step is required.")
-    return max(ceil(examples_per_step / _rollout_chunk_examples(config)), 1)
-
-
-def _count_rollout_rows(path) -> int:
-    rows = 0
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                rows += 1
-    if rows == 0:
-        raise ValueError(f"Rollout chunk '{path}' contains no rows.")
-    return rows
 
 
 if __name__ == "__main__":

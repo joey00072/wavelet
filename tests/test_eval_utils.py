@@ -5,8 +5,8 @@ import pytest
 from wavelet.configs.rl_config import RLEvalConfig
 from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_inference import _final_eval_policy_step
-from wavelet.entrypoints.rl_inference import _target_steps
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
+from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.verifiers import _eval_metrics
 
 
@@ -81,6 +81,37 @@ def test_eval_config_inherits_group_defaults() -> None:
     assert env.resolved_name == "alphabet"
 
 
+def test_select_due_eval_envs_updates_each_env_independently() -> None:
+    config = RLConfig(
+        eval={
+            "eval_base_model": False,
+            "env": [
+                {"id": "alphabet-sort", "name": "alphabet", "interval": 4},
+                {"id": "reverse-text", "name": "reverse", "interval": 8},
+            ],
+        },
+    )
+    last_eval_steps = {"alphabet": -1, "reverse": -1}
+
+    assert (
+        select_due_eval_envs(
+            config,
+            policy_step=0,
+            last_eval_steps=last_eval_steps,
+        )
+        == []
+    )
+
+    due = select_due_eval_envs(
+        config,
+        policy_step=8,
+        last_eval_steps=last_eval_steps,
+    )
+
+    assert [env.resolved_name for env in due] == ["alphabet", "reverse"]
+    assert last_eval_steps == {"alphabet": 8, "reverse": 8}
+
+
 def test_final_eval_policy_step_uses_last_exported_step() -> None:
     config = RLConfig()
     config.policy_transfer.export_every_steps = 4
@@ -94,7 +125,7 @@ def test_rl_config_allows_zero_step_eval_only_runs() -> None:
         {"max_steps": 0, "policy_transfer": {"export_initial": True}}
     )
 
-    assert _target_steps(config) == 0
+    assert target_steps(config) == 0
     assert _final_eval_policy_step(config, 0) == 0
 
 

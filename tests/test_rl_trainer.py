@@ -195,7 +195,9 @@ def test_model_logprobs_casts_chunked_output_to_fp32() -> None:
     assert torch.allclose(actual, logprobs.float())
 
 
-def test_float32_fsdp_config_uses_prime_style_mixed_precision(monkeypatch) -> None:
+def test_float32_fsdp_config_uses_bfloat16_params_and_float32_reduce(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
     policy = _fsdp_mixed_precision(ModelConfig(torch_dtype="float32"))  # noqa: SLF001

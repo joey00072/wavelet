@@ -1,48 +1,45 @@
 from __future__ import annotations
 
+import importlib
 import sys
 
-import wavelet.entrypoints.rl_launcher
-import wavelet.entrypoints.rl_inference
-import wavelet.entrypoints.rl_orchestrator
-import wavelet.entrypoints.rl_trainer
-import wavelet.entrypoints.rl_vllm_openai_server
-import wavelet.entrypoints.rl_vllm_server
-import wavelet.entrypoints.sft
+
+COMMANDS = {
+    "rl": ("wavelet.entrypoints.rl_launcher", "Run reinforcement learning launcher"),
+    "rl-trainer": ("wavelet.entrypoints.rl_trainer", "Run RL trainer"),
+    "rl-orchestrator": ("wavelet.entrypoints.rl_orchestrator", "Run RL orchestrator"),
+    "rl-inference": (
+        "wavelet.entrypoints.rl_inference",
+        "Run RL inference annotation stage",
+    ),
+    "rl-vllm-server": (
+        "wavelet.entrypoints.rl_vllm_server",
+        "Run persistent vLLM HTTP rollout server",
+    ),
+    "rl-vllm-openai-server": (
+        "wavelet.entrypoints.rl_vllm_openai_server",
+        "Run vLLM OpenAI rollout server",
+    ),
+    "sft": ("wavelet.entrypoints.sft", "Run supervised fine-tuning"),
+}
 
 
 def main() -> int:
     if len(sys.argv) < 2:
         print("Usage: wavelet <command> [args]")
         print("Commands:")
-        print("  rl               Run reinforcement learning launcher")
-        print("  rl-trainer       Run RL trainer")
-        print("  rl-orchestrator  Run RL orchestrator")
-        print("  rl-inference     Run RL inference annotation stage")
-        print("  rl-vllm-server   Run persistent vLLM HTTP rollout server")
-        print("  rl-vllm-openai-server Run vLLM OpenAI rollout server")
-        print("  sft    Run supervised fine-tuning")
+        for command, (_, description) in COMMANDS.items():
+            print(f"  {command:<22} {description}")
         return 1
 
     command = sys.argv[1]
-
-    if command == "rl":
-        return wavelet.entrypoints.rl_launcher.main(sys.argv[2:])
-    if command == "rl-trainer":
-        return wavelet.entrypoints.rl_trainer.main(sys.argv[2:])
-    if command == "rl-orchestrator":
-        return wavelet.entrypoints.rl_orchestrator.main(sys.argv[2:])
-    if command == "rl-inference":
-        return wavelet.entrypoints.rl_inference.main(sys.argv[2:])
-    if command == "rl-vllm-server":
-        return wavelet.entrypoints.rl_vllm_server.main(sys.argv[2:])
-    if command == "rl-vllm-openai-server":
-        return wavelet.entrypoints.rl_vllm_openai_server.main(sys.argv[2:])
-    if command == "sft":
-        return wavelet.entrypoints.sft.main(sys.argv[2:])
-    else:
+    if command not in COMMANDS:
         print(f"Unknown command: {command}")
         return 1
+
+    module_name, _ = COMMANDS[command]
+    module = importlib.import_module(module_name)
+    return module.main(sys.argv[2:])
 
 
 if __name__ == "__main__":

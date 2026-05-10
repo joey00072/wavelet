@@ -9,7 +9,7 @@ from wavelet.configs.rl_config import RLLossConfig
 from wavelet.trainer.rl_loss import compute_loss
 
 
-def test_loss_scale_matches_prime_batch_token_normalization() -> None:
+def test_loss_scale_matches_batch_token_normalization() -> None:
     loss_config = RLLossConfig(kl_tau=0.0)
     total_loss = torch.tensor(0.0)
 
@@ -33,7 +33,7 @@ def test_loss_scale_matches_prime_batch_token_normalization() -> None:
     assert total_loss.item() == -1.25
 
 
-def test_packed_loss_metrics_are_averaged_per_sequence_like_prime() -> None:
+def test_packed_loss_metrics_are_averaged_per_sequence() -> None:
     loss_config = RLLossConfig(kl_tau=0.0)
     trainer_logprobs = torch.tensor([[0.0, 0.0, 0.0, math.log(0.5)]])
     inference_logprobs = torch.tensor([[0.0, 0.0, 0.0, math.log(0.25)]])
