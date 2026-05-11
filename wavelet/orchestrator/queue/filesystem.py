@@ -1,17 +1,30 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
+from wavelet.orchestrator.queue.events import append_event_best_effort
+from wavelet.orchestrator.queue.lifecycle import (
+    process_identity,
+    utc_now,
+    write_manifest,
+)
+from wavelet.orchestrator.queue.types import (
+    POLICY_META_FILENAME,
+    STABLE_BATCH_MARKER,
+    STEP_DIR_PREFIX,
+    PolicySnapshot,
+    QueueEvent,
+    RolloutBatch,
+    RolloutManifest,
+)
 
 
-STEP_DIR_PREFIX = "step-"
-STABLE_BATCH_MARKER = "STABLE"
-POLICY_META_FILENAME = "policy.json"
+logger = logging.getLogger(__name__)
 
 
 def resolve_queue_dir(output_dir: Path, config: RLTransportConfig) -> Path:
@@ -43,43 +56,75 @@ def _parse_step(path: Path) -> int | None:
         return None
 
 
-@dataclass(frozen=True, slots=True)
-class RolloutBatch:
-    step: int
-    path: Path
-    step_dir: Path
-
-
-@dataclass(frozen=True, slots=True)
-class PolicySnapshot:
-    step: int
-    step_dir: Path
-
-    @property
-    def adapter_dir(self) -> Path:
-        return self.step_dir / "adapter"
-
-    @property
-    def model_dir(self) -> Path:
-        return self.step_dir / "model"
-
-    @property
-    def meta_path(self) -> Path:
-        return self.step_dir / POLICY_META_FILENAME
-
-
 class FileSystemRolloutSender:
     def __init__(self, output_dir: Path, config: RLTransportConfig) -> None:
         self.config = config
+        self.output_dir = output_dir
         self.queue_dir = resolve_queue_dir(output_dir, config)
 
-    def publish(self, source_path: Path, *, step: int) -> RolloutBatch:
+    def publish(
+        self,
+        source_path: Path,
+        *,
+        step: int,
+        optimizer_step: int | None = None,
+        chunk_index: int | None = None,
+        policy_step: int | None = None,
+        rows: int | None = None,
+        tokens: int | None = None,
+        reward_mean: float | None = None,
+        producer_id: str | None = None,
+        events_dir: Path | None = None,
+    ) -> RolloutBatch:
         step_dir = get_step_dir(self.queue_dir, step)
         step_dir.mkdir(parents=True, exist_ok=True)
         target_path = step_dir / self.config.rollout_filename
         tmp_path = step_dir / f"{self.config.rollout_filename}.tmp"
         tmp_path.write_bytes(Path(source_path).read_bytes())
         tmp_path.replace(target_path)
+        metadata_provided = any(
+            value is not None
+            for value in (
+                optimizer_step,
+                chunk_index,
+                policy_step,
+                rows,
+                tokens,
+                reward_mean,
+                producer_id,
+                events_dir,
+            )
+        )
+        if metadata_provided:
+            created_at = utc_now()
+            producer_id = producer_id or process_identity("rl-inference")
+            manifest = RolloutManifest(
+                format_version=1,
+                queue_step=step,
+                optimizer_step=optimizer_step,
+                chunk_index=chunk_index,
+                policy_step=policy_step,
+                rows=rows,
+                tokens=tokens,
+                reward_mean=reward_mean,
+                producer_id=producer_id,
+                created_at=created_at,
+            )
+            try:
+                write_manifest(step_dir, manifest)
+            except Exception as exc:  # pragma: no cover - fail-open observability
+                logger.warning("Failed to write rollout manifest for step %s: %s", step, exc)
+            append_event_best_effort(
+                events_dir or (self.output_dir / "events"),
+                QueueEvent(
+                    time=created_at,
+                    kind="rollout_published",
+                    queue_step=step,
+                    optimizer_step=optimizer_step,
+                    policy_step=policy_step,
+                    producer_id=producer_id,
+                ),
+            )
         (step_dir / STABLE_BATCH_MARKER).touch()
         return RolloutBatch(step=step, path=target_path, step_dir=step_dir)
 
@@ -292,4 +337,12 @@ def publish_adapter_policy_snapshot(
     (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
     (tmp_dir / STABLE_BATCH_MARKER).touch()
     tmp_dir.replace(step_dir)
+    append_event_best_effort(
+        output_dir / "events",
+        QueueEvent(
+            time=utc_now(),
+            kind="policy_export_completed",
+            policy_step=step,
+        ),
+    )
     return step_dir

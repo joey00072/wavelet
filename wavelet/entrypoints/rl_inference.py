@@ -12,10 +12,14 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.queue import (
+    QueueEvent,
     FileSystemPolicyReceiver,
     FileSystemRolloutSender,
+    append_event_best_effort,
     publish_adapter_policy_snapshot,
+    utc_now,
 )
+from wavelet.orchestrator.metrics import log_rollout_metrics
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
@@ -146,6 +150,7 @@ def _run_prefetch_inference(
             rollout_sender,
             step,
             inference_engine,
+            loaded_policy_step,
         )
         pending[future] = step
 
@@ -470,6 +475,7 @@ def _run_streaming_native_inference(
             queue_step,
             chunk_examples,
             inference_engine,
+            loaded_policy_step,
         )
         pending[future] = queue_step
 
@@ -844,7 +850,12 @@ async def _run_rolling_verifier_inference(
             )
             if policy_step is not None and pending_policy_update is None:
                 wait_started_at = perf_counter()
-                if loaded_policy_step is None:
+                required_policy_step = _required_policy_step(config, optimizer_step)
+                must_load_before_rollout = (
+                    loaded_policy_step is None
+                    or loaded_policy_step < required_policy_step
+                )
+                if must_load_before_rollout:
                     loaded_policy_step = await _load_policy_async(
                         config,
                         inference_engine,
@@ -889,6 +900,69 @@ async def _run_rolling_verifier_inference(
                         )
                     wait_policy_seconds = 0.0
                     load_policy_seconds = 0.0
+            elif policy_step is not None and pending_policy_update is not None:
+                required_policy_step = _required_policy_step(config, optimizer_step)
+                must_load_before_rollout = (
+                    loaded_policy_step is None
+                    or loaded_policy_step < required_policy_step
+                )
+                if must_load_before_rollout:
+                    wait_started_at = perf_counter()
+                    loaded_policy_step = await pending_policy_update
+                    pending_policy_update = None
+                    if state is not None:
+                        state.update_policy(
+                            loaded_step=loaded_policy_step,
+                            pending_load=False,
+                            requested_step=None,
+                            available_tail=policy_receiver.available_steps()[-20:],
+                        )
+                    await _maybe_run_evals_async(
+                        config,
+                        orchestrator,
+                        policy_step=loaded_policy_step,
+                        rollout_step=optimizer_step,
+                        last_eval_steps=last_eval_steps,
+                    )
+                    wait_policy_seconds = perf_counter() - wait_started_at
+                    load_policy_seconds = wait_policy_seconds
+                    emit_perf(
+                        "policy_load",
+                        step=loaded_policy_step,
+                        wait_policy=wait_policy_seconds,
+                        load_policy="async",
+                    )
+                    if loaded_policy_step < required_policy_step:
+                        wait_started_at = perf_counter()
+                        loaded_policy_step = await _load_policy_async(
+                            config,
+                            inference_engine,
+                            policy_receiver,
+                            policy_step,
+                        )
+                        scheduler.set_policy_step(
+                            loaded_policy_step,
+                            model_name=_current_policy_model_name(inference_engine),
+                        )
+                        if state is not None:
+                            state.update_policy(
+                                loaded_step=loaded_policy_step,
+                                pending_load=False,
+                                requested_step=None,
+                                available_tail=policy_receiver.available_steps()[-20:],
+                            )
+                        wait_policy_seconds += perf_counter() - wait_started_at
+                        load_policy_seconds = wait_policy_seconds
+                        await _maybe_run_evals_async(
+                            config,
+                            orchestrator,
+                            policy_step=loaded_policy_step,
+                            rollout_step=optimizer_step,
+                            last_eval_steps=last_eval_steps,
+                        )
+                else:
+                    wait_policy_seconds = 0.0
+                    load_policy_seconds = 0.0
             else:
                 wait_policy_seconds = 0.0
                 load_policy_seconds = 0.0
@@ -905,8 +979,30 @@ async def _run_rolling_verifier_inference(
             )
             materialize_seconds = perf_counter() - materialize_started_at
             publish_started_at = perf_counter()
-            batch = rollout_sender.publish(materialized_path, step=queue_step)
+            batch = rollout_sender.publish(
+                materialized_path,
+                step=queue_step,
+                optimizer_step=optimizer_step,
+                chunk_index=queue_step % chunks_per_step,
+                policy_step=loaded_policy_step,
+                rows=_count_nonempty_lines(materialized_path),
+            )
             publish_seconds = perf_counter() - publish_started_at
+            log_rollout_metrics(
+                config,
+                materialized_path,
+                step=optimizer_step,
+                policy_step=loaded_policy_step,
+                queue_step=queue_step,
+                optimizer_step=optimizer_step,
+                chunk_index=queue_step % chunks_per_step,
+                timings={
+                    "generate_completions": generate_seconds,
+                    "parallel_preprocess": materialize_seconds,
+                    "publish": publish_seconds,
+                    "step": perf_counter() - step_started_at,
+                },
+            )
             if state is not None:
                 state.update_rollouts(next_queue_step_to_submit=queue_step + 1)
                 state.mark_submitted(
@@ -1054,6 +1150,14 @@ def _load_policy_step(
     inference_engine.load_policy(policy.step_dir, step=policy.step)
     _wake_for_colocated_sleep(config, inference_engine, tags=["kv_cache"])
     load_policy_seconds = perf_counter() - load_started_at
+    append_event_best_effort(
+        config.output_dir / "events",
+        QueueEvent(
+            time=utc_now(),
+            kind="policy_load_completed",
+            policy_step=policy.step,
+        ),
+    )
     return policy.step, wait_policy_seconds, load_policy_seconds
 
 
@@ -1086,14 +1190,18 @@ def _publish_step(
     rollout_sender: FileSystemRolloutSender,
     step: int,
     inference_engine,
+    policy_step: int | None,
 ):
     return _time_materialize_and_publish(
+        orchestrator,
         lambda: orchestrator.materialize(
             step=step,
             inference_engine=inference_engine,
         ),
         rollout_sender,
         step=step,
+        optimizer_step=step,
+        policy_step=policy_step,
     )
 
 
@@ -1105,8 +1213,10 @@ def _publish_native_chunk(
     queue_step: int,
     chunk_examples: int,
     inference_engine,
+    policy_step: int | None,
 ):
     return _time_materialize_and_publish(
+        orchestrator,
         lambda: orchestrator.materialize_native_chunk(
             optimizer_step=optimizer_step,
             chunk_index=chunk_index,
@@ -1116,22 +1226,57 @@ def _publish_native_chunk(
         ),
         rollout_sender,
         step=queue_step,
+        optimizer_step=optimizer_step,
+        chunk_index=chunk_index,
+        policy_step=policy_step,
     )
 
 
 def _time_materialize_and_publish(
+    orchestrator: RLOrchestrator,
     materialize,
     rollout_sender: FileSystemRolloutSender,
     *,
     step: int,
+    optimizer_step: int | None = None,
+    chunk_index: int | None = None,
+    policy_step: int | None = None,
 ):
     materialize_started_at = perf_counter()
     materialized_path = materialize()
     materialize_seconds = perf_counter() - materialize_started_at
     publish_started_at = perf_counter()
-    batch = rollout_sender.publish(materialized_path, step=step)
+    batch = rollout_sender.publish(
+        materialized_path,
+        step=step,
+        optimizer_step=optimizer_step,
+        chunk_index=chunk_index,
+        policy_step=policy_step,
+        rows=_count_nonempty_lines(materialized_path),
+    )
     publish_seconds = perf_counter() - publish_started_at
+    log_step = optimizer_step if optimizer_step is not None else step
+    log_rollout_metrics(
+        orchestrator.config,
+        materialized_path,
+        step=log_step,
+        policy_step=policy_step,
+        queue_step=step,
+        optimizer_step=optimizer_step,
+        chunk_index=chunk_index,
+        timings={
+            "generate_completions": materialize_seconds,
+            "parallel_preprocess": 0.0,
+            "publish": publish_seconds,
+            "step": materialize_seconds + publish_seconds,
+        },
+    )
     return step, batch, materialize_seconds, publish_seconds
+
+
+def _count_nonempty_lines(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
 
 
 def _final_eval_policy_step(config: RLConfig, target_step: int) -> int | None:

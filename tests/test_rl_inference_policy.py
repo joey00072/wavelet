@@ -30,8 +30,8 @@ def test_required_policy_step_uses_stricter_async_window() -> None:
     config = _config()
 
     assert required_policy_step(config, 0) == 0
-    assert required_policy_step(config, 1) == 0
-    assert required_policy_step(config, 2) == 1
+    assert required_policy_step(config, 1) == 1
+    assert required_policy_step(config, 2) == 2
 
 
 def test_required_policy_step_uses_off_policy_window_when_stricter() -> None:
@@ -46,13 +46,14 @@ def test_required_policy_step_falls_back_to_async_window() -> None:
     config = RLConfig(orchestrator={"max_async_level": 1, "max_off_policy_steps": 0})
 
     assert required_policy_step(config, 0) == 0
-    assert required_policy_step(config, 1) == 0
-    assert required_policy_step(config, 2) == 1
+    assert required_policy_step(config, 1) == 1
+    assert required_policy_step(config, 2) == 2
 
 
 def test_policy_selection_does_not_wait_for_current_rollout_step() -> None:
+    config = RLConfig(orchestrator={"max_async_level": 2, "max_off_policy_steps": 8})
     policy_step = policy_step_to_load(
-        _config(),
+        config,
         _PolicyReceiver([0, 1]),  # type: ignore[arg-type]
         rollout_step=2,
         loaded_policy_step=0,
@@ -84,8 +85,9 @@ def test_policy_selection_does_not_load_policy_newer_than_rollout_step() -> None
 
 
 def test_policy_selection_reuses_loaded_policy_inside_async_window() -> None:
+    config = RLConfig(orchestrator={"max_async_level": 2, "max_off_policy_steps": 8})
     policy_step = policy_step_to_load(
-        _config(),
+        config,
         _PolicyReceiver([0]),  # type: ignore[arg-type]
         rollout_step=1,
         loaded_policy_step=0,

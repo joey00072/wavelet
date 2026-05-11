@@ -1,4 +1,5 @@
 from wavelet.configs.rl_config import RLConfig
+from wavelet.orchestrator.queue import FileSystemRolloutSender
 from wavelet.orchestrator.state_server import OrchestratorRunState
 
 
@@ -56,3 +57,20 @@ def test_orchestrator_state_config_redacts_secrets(tmp_path) -> None:
     assert sanitized["orchestrator"]["verifier_api_key_var"] == "<redacted>"
     assert sanitized["orchestrator"]["verifier_env_args"]["api_key"] == "<redacted>"
     assert sanitized["orchestrator"]["verifier_env_args"]["safe"] == "value"
+
+
+def test_orchestrator_state_includes_queue_summary(tmp_path) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    sender.publish(source, step=0, optimizer_step=0, rows=1)
+    state = OrchestratorRunState(config, target_step=1)
+
+    snapshot = state.snapshot()
+    queues = state.queue_snapshot(detail=True, limit=10)
+
+    assert snapshot["queue_summary"]["ready_count"] == 1
+    assert queues is not None
+    assert queues["summary"]["ready_count"] == 1
+    assert queues["items"][0]["queue_step"] == 0

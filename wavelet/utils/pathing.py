@@ -5,6 +5,21 @@ from pathlib import Path
 
 
 STABLE_CHECKPOINT_MARKER = "STABLE"
+OUTPUT_RUN_STATE_MARKERS = (
+    "configs",
+    "eval_metrics.jsonl",
+    "evals",
+    "events",
+    "events.jsonl",
+    "heartbeat.json",
+    "logs",
+    "metrics.csv",
+    "metrics.jsonl",
+    "policies",
+    "rollouts",
+    "run_metadata.json",
+    "wandb",
+)
 
 
 def resolve_output_dir(base_dir: Path, name: str | None = None) -> Path:
@@ -67,20 +82,40 @@ def resolve_resume_checkpoint(output_dir: Path, resume_step: int) -> Path:
     return checkpoint_dir
 
 
-def has_checkpoints(output_dir: Path) -> bool:
-    return any(output_dir.glob("checkpoint-*"))
+def existing_run_state_entries(output_dir: Path) -> list[str]:
+    if not output_dir.exists():
+        return []
+    entries = [
+        marker
+        for marker in OUTPUT_RUN_STATE_MARKERS
+        if (output_dir / marker).exists()
+    ]
+    entries.extend(path.name for path in sorted(output_dir.glob("checkpoint-*")))
+    return entries
 
 
 def validate_output_dir(output_dir: Path, *, resuming: bool, clean: bool) -> None:
+    if resuming and clean:
+        raise ValueError(
+            "clean_output_dir=true cannot be used with checkpoint resume. "
+            "Choose either a clean run or an explicit resume."
+        )
     if resuming:
         return
     if clean:
         if output_dir.exists():
-            shutil.rmtree(output_dir)
+            if output_dir.is_dir():
+                shutil.rmtree(output_dir)
+            else:
+                output_dir.unlink()
         return
-    if has_checkpoints(output_dir):
+    run_state_entries = existing_run_state_entries(output_dir)
+    if run_state_entries:
+        preview = ", ".join(run_state_entries[:5])
+        if len(run_state_entries) > 5:
+            preview += ", ..."
         raise FileExistsError(
-            f"Directory '{output_dir}' already contains checkpoints. "
+            f"Directory '{output_dir}' already contains run state ({preview}). "
             "Use a fresh output_dir, set clean_output_dir=true, or resume from "
             "an existing checkpoint explicitly."
         )

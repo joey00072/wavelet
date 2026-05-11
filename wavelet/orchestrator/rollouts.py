@@ -223,13 +223,20 @@ class RLOrchestrator:
         *,
         step: int,
         inference_engine=None,
+        policy_step: int | None = None,
     ) -> RolloutBatch:
         materialized_path = self.materialize(
             step=step,
             inference_engine=inference_engine,
         )
         sender = FileSystemRolloutSender(self.config.output_dir, self.config.transport)
-        return sender.publish(materialized_path, step=step)
+        return sender.publish(
+            materialized_path,
+            step=step,
+            optimizer_step=step,
+            policy_step=policy_step,
+            rows=_count_nonempty_lines(materialized_path),
+        )
 
     def run(
         self, *, start_step: int = 0, max_steps: int | None = None
@@ -508,3 +515,8 @@ class RLOrchestrator:
         if not callable(function):
             raise TypeError(f"Custom rollout function is not callable: {function_path}")
         return function
+
+
+def _count_nonempty_lines(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())

@@ -434,15 +434,39 @@ def _quantized_device_map(distributed: bool) -> str | dict[str, int]:
     return {"": torch.cuda.current_device()}
 
 
+def _state_dict_to_save_dtype(
+    state_dict: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    return {
+        key: (
+            value.detach().to(device="cpu", dtype=dtype)
+            if value.is_floating_point()
+            else value.detach().to(device="cpu")
+        )
+        for key, value in state_dict.items()
+    }
+
+
 def export_model_for_save(
     model: PreTrainedModel,
+    *,
+    state_dict_dtype: torch.dtype | None = None,
 ) -> tuple[PreTrainedModel, dict[str, torch.Tensor] | None]:
     if not isinstance(model, FSDP):
-        return unwrap_model(model), None
+        unwrapped = unwrap_model(model)
+        if state_dict_dtype is None:
+            return unwrapped, None
+        return unwrapped, _state_dict_to_save_dtype(
+            unwrapped.state_dict(),
+            state_dict_dtype,
+        )
 
     config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, config):
         state_dict = model.state_dict()
+    if state_dict_dtype is not None:
+        state_dict = _state_dict_to_save_dtype(state_dict, state_dict_dtype)
     return unwrap_model(model), state_dict
 
 

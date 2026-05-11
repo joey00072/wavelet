@@ -1,6 +1,6 @@
 model:
   name: "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
-  torch_dtype: bfloat16
+  torch_dtype: float32
   attn_implementation: auto
   load_in_4bit: false
   gradient_checkpointing: true
@@ -32,7 +32,7 @@ orchestrator:
   verifier_client_type: openai_chat_completions_token
   advantage_mode: group_reward
   normalize_group_advantages: false
-  examples_per_step: 8
+  examples_per_step: 128
   rollouts_per_example: 16
   filter_zero_advantage: true
   zero_advantage_max_retries: 8
@@ -72,7 +72,8 @@ inference:
     seed: null
   vllm:
     server_backend: openai
-    gpu_memory_utilization: 0.75
+    dtype: bfloat16
+    gpu_memory_utilization: 0.9
     max_model_len: 2048
     enforce_eager: false
     max_loras: 8
@@ -92,7 +93,7 @@ policy_transfer:
   poll_interval_seconds: 0.05
 
 optim:
-  type: adam
+  type: adamw
   implementation: fused
   lr: 3e-6
   weight_decay: 0.01

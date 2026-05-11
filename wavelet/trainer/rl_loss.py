@@ -34,6 +34,25 @@ def _safe_mean(values: Tensor, mask: Tensor) -> Tensor:
     return values[mask].sum() / denom
 
 
+def _tensor_stats(values: Tensor) -> dict[str, Tensor]:
+    if values.numel() == 0:
+        nan = torch.tensor(float("nan"), device=values.device)
+        return {
+            "mean": nan,
+            "median": nan,
+            "std": nan,
+            "min": nan,
+            "max": nan,
+        }
+    return {
+        "mean": values.mean(),
+        "median": values.median(),
+        "std": values.std(unbiased=False),
+        "min": values.min(),
+        "max": values.max(),
+    }
+
+
 def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutputs:
     trainer_logprobs = inputs.trainer_logprobs
     inference_logprobs = inputs.inference_logprobs
@@ -112,6 +131,7 @@ def compute_loss(
 ) -> tuple[Tensor, dict[str, Any]]:
     total_loss: Tensor | None = None
     metric_values: dict[str, list[Tensor]] = {}
+    sequence_count = 0
 
     if position_ids is None:
         spans_by_row = [
@@ -125,6 +145,10 @@ def compute_loss(
 
     for row_index, spans in enumerate(spans_by_row):
         for start, end in spans:
+            span_loss_mask = loss_mask[row_index, start:end]
+            span_trainable_tokens = span_loss_mask.sum()
+            if int(span_trainable_tokens.item()) == 0:
+                continue
             row_teacher = (
                 None
                 if teacher_logprobs is None
@@ -136,18 +160,26 @@ def compute_loss(
                     inference_logprobs=inference_logprobs[row_index, start:end],
                     teacher_logprobs=row_teacher,
                     advantages=advantages[row_index, start:end],
-                    loss_mask=loss_mask[row_index, start:end],
+                    loss_mask=span_loss_mask,
                 ),
                 loss_config,
             )
-            total_loss = outputs.loss if total_loss is None else total_loss + outputs.loss
+            if loss_config.normalization == "sequence":
+                span_loss = outputs.loss / torch.clamp_min(span_trainable_tokens, 1)
+                sequence_count += 1
+            else:
+                span_loss = outputs.loss
+            total_loss = span_loss if total_loss is None else total_loss + span_loss
             for key, value in outputs.metrics.items():
                 metric_values.setdefault(key, []).append(value)
 
     if total_loss is None:
         total_loss = trainer_logprobs.sum() * 0.0
     if loss_scale is None:
-        scale = torch.clamp_min(loss_mask.sum(), 1)
+        if loss_config.normalization == "sequence":
+            scale = max(float(sequence_count), 1.0)
+        else:
+            scale = torch.clamp_min(loss_mask.sum(), 1)
     elif isinstance(loss_scale, Tensor):
         scale = torch.clamp_min(loss_scale.to(total_loss.device), 1)
     else:
@@ -158,4 +190,10 @@ def compute_loss(
         for key, values in metric_values.items()
         if values
     }
+    for key, values in metric_values.items():
+        if not values:
+            continue
+        stacked = torch.stack(values)
+        for stat_name, stat_value in _tensor_stats(stacked).items():
+            metrics[f"{key}/{stat_name}"] = stat_value
     return scaled_loss, metrics

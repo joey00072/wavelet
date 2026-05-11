@@ -96,6 +96,7 @@ class RLLossConfig(BaseModel):
     kl_tau: float = Field(default=1e-3, ge=0.0)
     adv_tau: float = Field(default=1.0, ge=0.0)
     teacher_tau: float = Field(default=0.0, ge=0.0)
+    normalization: Literal["token", "sequence"] = "token"
 
     @model_validator(mode="before")
     @classmethod
@@ -480,6 +481,25 @@ class RLConfig(BaseModel):
             raise ValueError(
                 "reward.mode must score generated completions when inference.mode "
                 "generates rollouts."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_policy_transfer(self) -> "RLConfig":
+        if self.policy_transfer.type != "nccl":
+            return self
+        if self.lora is not None:
+            raise ValueError(
+                "policy_transfer.type='nccl' only supports full-model updates; "
+                "use policy_transfer.type='filesystem' for LoRA adapters."
+            )
+        if (
+            self.inference.mode != "vllm_http"
+            or self.inference.vllm.server_backend != "openai"
+        ):
+            raise ValueError(
+                "policy_transfer.type='nccl' requires inference.mode='vllm_http' "
+                "and inference.vllm.server_backend='openai'."
             )
         return self
 

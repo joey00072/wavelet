@@ -25,6 +25,8 @@ from wavelet.orchestrator.queue import (
     FileSystemPolicyReceiver,
     FileSystemRolloutReceiver,
     RolloutBatch,
+    record_rollout_claim,
+    record_rollout_consumed,
 )
 from wavelet.orchestrator.schedule import target_steps as _target_steps
 from wavelet.utils.config import load_config
@@ -50,23 +52,18 @@ class StepTimes:
 def _write_subconfigs(config: RLConfig, trainer_config: RLConfig | None = None) -> None:
     config_dir = get_config_dir(config.output_dir)
     full_trainer_config = trainer_config or config
-    dump_yaml(
-        config_dir / "rl_trainer.yaml",
-        full_trainer_config.model_dump(mode="json", exclude_none=True),
-    )
-    dump_yaml(
-        config_dir / "rl_orchestrator.yaml",
-        config.model_dump(mode="json", exclude_none=True),
-    )
-    dump_yaml(
-        config_dir / "rl_inference.yaml",
-        config.model_dump(mode="json", exclude_none=True),
-    )
+    dump_yaml(config_dir / "rl_trainer.yaml", _role_config_payload(full_trainer_config))
+    dump_yaml(config_dir / "rl_orchestrator.yaml", _role_config_payload(config))
+    dump_yaml(config_dir / "rl_inference.yaml", _role_config_payload(config))
+
+
+def _role_config_payload(config: RLConfig) -> dict:
+    return config.model_dump(mode="json", exclude_none=False)
 
 
 def _config_path_for_role(config: RLConfig, name: str, role_config: RLConfig) -> Path:
     config_path = get_config_dir(config.output_dir) / f"{name}.yaml"
-    dump_yaml(config_path, role_config.model_dump(mode="json", exclude_none=True))
+    dump_yaml(config_path, _role_config_payload(role_config))
     return config_path
 
 
@@ -142,7 +139,54 @@ def _vllm_base_urls(config: RLConfig, ports: list[int]) -> list[str]:
     return [f"http://{config.inference.http.host}:{port}/v1" for port in ports]
 
 
-def _inference_replica_config(config: RLConfig, *, port: int) -> RLConfig:
+def _device_group_size(config: RLConfig, cuda_visible_devices: str | None) -> int:
+    if cuda_visible_devices is None:
+        dp_size = (
+            config.inference.vllm.data_parallel_size_local
+            or config.inference.vllm.data_parallel_size
+        )
+        return config.inference.vllm.tensor_parallel_size * dp_size
+    return len([device for device in cuda_visible_devices.split(",") if device.strip()])
+
+
+def _config_with_nccl_inference_world_size(
+    config: RLConfig,
+    *,
+    inference_replicas: int,
+) -> RLConfig:
+    if config.policy_transfer.type != "nccl" or config.inference.mode != "vllm_http":
+        return config
+    inference_devices = _as_device_groups(
+        config.launcher.inference_cuda_visible_devices,
+        inference_replicas,
+    )
+    inference_world_size = sum(
+        _device_group_size(config, cuda_visible_devices)
+        for cuda_visible_devices in inference_devices
+    )
+    return config.model_copy(
+        update={
+            "policy_transfer": config.policy_transfer.model_copy(
+                update={
+                    "nccl_inference_world_size": inference_world_size,
+                    "nccl_rank_offset": 1,
+                }
+            )
+        }
+    )
+
+
+def _inference_replica_config(
+    config: RLConfig,
+    *,
+    port: int,
+    nccl_rank_offset: int | None = None,
+) -> RLConfig:
+    policy_transfer = config.policy_transfer
+    if nccl_rank_offset is not None:
+        policy_transfer = policy_transfer.model_copy(
+            update={"nccl_rank_offset": nccl_rank_offset}
+        )
     return config.model_copy(
         update={
             "inference": config.inference.model_copy(
@@ -150,6 +194,7 @@ def _inference_replica_config(config: RLConfig, *, port: int) -> RLConfig:
                     "http": config.inference.http.model_copy(update={"port": port}),
                 }
             ),
+            "policy_transfer": policy_transfer,
             "launcher": config.launcher.model_copy(
                 update={"inference_num_replicas": 1}
             ),
@@ -311,6 +356,12 @@ def _load_and_train_received_batch(
     received: RolloutBatch,
     timings: StepTimes,
 ) -> None:
+    trainer_step_before = trainer.step
+    _record_rollout_claim_if_main(
+        trainer,
+        received,
+        trainer_step_before=trainer_step_before,
+    )
     load_started_at = perf_counter()
     trainer.load_rollout_path(received.path)
     timings.load_data = perf_counter() - load_started_at
@@ -318,6 +369,13 @@ def _load_and_train_received_batch(
     train_started_at = perf_counter()
     trainer.train_until(trainer.step + 1)
     timings.train_until = perf_counter() - train_started_at
+    _record_rollout_consumed_if_main(
+        trainer,
+        received,
+        trainer_step_before=trainer_step_before,
+        trainer_step_after=trainer.step,
+        optimizer_step_completed=True,
+    )
 
     export_started_at = perf_counter()
     trainer.export_policy(step=trainer.step)
@@ -344,6 +402,44 @@ def _log_step_times(
     )
 
 
+def _record_rollout_claim_if_main(
+    trainer: RLTrainer,
+    batch: RolloutBatch,
+    *,
+    trainer_step_before: int,
+) -> None:
+    if not _is_main_trainer_process(trainer):
+        return
+    record_rollout_claim(
+        batch,
+        trainer_step_before=trainer_step_before,
+        events_dir=trainer.config.output_dir / "events",
+    )
+
+
+def _record_rollout_consumed_if_main(
+    trainer: RLTrainer,
+    batch: RolloutBatch,
+    *,
+    trainer_step_before: int,
+    trainer_step_after: int,
+    optimizer_step_completed: bool,
+) -> None:
+    if not _is_main_trainer_process(trainer):
+        return
+    record_rollout_consumed(
+        batch,
+        trainer_step_before=trainer_step_before,
+        trainer_step_after=trainer_step_after,
+        optimizer_step_completed=optimizer_step_completed,
+        events_dir=trainer.config.output_dir / "events",
+    )
+
+
+def _is_main_trainer_process(trainer: RLTrainer) -> bool:
+    return trainer.world is None or trainer.world.is_main
+
+
 def _role_specs(
     config: RLConfig,
     *,
@@ -359,10 +455,19 @@ def _role_specs(
             config.launcher.inference_cuda_visible_devices,
             inference_replicas,
         )
+        nccl_rank_offset = 1
         for replica, (port, cuda_visible_devices) in enumerate(
             zip(inference_ports, inference_devices, strict=True)
         ):
-            replica_config = _inference_replica_config(config, port=port)
+            replica_rank_offset = None
+            if config.policy_transfer.type == "nccl":
+                replica_rank_offset = nccl_rank_offset
+                nccl_rank_offset += _device_group_size(config, cuda_visible_devices)
+            replica_config = _inference_replica_config(
+                config,
+                port=port,
+                nccl_rank_offset=replica_rank_offset,
+            )
             replica_config_path = _config_path_for_role(
                 config,
                 f"rl_vllm_server_{replica}",
@@ -414,6 +519,10 @@ def _run_process_launcher(config: RLConfig) -> int:
         )
 
     inference_replicas = config.launcher.inference_num_replicas
+    config = _config_with_nccl_inference_world_size(
+        config,
+        inference_replicas=inference_replicas,
+    )
     inference_ports = _http_ports(config, inference_replicas)
     rollout_config = _rollout_client_config(config, ports=inference_ports)
 
@@ -421,10 +530,7 @@ def _run_process_launcher(config: RLConfig) -> int:
     config_dir = get_config_dir(config.output_dir)
     trainer_config_path = config_dir / "rl_trainer.yaml"
     inference_config_path = config_dir / "rl_inference.yaml"
-    dump_yaml(
-        inference_config_path,
-        rollout_config.model_dump(mode="json", exclude_none=True),
-    )
+    dump_yaml(inference_config_path, _role_config_payload(rollout_config))
     roles = _role_specs(
         config,
         trainer_config_path=trainer_config_path,
@@ -595,7 +701,7 @@ def main(argv: list[str] | None = None) -> int:
         resolve_resume_checkpoint(config.output_dir, config.ckpt.resume_step)
     dump_yaml(
         get_config_dir(config.output_dir) / "rl.yaml",
-        config.model_dump(mode="json", exclude_none=True),
+        _role_config_payload(config),
     )
 
     if config.dry_run:

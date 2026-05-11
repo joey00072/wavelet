@@ -38,11 +38,12 @@ def chunks_per_step(config: RLConfig) -> int:
 def required_policy_step(config: RLConfig, rollout_step: int) -> int:
     """Oldest policy step allowed for a rollout under the async window."""
     async_level = config.orchestrator.max_async_level
+    async_lag = max(async_level - 1, 0)
     off_policy_steps = config.orchestrator.max_off_policy_steps
     if async_level > 0 and off_policy_steps > 0:
-        allowed_lag = min(async_level, off_policy_steps)
+        allowed_lag = min(async_lag, off_policy_steps)
     else:
-        allowed_lag = max(async_level, off_policy_steps)
+        allowed_lag = max(async_lag, off_policy_steps)
     return max(rollout_step - allowed_lag, 0)
 
 

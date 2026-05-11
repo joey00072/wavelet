@@ -10,6 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.orchestrator.queue import (
+    build_queue_report,
+    resolve_policy_dir,
+    resolve_queue_dir,
+)
 
 
 def _now() -> str:
@@ -197,7 +202,40 @@ class OrchestratorRunState:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return json.loads(json.dumps(self._state))
+            snapshot = json.loads(json.dumps(self._state))
+        queue_report = self.queue_snapshot(detail=False, limit=0)
+        if queue_report is not None:
+            snapshot["queue_summary"] = queue_report.get("summary")
+            snapshot["queue_rates"] = queue_report.get("rates")
+        return snapshot
+
+    def queue_snapshot(
+        self,
+        *,
+        detail: bool,
+        limit: int,
+    ) -> dict[str, Any] | None:
+        try:
+            queue_dir = resolve_queue_dir(self._config.output_dir, self._config.transport)
+            policy_dir = resolve_policy_dir(
+                self._config.output_dir,
+                self._config.policy_transfer,
+            )
+            return build_queue_report(
+                queue_dir=queue_dir,
+                policy_dir=policy_dir,
+                events_dir=self._config.output_dir / "events",
+                detail=detail,
+                limit=limit,
+            )
+        except Exception as exc:  # pragma: no cover - health should degrade only
+            return {
+                "summary": None,
+                "policy": None,
+                "rates": None,
+                "errors": {"queue_snapshot": str(exc)},
+                "items": [],
+            }
 
     def sanitized_config(self) -> dict[str, Any]:
         return _redact(self._config.model_dump(mode="json", exclude_none=True))
@@ -263,6 +301,22 @@ class StateServerHandle:
         @app.get("/state")
         async def state() -> dict[str, Any]:
             return self.state.snapshot()
+
+        @app.get("/queues")
+        async def queues(
+            detail: bool = Query(default=False),
+            limit: int = Query(default=100, ge=0, le=1000),
+        ) -> dict[str, Any]:
+            snapshot = self.state.queue_snapshot(detail=detail, limit=limit)
+            if snapshot is None:
+                return {
+                    "summary": None,
+                    "policy": None,
+                    "rates": None,
+                    "errors": {"queue_snapshot": "unavailable"},
+                    "items": [],
+                }
+            return snapshot
 
         @app.get("/config")
         async def run_config() -> dict[str, Any]:
