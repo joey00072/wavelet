@@ -20,7 +20,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser(
-        prog="wavelet orchestrator-debug",
+        prog="wavelet debug orchestrator",
         description="Inspect and benchmark RL orchestration without trainer.",
     )
     parser.add_argument(

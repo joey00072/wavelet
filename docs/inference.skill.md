@@ -20,38 +20,38 @@ token accounting, and logprob behavior before involving the full RL loop.
 Inspect the resolved inference configuration:
 
 ```bash
-uv run python -m wavelet inference-debug inspect @ examples/wordle/rl.yaml --json
+uv run python -m wavelet debug inference inspect @ examples/wordle/rl.yaml --json
 ```
 
 Check live HTTP inference servers:
 
 ```bash
-uv run python -m wavelet inference-debug health @ examples/wordle/rl.yaml --json
+uv run python -m wavelet debug inference health @ examples/wordle/rl.yaml --json
 ```
 
 Run a small end-to-end inference smoke test:
 
 ```bash
-uv run python -m wavelet inference-debug smoke @ examples/wordle/rl.yaml --count 4 --json
+uv run python -m wavelet debug inference smoke @ examples/wordle/rl.yaml --count 4 --json
 ```
 
 Run a throughput probe:
 
 ```bash
-uv run python -m wavelet inference-debug benchmark @ examples/wordle/rl.yaml --count 32 --warmup 4 --repeats 3 --json
+uv run python -m wavelet debug inference benchmark @ examples/wordle/rl.yaml --count 32 --warmup 4 --repeats 3 --json
 ```
 
 Run a live continuous-batching probe against a running OpenAI-compatible vLLM
 server:
 
 ```bash
-uv run python -m wavelet inference-debug continuous-batch @ examples/wordle/rl.yaml --count 96 --concurrency 48 --stagger-ms 100 --max-completion-tokens 512 --json
+uv run python -m wavelet debug inference continuous-batch @ examples/wordle/rl.yaml --count 96 --concurrency 48 --stagger-ms 100 --max-completion-tokens 512 --json
 ```
 
 Load a specific exported policy before probing:
 
 ```bash
-uv run python -m wavelet inference-debug smoke @ path/to/rl.yaml --policy-dir path/to/policies/step-000010 --policy-step 10 --json
+uv run python -m wavelet debug inference smoke @ path/to/rl.yaml --policy-dir path/to/policies/step-000010 --policy-step 10 --json
 ```
 
 ## Live Server Endpoints

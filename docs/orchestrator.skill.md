@@ -19,37 +19,37 @@ assignment, advantage shaping, filtering, and materialization timing in isolatio
 Inspect schedule and rollout settings:
 
 ```bash
-uv run python -m wavelet orchestrator-debug inspect @ examples/wordle/rl.yaml --json
+uv run python -m wavelet debug orchestrator inspect @ examples/wordle/rl.yaml --json
 ```
 
 Sample selected examples without generation:
 
 ```bash
-uv run python -m wavelet orchestrator-debug sample @ examples/wordle/rl.yaml --step 0 --examples 4 --json
+uv run python -m wavelet debug orchestrator sample @ examples/wordle/rl.yaml --step 0 --examples 4 --json
 ```
 
 Benchmark one small Wordle rollout step against a running inference server:
 
 ```bash
-uv run python -m wavelet orchestrator-debug benchmark @ examples/wordle/rl.yaml --step 0 --examples 1 --rollouts 1 --json
+uv run python -m wavelet debug orchestrator benchmark @ examples/wordle/rl.yaml --step 0 --examples 1 --rollouts 1 --json
 ```
 
 Benchmark a larger Wordle rollout step:
 
 ```bash
-uv run python -m wavelet orchestrator-debug benchmark @ examples/wordle/rl.yaml --step 0 --examples 4 --rollouts 8 --json
+uv run python -m wavelet debug orchestrator benchmark @ examples/wordle/rl.yaml --step 0 --examples 4 --rollouts 8 --json
 ```
 
 Materialize a rollout file without trainer:
 
 ```bash
-uv run python -m wavelet orchestrator-debug materialize @ examples/wordle/rl.yaml --step 0 --examples 2 --rollouts 2 --json
+uv run python -m wavelet debug orchestrator materialize @ examples/wordle/rl.yaml --step 0 --examples 2 --rollouts 2 --json
 ```
 
 For native passthrough or dataset-only checks, skip inference setup:
 
 ```bash
-uv run python -m wavelet orchestrator-debug benchmark @ path/to/rl.yaml --no-inference --json
+uv run python -m wavelet debug orchestrator benchmark @ path/to/rl.yaml --no-inference --json
 ```
 
 ## What To Read
@@ -71,8 +71,8 @@ uv run python -m wavelet orchestrator-debug benchmark @ path/to/rl.yaml --no-inf
 ## Wordle Workflow
 
 1. Start only the vLLM inference server, not trainer.
-2. Run `wavelet inference-debug health @ examples/wordle/rl.yaml --json`.
-3. Run `wavelet orchestrator-debug inspect @ examples/wordle/rl.yaml --json`.
+2. Run `wavelet debug inference health @ examples/wordle/rl.yaml --json`.
+3. Run `wavelet debug orchestrator inspect @ examples/wordle/rl.yaml --json`.
 4. Run `sample --examples 4` to verify data is present and step selection works.
 5. Run `benchmark --examples 1 --rollouts 1` to measure one rollout.
 6. Increase to `--examples 4 --rollouts 8`, then compare `generate_score` time,
