@@ -246,7 +246,7 @@ class RLEvalConfig(BaseModel):
 
 
 class RLVLLMConfig(BaseModel):
-    server_backend: Literal["offline", "openai"] = "offline"
+    server_backend: Literal["offline", "openai"] = "openai"
     gpu_memory_utilization: float = Field(default=0.35, gt=0.0, le=1.0)
     max_model_len: int | None = Field(default=None, ge=8)
     quantization: str | None = None

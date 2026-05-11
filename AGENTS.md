@@ -13,6 +13,9 @@ Guidance for coding agents working in this repository.
   the user explicitly asks to inspect it.
 - Optimize changes for debuggability: one obvious run path, explicit state,
   structured metrics, and small testable functions.
+- When code changes alter commands, config defaults, examples, diagnostics,
+  public behavior, or agent workflows, update the relevant docs in the same
+  change. Do not leave documentation for a later cleanup pass.
 
 ## Repository Layout
 
@@ -70,8 +73,9 @@ Guidance for coding agents working in this repository.
   - `uv run python -m wavelet rl-inference @ <config>.yaml`
   - `uv run python -m wavelet rl-trainer @ <config>.yaml`
   - `uv run python -m wavelet rl-orchestrator @ <config>.yaml`
-  - `uv run python -m wavelet rl-vllm-server @ <config>.yaml`
-  - `uv run python -m wavelet rl-vllm-openai-server @ <config>.yaml`
+  - `uv run python -m wavelet inference-server @ <config>.yaml`
+  - `uv run python -m wavelet debug inference inspect @ <config>.yaml --json`
+  - `uv run python -m wavelet debug orchestrator inspect @ <config>.yaml --json`
 - Build source/wheel packages: `uv build`
 
 ### Known Runnable Examples

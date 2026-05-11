@@ -28,8 +28,8 @@ from wavelet.entrypoints.rl_trainer import (
     _should_step_streaming_rollouts,
     _use_streaming_rollout_chunks,
 )
-from wavelet.entrypoints.rl_vllm_openai_server import _serve_args
-from wavelet.entrypoints.rl_vllm_openai_server import _fit_chat_request_to_context
+from wavelet.entrypoints.inference_server import _serve_args
+from wavelet.entrypoints.inference_server import _fit_chat_request_to_context
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
@@ -262,7 +262,7 @@ def test_sleep_colocate_enables_vllm_sleep_allocator() -> None:
     assert args.enable_sleep_mode is True
 
 
-def test_vllm_openai_server_enables_fully_sharded_loras() -> None:
+def test_inference_server_enables_fully_sharded_loras() -> None:
     config = RLConfig(
         inference={"vllm": {"fully_sharded_loras": True}},
         lora={"rank": 32, "target_modules": ["q_proj"]},
@@ -275,7 +275,7 @@ def test_vllm_openai_server_enables_fully_sharded_loras() -> None:
     assert args.max_lora_rank == 32
 
 
-def test_vllm_openai_server_passes_quantized_load_args() -> None:
+def test_inference_server_passes_quantized_load_args() -> None:
     config = RLConfig(
         inference={
             "vllm": {
@@ -291,7 +291,7 @@ def test_vllm_openai_server_passes_quantized_load_args() -> None:
     assert args.load_format == "bitsandbytes"
 
 
-def test_vllm_openai_server_uses_nccl_worker_for_nccl_transfer() -> None:
+def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
     config = RLConfig(
         inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
         lora=None,
@@ -326,7 +326,28 @@ def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
         inference_ports=[8100],
     )
 
-    assert [role.name for role in roles] == ["vllm_server_0", "inference"]
+    assert [role.name for role in roles] == ["inference_server_0", "inference"]
+    assert roles[0].command == "inference-server"
+
+
+def test_launcher_uses_native_inference_server_only_when_requested(tmp_path: Path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        launcher={"mode": "process", "inference_num_replicas": 1},
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "offline"}},
+        orchestrator={
+            "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
+        },
+    )
+
+    roles = _role_specs(
+        config,
+        trainer_config_path=_config_path_for_role(config, "trainer", config),
+        inference_config_path=_config_path_for_role(config, "inference", config),
+        inference_ports=[8100],
+    )
+
+    assert roles[0].command == "native-inference-server"
 
 
 def test_publish_adapter_policy_snapshot_copies_adapter(tmp_path: Path) -> None:
@@ -346,7 +367,7 @@ def test_publish_adapter_policy_snapshot_copies_adapter(tmp_path: Path) -> None:
     assert (step_dir / "policy.json").exists()
 
 
-def test_vllm_openai_server_auto_enables_qwen_tool_parser() -> None:
+def test_inference_server_auto_enables_qwen_tool_parser() -> None:
     config = RLConfig(model={"name": "Qwen/Qwen3-4B-Instruct-2507"})
 
     args = _serve_args(config)
@@ -355,7 +376,7 @@ def test_vllm_openai_server_auto_enables_qwen_tool_parser() -> None:
     assert args.enable_auto_tool_choice is True
 
 
-def test_vllm_openai_server_auto_detects_qwen35_tool_parser() -> None:
+def test_inference_server_auto_detects_qwen35_tool_parser() -> None:
     config = RLConfig(model={"name": "Qwen/Qwen3.5-397B-A17B"})
 
     args = _serve_args(config)
@@ -364,7 +385,7 @@ def test_vllm_openai_server_auto_detects_qwen35_tool_parser() -> None:
     assert args.enable_auto_tool_choice is True
 
 
-def test_vllm_openai_server_unknown_auto_tool_parser_disabled() -> None:
+def test_inference_server_unknown_auto_tool_parser_disabled() -> None:
     config = RLConfig(model={"name": "some/unknown-model"})
 
     args = _serve_args(config)
@@ -373,7 +394,7 @@ def test_vllm_openai_server_unknown_auto_tool_parser_disabled() -> None:
     assert args.enable_auto_tool_choice is False
 
 
-def test_vllm_openai_server_allows_disabling_tool_parser() -> None:
+def test_inference_server_allows_disabling_tool_parser() -> None:
     config = RLConfig(
         model={"name": "Qwen/Qwen3-4B-Instruct-2507"},
         inference={"vllm": {"tool_call_parser": None}},
@@ -665,7 +686,7 @@ def test_http_openai_payload_sets_vllm_request_fields() -> None:
     assert "extra_body" not in payload
 
 
-def test_vllm_openai_server_fits_overlong_chat_completion_request() -> None:
+def test_inference_server_fits_overlong_chat_completion_request() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.exceptions import VLLMValidationError
 

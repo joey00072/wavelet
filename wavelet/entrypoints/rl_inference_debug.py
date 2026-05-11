@@ -21,7 +21,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser(
-        prog="wavelet inference-debug",
+        prog="wavelet debug inference",
         description="Inspect and probe RL inference without trainer/orchestrator.",
     )
     parser.add_argument(

@@ -470,19 +470,19 @@ def _role_specs(
             )
             replica_config_path = _config_path_for_role(
                 config,
-                f"rl_vllm_server_{replica}",
+                f"inference_server_{replica}",
                 replica_config,
             )
             roles.append(
                 RoleSpec(
-                    name=f"vllm_server_{replica}",
+                    name=f"inference_server_{replica}",
                     command=(
-                        "rl-vllm-openai-server"
+                        "inference-server"
                         if config.inference.vllm.server_backend == "openai"
-                        else "rl-vllm-server"
+                        else "native-inference-server"
                     ),
                     config_path=replica_config_path,
-                    log_name=f"rl_vllm_server_{replica}",
+                    log_name=f"inference_server_{replica}",
                     cuda_visible_devices=cuda_visible_devices,
                     service=True,
                 )
