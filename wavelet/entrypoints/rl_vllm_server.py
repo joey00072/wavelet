@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.inference.diagnostics import inference_debug_state
 from wavelet.inference.serialization import (
     rl_examples_from_payload,
     rl_examples_to_payload,
@@ -61,6 +62,15 @@ def _build_app(config: RLConfig):
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {"status": "ok", "policy_step": engine.policy_step}
+
+    @app.get("/debug/state")
+    def debug_state() -> dict[str, Any]:
+        state = inference_debug_state(config)
+        state["runtime"] = {
+            "policy_step": engine.policy_step,
+            "policy_adapter_loaded": getattr(engine, "_lora_request", None) is not None,
+        }
+        return state
 
     @app.post("/pause")
     def pause() -> dict[str, str]:
