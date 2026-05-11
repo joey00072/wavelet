@@ -44,6 +44,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.inference.diagnostics import inference_debug_state
 from wavelet.utils.config import load_config
 from wavelet.utils.perf import emit_perf
 
@@ -676,6 +677,21 @@ async def health(request: Request) -> dict[str, Any]:
         "policy_step": getattr(request.app.state, "policy_step", None),
         "asleep": getattr(request.app.state, "asleep", False),
     }
+
+
+@router.get("/debug/state")
+async def debug_state(request: Request) -> dict[str, Any]:
+    if _CONFIG is None:
+        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    state = inference_debug_state(_CONFIG)
+    state["runtime"] = {
+        "policy_step": getattr(request.app.state, "policy_step", None),
+        "policy_adapter_name": getattr(request.app.state, "policy_adapter_name", None),
+        "policy_adapter_path": getattr(request.app.state, "policy_adapter_path", None),
+        "policy_weight_path": getattr(request.app.state, "policy_weight_path", None),
+        "asleep": getattr(request.app.state, "asleep", False),
+    }
+    return state
 
 
 @router.post("/sleep")

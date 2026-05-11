@@ -8,9 +8,17 @@ COMMANDS = {
     "rl": ("wavelet.entrypoints.rl_launcher", "Run reinforcement learning launcher"),
     "rl-trainer": ("wavelet.entrypoints.rl_trainer", "Run RL trainer"),
     "rl-orchestrator": ("wavelet.entrypoints.rl_orchestrator", "Run RL orchestrator"),
+    "orchestrator-debug": (
+        "wavelet.entrypoints.rl_orchestrator_debug",
+        "Inspect and benchmark RL orchestration",
+    ),
     "rl-inference": (
         "wavelet.entrypoints.rl_inference",
         "Run RL inference annotation stage",
+    ),
+    "inference-debug": (
+        "wavelet.entrypoints.rl_inference_debug",
+        "Inspect and probe RL inference",
     ),
     "rl-vllm-server": (
         "wavelet.entrypoints.rl_vllm_server",

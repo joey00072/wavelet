@@ -13,7 +13,10 @@ def test_cli_usage_does_not_eagerly_import_entrypoints(monkeypatch, capsys) -> N
 
     assert wavelet.cli.main() == 1
 
-    assert "Usage: wavelet <command> [args]" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Usage: wavelet <command> [args]" in output
+    assert "inference-debug" in output
+    assert "orchestrator-debug" in output
     assert not any(
         module_name.startswith("wavelet.entrypoints.") for module_name in sys.modules
     )
