@@ -5,9 +5,11 @@ import json
 import logging
 import random
 import shutil
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from math import ceil
 from pathlib import Path
+from time import monotonic, sleep
 
 import torch
 from peft import PeftModel
@@ -31,14 +33,22 @@ from wavelet.distributed.world import barrier
 from wavelet.orchestrator.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
+    QueueEvent,
+    append_event_best_effort,
     get_policy_step_dir,
     resolve_policy_dir,
+    utc_now,
 )
 from wavelet.trainer.base import BaseTrainer
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.lora import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.nccl_broadcast import (
+    NCCLWeightBroadcaster,
+    update_info_for_named_tensors,
+)
 from wavelet.trainer.rl_loss import compute_loss, selective_log_softmax
 from wavelet.utils.monitoring import RunMonitor
+from wavelet.utils.policy_transfer import NCCL_READY_MARKER, NCCL_UPDATE_INFO_FILENAME
 from wavelet.utils.pathing import resolve_resume_checkpoint
 
 
@@ -47,6 +57,7 @@ SUM_SYNCED_METRIC_KEYS = {
     "rollout/count",
     "micro_batch/count",
     "tokens/train",
+    "tokens/model",
 }
 ZERO_LOSS_METRIC_KEYS = (
     "mismatch_kl",
@@ -231,6 +242,8 @@ class RLTrainer(BaseTrainer):
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
         self._run_closed = False
+        self._nccl_broadcaster_executor: ThreadPoolExecutor | None = None
+        self._nccl_broadcaster_future: Future[NCCLWeightBroadcaster] | None = None
 
     def _setup_data(self) -> None:
         if self.tokenizer is None:
@@ -605,12 +618,7 @@ class RLTrainer(BaseTrainer):
         if not self.should_export_policy(export_step):
             return None
         if self.config.policy_transfer.type == "nccl":
-            raise NotImplementedError(
-                "NCCL policy transfer primitives are available in "
-                "wavelet.trainer.nccl_broadcast, but the vLLM worker-side hot "
-                "weight receiver is not wired into RL training yet. Use "
-                "policy_transfer.type='filesystem' for runnable LoRA RL."
-            )
+            return self._export_nccl_policy(export_step)
 
         policy_dir = resolve_policy_dir(self.output_dir, self.config.policy_transfer)
         step_dir = get_policy_step_dir(policy_dir, export_step)
@@ -627,8 +635,10 @@ class RLTrainer(BaseTrainer):
 
         export_model = None
         state_dict = None
-        if self.config.policy_transfer.lightweight_lora and isinstance(
-            self.model, FSDP
+        if (
+            self.config.lora is not None
+            and self.config.policy_transfer.lightweight_lora
+            and isinstance(self.model, FSDP)
         ):
             if tmp_dir.exists() and self.world.is_main:
                 shutil.rmtree(tmp_dir)
@@ -643,7 +653,13 @@ class RLTrainer(BaseTrainer):
                 parallel_dims=self.parallel_dims,
             )
         else:
-            export_model, state_dict = export_model_for_save(self.model)
+            export_dtype = None
+            if self.config.lora is None:
+                export_dtype = torch.bfloat16
+            export_model, state_dict = export_model_for_save(
+                self.model,
+                state_dict_dtype=export_dtype,
+            )
             if self.world.is_main:
                 if tmp_dir.exists():
                     shutil.rmtree(tmp_dir)
@@ -684,11 +700,144 @@ class RLTrainer(BaseTrainer):
         if self.world.is_main:
             (tmp_dir / STABLE_BATCH_MARKER).touch()
             tmp_dir.replace(step_dir)
+            append_event_best_effort(
+                self.config.output_dir / "events",
+                QueueEvent(
+                    time=utc_now(),
+                    kind="policy_export_completed",
+                    policy_step=export_step,
+                ),
+            )
         if self.world.world_size > 1:
             barrier(self.world)
         return step_dir
 
+    def _export_nccl_policy(self, export_step: int) -> Path:
+        if self.model is None:
+            raise RuntimeError("Trainer not set up. Call setup() first.")
+        if self.world is None:
+            raise RuntimeError("World not set up")
+        if self.config.lora is not None:
+            raise NotImplementedError(
+                "NCCL policy transfer is only implemented for full-model updates. "
+                "Use filesystem policy transfer for LoRA adapters."
+            )
+
+        policy_dir = resolve_policy_dir(self.output_dir, self.config.policy_transfer)
+        step_dir = get_policy_step_dir(policy_dir, export_step)
+        tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
+
+        if self.world.is_main:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            if step_dir.exists():
+                shutil.rmtree(step_dir)
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        state_dict = None
+        if export_step > 0:
+            from wavelet.trainer.model import export_model_for_save
+
+            _, state_dict = export_model_for_save(
+                self.model,
+                state_dict_dtype=torch.bfloat16,
+            )
+
+        if self.world.is_main:
+            named_tensors = [] if state_dict is None else list(state_dict.items())
+            update_info = update_info_for_named_tensors(named_tensors)
+            (tmp_dir / NCCL_UPDATE_INFO_FILENAME).write_text(json.dumps(update_info))
+            meta = {
+                "format_version": 1,
+                "step": export_step,
+                "kind": "nccl",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
+            (tmp_dir / STABLE_BATCH_MARKER).touch()
+            tmp_dir.replace(step_dir)
+            if export_step > 0:
+                self._start_nccl_broadcaster()
+
+        self.offload_after_refit()
+
+        if export_step > 0 and self.world.is_main:
+            self._wait_for_nccl_ready(step_dir)
+            if state_dict is None:
+                raise RuntimeError("Missing state dict for NCCL policy broadcast.")
+            broadcaster = self._nccl_broadcaster()
+            broadcaster.broadcast_named_tensors(state_dict.items())
+
+        state_dict = None
+        if self.world.world_size > 1:
+            barrier(self.world)
+        if self.world.is_main:
+            append_event_best_effort(
+                self.config.output_dir / "events",
+                QueueEvent(
+                    time=utc_now(),
+                    kind="policy_export_completed",
+                    policy_step=export_step,
+                ),
+            )
+        if self.world.world_size > 1:
+            barrier(self.world)
+        return step_dir
+
+    def _wait_for_nccl_ready(self, step_dir: Path) -> None:
+        ready_path = step_dir / NCCL_READY_MARKER
+        deadline = monotonic() + self.config.policy_transfer.nccl_timeout_seconds
+        while monotonic() < deadline:
+            if ready_path.exists():
+                return
+            sleep(0.1)
+        raise TimeoutError(
+            "Timed out waiting for inference workers to enter NCCL policy update "
+            f"for {step_dir}."
+        )
+
+    def _start_nccl_broadcaster(self) -> None:
+        if self._nccl_broadcaster_future is not None:
+            return
+        if self._nccl_broadcaster_executor is None:
+            self._nccl_broadcaster_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="wavelet-nccl-broadcaster",
+            )
+        self._nccl_broadcaster_future = self._nccl_broadcaster_executor.submit(
+            self._create_nccl_broadcaster
+        )
+
+    def _nccl_broadcaster(self) -> NCCLWeightBroadcaster:
+        if self._nccl_broadcaster_future is None:
+            self._start_nccl_broadcaster()
+        assert self._nccl_broadcaster_future is not None
+        return self._nccl_broadcaster_future.result(
+            timeout=self.config.policy_transfer.nccl_timeout_seconds
+        )
+
+    def _create_nccl_broadcaster(self) -> NCCLWeightBroadcaster:
+        device = (
+            self.world.device
+            if self.world is not None
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+        return NCCLWeightBroadcaster(
+            host=self.config.policy_transfer.nccl_host,
+            port=self.config.policy_transfer.nccl_port,
+            rank=0,
+            world_size=(
+                self.config.policy_transfer.nccl_inference_world_size
+                + self.config.policy_transfer.nccl_rank_offset
+            ),
+            device=device,
+            timeout_seconds=self.config.policy_transfer.nccl_timeout_seconds,
+        )
+
     def finalize(self, *, status: str = "completed") -> None:
+        if self._nccl_broadcaster_executor is not None:
+            self._nccl_broadcaster_executor.shutdown(wait=False, cancel_futures=True)
+            self._nccl_broadcaster_executor = None
         if self.monitor is None or self._run_closed:
             return
         self.monitor.finish(status=status, step=self.step)
@@ -697,6 +846,8 @@ class RLTrainer(BaseTrainer):
             self._save_model()
 
     def _validate_reference_policy_support(self) -> None:
+        if self.config.orchestrator.enabled:
+            return
         if not isinstance(self.dataset, RLDataset):
             return
         if self.model is None:
@@ -739,7 +890,10 @@ class RLTrainer(BaseTrainer):
             record.advantage is None and record.reward is None for record in records
         ):
             return None
-        return self.dataset.loss_scale_for_next_local_batch(self.accumulation_steps)
+        return self.dataset.loss_scale_for_next_local_batch(
+            self.accumulation_steps,
+            normalization=self.config.loss.normalization,
+        )
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.world is None:
@@ -919,18 +1073,31 @@ class RLTrainer(BaseTrainer):
     ) -> Tensor:
         if self.model is None:
             raise RuntimeError("Model not set up")
-        outputs = self.model(
-            input_ids=batch["input_ids"],
-            attention_mask=attention_mask,
-            position_ids=batch["position_ids"],
-            labels=batch["target_ids"],
-            temperature=batch["temperatures"],
-        )
+        model_kwargs = {
+            "input_ids": batch["input_ids"],
+            "attention_mask": attention_mask,
+            "position_ids": batch["position_ids"],
+        }
+        if self.config.model.fused_lm_head_token_chunk_size != "disabled":
+            model_kwargs["labels"] = batch["target_ids"]
+            model_kwargs["temperature"] = batch["temperatures"]
+
+        with self._model_forward_context():
+            outputs = self.model(**model_kwargs)
         if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
             return outputs["logprobs"].float().contiguous()
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         scaled_logits = logits.float() / batch["temperatures"].float().unsqueeze(-1)
         return selective_log_softmax(scaled_logits, batch["target_ids"])
+
+    def _model_forward_context(self):
+        if (
+            self.world is not None
+            and self.world.device.type == "cuda"
+            and self.config.model.torch_dtype == "float32"
+        ):
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return contextlib.nullcontext()
 
     def _teacher_logprobs(self, batch: dict[str, Tensor]) -> Tensor | None:
         if not batch["has_teacher_logprobs"].bool().any():
@@ -972,6 +1139,7 @@ class RLTrainer(BaseTrainer):
             "rollout/count": rollout_count,
             "micro_batch/count": float(batch["input_ids"].shape[0]),
             "tokens/train": float(loss_mask.sum().item()),
+            "tokens/model": float(batch["input_ids"].numel()),
             "seq_len/all/mean": float(seq_lens.mean().item()),
             "seq_len/all/max": float(seq_lens.max().item()),
             "seq_len/all/min": float(seq_lens.min().item()),
@@ -1048,7 +1216,12 @@ class RLTrainer(BaseTrainer):
                     aggregated[key] = sum(values) / len(values)
                 aggregated["_reward_weighted_sum"] = weighted_sum
                 aggregated["_reward_weight"] = total_weight
-            elif key in {"tokens/train", "rollout/count", "micro_batch/count"}:
+            elif key in {
+                "tokens/train",
+                "tokens/model",
+                "rollout/count",
+                "micro_batch/count",
+            }:
                 aggregated[key] = sum(values)
             else:
                 aggregated[key] = sum(values) / len(values)
@@ -1219,8 +1392,10 @@ class RLTrainer(BaseTrainer):
         from wavelet.trainer.lora import save_lora_adapter_snapshot_from_fsdp
         from wavelet.trainer.model import export_model_for_save, save_model
 
-        if self.config.policy_transfer.lightweight_lora and isinstance(
-            self.model, FSDP
+        if (
+            self.config.lora is not None
+            and self.config.policy_transfer.lightweight_lora
+            and isinstance(self.model, FSDP)
         ):
             saved_path = save_lora_adapter_snapshot_from_fsdp(
                 self.model,

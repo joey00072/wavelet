@@ -11,7 +11,12 @@ import torch
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.jsonl import count_nonempty_jsonl_rows
 from wavelet.distributed.world import barrier
-from wavelet.orchestrator.queue import FileSystemRolloutReceiver
+from wavelet.orchestrator.queue import (
+    FileSystemRolloutReceiver,
+    RolloutBatch,
+    record_rollout_claim,
+    record_rollout_consumed,
+)
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
     target_steps as _target_steps,
@@ -28,11 +33,16 @@ class _StreamingChunkAccumulator:
     accumulated_loss_scale: float = 0.0
     chunk_index: int = 0
     pending_paths: list[Path] = field(default_factory=list)
+    pending_batches: list[RolloutBatch] = field(default_factory=list)
     pending_rows: int = 0
 
-    def buffer(self, path: Path, rows: int) -> None:
+    def buffer(self, batch: RolloutBatch | Path, rows: int) -> None:
         self.chunk_index += 1
-        self.pending_paths.append(path)
+        if isinstance(batch, RolloutBatch):
+            self.pending_paths.append(batch.path)
+            self.pending_batches.append(batch)
+        else:
+            self.pending_paths.append(batch)
         self.pending_rows += rows
 
     def should_load(self, *, min_rows: int) -> bool:
@@ -40,11 +50,17 @@ class _StreamingChunkAccumulator:
             return True
         return self.accumulated_rows > 0 and self.pending_rows > 0
 
-    def drain_pending_paths(self) -> tuple[list[Path], int]:
+    def drain_pending_batches(self) -> tuple[list[Path], list[RolloutBatch], int]:
         paths = self.pending_paths
+        batches = self.pending_batches
         loaded_chunks = len(paths)
         self.pending_paths = []
+        self.pending_batches = []
         self.pending_rows = 0
+        return paths, batches, loaded_chunks
+
+    def drain_pending_paths(self) -> tuple[list[Path], int]:
+        paths, _, loaded_chunks = self.drain_pending_batches()
         return paths, loaded_chunks
 
     def mark_loaded(
@@ -104,6 +120,12 @@ def main(argv: list[str] | None = None) -> int:
                     wait_started_at = perf_counter()
                     batch = receiver.wait()
                     wait_seconds = perf_counter() - wait_started_at
+                    trainer_step_before = trainer.step
+                    _record_rollout_claim_if_main(
+                        trainer,
+                        batch,
+                        trainer_step_before=trainer_step_before,
+                    )
                     load_started_at = perf_counter()
                     trainer.load_rollout_path(batch.path)
                     load_seconds = perf_counter() - load_started_at
@@ -111,6 +133,13 @@ def main(argv: list[str] | None = None) -> int:
                     trainer.prepare_for_training()
                     trainer.train_until(trainer.step + 1)
                     train_seconds = perf_counter() - train_started_at
+                    _record_rollout_consumed_if_main(
+                        trainer,
+                        batch,
+                        trainer_step_before=trainer_step_before,
+                        trainer_step_after=trainer.step,
+                        optimizer_step_completed=True,
+                    )
                     export_started_at = perf_counter()
                     trainer.export_policy(step=trainer.step)
                     trainer.offload_after_refit()
@@ -169,11 +198,17 @@ def _run_streaming_rollout_training(
         wait_started_at = perf_counter()
         batch = receiver.wait_available()
         wait_seconds = perf_counter() - wait_started_at
+        trainer_step_before = trainer.step
+        _record_rollout_claim_if_main(
+            trainer,
+            batch,
+            trainer_step_before=trainer_step_before,
+        )
         row_count = count_nonempty_jsonl_rows(
             batch.path,
             description="Rollout chunk",
         )
-        accumulator.buffer(batch.path, row_count)
+        accumulator.buffer(batch, row_count)
         if not accumulator.should_load(min_rows=min_loadable_rows):
             emit_perf(
                 "trainer_chunk_buffered",
@@ -198,7 +233,7 @@ def _run_streaming_rollout_training(
             rollout_path,
             description="Rollout chunk",
         )
-        _, loaded_chunks = accumulator.drain_pending_paths()
+        _, loaded_batches, loaded_chunks = accumulator.drain_pending_batches()
         trainer.load_rollout_path(rollout_path)
         accumulator.mark_loaded(
             rows=row_count,
@@ -235,6 +270,14 @@ def _run_streaming_rollout_training(
         metrics = trainer.train_loaded_rollouts_once()
         _validate_distributed_step_sync(trainer, metrics is not None)
         train_seconds = perf_counter() - train_started_at
+        for loaded_batch in loaded_batches:
+            _record_rollout_consumed_if_main(
+                trainer,
+                loaded_batch,
+                trainer_step_before=trainer_step_before,
+                trainer_step_after=trainer.step,
+                optimizer_step_completed=metrics is not None,
+            )
 
         export_seconds = 0.0
         if metrics is not None:
@@ -276,6 +319,44 @@ def _should_step_streaming_rollouts(
     return accumulated_chunks >= chunks_per_step
 
 
+def _record_rollout_claim_if_main(
+    trainer: RLTrainer,
+    batch: RolloutBatch,
+    *,
+    trainer_step_before: int,
+) -> None:
+    if not _is_main_trainer_process(trainer):
+        return
+    record_rollout_claim(
+        batch,
+        trainer_step_before=trainer_step_before,
+        events_dir=trainer.config.output_dir / "events",
+    )
+
+
+def _record_rollout_consumed_if_main(
+    trainer: RLTrainer,
+    batch: RolloutBatch,
+    *,
+    trainer_step_before: int,
+    trainer_step_after: int,
+    optimizer_step_completed: bool,
+) -> None:
+    if not _is_main_trainer_process(trainer):
+        return
+    record_rollout_consumed(
+        batch,
+        trainer_step_before=trainer_step_before,
+        trainer_step_after=trainer_step_after,
+        optimizer_step_completed=optimizer_step_completed,
+        events_dir=trainer.config.output_dir / "events",
+    )
+
+
+def _is_main_trainer_process(trainer: RLTrainer) -> bool:
+    return trainer.world is None or trainer.world.is_main
+
+
 def _log_step_perf_metrics(
     trainer: RLTrainer,
     metrics: dict[str, float],
@@ -285,14 +366,25 @@ def _log_step_perf_metrics(
 ) -> None:
     if trainer.monitor is None:
         return
-    tokens = metrics.get("tokens/train")
-    if tokens is None or tokens <= 0:
+    train_tokens = metrics.get("tokens/train")
+    model_tokens = metrics.get("tokens/model", train_tokens)
+    if train_tokens is None or train_tokens <= 0:
         return
+    if model_tokens is None or model_tokens <= 0:
+        model_tokens = train_tokens
+    world_size = trainer.world.world_size if trainer.world is not None else 1
+    train_tokens_per_second = train_tokens / max(train_seconds, 1e-9)
+    model_tokens_per_second = model_tokens / max(train_seconds, 1e-9)
     perf_metrics = {
         "perf/train_seconds": train_seconds,
         "perf/step_seconds": loop_seconds,
-        "perf/train_tokens_per_second": tokens / max(train_seconds, 1e-9),
-        "perf/step_tokens_per_second": tokens / max(loop_seconds, 1e-9),
+        "perf/train_tokens_per_second": train_tokens_per_second,
+        "perf/model_tokens_per_second": model_tokens_per_second,
+        "perf/step_tokens_per_second": model_tokens / max(loop_seconds, 1e-9),
+        "perf/throughput": model_tokens_per_second,
+        "perf/throughput_per_gpu": model_tokens_per_second / max(world_size, 1),
+        "time/forward_backward": train_seconds,
+        "time/step": loop_seconds,
     }
     trainer.monitor.log(perf_metrics, step=trainer.step)
 

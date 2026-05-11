@@ -339,8 +339,13 @@ class RLDataset(IterableDataset[RLSample]):
             "skipped": self.skipped,
         }
 
-    def loss_scale_for_next_local_batch(self, local_batch_size: int) -> int:
-        """Count trainable tokens for the next local optimizer batch."""
+    def loss_scale_for_next_local_batch(
+        self,
+        local_batch_size: int,
+        *,
+        normalization: str = "token",
+    ) -> int:
+        """Count trainable units for the next local optimizer batch."""
         if local_batch_size <= 0:
             return 1
 
@@ -366,7 +371,10 @@ class RLDataset(IterableDataset[RLSample]):
             )
             if sample is None:
                 continue
-            total += sum(sample["loss_mask"])
+            if normalization == "sequence":
+                total += _sample_trainable_sequence_count(sample)
+            else:
+                total += _sample_trainable_count(sample)
             collected += 1
         return max(total, 1)
 
@@ -421,6 +429,26 @@ class RLDataset(IterableDataset[RLSample]):
 
 def _sample_trainable_count(sample: RLSample) -> int:
     return sum(bool(value) for value in sample["loss_mask"])
+
+
+def _sample_trainable_sequence_count(sample: RLSample) -> int:
+    loss_mask = sample["loss_mask"]
+    if not any(bool(value) for value in loss_mask):
+        return 0
+    starts = [
+        index
+        for index, position_id in enumerate(sample["position_ids"][: len(loss_mask)])
+        if position_id == 0
+    ]
+    if not starts:
+        return 1
+    if starts[0] != 0:
+        starts.insert(0, 0)
+    ends = [*starts[1:], len(loss_mask)]
+    return sum(
+        any(bool(value) for value in loss_mask[start:end])
+        for start, end in zip(starts, ends, strict=True)
+    )
 
 
 def _packed_sample(samples: list[RLSample], *, pad_to_multiple_of: int) -> RLSample:
@@ -587,12 +615,19 @@ class PackedRLDataset(IterableDataset[RLSample]):
             for sample in self._bins_for_epoch(self.epoch)
         )
 
-    def loss_scale_for_next_local_batch(self, _local_batch_size: int) -> float:
-        local_tokens = sum(
-            _sample_trainable_count(sample)
-            for sample in self._bins_for_epoch(self.epoch)
+    def loss_scale_for_next_local_batch(
+        self,
+        _local_batch_size: int,
+        *,
+        normalization: str = "token",
+    ) -> float:
+        counter = (
+            _sample_trainable_sequence_count
+            if normalization == "sequence"
+            else _sample_trainable_count
         )
-        return max(float(local_tokens), 1.0)
+        total = sum(counter(sample) for sample in self._bins_for_epoch(self.epoch))
+        return max(float(total), 1.0)
 
     def __iter__(self) -> Iterator[RLSample]:
         while True:

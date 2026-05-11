@@ -54,6 +54,10 @@ def test_packed_rl_dataset_pads_incomplete_distributed_tail_with_zero_loss() -> 
     assert bins[-1]["advantages"] == []
     assert bins[-1]["sample_count"] == 0
     assert dataset.loss_scale_for_next_local_batch(2) == pytest.approx(6.0)
+    assert dataset.loss_scale_for_next_local_batch(
+        2,
+        normalization="sequence",
+    ) == pytest.approx(1.0)
 
 
 def test_packed_rl_dataset_counts_real_local_samples() -> None:

@@ -50,6 +50,7 @@ from wavelet.utils.perf import emit_perf
 
 _CONFIG: RLConfig | None = None
 router = APIRouter()
+CONTEXT_FIT_SAFETY_TOKENS = 16
 
 MODEL_TOOL_CALL_PARSER: dict[str, str] = {
     "zai-org/GLM-4.5": "glm45",
@@ -158,23 +159,34 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         request: ChatCompletionRequest,
         raw_request: Request | None = None,
     ):
-        try:
-            return await super().create_chat_completion(request, raw_request)
-        except VLLMValidationError as exc:
-            fitted_request = _fit_chat_request_to_context(
-                request,
-                max_model_len=self.model_config.max_model_len,
-                error=exc,
-            )
-            if fitted_request is request:
-                raise
-            return await super().create_chat_completion(fitted_request, raw_request)
+        fitted_request = request
+        for _ in range(4):
+            try:
+                return await super().create_chat_completion(
+                    fitted_request,
+                    raw_request,
+                )
+            except VLLMValidationError as exc:
+                next_request = _fit_chat_request_to_context(
+                    fitted_request,
+                    max_model_len=self.model_config.max_model_len,
+                    error=exc,
+                )
+                if next_request is fitted_request:
+                    raise
+                fitted_request = next_request
+        return await super().create_chat_completion(fitted_request, raw_request)
 
     async def create_chat_completion_with_tokens(
         self,
         request: ChatCompletionRequestWithTokens,
         raw_request: Request | None = None,
     ):
+        request = _fit_chat_request_to_prompt_tokens(
+            request,
+            max_model_len=self.model_config.max_model_len,
+            prompt_tokens=len(request.tokens),
+        )
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
         reasoning_parser: ReasoningParser | None = None
@@ -191,9 +203,26 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         except RuntimeError as exc:
             return self.create_error_response(str(exc))
 
-        rendered = await self.render_chat_request(request)
-        if isinstance(rendered, ErrorResponse):
-            return rendered
+        for _ in range(4):
+            try:
+                rendered = await self.render_chat_request(request)
+            except VLLMValidationError as exc:
+                fitted_request = _fit_chat_request_to_context(
+                    request,
+                    max_model_len=self.model_config.max_model_len,
+                    error=exc,
+                )
+                if fitted_request is request:
+                    raise
+                request = fitted_request
+                continue
+            if isinstance(rendered, ErrorResponse):
+                return rendered
+            break
+        else:
+            rendered = await self.render_chat_request(request)
+            if isinstance(rendered, ErrorResponse):
+                return rendered
         conversation, engine_prompts = rendered
         engine_prompts[0]["prompt_token_ids"] = request.tokens
         request_id = (
@@ -330,7 +359,23 @@ def _fit_chat_request_to_context(
     prompt_tokens = _prompt_tokens_from_validation_error(error)
     if prompt_tokens is None or prompt_tokens >= max_model_len:
         return request
-    remaining_tokens = max(max_model_len - prompt_tokens, 1)
+    return _fit_chat_request_to_prompt_tokens(
+        request,
+        max_model_len=max_model_len,
+        prompt_tokens=prompt_tokens,
+    )
+
+
+def _fit_chat_request_to_prompt_tokens(
+    request: ChatCompletionRequest,
+    *,
+    max_model_len: int,
+    prompt_tokens: int,
+) -> ChatCompletionRequest:
+    remaining_tokens = max(
+        max_model_len - prompt_tokens - CONTEXT_FIT_SAFETY_TOKENS,
+        1,
+    )
     requested_tokens = (
         request.max_completion_tokens
         if request.max_completion_tokens is not None
@@ -685,6 +730,43 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
         raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
     policy_dir = Path(payload["policy_dir"])
     step = int(payload["step"])
+    if _CONFIG.lora is None:
+        if _CONFIG.policy_transfer.type == "nccl":
+            weight_dir = policy_dir
+        else:
+            weight_dir = policy_dir / "model"
+            if not weight_dir.exists():
+                weight_dir = policy_dir
+        weight_path = str(weight_dir.resolve())
+        if step == 0:
+            raw_request.app.state.policy_step = step
+            raw_request.app.state.policy_weight_path = weight_path
+            return {"status": "ok", "policy_step": step, "weight_path": weight_path}
+        if (
+            getattr(raw_request.app.state, "policy_step", None) == step
+            and getattr(raw_request.app.state, "policy_weight_path", None)
+            == weight_path
+        ):
+            return {"status": "ok", "policy_step": step, "weight_path": weight_path}
+        if _CONFIG.policy_transfer.type == "nccl":
+            await _engine_client(raw_request).collective_rpc(
+                "init_broadcaster",
+                args=(
+                    _CONFIG.policy_transfer.nccl_host,
+                    _CONFIG.policy_transfer.nccl_port,
+                    _CONFIG.policy_transfer.nccl_rank_offset,
+                    _CONFIG.policy_transfer.nccl_inference_world_size,
+                    _CONFIG.policy_transfer.nccl_timeout_seconds,
+                ),
+            )
+        await _engine_client(raw_request).collective_rpc(
+            "update_weights_from_path",
+            args=(weight_path,),
+        )
+        raw_request.app.state.policy_step = step
+        raw_request.app.state.policy_weight_path = weight_path
+        return {"status": "ok", "policy_step": step, "weight_path": weight_path}
+
     adapter_name = str(
         payload.get("adapter_name") or _CONFIG.policy_transfer.adapter_name
     )
@@ -714,6 +796,39 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
     raw_request.app.state.policy_adapter_name = adapter_name
     raw_request.app.state.policy_adapter_path = adapter_path
     return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
+
+
+@router.post("/init_broadcaster")
+async def init_broadcaster(payload: dict[str, Any], raw_request: Request):
+    if _CONFIG is None:
+        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    init_info = payload.get("init_info", payload)
+    await _engine_client(raw_request).collective_rpc(
+        "init_broadcaster",
+        args=(
+            init_info.get("host", _CONFIG.policy_transfer.nccl_host),
+            int(init_info.get("port", _CONFIG.policy_transfer.nccl_port)),
+            int(
+                init_info.get(
+                    "rank_offset",
+                    _CONFIG.policy_transfer.nccl_rank_offset,
+                )
+            ),
+            int(
+                init_info.get(
+                    "inference_world_size",
+                    _CONFIG.policy_transfer.nccl_inference_world_size,
+                )
+            ),
+            int(
+                init_info.get(
+                    "timeout",
+                    _CONFIG.policy_transfer.nccl_timeout_seconds,
+                )
+            ),
+        ),
+    )
+    return {"status": "ok"}
 
 
 @router.post(
@@ -756,6 +871,7 @@ async def custom_init_app_state(
     state.policy_step = None
     state.policy_adapter_name = None
     state.policy_adapter_path = None
+    state.policy_weight_path = None
     if "generate" in supported_tasks and state.openai_serving_chat is not None:
         serving_chat = object.__new__(OpenAIServingChatWithTokens)
         serving_chat.__dict__.update(state.openai_serving_chat.__dict__)
@@ -781,9 +897,6 @@ def _patch_build_app() -> None:
 
 def _serve_args(config: RLConfig) -> Namespace:
     vllm_config = config.inference.vllm
-    max_lora_rank = vllm_config.max_lora_rank or (
-        config.lora.rank if config.lora is not None else 1
-    )
     argv = [
         "--host",
         config.inference.http.host,
@@ -801,12 +914,6 @@ def _serve_args(config: RLConfig) -> Namespace:
         str(vllm_config.gpu_memory_utilization),
         "--max-model-len",
         str(vllm_config.max_model_len or config.data.seq_len + 1),
-        "--max-loras",
-        str(vllm_config.max_loras),
-        "--max-cpu-loras",
-        str(vllm_config.max_cpu_loras),
-        "--max-lora-rank",
-        str(max_lora_rank),
         "--logprobs-mode",
         "processed_logprobs",
         "--generation-config",
@@ -849,7 +956,18 @@ def _serve_args(config: RLConfig) -> Namespace:
     if config.launcher.mode == "colocate_sleep":
         argv.append("--enable-sleep-mode")
     if config.lora is not None:
+        max_lora_rank = vllm_config.max_lora_rank or config.lora.rank
         argv.append("--enable-lora")
+        argv.extend(
+            [
+                "--max-loras",
+                str(vllm_config.max_loras),
+                "--max-cpu-loras",
+                str(vllm_config.max_cpu_loras),
+                "--max-lora-rank",
+                str(max_lora_rank),
+            ]
+        )
         if vllm_config.fully_sharded_loras:
             argv.append("--fully-sharded-loras")
 
@@ -859,6 +977,14 @@ def _serve_args(config: RLConfig) -> Namespace:
     parser = make_arg_parser(parser)
     args = parser.parse_args(argv)
     assert args is not None
+    if config.policy_transfer.type == "nccl":
+        args.worker_extension_cls = (
+            "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
+        )
+    else:
+        args.worker_extension_cls = (
+            "wavelet.inference.vllm_weight_update.FileSystemWeightUpdateWorker"
+        )
     validate_parsed_serve_args(args)
     return args
 

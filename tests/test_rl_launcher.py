@@ -14,6 +14,8 @@ from wavelet.entrypoints.rl_inference import (
 )
 from wavelet.entrypoints.rl_launcher import (
     _config_path_for_role,
+    _config_with_nccl_inference_world_size,
+    _is_main_trainer_process as _launcher_is_main_trainer_process,
     _role_specs,
     _sleep_vllm_http_servers,
     _trainer_device_group,
@@ -22,6 +24,7 @@ from wavelet.entrypoints.rl_launcher import (
 from wavelet.entrypoints.rl_trainer import (
     _StreamingChunkAccumulator,
     _dummy_rollout_row,
+    _is_main_trainer_process as _entrypoint_is_main_trainer_process,
     _should_step_streaming_rollouts,
     _use_streaming_rollout_chunks,
 )
@@ -32,6 +35,17 @@ from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import chunks_per_step, rollout_chunk_examples
+from wavelet.utils.policy_transfer import NCCL_READY_MARKER
+
+
+class _FakeWorld:
+    def __init__(self, *, is_main: bool) -> None:
+        self.is_main = is_main
+
+
+class _FakeTrainer:
+    def __init__(self, *, is_main: bool | None) -> None:
+        self.world = None if is_main is None else _FakeWorld(is_main=is_main)
 
 
 def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
@@ -43,6 +57,14 @@ def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
     )
 
     assert _trainer_device_group(config) == "0"
+
+
+def test_queue_lifecycle_records_are_rank_zero_only() -> None:
+    assert _entrypoint_is_main_trainer_process(_FakeTrainer(is_main=None))
+    assert _entrypoint_is_main_trainer_process(_FakeTrainer(is_main=True))
+    assert not _entrypoint_is_main_trainer_process(_FakeTrainer(is_main=False))
+    assert _launcher_is_main_trainer_process(_FakeTrainer(is_main=True))
+    assert not _launcher_is_main_trainer_process(_FakeTrainer(is_main=False))
 
 
 def test_sleep_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
@@ -269,6 +291,22 @@ def test_vllm_openai_server_passes_quantized_load_args() -> None:
     assert args.load_format == "bitsandbytes"
 
 
+def test_vllm_openai_server_uses_nccl_worker_for_nccl_transfer() -> None:
+    config = RLConfig(
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        lora=None,
+        reward={"mode": "reference_match"},
+        policy_transfer={"type": "nccl"},
+    )
+
+    args = _serve_args(config)
+
+    assert (
+        args.worker_extension_cls
+        == "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
+    )
+
+
 def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
     config = RLConfig(
         max_steps=0,
@@ -448,6 +486,64 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
     assert engine.policy_model_name == "policy"
 
 
+def test_http_openai_nccl_load_policy_signals_ready(tmp_path: Path) -> None:
+    config = RLConfig(
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        lora=None,
+        reward={"mode": "reference_match"},
+        policy_transfer={"type": "nccl"},
+    )
+    engine = HTTPPolicyInferenceEngine(config)
+    calls = []
+
+    def fake_request(
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        *,
+        base_url: str | None = None,
+    ) -> dict:
+        calls.append((method, path, payload, base_url))
+        return {}
+
+    engine._request = fake_request  # type: ignore[method-assign]
+
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    engine.load_policy(policy_dir, step=3)
+
+    assert (policy_dir / NCCL_READY_MARKER).is_file()
+    assert calls == [
+        (
+            "POST",
+            "/load_policy",
+            {"policy_dir": str(policy_dir), "step": 3},
+            "http://127.0.0.1:8000",
+        )
+    ]
+
+
+def test_launcher_derives_nccl_inference_world_size() -> None:
+    config = RLConfig(
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        lora=None,
+        reward={"mode": "reference_match"},
+        policy_transfer={"type": "nccl"},
+        launcher={
+            "inference_num_replicas": 2,
+            "inference_cuda_visible_devices": ["0,1", "2,3"],
+        },
+    )
+
+    resolved = _config_with_nccl_inference_world_size(
+        config,
+        inference_replicas=2,
+    )
+
+    assert resolved.policy_transfer.nccl_inference_world_size == 4
+    assert resolved.policy_transfer.nccl_rank_offset == 1
+
+
 def test_http_openai_load_policy_stages_adapter_in_tmpfs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -593,7 +689,7 @@ def test_vllm_openai_server_fits_overlong_chat_completion_request() -> None:
     )
 
     assert fitted is not request
-    assert fitted.max_completion_tokens == 1023
+    assert fitted.max_completion_tokens == 1007
 
 
 def test_openai_sampling_kwargs_passes_stop_strings() -> None:

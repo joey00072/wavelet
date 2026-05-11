@@ -32,16 +32,20 @@ class _Wrapper:
 class _LogitModel:
     def __init__(self, logits: torch.Tensor) -> None:
         self.logits = logits
+        self.kwargs: dict[str, object] | None = None
 
     def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
+        self.kwargs = kwargs
         return {"logits": self.logits}
 
 
 class _LogprobModel:
     def __init__(self, logprobs: torch.Tensor) -> None:
         self.logprobs = logprobs
+        self.kwargs: dict[str, object] | None = None
 
     def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
+        self.kwargs = kwargs
         return {"logprobs": self.logprobs}
 
 
@@ -156,7 +160,8 @@ def test_model_logprobs_uses_fp32_for_bfloat16_logits() -> None:
     targets = torch.tensor([[1, 2, 3], [3, 4, 5]])
     temperatures = torch.ones((2, 3), dtype=torch.float32)
     trainer = RLTrainer(RLConfig())
-    trainer.model = _LogitModel(logits)  # type: ignore[assignment]
+    model = _LogitModel(logits)
+    trainer.model = model  # type: ignore[assignment]
 
     actual = trainer._model_logprobs(  # noqa: SLF001
         {
@@ -174,12 +179,18 @@ def test_model_logprobs_uses_fp32_for_bfloat16_logits() -> None:
 
     assert actual.dtype == torch.float32
     assert torch.allclose(actual, expected)
+    assert model.kwargs is not None
+    assert "labels" not in model.kwargs
+    assert "temperature" not in model.kwargs
 
 
 def test_model_logprobs_casts_chunked_output_to_fp32() -> None:
     logprobs = torch.randn(2, 3, dtype=torch.bfloat16)
-    trainer = RLTrainer(RLConfig())
-    trainer.model = _LogprobModel(logprobs)  # type: ignore[assignment]
+    config = RLConfig()
+    config.model.fused_lm_head_token_chunk_size = 1024
+    trainer = RLTrainer(config)
+    model = _LogprobModel(logprobs)
+    trainer.model = model  # type: ignore[assignment]
 
     actual = trainer._model_logprobs(  # noqa: SLF001
         {
@@ -193,6 +204,9 @@ def test_model_logprobs_casts_chunked_output_to_fp32() -> None:
 
     assert actual.dtype == torch.float32
     assert torch.allclose(actual, logprobs.float())
+    assert model.kwargs is not None
+    assert "labels" in model.kwargs
+    assert "temperature" in model.kwargs
 
 
 def test_float32_fsdp_config_uses_bfloat16_params_and_float32_reduce(

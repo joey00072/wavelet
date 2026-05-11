@@ -35,7 +35,7 @@ orchestrator:
   oversampling_factor: 1.0
   filter_zero_advantage: true
   zero_advantage_max_retries: 8
-  max_async_level: 8
+  max_async_level: 1
   max_off_policy_steps: 8
 
 eval:
@@ -100,10 +100,7 @@ optim:
 scheduler:
   type: constant
 
-lora:
-  rank: 32
-  alpha: 64.0
-  dropout: 0.0
+lora: null
 
 max_grad_norm: 1.0
 max_steps: 200

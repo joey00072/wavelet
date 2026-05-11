@@ -57,4 +57,5 @@ ref*
 .vscode/
 AGENT.md
 progress.md
+plan.md
 tools/prime_rl_compat/

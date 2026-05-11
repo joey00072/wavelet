@@ -21,6 +21,7 @@ from wavelet.inference.serialization import (
     rl_examples_to_payload,
 )
 from wavelet.trainer.model import setup_tokenizer
+from wavelet.utils.policy_transfer import NCCL_READY_MARKER
 
 
 class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
@@ -59,6 +60,13 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
         if self._uses_openai_rollouts() and self.config.lora is not None:
             policy_dir = self._cache_lora_policy_dir(policy_dir, step=step)
+        if (
+            self._uses_openai_rollouts()
+            and self.config.lora is None
+            and self.config.policy_transfer.type == "nccl"
+            and step > 0
+        ):
+            (policy_dir / NCCL_READY_MARKER).touch()
         payload: dict[str, Any] = {"policy_dir": str(policy_dir), "step": step}
         if self._uses_openai_rollouts() and self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name

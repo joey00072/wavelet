@@ -9,28 +9,48 @@ from wavelet.configs.rl_config import RLLossConfig
 from wavelet.trainer.rl_loss import compute_loss
 
 
-def test_loss_scale_matches_batch_token_normalization() -> None:
+def test_loss_scale_matches_token_normalization() -> None:
     loss_config = RLLossConfig(kl_tau=0.0)
-    total_loss = torch.tensor(0.0)
+    trainer_logprobs = torch.zeros(1, 4)
+    inference_logprobs = torch.zeros_like(trainer_logprobs)
+    advantages = torch.tensor([[2.0, 2.0, 2.0, -1.0]])
+    loss_mask = torch.tensor([[True, True, True, True]])
+    position_ids = torch.tensor([[0, 1, 2, 0]])
 
-    for advantages, mask in [
-        ([2.0, 2.0, 2.0], [True, True, True]),
-        ([-1.0], [True]),
-    ]:
-        trainer_logprobs = torch.zeros(1, len(advantages))
-        inference_logprobs = torch.zeros_like(trainer_logprobs)
-        loss, _ = compute_loss(
-            trainer_logprobs,
-            inference_logprobs,
-            None,
-            torch.tensor([advantages]),
-            torch.tensor([mask]),
-            loss_config,
-            loss_scale=4,
-        )
-        total_loss = total_loss + loss
+    loss, _ = compute_loss(
+        trainer_logprobs,
+        inference_logprobs,
+        None,
+        advantages,
+        loss_mask,
+        loss_config,
+        loss_scale=4,
+        position_ids=position_ids,
+    )
 
-    assert total_loss.item() == -1.25
+    assert loss.item() == pytest.approx(-1.25)
+
+
+def test_sequence_normalization_remains_available() -> None:
+    loss_config = RLLossConfig(kl_tau=0.0, normalization="sequence")
+    trainer_logprobs = torch.zeros(1, 4)
+    inference_logprobs = torch.zeros_like(trainer_logprobs)
+    advantages = torch.tensor([[2.0, 2.0, 2.0, -1.0]])
+    loss_mask = torch.tensor([[True, True, True, True]])
+    position_ids = torch.tensor([[0, 1, 2, 0]])
+
+    loss, _ = compute_loss(
+        trainer_logprobs,
+        inference_logprobs,
+        None,
+        advantages,
+        loss_mask,
+        loss_config,
+        loss_scale=2,
+        position_ids=position_ids,
+    )
+
+    assert loss.item() == pytest.approx(-0.5)
 
 
 def test_packed_loss_metrics_are_averaged_per_sequence() -> None:
