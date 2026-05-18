@@ -1,8 +1,11 @@
-# Inference Diagnostics Skill
+# Inference Diagnostics Runbook
 
-Use this guide when debugging Wavelet inference without starting the trainer or
-orchestrator. The goal is to isolate model serving, policy loading, throughput,
-token accounting, and logprob behavior before involving the full RL loop.
+Use this human- and agent-readable guide when debugging Wavelet inference without
+starting the trainer or orchestrator. The goal is to isolate model serving,
+policy loading, throughput, token accounting, and logprob behavior before
+involving the full RL loop.
+
+Related docs: [documentation index](index.md).
 
 ## First Principles
 

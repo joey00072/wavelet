@@ -1,0 +1,121 @@
+# Wavelet Documentation
+
+Wavelet docs are written for both people and coding agents. Keep commands
+copy-pasteable from the repository root, prefer JSON diagnostics for machine
+comparison, and make the expected inspection path explicit before expensive
+training or inference runs.
+
+## Start Here
+
+- [README](../README.md): project overview, quick start, and the RL process
+  split.
+- [Examples](../examples/README.md): runnable example status, environment notes,
+  and verifier data preparation.
+- [Inference diagnostics](inference.skill.md): isolate model serving, policy
+  loading, generation, logprobs, and throughput.
+- [Orchestrator diagnostics](orchestrator.skill.md): inspect scheduling,
+  rollout generation, scoring, filtering, and rollout materialization without
+  starting the trainer.
+- [WebUI](../webui/README.md): run the browser dashboard for the RL state server.
+- [Agent instructions](../AGENTS.md): repository rules for coding agents and
+  contributors.
+
+## Common Workflows
+
+### First Local Smoke Run
+
+Use the smallest example that exercises the subsystem you changed.
+
+```bash
+uv sync
+uv run python examples/reverse_text/prepare_rl_data.py
+uv run python -m wavelet rl @ examples/reverse_text/rl.yaml
+```
+
+For a math SFT-to-RL path:
+
+```bash
+uv run python examples/unsloth_math/prepare_sft_data.py
+uv run python -m wavelet sft @ examples/unsloth_math/sft.yaml
+uv run python -m wavelet rl @ examples/unsloth_math/rl.yaml
+```
+
+### Debug Inference First
+
+Before changing RL hyperparameters, prove that inference can serve the intended
+policy and attach the training metadata that RL needs.
+
+```bash
+uv run python -m wavelet debug inference inspect @ examples/wordle/rl.yaml --json
+uv run python -m wavelet debug inference health @ examples/wordle/rl.yaml --json
+uv run python -m wavelet debug inference smoke \
+  @ examples/wordle/rl.yaml --count 2 --json
+```
+
+Then use the full [inference diagnostics](inference.skill.md) runbook if policy
+step, logprob, token accounting, or throughput looks wrong.
+
+### Debug Orchestration Without Trainer
+
+Keep the trainer stopped until the orchestrator can select examples, generate
+and score rollouts, assign advantages, and write trainable batches.
+
+```bash
+uv run python -m wavelet debug orchestrator inspect @ examples/wordle/rl.yaml --json
+uv run python -m wavelet debug orchestrator sample \
+  @ examples/wordle/rl.yaml --step 0 --examples 4 --json
+uv run python -m wavelet debug orchestrator materialize \
+  @ examples/wordle/rl.yaml --step 0 --examples 2 --rollouts 2 --json
+```
+
+Then use the full [orchestrator diagnostics](orchestrator.skill.md) runbook to
+interpret timings, reward metrics, trainable records, and failure patterns.
+
+### Run Split RL Processes
+
+Use the split commands when the trainer needs distributed launch or when
+inference and training need different GPU placement. Do not wrap the combined
+`wavelet rl` launcher in `torchrun`.
+
+```bash
+uv run python -m wavelet rl-inference @ outputs/my_run/configs/rl_inference.yaml
+uv run torchrun --standalone --nproc_per_node=2 \
+  -m wavelet rl-trainer @ outputs/my_run/configs/rl_trainer.yaml
+```
+
+### Add Or Change An Example
+
+When an example changes behavior, update:
+
+- the example config or helper under `examples/<name>/`
+- [examples/README.md](../examples/README.md)
+- a small smoke config when the main config is GPU-memory-sensitive or slow
+- tests under `tests/` when config normalization, scheduling, rollout queues,
+  policy sync, reward calculation, or trainer behavior changes
+
+## Agent Runbook Contract
+
+Every diagnostic guide should make the next action obvious to a coding agent:
+
+- State which subsystem is isolated and which processes should be stopped.
+- Put commands before interpretation notes.
+- Prefer `--json` output when the command supports it.
+- Name the metrics or fields that prove the subsystem is healthy.
+- Include common failure patterns and the next subsystem to inspect.
+- Keep generated outputs under the configured run directory.
+- Update this index when adding a new runbook or public workflow.
+
+## Verification
+
+For documentation-only changes, run:
+
+```bash
+git diff --check
+```
+
+For code changes, run a targeted test for the changed behavior, then:
+
+```bash
+uvx ruff check wavelet tests
+git diff --check
+```

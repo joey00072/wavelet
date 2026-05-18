@@ -1,8 +1,11 @@
-# Orchestrator Diagnostics Skill
+# Orchestrator Diagnostics Runbook
 
-Use this guide when debugging Wavelet orchestration without starting the trainer.
-The goal is to verify scheduling, example selection, rollout generation, reward
-assignment, advantage shaping, filtering, and materialization timing in isolation.
+Use this human- and agent-readable guide when debugging Wavelet orchestration
+without starting the trainer. The goal is to verify scheduling, example
+selection, rollout generation, reward assignment, advantage shaping, filtering,
+and materialization timing in isolation.
+
+Related docs: [documentation index](index.md).
 
 ## First Principles
 
