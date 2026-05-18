@@ -6,6 +6,19 @@
 
 Minimal post-training scaffolding for SFT and RL experiments.
 
+## Documentation
+
+Start with the [documentation index](docs/index.md) for the human and
+agent-readable map of workflows, diagnostics, and repository guidance.
+
+- [Examples](examples/README.md): runnable configs and environment notes
+- [Inference diagnostics](docs/inference.skill.md): model serving, policy loading,
+  logprobs, and throughput checks
+- [Orchestrator diagnostics](docs/orchestrator.skill.md): scheduling, rollout,
+  reward, filtering, and materialization checks
+- [Agent instructions](AGENTS.md): repository rules for coding agents and
+  contributors
+
 ## RL Quick Start
 
 Prepare the Unsloth math data:
