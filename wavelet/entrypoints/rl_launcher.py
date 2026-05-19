@@ -705,9 +705,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if config.dry_run:
-        if config.orchestrator.enabled and config.inference.mode == "passthrough":
-            rollout_path = RLOrchestrator(config).materialize()
-        elif config.orchestrator.enabled:
+        if config.orchestrator.enabled:
             rollout_path = config.output_dir / "rollouts"
         else:
             rollout_path = config.data.path

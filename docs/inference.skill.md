@@ -69,7 +69,8 @@ Use the configured `inference.http.host` and `inference.http.port` or the full
 
 ## What To Check
 
-- `inference.mode`: `vllm_http` probes a running server; `vllm` boots local vLLM.
+- `inference.mode`: `vllm_http` probes the configured OpenAI-compatible vLLM
+  server. The public RL path uses HTTP serving for continuous batching.
 - `server_backend`: `openai` should expose `/v1/chat/completions/tokens`.
 - `policy_step`: must match the expected trainer export after policy load.
 - `policy_adapter_path` or `policy_weight_path`: must point at the intended
