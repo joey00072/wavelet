@@ -16,11 +16,7 @@ from wavelet.utils.config import load_config
 
 
 def _server_engine_config(config: RLConfig) -> RLConfig:
-    return config.model_copy(
-        update={
-            "inference": config.inference.model_copy(update={"mode": "vllm"}),
-        }
-    )
+    return config
 
 
 def _build_app(config: RLConfig):
