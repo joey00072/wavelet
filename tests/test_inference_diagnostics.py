@@ -74,7 +74,7 @@ def test_inference_debug_inspect_outputs_json(capsys) -> None:
     assert inference_debug_main(["inspect", "--json"]) == 0
 
     report = json.loads(capsys.readouterr().out)
-    assert report["inference"]["mode"] == "passthrough"
+    assert report["inference"]["mode"] == "vllm_http"
     assert report["sampling"]["temperature"] == 1.0
 
 

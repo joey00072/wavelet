@@ -5,6 +5,12 @@ import pytest
 from wavelet.configs.rl_config import RLConfig, TokensLengthPenaltyConfig
 
 
+def test_vllm_http_is_default_inference_mode() -> None:
+    config = RLConfig()
+
+    assert config.inference.mode == "vllm_http"
+
+
 def test_sampling_max_tokens_maps_to_max_completion_tokens() -> None:
     config = RLConfig(inference={"sampling": {"max_tokens": 17}})
 

@@ -124,7 +124,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         except ImportError as exc:
             raise ImportError(
                 "vLLM inference requires the 'vllm' package. Install project "
-                "dependencies with `uv sync`, then use inference.mode='vllm'."
+                "dependencies with `uv sync`, then use inference.mode='vllm_http'."
             ) from exc
 
         vllm_config = self.config.inference.vllm
@@ -227,10 +227,6 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
         if not self.config.inference.enabled:
             return records
-        if self.config.inference.mode != "vllm":
-            raise ValueError(
-                "VLLMPolicyInferenceEngine requires inference.mode='vllm'."
-            )
 
         prompts = [
             {
