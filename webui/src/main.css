@@ -1,10 +1,12 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,300..700;1,14..32,300..700&family=JetBrains+Mono:wght@400;500&display=swap");
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 :root {
-  color: #f4f4f5;
-  background: #09090b;
+  color: #f8fafc;
+  background: #0a0a0f;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -12,8 +14,8 @@
 }
 
 :root:not(.dark) {
-  color: #17211a;
-  background: #f6f7f4;
+  color: #0f172a;
+  background: #f8fafc;
 }
 
 body {
@@ -26,4 +28,48 @@ body {
 button,
 input {
   font: inherit;
+}
+
+/* Animated live dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.live-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+
+/* Progress bar */
+.progress-bar {
+  background: #3b82f6;
+  transition: width 0.6s ease;
+}
+
+/* Scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.08) transparent;
+}
+*::-webkit-scrollbar { width: 4px; height: 4px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
+
+/* Code pre */
+pre.code-block {
+  background: #0d0d14;
+  border: 1px solid rgba(255,255,255,0.06);
+  color: #94a3b8;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  border-radius: 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+:root:not(.dark) pre.code-block {
+  background: #f1f5f9;
+  border-color: rgba(0,0,0,0.08);
+  color: #475569;
 }

@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.queue import FileSystemRolloutSender
 from wavelet.orchestrator.state_server import OrchestratorRunState
@@ -74,3 +78,94 @@ def test_orchestrator_state_includes_queue_summary(tmp_path) -> None:
     assert queues is not None
     assert queues["summary"]["ready_count"] == 1
     assert queues["items"][0]["queue_step"] == 0
+
+
+def test_orchestrator_state_inspects_latest_stable_rollout_batch(tmp_path) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    source = tmp_path / "source.jsonl"
+    rows = [
+        {
+            "prompt": [{"role": "user", "content": "low"}],
+            "completion": [{"role": "assistant", "content": "bad"}],
+            "reward": 0.0,
+            "advantage": -1.0,
+            "example_id": "a",
+            "metadata": {
+                "group_key": "g-a",
+                "rollout_key": "g-a:0",
+                "completion_token_count": 3,
+            },
+            "input_ids": [1, 2, 3],
+        },
+        {
+            "prompt": [{"role": "user", "content": "mid"}],
+            "completion": [{"role": "assistant", "content": "ok"}],
+            "reward": 0.5,
+            "advantage": 0.0,
+            "example_id": "b",
+            "metadata": {"group_key": "g-b", "rollout_key": "g-b:0"},
+        },
+        {
+            "prompt": [{"role": "user", "content": "high"}],
+            "completion": [{"role": "assistant", "content": "good"}],
+            "reward": 1.0,
+            "advantage": 1.0,
+            "example_id": "c",
+            "metadata": {"group_key": "g-c", "rollout_key": "g-c:0"},
+        },
+    ]
+    source.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    sender.publish(source, step=0, optimizer_step=0, rows=3)
+    sender.publish(source, step=2, optimizer_step=2, rows=3)
+    state = OrchestratorRunState(config, target_step=3)
+
+    inspection = state.inspect_rollouts(
+        step=None,
+        random_count=2,
+        seed=1,
+        max_scan_rows=100,
+        max_text_chars=1000,
+    )
+
+    assert inspection["available"] is True
+    assert inspection["queue_step"] == 2
+    assert inspection["scanned_rows"] == 3
+    assert inspection["stats"]["reward"]["mean"] == pytest.approx(0.5)
+    assert inspection["samples"]["min_reward"]["reward"] == 0.0
+    assert inspection["samples"]["max_reward"]["reward"] == 1.0
+    assert inspection["samples"]["near_mean_reward"]["reward"] == 0.5
+    assert len(inspection["samples"]["random"]) == 2
+    assert "input_ids" not in inspection["samples"]["min_reward"]
+
+
+def test_orchestrator_state_rollout_inspection_is_bounded(tmp_path) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        "".join(json.dumps({"reward": index}) + "\n" for index in range(5)),
+        encoding="utf-8",
+    )
+    FileSystemRolloutSender(tmp_path, config.transport).publish(
+        source,
+        step=0,
+        optimizer_step=0,
+        rows=5,
+    )
+    state = OrchestratorRunState(config, target_step=1)
+
+    inspection = state.inspect_rollouts(
+        step=0,
+        random_count=10,
+        seed=None,
+        max_scan_rows=2,
+        max_text_chars=1000,
+    )
+
+    assert inspection["scanned_rows"] == 2
+    assert inspection["truncated"] is True
+    assert inspection["stats"]["reward"]["max"] == 1.0
+    assert len(inspection["samples"]["random"]) == 2
