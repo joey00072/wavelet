@@ -281,7 +281,7 @@ class RLVLLMHTTPConfig(BaseModel):
 
 class RLInferenceConfig(BaseModel):
     enabled: bool = True
-    mode: Literal["passthrough", "vllm", "vllm_http"] = "passthrough"
+    mode: Literal["passthrough", "vllm_http"] = "vllm_http"
     default_temperature: float = Field(default=1.0, gt=0.0)
     sampling: RLSamplingConfig = RLSamplingConfig()
     vllm: RLVLLMConfig = RLVLLMConfig()
@@ -474,7 +474,8 @@ class RLConfig(BaseModel):
     @model_validator(mode="after")
     def validate_rollout_modes(self) -> "RLConfig":
         if (
-            self.inference.mode in {"vllm", "vllm_http"}
+            self.inference.mode == "vllm_http"
+            and "mode" in self.inference.model_fields_set
             and self.reward.mode == "passthrough"
             and self.orchestrator.custom_rollout_function is None
         ):

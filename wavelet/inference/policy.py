@@ -9,17 +9,16 @@ from wavelet.data.rl_dataset import RLExample
 
 
 def create_policy_inference_engine(config: RLConfig) -> PolicyInferenceEngine:
-    if config.inference.mode == "vllm":
-        from wavelet.inference.vllm import VLLMPolicyInferenceEngine
-
-        return VLLMPolicyInferenceEngine(config)
     if config.inference.mode == "vllm_http":
         from wavelet.inference.http import HTTPPolicyInferenceEngine
 
         return HTTPPolicyInferenceEngine(config)
     if config.inference.mode == "passthrough":
         return PassthroughPolicyInferenceEngine(config)
-    raise ValueError(f"Unsupported inference mode: {config.inference.mode}")
+    raise ValueError(
+        f"Unsupported inference mode: {config.inference.mode}. "
+        "Use inference.mode='vllm_http' for model serving."
+    )
 
 
 def token_ids(value: object) -> list[int]:
