@@ -29,6 +29,7 @@ Use the smallest example that exercises the subsystem you changed.
 ```bash
 uv sync
 uv run python examples/reverse_text/prepare_rl_data.py
+uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json
 uv run python -m wavelet rl @ examples/reverse_text/rl.yaml
 ```
 
