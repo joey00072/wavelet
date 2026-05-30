@@ -74,6 +74,7 @@ Guidance for coding agents working in this repository.
   - `uv run python -m wavelet rl-trainer @ <config>.yaml`
   - `uv run python -m wavelet rl-orchestrator @ <config>.yaml`
   - `uv run python -m wavelet inference-server @ <config>.yaml`
+  - `uv run python -m wavelet debug preflight @ <config>.yaml --json`
   - `uv run python -m wavelet debug inference inspect @ <config>.yaml --json`
   - `uv run python -m wavelet debug orchestrator inspect @ <config>.yaml --json`
 - Build source/wheel packages: `uv build`
@@ -113,6 +114,9 @@ small smoke config that can prove the pipeline before long runs.
 ## Debugging and Run Hygiene
 
 - Prefer short deterministic smoke runs before long GPU runs.
+- Run `uv run python -m wavelet debug preflight @ <config>.yaml --json` before
+  expensive RL launches to catch missing local data, port conflicts, device
+  placement mismatches, stale output directories, and resolved role commands.
 - Use the smallest working example that exercises the subsystem being changed.
 - Treat a completed process as only one success criterion. For training runs,
   also verify baseline eval, final eval, failed rollout count, queue health,
