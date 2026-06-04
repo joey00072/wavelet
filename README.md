@@ -14,6 +14,8 @@ agent-readable map of workflows, diagnostics, and repository guidance.
 - [Examples](examples/README.md): runnable configs and environment notes
 - Run preflight checks before expensive RL launches:
   `uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
+  The report includes low-precision checks for QLoRA and vLLM quantized
+  inference settings.
 - [Inference diagnostics](docs/inference.skill.md): model serving, policy loading,
   logprobs, and throughput checks
 - [Orchestrator diagnostics](docs/orchestrator.skill.md): scheduling, rollout,
@@ -45,7 +47,9 @@ Current distributed scope is experimental:
 
 - root FSDP and HSDP-style DP meshes are wired into the trainer bootstrap
 - hybrid backend config is accepted
-- QLoRA config is accepted
+- QLoRA config is accepted for LoRA adapter training with replicated DDP;
+  preflight rejects unsupported full-model 4-bit, FSDP, tensor-parallel, and
+  `colocate_sleep` combinations
 - tensor-parallel model loading/saving now works for full-model paths when the
   selected architecture exposes a `transformers` TP plan
 - EP and CP are still not wired into the model kernels or attention stack

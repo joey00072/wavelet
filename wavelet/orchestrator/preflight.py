@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import os
 import socket
 import subprocess
@@ -30,6 +31,7 @@ def build_preflight_report(config: RLConfig) -> dict[str, Any]:
         *_launcher_checks(config),
         *_port_checks(config),
         *_schedule_checks(config),
+        *_low_precision_checks(config),
     ]
     commands: list[dict[str, Any]] = []
     try:
@@ -61,6 +63,18 @@ def _summary(config: RLConfig) -> dict[str, Any]:
         "inference_backend": config.inference.vllm.server_backend,
         "policy_transfer": config.policy_transfer.type,
         "target_steps": target_steps(config),
+        "low_precision": _low_precision_summary(config),
+    }
+
+
+def _low_precision_summary(config: RLConfig) -> dict[str, Any]:
+    return {
+        "trainer_load_in_4bit": config.model.load_in_4bit,
+        "lora_enabled": config.lora is not None,
+        "fsdp_enabled": config.fsdp.enabled,
+        "launcher_mode": config.launcher.mode,
+        "inference_quantization": config.inference.vllm.quantization,
+        "inference_load_format": config.inference.vllm.load_format,
     }
 
 
@@ -327,6 +341,131 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
                 name="rollout_chunks",
                 status="ok",
                 message=f"Resolved chunks per optimizer step: {chunks_per_step(config)}",
+            )
+        )
+    return checks
+
+
+def _low_precision_checks(config: RLConfig) -> list[PreflightCheck]:
+    trainer_4bit = config.model.load_in_4bit
+    inference_quantized = bool(
+        config.inference.vllm.quantization or config.inference.vllm.load_format
+    )
+    if not trainer_4bit and not inference_quantized:
+        return [
+            PreflightCheck(
+                name="low_precision",
+                status="ok",
+                message="No low-precision trainer or inference settings enabled.",
+                details=_low_precision_summary(config),
+            )
+        ]
+
+    checks: list[PreflightCheck] = [
+        PreflightCheck(
+            name="low_precision",
+            status="ok",
+            message="Resolved low-precision launch settings.",
+            details=_low_precision_summary(config),
+        )
+    ]
+    if trainer_4bit:
+        checks.extend(_trainer_4bit_checks(config))
+    if inference_quantized and not trainer_4bit:
+        checks.append(
+            PreflightCheck(
+                name="low_precision_inference_mismatch",
+                status="warning",
+                message=(
+                    "Inference is configured with vLLM low-precision loading, but "
+                    "trainer model.load_in_4bit is false. Verify the train/serve "
+                    "precision mismatch is intentional."
+                ),
+                details={
+                    "quantization": config.inference.vllm.quantization,
+                    "load_format": config.inference.vllm.load_format,
+                },
+            )
+        )
+    return checks
+
+
+def _trainer_4bit_checks(config: RLConfig) -> list[PreflightCheck]:
+    checks: list[PreflightCheck] = []
+    bitsandbytes_available = importlib.util.find_spec("bitsandbytes") is not None
+    checks.append(
+        PreflightCheck(
+            name="bitsandbytes_available",
+            status="ok" if bitsandbytes_available else "error",
+            message=(
+                "bitsandbytes is importable for QLoRA training."
+                if bitsandbytes_available
+                else "model.load_in_4bit=true requires bitsandbytes to be installed."
+            ),
+        )
+    )
+    checks.append(
+        PreflightCheck(
+            name="qlora_adapter",
+            status="ok" if config.lora is not None else "error",
+            message=(
+                "QLoRA adapter training is enabled."
+                if config.lora is not None
+                else (
+                    "model.load_in_4bit=true requires a LoRA config; Wavelet does "
+                    "not support full-model 4-bit training."
+                )
+            ),
+        )
+    )
+    if config.fsdp.enabled:
+        checks.append(
+            PreflightCheck(
+                name="qlora_fsdp",
+                status="error",
+                message=(
+                    "QLoRA training uses replicated DDP in Wavelet. Disable "
+                    "fsdp.enabled for model.load_in_4bit=true."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            PreflightCheck(
+                name="qlora_fsdp",
+                status="ok",
+                message="FSDP is disabled for QLoRA training.",
+            )
+        )
+    if config.launcher.mode == "colocate_sleep":
+        checks.append(
+            PreflightCheck(
+                name="qlora_colocate_sleep",
+                status="error",
+                message=(
+                    "QLoRA does not support colocate_sleep yet because bitsandbytes "
+                    "4-bit modules cannot be moved between CPU and GPU."
+                ),
+            )
+        )
+    else:
+        checks.append(
+            PreflightCheck(
+                name="qlora_colocate_sleep",
+                status="ok",
+                message="Launcher mode is compatible with QLoRA.",
+            )
+        )
+    if config.fsdp.tp > 1:
+        checks.append(
+            PreflightCheck(
+                name="qlora_tensor_parallel",
+                status="error",
+                message=(
+                    "QLoRA with trainer tensor parallelism is not supported. Set "
+                    "fsdp.tp=1 for model.load_in_4bit=true."
+                ),
+                details={"fsdp_tp": config.fsdp.tp},
             )
         )
     return checks
