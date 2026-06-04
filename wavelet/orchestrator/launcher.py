@@ -12,6 +12,9 @@ from typing import Any, TextIO
 from wavelet.configs.rl_config import RLConfig
 
 
+_TERMINATE_TIMEOUT_SECONDS = 10.0
+
+
 @dataclass(frozen=True, slots=True)
 class RoleSpec:
     name: str
@@ -87,6 +90,7 @@ def _run_role_subprocess(
             stdout=log_file,
             stderr=subprocess.STDOUT,
             env=_role_env(cuda_visible_devices),
+            start_new_session=True,
         )
         return int(process.wait())
 
@@ -102,14 +106,14 @@ class LocalRoleHandle:
         code = self.process.poll()
         return None if code is None else int(code)
 
-    def terminate(self, *, timeout_seconds: float = 10.0) -> None:
+    def terminate(self, *, timeout_seconds: float = _TERMINATE_TIMEOUT_SECONDS) -> None:
         if self.process.poll() is not None:
             return
-        self.process.send_signal(signal.SIGTERM)
+        _signal_process_group(self.process, signal.SIGTERM)
         try:
             self.process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
-            self.process.kill()
+            _signal_process_group(self.process, signal.SIGKILL)
             self.process.wait()
 
     def close(self) -> None:
@@ -155,6 +159,7 @@ class LocalRoleLauncher:
             stdout=log_file,
             stderr=subprocess.STDOUT,
             env=_role_env(spec.cuda_visible_devices),
+            start_new_session=True,
         )
         return LocalRoleHandle(spec, process, log_file)
 
@@ -199,6 +204,16 @@ def create_role_launcher(config: RLConfig) -> LocalRoleLauncher | RayRoleLaunche
     if config.launcher.backend == "ray":
         return RayRoleLauncher(config)
     raise ValueError(f"Unsupported launcher backend: {config.launcher.backend}")
+
+
+def _signal_process_group(process: subprocess.Popen, signal_number: int) -> None:
+    try:
+        pgid = os.getpgid(process.pid)
+        os.killpg(pgid, signal_number)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.send_signal(signal_number)
 
 
 def terminate_remaining(handles: list[RoleHandle]) -> None:
