@@ -51,6 +51,8 @@ class RolloutManifest:
     reward_mean: float | None
     producer_id: str | None
     created_at: str
+    payload_bytes: int | None = None
+    transfer_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

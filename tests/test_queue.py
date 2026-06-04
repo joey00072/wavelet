@@ -10,6 +10,7 @@ from wavelet.orchestrator.queue import (
     RolloutBatch,
     RolloutManifest,
     read_manifest,
+    tail_events,
 )
 
 
@@ -72,7 +73,14 @@ def test_publish_with_metadata_writes_manifest(tmp_path: Path) -> None:
     sender = FileSystemRolloutSender(tmp_path, config)
     source = _write_source(tmp_path / "rollouts.jsonl", "{}\n")
 
-    batch = sender.publish(source, step=0, optimizer_step=0, policy_step=0, rows=1)
+    batch = sender.publish(
+        source,
+        step=0,
+        optimizer_step=0,
+        policy_step=0,
+        rows=1,
+        events_dir=tmp_path / "events",
+    )
 
     manifest = read_manifest(batch.step_dir)
     assert isinstance(manifest, RolloutManifest)
@@ -80,3 +88,13 @@ def test_publish_with_metadata_writes_manifest(tmp_path: Path) -> None:
     assert manifest.optimizer_step == 0
     assert manifest.policy_step == 0
     assert manifest.rows == 1
+    assert manifest.payload_bytes == 3
+    assert manifest.transfer_seconds is not None
+    assert manifest.transfer_seconds >= 0
+
+    events, parse_errors = tail_events(tmp_path / "events", limit=1)
+    assert parse_errors == 0
+    assert len(events) == 1
+    assert events[0].details is not None
+    assert events[0].details["payload_bytes"] == 3
+    assert events[0].details["transfer_seconds"] >= 0

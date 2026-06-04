@@ -68,6 +68,8 @@ The RL stack is now split into minimal but scalable pieces:
 
 The transport is intentionally simple and durable: each batch is written under
 `<output_dir>/rollouts/step-000000/rollouts.jsonl` with an atomic stable marker.
+When rollout metadata is enabled, each batch also records payload size and
+transfer time in the manifest and queue event log for transfer observability.
 
 For distributed trainer jobs, do not run `wavelet rl` under `torchrun`. Start one
 inference process and one trainer job:
