@@ -33,3 +33,21 @@ When a custom rollout emits trainer rows, use these metadata conventions:
 - `rollout`: `group_key`, `rollout_key`, `trajectory_id`, `num_turns`,
   `tool_calls`, `elapsed_sec`, `error`, `is_truncated`, `stop_condition`, and
   `reward_components` when available
+
+## Custom Rollout Boundary
+
+Keep task logic separate from execution mechanics:
+
+- Source rows define prompts, hidden task data, expected answers, and task-owned
+  tools or bindings.
+- The rollout function drives model calls, tool loops, sandboxes, and retries.
+- Reward code scores the finished trajectory and records reward components.
+- Metrics summarize timing, truncation, parser failures, tool calls, and cleanup.
+- Cleanup tears down sandboxes, temp files, network handles, or subprocesses
+  even when reward or parsing fails.
+
+Custom harnesses should emit tool metadata in sidecars or row metadata: tool
+name, call id, redacted argument summary, duration, success or error, result
+size, and whether tool calls ran sequentially or in parallel. Timeout and
+cleanup failures should become visible rollout metadata; they should not silently
+turn into trainable tokens.
