@@ -123,10 +123,8 @@ def _build_loss_mask(
 
     This naturally handles Qwen3 and other models where a message's token
     representation depends on its position in the conversation (e.g. whether a
-    system prompt is prepended, or whether thinking tokens are inserted). SLIME
-    works around the same problem by prepending/appending a dummy user message
-    when tokenizing individual turns in isolation — we don't need that hack here
-    because we never tokenize a message in isolation."""
+    system prompt is prepended, or whether thinking tokens are inserted). We
+    avoid tokenizing turns in isolation so the rendered prefix remains exact."""
     messages = record.prompt + record.completion
     loss_mask: list[bool] = []
     prev_ids: list[int] = []
@@ -171,8 +169,8 @@ def _build_loss_mask(
             prev_ids, prev_len = prefilled
             continue
         # Per-turn override: if the message carries step_loss_mask=0, mask the
-        # whole turn regardless of role. Mirrors SLIME's selective-turn masking,
-        # useful for curriculum learning or filtering bad turns in multi-turn data.
+        # whole turn regardless of role. This is useful for curriculum learning
+        # or filtering bad turns in multi-turn data.
         role_mask = _should_mask(message["role"], loss_mask_config)
         turn_mask = bool(message.get("step_loss_mask", 1)) and role_mask
         loss_mask.extend([turn_mask] * (len(current_ids) - prev_len))
@@ -287,3 +285,29 @@ def build_sample(
         "target_ids": target_ids,
         "loss_mask": loss_mask,
     }
+
+
+def trainable_target_ids(sample: Sample) -> list[int]:
+    return [
+        int(target_id)
+        for target_id, trainable in zip(
+            sample["target_ids"],
+            sample["loss_mask"],
+            strict=True,
+        )
+        if trainable
+    ]
+
+
+def validate_token_logprob_alignment(
+    sample: Sample,
+    logprobs: list[float],
+    *,
+    field_name: str = "inference_logprobs",
+) -> None:
+    trainable_tokens = sum(bool(value) for value in sample["loss_mask"])
+    if len(logprobs) != trainable_tokens:
+        raise ValueError(
+            f"{field_name} must align with trainable tokens "
+            f"({len(logprobs)} != {trainable_tokens})."
+        )
