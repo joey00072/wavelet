@@ -87,6 +87,19 @@ def test_verifier_step_converts_to_trainable_record() -> None:
         "tool_response_token_count": 0,
         "turn_count": 1,
         "_wavelet_rollout_count": 1,
+        "task": {"name": "alphabet-sort", "example_id": 7},
+        "harness": {
+            "name": "alphabet-sort",
+            "type": "environment",
+            "version": None,
+        },
+        "rollout": {
+            "group_key": '{"env_name":"alphabet-sort","example_id":"7"}',
+            "rollout_key": '{"env_name":"alphabet-sort","example_id":"7"}:0',
+            "sample_index": 0,
+            "stop_condition": "done",
+            "is_truncated": False,
+        },
     }
     assert record.prompt[1]["step_loss_mask"] == 0
     assert record.source == "alphabet-sort"
@@ -782,6 +795,43 @@ def test_verifier_records_include_length_metadata() -> None:
     assert record.metadata["completion_token_count"] == 3
     assert record.metadata["tool_response_token_count"] == 12
     assert record.metadata["turn_count"] == 1
+
+
+def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
+    output = {
+        "example_id": "case-7",
+        "task": "repair",
+        "harness_name": "local-runner",
+        "harness_type": "agent",
+        "harness_version": "1",
+        "reward": 1.0,
+        "advantage": 0.5,
+        "sampling_args": {"temperature": 1.0},
+        "trajectory": [
+            {
+                "prompt": [{"role": "user", "content": "fix"}],
+                "completion": [{"role": "assistant", "content": "patch"}],
+                "tokens": {
+                    "prompt_ids": [1],
+                    "prompt_mask": [0],
+                    "completion_ids": [2],
+                    "completion_mask": [1],
+                    "completion_logprobs": [-0.2],
+                },
+            }
+        ],
+    }
+
+    record = _records_from_output(output)[0]
+
+    assert record.source == "repair"
+    assert record.metadata["task"] == {"name": "repair", "example_id": "case-7"}
+    assert record.metadata["harness"] == {
+        "name": "local-runner",
+        "type": "agent",
+        "version": "1",
+    }
+    assert record.metadata["rollout"]["sample_index"] == 0
 
 
 def test_verifier_tool_response_length_penalty_shapes_advantages() -> None:

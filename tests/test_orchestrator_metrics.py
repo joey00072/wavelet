@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
+from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
+from wavelet.orchestrator.metrics import log_rollout_metrics
 
 
 def test_rollout_metrics_match_reference_style_grouping() -> None:
@@ -85,3 +89,41 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
     assert metrics["fate/all/with_inference_logprobs"] == 1
     assert metrics["fate/all/with_teacher_logprobs"] == 1
     assert metrics["fate/reverse-text/filtered_rate"] == pytest.approx(0.25)
+
+
+def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:
+    rollout_path = tmp_path / "rollouts.jsonl"
+    row = {
+        "env_name": "reverse-text",
+        "example_id": "a",
+        "reward": 1.0,
+        "advantage": 0.5,
+        "input_ids": [1, 2],
+        "loss_mask": [False, True],
+        "metadata": {
+            "task": {"name": "reverse-text", "example_id": "a"},
+            "harness": {"name": "tiny-agent", "type": "agent", "version": "1"},
+        },
+    }
+    rollout_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    metrics = log_rollout_metrics(
+        RLConfig(output_dir=tmp_path),
+        rollout_path,
+        step=4,
+        queue_step=5,
+        optimizer_step=6,
+        policy_step=3,
+    )
+
+    trace_path = tmp_path / "traces" / "step-000004.jsonl"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert metrics["progress/samples"] == 1
+    assert trace["event"] == "rollout_metrics_logged"
+    assert trace["subsystem"] == "orchestrator"
+    assert trace["task"] == "reverse-text"
+    assert trace["harness"] == "tiny-agent"
+    assert trace["queue_step"] == 5
+    assert trace["optimizer_step"] == 6
+    assert trace["policy_step"] == 3
+    assert trace["details"]["trainable"] == 1.0
