@@ -74,6 +74,22 @@ uv run python -m wavelet debug orchestrator materialize \
 Then use the full [orchestrator diagnostics](orchestrator.skill.md) runbook to
 interpret timings, reward metrics, trainable records, and failure patterns.
 
+### Debug Trainer Inputs Without Inference
+
+Use a saved rollout batch to check trainer-facing token artifacts before
+starting the trainer.
+
+```bash
+uv run python -m wavelet debug trainer inspect \
+  --rollout-path outputs/my_run/rollouts/step-000000/rollouts.jsonl --json \
+  @ examples/reverse_text/rl.yaml
+```
+
+The report validates `input_ids`, `target_ids`, `loss_mask`, rollout logprobs,
+and teacher logprobs when present. It proves the saved batch is structurally
+ready for trainer replay; it does not compare model logprobs or run an optimizer
+step.
+
 ### Run Split RL Processes
 
 Use the split commands when the trainer needs distributed launch or when
