@@ -69,6 +69,7 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     is_truncated = [_bool_metric(_metadata(row).get("is_truncated")) for row in rows]
     sample_counts = [_sample_count(row) for row in rows]
     turn_counts = [_turn_count(row) for row in rows]
+    fate_counts = _fate_counts(rows)
 
     metrics: dict[str, float] = {
         "progress/tokens": float(sum(seq_lens)),
@@ -82,6 +83,7 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         "filters/all/is_filtered": float(mean(_filtered_flags(rows))) if rows else 0.0,
         "step": float(inputs.step),
     }
+    metrics.update(_fate_metrics("fate/all", fate_counts))
     if inputs.policy_step is not None:
         metrics["policy/step"] = float(inputs.policy_step)
         metrics["policy/lag"] = float(inputs.step - inputs.policy_step)
@@ -117,6 +119,7 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     for env_name, env_rows in _group_by_env(rows).items():
         env_grouped = _group_by_example(env_rows)
         metrics[f"batch/{env_name}"] = len(env_rows) / max(len(rows), 1)
+        metrics.update(_fate_metrics(f"fate/{env_name}", _fate_counts(env_rows)))
         metrics.update(_series_stats(f"seq_len/{env_name}", _grouped_means(env_grouped, _seq_len)))
         metrics.update(_series_stats(f"decode_len/{env_name}", _grouped_means(env_grouped, _decode_len)))
         metrics.update(_series_stats(f"reward/{env_name}", _grouped_means(env_grouped, lambda row: _float_or_none(row.get("reward")))))
@@ -352,6 +355,52 @@ def _turn_count(row: dict[str, Any]) -> int:
 
 def _filtered_flags(rows: list[dict[str, Any]]) -> list[float]:
     return [float(bool(_metadata(row).get("_wavelet_filtered_rollout"))) for row in rows]
+
+
+def _fate_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "produced": len(rows),
+        "trainable": 0,
+        "zero_loss": 0,
+        "filtered": 0,
+        "dummy": 0,
+        "errored": 0,
+        "truncated": 0,
+        "with_inference_logprobs": 0,
+        "with_teacher_logprobs": 0,
+    }
+    for row in rows:
+        metadata = _metadata(row)
+        trainable_tokens = _decode_len(row)
+        counts["trainable"] += int(trainable_tokens > 0)
+        counts["zero_loss"] += int(trainable_tokens == 0)
+        counts["filtered"] += int(bool(metadata.get("_wavelet_filtered_rollout")))
+        counts["dummy"] += int(bool(metadata.get("_wavelet_dummy_rollout")))
+        counts["errored"] += int(_has_error(row))
+        counts["truncated"] += int(bool(metadata.get("is_truncated")))
+        counts["with_inference_logprobs"] += int(
+            isinstance(row.get("inference_logprobs"), list)
+        )
+        counts["with_teacher_logprobs"] += int(
+            isinstance(row.get("teacher_logprobs"), list)
+        )
+    return counts
+
+
+def _fate_metrics(prefix: str, counts: dict[str, int]) -> dict[str, float]:
+    total = max(counts["produced"], 1)
+    metrics: dict[str, float] = {}
+    for name, count in counts.items():
+        metrics[f"{prefix}/{name}"] = float(count)
+        if name != "produced":
+            metrics[f"{prefix}/{name}_rate"] = float(count / total)
+    return metrics
+
+
+def _has_error(row: dict[str, Any]) -> bool:
+    if row.get("error") is not None:
+        return True
+    return _metadata(row).get("error") is not None
 
 
 def _float_or_none(value: object) -> float | None:
