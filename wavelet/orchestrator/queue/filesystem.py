@@ -156,11 +156,15 @@ class FileSystemRolloutReceiver:
         config: RLTransportConfig,
         *,
         start_step: int = 0,
+        events_dir: Path | None = None,
+        consumer_id: str | None = None,
     ) -> None:
         self.config = config
         self.queue_dir = resolve_queue_dir(output_dir, config)
         self.next_step = start_step
         self._consumed_steps: set[int] = set()
+        self.events_dir = events_dir
+        self.consumer_id = consumer_id
 
     def can_receive(self) -> bool:
         return self._stable_batch_for_step(self.next_step) is not None
@@ -172,12 +176,14 @@ class FileSystemRolloutReceiver:
                 f"No stable rollout batch available for step {self.next_step}."
             )
         self.next_step += 1
+        self._record_received(batch, wait_seconds=0.0, mode="receive")
         if self.config.cleanup_consumed:
             marker = batch.step_dir / ".consumed"
             marker.touch()
         return batch
 
     def wait(self) -> RolloutBatch:
+        started_at = time.monotonic()
         deadline = None
         if self.config.idle_timeout_seconds is not None:
             deadline = time.monotonic() + self.config.idle_timeout_seconds
@@ -185,6 +191,11 @@ class FileSystemRolloutReceiver:
             batch = self._stable_batch_for_step(self.next_step)
             if batch is not None:
                 self.next_step += 1
+                self._record_received(
+                    batch,
+                    wait_seconds=time.monotonic() - started_at,
+                    mode="wait",
+                )
                 if self.config.cleanup_consumed:
                     marker = batch.step_dir / ".consumed"
                     marker.touch()
@@ -198,6 +209,7 @@ class FileSystemRolloutReceiver:
 
     def wait_available(self) -> RolloutBatch:
         """Return the oldest currently stable unconsumed batch at or after next_step."""
+        started_at = time.monotonic()
         deadline = None
         if self.config.idle_timeout_seconds is not None:
             deadline = time.monotonic() + self.config.idle_timeout_seconds
@@ -205,6 +217,11 @@ class FileSystemRolloutReceiver:
             batch = self._oldest_available_batch()
             if batch is not None:
                 self._mark_consumed(batch)
+                self._record_received(
+                    batch,
+                    wait_seconds=time.monotonic() - started_at,
+                    mode="wait_available",
+                )
                 return batch
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -250,6 +267,35 @@ class FileSystemRolloutReceiver:
         if self.config.cleanup_consumed:
             marker = batch.step_dir / ".consumed"
             marker.touch()
+
+    def _record_received(
+        self,
+        batch: RolloutBatch,
+        *,
+        wait_seconds: float,
+        mode: str,
+    ) -> None:
+        if self.events_dir is None:
+            return
+        consumer_id = self.consumer_id or process_identity("rl-trainer")
+        try:
+            payload_bytes = batch.path.stat().st_size
+        except OSError:
+            payload_bytes = None
+        append_event_best_effort(
+            self.events_dir,
+            QueueEvent(
+                time=utc_now(),
+                kind="rollout_received",
+                queue_step=batch.step,
+                consumer_id=consumer_id,
+                details={
+                    "mode": mode,
+                    "payload_bytes": payload_bytes,
+                    "wait_seconds": wait_seconds,
+                },
+            ),
+        )
 
     @staticmethod
     def _is_stable_step_dir(step_dir: Path) -> bool:
