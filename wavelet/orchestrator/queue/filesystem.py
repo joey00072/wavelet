@@ -23,6 +23,7 @@ from wavelet.orchestrator.queue.types import (
     RolloutBatch,
     RolloutManifest,
 )
+from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 
 
 logger = logging.getLogger(__name__)
@@ -296,6 +297,21 @@ class FileSystemRolloutReceiver:
                 },
             ),
         )
+        append_trace_event_best_effort(
+            _trace_output_dir(self.events_dir),
+            make_trace_event(
+                subsystem="trainer",
+                event="rollout_received",
+                step=batch.step,
+                queue_step=batch.step,
+                details={
+                    "consumer_id": consumer_id,
+                    "mode": mode,
+                    "payload_bytes": payload_bytes,
+                    "wait_seconds": wait_seconds,
+                },
+            ),
+        )
 
     @staticmethod
     def _is_stable_step_dir(step_dir: Path) -> bool:
@@ -385,16 +401,33 @@ class FileSystemPolicyReceiver:
     ) -> None:
         if self.events_dir is None:
             return
+        consumer_id = self.consumer_id or process_identity("rl-inference")
+        payload_bytes = _directory_payload_bytes(snapshot.step_dir)
         append_event_best_effort(
             self.events_dir,
             QueueEvent(
                 time=utc_now(),
                 kind="policy_received",
                 policy_step=snapshot.step,
-                consumer_id=self.consumer_id or process_identity("rl-inference"),
+                consumer_id=consumer_id,
                 details={
                     "mode": mode,
-                    "payload_bytes": _directory_payload_bytes(snapshot.step_dir),
+                    "payload_bytes": payload_bytes,
+                    "wait_seconds": wait_seconds,
+                },
+            ),
+        )
+        append_trace_event_best_effort(
+            _trace_output_dir(self.events_dir),
+            make_trace_event(
+                subsystem="inference",
+                event="policy_received",
+                step=snapshot.step,
+                policy_step=snapshot.step,
+                details={
+                    "consumer_id": consumer_id,
+                    "mode": mode,
+                    "payload_bytes": payload_bytes,
                     "wait_seconds": wait_seconds,
                 },
             ),
@@ -412,6 +445,10 @@ def _directory_payload_bytes(path: Path) -> int:
             continue
         total += candidate.stat().st_size
     return total
+
+
+def _trace_output_dir(events_dir: Path | None) -> Path | None:
+    return events_dir.parent if events_dir is not None else None
 
 
 def publish_adapter_policy_snapshot(

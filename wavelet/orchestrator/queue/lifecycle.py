@@ -20,6 +20,7 @@ from wavelet.orchestrator.queue.types import (
     RolloutBatch,
     RolloutManifest,
 )
+from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,19 @@ def record_rollout_claim(
             consumer_id=claim.consumer_id,
         ),
     )
+    append_trace_event_best_effort(
+        _trace_output_dir(events_dir),
+        make_trace_event(
+            subsystem="trainer",
+            event="rollout_claimed",
+            step=trainer_step_before,
+            queue_step=batch.step,
+            details={
+                "consumer_id": claim.consumer_id,
+                "path": str(batch.path),
+            },
+        ),
+    )
     return claim
 
 
@@ -128,7 +142,26 @@ def record_rollout_consumed(
             consumer_id=consumed.consumer_id,
         ),
     )
+    append_trace_event_best_effort(
+        _trace_output_dir(events_dir),
+        make_trace_event(
+            subsystem="trainer",
+            event="rollout_consumed",
+            step=trainer_step_after,
+            queue_step=batch.step,
+            optimizer_step=trainer_step_after,
+            details={
+                "consumer_id": consumed.consumer_id,
+                "trainer_step_before": trainer_step_before,
+                "optimizer_step_completed": optimizer_step_completed,
+            },
+        ),
+    )
     return consumed
+
+
+def _trace_output_dir(events_dir: Path | None) -> Path | None:
+    return events_dir.parent if events_dir is not None else None
 
 
 def _write_record(path: Path, record: object) -> Path:
