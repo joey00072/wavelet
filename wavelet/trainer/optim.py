@@ -14,6 +14,7 @@ def setup_optimizer(
     config: OptimizerConfig,
     named_params: Sequence[tuple[str, nn.Parameter]],
 ) -> Optimizer:
+    _validate_single_trainable_lora_adapter(named_params)
     params = [param for _, param in named_params if param.requires_grad]
 
     if config.type in ("adamw", "adamw_8bit", "paged_adamw_8bit"):
@@ -79,6 +80,39 @@ def setup_optimizer(
             implementation=config.implementation,
         )
     raise ValueError(f"Unsupported optimizer type: {config.type}")
+
+
+def _validate_single_trainable_lora_adapter(
+    named_params: Sequence[tuple[str, nn.Parameter]],
+) -> None:
+    adapter_names = {
+        adapter_name
+        for name, param in named_params
+        if param.requires_grad
+        for adapter_name in [_lora_adapter_name_from_parameter(name)]
+        if adapter_name is not None
+    }
+    if len(adapter_names) > 1:
+        raise RuntimeError(
+            "Wavelet optimizers support trainable parameters from exactly one "
+            f"LoRA adapter; found {sorted(adapter_names)}."
+        )
+
+
+def _lora_adapter_name_from_parameter(name: str) -> str | None:
+    for marker in (
+        ".lora_A.",
+        ".lora_B.",
+        ".lora_embedding_A.",
+        ".lora_embedding_B.",
+    ):
+        if marker not in name:
+            continue
+        suffix = name.split(marker, 1)[1]
+        if "." not in suffix:
+            return None
+        return suffix.split(".", 1)[0]
+    return None
 
 
 def _build_optimizer(

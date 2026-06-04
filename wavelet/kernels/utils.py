@@ -73,10 +73,18 @@ def get_lora_parameters(proj) -> tuple:
     if getattr(proj, "disable_adapters", True) or getattr(proj, "merged", False):
         return W, W_quant, None, None, None
 
-    adapter = getattr(proj, "active_adapters", None)
-    if adapter is None:
-        adapter = getattr(proj, "active_adapter", ("default",))
-    adapter = adapter[0]
+    adapters = getattr(proj, "active_adapters", None)
+    if callable(adapters):
+        adapters = adapters()
+    if adapters is None:
+        adapters = getattr(proj, "active_adapter", ("default",))
+    adapters = list(adapters)
+    if len(adapters) != 1:
+        raise RuntimeError(
+            "Wavelet fused LoRA kernels support exactly one active adapter; "
+            f"found {adapters}."
+        )
+    adapter = adapters[0]
 
     A = proj.lora_A[adapter].weight
     B = proj.lora_B[adapter].weight

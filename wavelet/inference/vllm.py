@@ -146,8 +146,8 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "gpu_memory_utilization": vllm_config.gpu_memory_utilization,
             "enforce_eager": vllm_config.enforce_eager,
             "enable_lora": self.config.lora is not None,
-            "max_loras": vllm_config.max_loras,
-            "max_cpu_loras": vllm_config.max_cpu_loras,
+            "max_loras": 1,
+            "max_cpu_loras": 1,
             "max_lora_rank": max_lora_rank,
         }
         if vllm_config.quantization is not None:
@@ -632,9 +632,6 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
 
         adapter_id = self.config.policy_transfer.adapter_id
         adapter_name = self.config.policy_transfer.adapter_name
-        if step is not None:
-            adapter_id += step
-            adapter_name = f"{adapter_name}-{step:06d}"
         self._lora_request = LoRARequest(
             adapter_name,
             adapter_id,

@@ -783,9 +783,7 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
         raw_request.app.state.policy_weight_path = weight_path
         return {"status": "ok", "policy_step": step, "weight_path": weight_path}
 
-    adapter_name = str(
-        payload.get("adapter_name") or _CONFIG.policy_transfer.adapter_name
-    )
+    adapter_name = _CONFIG.policy_transfer.adapter_name
     adapter_dir = policy_dir / "adapter"
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
@@ -977,9 +975,9 @@ def _serve_args(config: RLConfig) -> Namespace:
         argv.extend(
             [
                 "--max-loras",
-                str(vllm_config.max_loras),
+                "1",
                 "--max-cpu-loras",
-                str(vllm_config.max_cpu_loras),
+                "1",
                 "--max-lora-rank",
                 str(max_lora_rank),
             ]

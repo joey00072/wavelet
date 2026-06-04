@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import pytest
 import torch
 
+from wavelet.kernels.utils import get_lora_parameters
 from wavelet.trainer import lora as lora_utils
 
 
@@ -80,6 +82,54 @@ def test_fsdp_lora_gather_preserves_adapter_name_before_peft_filter(
 
     assert list(state) == ["base.q_proj.lora_A.default.weight"]
     assert torch.equal(state["base.q_proj.lora_A.default.weight"], parameter)
+
+
+def test_single_lora_guard_rejects_multiple_peft_adapters(monkeypatch) -> None:
+    class FakePeftModel:
+        peft_config = {"default": object(), "policy_old": object()}
+
+        def active_adapters(self):
+            return ["default"]
+
+    monkeypatch.setattr(lora_utils, "PeftModel", FakePeftModel)
+
+    with pytest.raises(RuntimeError, match="exactly one PEFT LoRA adapter"):
+        lora_utils.enforce_single_lora_adapter(FakePeftModel())
+
+
+def test_fsdp_lora_gather_filters_to_single_adapter(monkeypatch) -> None:
+    default = torch.nn.Parameter(torch.ones(2, 2))
+    old = torch.nn.Parameter(torch.full((2, 2), 9.0))
+
+    class FakePeftModel:
+        peft_config = {"default": object()}
+
+        def active_adapters(self):
+            return ["default"]
+
+    class FakeWrapped:
+        def named_parameters(self):
+            yield "_fsdp_wrapped_module.base.q_proj.lora_A.default.weight", default
+            yield "_fsdp_wrapped_module.base.q_proj.lora_A.policy_old.weight", old
+
+    monkeypatch.setattr(lora_utils, "PeftModel", FakePeftModel)
+    monkeypatch.setattr(lora_utils.torch.distributed, "is_initialized", lambda: False)
+
+    state = lora_utils._gather_fsdp_lora_state_dict(FakeWrapped(), FakePeftModel())
+
+    assert list(state) == ["base.q_proj.lora_A.default.weight"]
+    assert torch.equal(state["base.q_proj.lora_A.default.weight"], default)
+
+
+def test_fused_lora_parameters_reject_multiple_active_adapters() -> None:
+    class FakeProj:
+        disable_adapters = False
+        merged = False
+        active_adapters = ("default", "policy_old")
+        base_layer = torch.nn.Linear(2, 2, bias=False)
+
+    with pytest.raises(RuntimeError, match="exactly one active adapter"):
+        get_lora_parameters(FakeProj())
 
 
 def test_saved_lora_keys_strip_nested_fsdp_wrapped_module_segments() -> None:

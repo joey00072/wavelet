@@ -61,8 +61,6 @@ inference:
     gpu_memory_utilization: 0.9
     max_model_len: 2048
     enforce_eager: false
-    max_loras: 8
-    max_cpu_loras: 100
     max_lora_rank: 32
   http:
     port: 8000
