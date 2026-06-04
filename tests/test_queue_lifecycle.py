@@ -7,8 +7,11 @@ from wavelet.orchestrator.queue import (
     ClaimRecord,
     ConsumedRecord,
     QueueEvent,
+    RolloutBatch,
     RolloutManifest,
     append_event,
+    record_rollout_claim,
+    record_rollout_consumed,
     read_claim,
     read_consumed,
     read_manifest,
@@ -108,3 +111,37 @@ def test_lifecycle_json_is_compact_and_sorted(tmp_path: Path) -> None:
 
     assert "\n" not in path.read_text(encoding="utf-8")
     assert json.loads(path.read_text(encoding="utf-8"))["queue_step"] == 1
+
+
+def test_rollout_claim_and_consume_write_traces(tmp_path: Path) -> None:
+    step_dir = tmp_path / "rollouts" / "step-000003"
+    step_dir.mkdir(parents=True)
+    batch_path = step_dir / "rollouts.jsonl"
+    batch_path.write_text("{}\n", encoding="utf-8")
+    batch = RolloutBatch(step=3, path=batch_path, step_dir=step_dir)
+
+    record_rollout_claim(
+        batch,
+        trainer_step_before=1,
+        consumer_id="trainer",
+        events_dir=tmp_path / "events",
+    )
+    record_rollout_consumed(
+        batch,
+        trainer_step_before=1,
+        trainer_step_after=2,
+        optimizer_step_completed=True,
+        consumer_id="trainer",
+        events_dir=tmp_path / "events",
+    )
+
+    step_one_trace = json.loads(
+        (tmp_path / "traces" / "step-000001.jsonl").read_text(encoding="utf-8")
+    )
+    step_two_trace = json.loads(
+        (tmp_path / "traces" / "step-000002.jsonl").read_text(encoding="utf-8")
+    )
+    assert step_one_trace["event"] == "rollout_claimed"
+    assert step_one_trace["queue_step"] == 3
+    assert step_two_trace["event"] == "rollout_consumed"
+    assert step_two_trace["optimizer_step"] == 2

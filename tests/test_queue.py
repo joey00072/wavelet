@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
@@ -124,6 +125,13 @@ def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert events[0].details["mode"] == "wait"
     assert events[0].details["payload_bytes"] == 3
     assert events[0].details["wait_seconds"] >= 0
+    trace = json.loads(
+        (tmp_path / "traces" / "step-000000.jsonl").read_text(encoding="utf-8")
+    )
+    assert trace["subsystem"] == "trainer"
+    assert trace["event"] == "rollout_received"
+    assert trace["queue_step"] == 0
+    assert trace["details"]["consumer_id"] == "trainer"
 
 
 def test_policy_receiver_records_wait_metrics(tmp_path: Path) -> None:
@@ -153,3 +161,10 @@ def test_policy_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert events[0].details["mode"] == "wait"
     assert events[0].details["payload_bytes"] >= len(b"weights")
     assert events[0].details["wait_seconds"] >= 0
+    trace = json.loads(
+        (tmp_path / "traces" / "step-000000.jsonl").read_text(encoding="utf-8")
+    )
+    assert trace["subsystem"] == "inference"
+    assert trace["event"] == "policy_received"
+    assert trace["policy_step"] == 0
+    assert trace["details"]["consumer_id"] == "inference"
