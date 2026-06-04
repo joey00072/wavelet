@@ -69,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     policy_receiver = FileSystemPolicyReceiver(
         config.output_dir,
         config.policy_transfer,
+        events_dir=config.output_dir / "events",
     )
     if _target_steps(config) == 0 and config.model.adapter_path is not None:
         publish_adapter_policy_snapshot(
@@ -1163,6 +1164,10 @@ def _load_policy_step(
             time=utc_now(),
             kind="policy_load_completed",
             policy_step=policy.step,
+            details={
+                "load_seconds": load_policy_seconds,
+                "wait_seconds": wait_policy_seconds,
+            },
         ),
     )
     return policy.step, wait_policy_seconds, load_policy_seconds

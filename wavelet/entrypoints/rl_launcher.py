@@ -644,6 +644,7 @@ def _run_integrated_launcher(config: RLConfig) -> int:
             config.output_dir,
             config.policy_transfer,
             start_step=getattr(trainer, "step", 0),
+            events_dir=config.output_dir / "events",
         )
         inference_engine = create_policy_inference_engine(config)
         inference_engine.setup()

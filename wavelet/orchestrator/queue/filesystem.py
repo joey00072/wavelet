@@ -309,10 +309,14 @@ class FileSystemPolicyReceiver:
         config: RLPolicyTransferConfig,
         *,
         start_step: int = 0,
+        events_dir: Path | None = None,
+        consumer_id: str | None = None,
     ) -> None:
         self.config = config
         self.policy_dir = resolve_policy_dir(output_dir, config)
         self.next_step = start_step
+        self.events_dir = events_dir
+        self.consumer_id = consumer_id
 
     def can_receive(self) -> bool:
         return self._stable_policy_for_step(self.next_step) is not None
@@ -324,9 +328,11 @@ class FileSystemPolicyReceiver:
                 f"No stable policy snapshot available for step {self.next_step}."
             )
         self.next_step += 1
+        self._record_received(snapshot, wait_seconds=0.0, mode="receive")
         return snapshot
 
     def wait(self) -> PolicySnapshot:
+        started_at = time.monotonic()
         deadline = None
         if self.config.idle_timeout_seconds is not None:
             deadline = time.monotonic() + self.config.idle_timeout_seconds
@@ -334,6 +340,11 @@ class FileSystemPolicyReceiver:
             snapshot = self._stable_policy_for_step(self.next_step)
             if snapshot is not None:
                 self.next_step += 1
+                self._record_received(
+                    snapshot,
+                    wait_seconds=time.monotonic() - started_at,
+                    mode="wait",
+                )
                 return snapshot
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
@@ -365,9 +376,42 @@ class FileSystemPolicyReceiver:
             return None
         return PolicySnapshot(step=step, step_dir=step_dir)
 
+    def _record_received(
+        self,
+        snapshot: PolicySnapshot,
+        *,
+        wait_seconds: float,
+        mode: str,
+    ) -> None:
+        if self.events_dir is None:
+            return
+        append_event_best_effort(
+            self.events_dir,
+            QueueEvent(
+                time=utc_now(),
+                kind="policy_received",
+                policy_step=snapshot.step,
+                consumer_id=self.consumer_id or process_identity("rl-inference"),
+                details={
+                    "mode": mode,
+                    "payload_bytes": _directory_payload_bytes(snapshot.step_dir),
+                    "wait_seconds": wait_seconds,
+                },
+            ),
+        )
+
     @staticmethod
     def _is_stable_policy_dir(step_dir: Path) -> bool:
         return step_dir.is_dir() and (step_dir / STABLE_BATCH_MARKER).exists()
+
+
+def _directory_payload_bytes(path: Path) -> int:
+    total = 0
+    for candidate in path.rglob("*"):
+        if not candidate.is_file():
+            continue
+        total += candidate.stat().st_size
+    return total
 
 
 def publish_adapter_policy_snapshot(
