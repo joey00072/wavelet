@@ -49,6 +49,7 @@ def apply_lora(
     if config is None:
         return model
     if isinstance(model, PeftModel):
+        enforce_single_lora_adapter(model)
         if match_base_dtype:
             _align_lora_dtypes(model)
         return model
@@ -64,6 +65,7 @@ def apply_lora(
         task_type=TaskType.CAUSAL_LM,
     )
     model = get_peft_model(model, peft_config)
+    enforce_single_lora_adapter(model)
     if lora_dtype is not None:
         _cast_lora_dtypes(model, lora_dtype)
     elif match_base_dtype:
@@ -85,7 +87,12 @@ def prepare_hf_tp_lora_for_training(
 
     tp_mesh = parallel_dims.get_mesh("tp")
     for module in _hf_tp_lora_modules(model, "rowwise"):
-        for child in _lora_children(module, "lora_B", "lora_embedding_B"):
+        for child in _lora_children(
+            module,
+            "lora_B",
+            "lora_embedding_B",
+            adapter_name=_single_module_lora_adapter_name(module),
+        ):
             if not _needs_lora_allreduce_hook(child):
                 continue
 
@@ -115,7 +122,11 @@ def sync_hf_tp_lora_replicated_grads(
 
     for module, tp_plan in _hf_tp_lora_modules_with_plan(model):
         replicated_attrs = TP_REPLICATED_LORA_ATTRS[tp_plan]
-        for parameter in _lora_parameters(module, *replicated_attrs):
+        for parameter in _lora_parameters(
+            module,
+            *replicated_attrs,
+            adapter_name=_single_module_lora_adapter_name(module),
+        ):
             if parameter.grad is None:
                 continue
             torch.distributed.all_reduce(
@@ -150,7 +161,7 @@ def save_lora_adapter_snapshot(
         return target
 
     target.mkdir(parents=True, exist_ok=True)
-    adapter_name = _active_adapter_name(model)
+    adapter_name = _single_peft_adapter_name(model)
     peft_config = model.peft_config[adapter_name]
     peft_config.save_pretrained(target)
     lora_state = get_peft_model_state_dict(
@@ -258,24 +269,48 @@ def _hf_tp_plan(module: nn.Module) -> str | None:
     return tp_plan if isinstance(tp_plan, str) else None
 
 
-def _lora_children(module: nn.Module, *attrs: str) -> list[object]:
+def enforce_single_lora_adapter(model: nn.Module) -> None:
+    """Reject PEFT models with more than one adapter before training/export."""
+    if not isinstance(model, PeftModel):
+        return
+    _single_peft_adapter_name(model)
+
+
+def _lora_children(
+    module: nn.Module,
+    *attrs: str,
+    adapter_name: str | None = None,
+) -> list[object]:
     children: list[object] = []
     for attr in attrs:
         container = getattr(module, attr, None)
         if container is None:
             continue
         if isinstance(container, dict):
-            children.extend(container.values())
+            children.extend(
+                [container[adapter_name]]
+                if adapter_name is not None and adapter_name in container
+                else container.values()
+            )
         elif hasattr(container, "values"):
-            children.extend(list(container.values()))
+            values = (
+                [container[adapter_name]]
+                if adapter_name is not None and adapter_name in container
+                else list(container.values())
+            )
+            children.extend(values)
         else:
             children.append(container)
     return children
 
 
-def _lora_parameters(module: nn.Module, *attrs: str) -> list[nn.Parameter]:
+def _lora_parameters(
+    module: nn.Module,
+    *attrs: str,
+    adapter_name: str | None = None,
+) -> list[nn.Parameter]:
     parameters: list[nn.Parameter] = []
-    for child in _lora_children(module, *attrs):
+    for child in _lora_children(module, *attrs, adapter_name=adapter_name):
         if isinstance(child, nn.Parameter):
             parameters.append(child)
             continue
@@ -296,13 +331,21 @@ def _normalize_hf_tp_linear_feature_metadata(model: nn.Module) -> None:
 
 
 def _cast_lora_dtypes(model: nn.Module, lora_dtype: torch.dtype) -> None:
+    adapter_name = (
+        _single_peft_adapter_name(model) if isinstance(model, PeftModel) else None
+    )
     for _, wrapped in model.named_modules():
         if not _is_lora_wrapped(wrapped):
             continue
         for attr in ("lora_A", "lora_B"):
             container = getattr(wrapped, attr, None)
             if container:
-                for child in container.values():
+                children = (
+                    [container[adapter_name]]
+                    if adapter_name is not None and adapter_name in container
+                    else list(container.values())
+                )
+                for child in children:
                     child.to(dtype=lora_dtype)
 
 
@@ -339,10 +382,15 @@ def _gather_hf_tp_lora_state_dict(
 
 
 def _local_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    adapter_name = (
+        _single_peft_adapter_name(model) if isinstance(model, PeftModel) else None
+    )
     return {
         name: value.detach().cpu().contiguous()
         for name, value in model.named_parameters()
-        if "lora_" in name and value.numel() > 0
+        if "lora_" in name
+        and value.numel() > 0
+        and _lora_state_key_matches_adapter(name, adapter_name)
     }
 
 
@@ -377,6 +425,7 @@ def _strip_fsdp_wrapped_module_segments(key: str) -> str:
 
 
 def _lora_parameter_shapes(model: PeftModel) -> dict[str, tuple[int, ...]]:
+    active_adapter_name = _single_peft_adapter_name(model)
     shapes: dict[str, tuple[int, ...]] = {}
     for module_name, module in model.named_modules():
         for attr in LORA_STATE_ATTRS:
@@ -384,6 +433,8 @@ def _lora_parameter_shapes(model: PeftModel) -> dict[str, tuple[int, ...]]:
             if container is None:
                 continue
             for adapter_name, child in container.items():
+                if adapter_name != active_adapter_name:
+                    continue
                 weight = getattr(child, "weight", child)
                 if not isinstance(weight, nn.Parameter):
                     continue
@@ -402,12 +453,15 @@ def _gather_fsdp_lora_state_dict(
     parallel_dims: ParallelDims | None = None,
 ) -> dict[str, torch.Tensor] | None:
     if not torch.distributed.is_initialized():
+        adapter_name = _single_peft_adapter_name(unwrapped)
         return {
             name.removeprefix("_fsdp_wrapped_module."): value.detach()
             .cpu()
             .contiguous()
             for name, value in model.named_parameters()
-            if "lora_" in name and value.numel() > 0
+            if "lora_" in name
+            and value.numel() > 0
+            and _lora_state_key_matches_adapter(name, adapter_name)
         }
 
     expected_shapes = _lora_parameter_shapes(unwrapped)
@@ -492,12 +546,63 @@ def _distributed_group_rank(group: object | None) -> int:
     return torch.distributed.get_rank(group=group)
 
 
-def _active_adapter_name(model: PeftModel) -> str:
+def _single_peft_adapter_name(model: PeftModel) -> str:
+    adapter_names = list(getattr(model, "peft_config", {}).keys())
+    if len(adapter_names) > 1:
+        raise RuntimeError(
+            "Wavelet supports exactly one PEFT LoRA adapter per policy model; "
+            f"found {adapter_names}."
+        )
     active_adapters = getattr(model, "active_adapters", None)
     adapters = active_adapters() if callable(active_adapters) else active_adapters
-    if not adapters:
+    adapters = list(adapters or [])
+    if len(adapters) > 1:
+        raise RuntimeError(
+            "Wavelet supports exactly one active LoRA adapter per policy model; "
+            f"found {adapters}."
+        )
+    if not adapter_names and not adapters:
         return "default"
-    return str(adapters[0])
+    adapter_name = str(adapter_names[0] if adapter_names else adapters[0])
+    if adapters and str(adapters[0]) != adapter_name:
+        raise RuntimeError(
+            "Wavelet LoRA adapter mismatch: active adapter "
+            f"{adapters[0]!r} is not the configured adapter {adapter_name!r}."
+        )
+    return adapter_name
+
+
+def _single_module_lora_adapter_name(module: nn.Module) -> str | None:
+    names: set[str] = set()
+    for attr in LORA_STATE_ATTRS:
+        container = getattr(module, attr, None)
+        if isinstance(container, dict) or hasattr(container, "keys"):
+            names.update(str(name) for name in container.keys())
+    if len(names) > 1:
+        raise RuntimeError(
+            "Wavelet supports exactly one LoRA adapter per wrapped module; "
+            f"found {sorted(names)}."
+        )
+    return next(iter(names)) if names else None
+
+
+def _lora_state_key_matches_adapter(key: str, adapter_name: str | None) -> bool:
+    if adapter_name is None:
+        return True
+    key_adapter_name = _lora_state_key_adapter_name(key)
+    return key_adapter_name is None or key_adapter_name == adapter_name
+
+
+def _lora_state_key_adapter_name(key: str) -> str | None:
+    for attr in LORA_STATE_ATTRS:
+        marker = f".{attr}."
+        if marker not in key:
+            continue
+        suffix = key.split(marker, 1)[1]
+        if "." not in suffix:
+            return None
+        return suffix.split(".", 1)[0]
+    return None
 
 
 def _is_lora_wrapped(module: nn.Module) -> bool:
@@ -518,6 +623,9 @@ def _resolve_lora_target_modules(
 
 
 def _align_lora_dtypes(model: nn.Module) -> None:
+    adapter_name = (
+        _single_peft_adapter_name(model) if isinstance(model, PeftModel) else None
+    )
     for module in model.modules():
         if not _is_lora_wrapped(module):
             continue
@@ -530,7 +638,12 @@ def _align_lora_dtypes(model: nn.Module) -> None:
             container = getattr(module, attr, None)
             if container is None:
                 continue
-            for child in container.values():
+            children = (
+                [container[adapter_name]]
+                if adapter_name is not None and adapter_name in container
+                else list(container.values())
+            )
+            for child in children:
                 if isinstance(child, nn.Module):
                     child.to(device=target_device, dtype=target_dtype)
                 elif isinstance(child, nn.Parameter):

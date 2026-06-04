@@ -256,8 +256,6 @@ class RLVLLMConfig(BaseModel):
     data_parallel_size_local: int | None = Field(default=None, ge=1)
     data_parallel_rpc_port: int | None = Field(default=None, ge=1, le=65535)
     enforce_eager: bool = True
-    max_loras: int = Field(default=8, ge=1)
-    max_cpu_loras: int = Field(default=100, ge=1)
     max_lora_rank: int | None = Field(default=None, ge=1)
     fully_sharded_loras: bool = False
     trust_remote_code: bool | None = None

@@ -63,7 +63,7 @@ def test_openai_batch_collector_waits_for_min_size() -> None:
     assert [request.payload["index"] for request in batch] == [0, 1]
 
 
-def test_vllm_policy_load_uses_step_scoped_lora_request(monkeypatch) -> None:
+def test_vllm_policy_load_reuses_stable_lora_request(monkeypatch) -> None:
     request_module = ModuleType("vllm.lora.request")
 
     class FakeLoRARequest:
@@ -93,14 +93,14 @@ def test_vllm_policy_load_uses_step_scoped_lora_request(monkeypatch) -> None:
 
     engine._load_adapter_policy(Path("snapshot/adapter"), step=7)
 
-    assert engine._lora_request.lora_name == "policy-000007"
-    assert engine._lora_request.lora_int_id == 17
+    assert engine._lora_request.lora_name == "policy"
+    assert engine._lora_request.lora_int_id == 10
     assert engine._lora_request.lora_path == "snapshot/adapter"
 
     engine._mark_lora_loaded()
 
-    assert engine._lora_request.lora_name == "policy-000007"
-    assert engine._lora_request.lora_int_id == 17
+    assert engine._lora_request.lora_name == "policy"
+    assert engine._lora_request.lora_int_id == 10
 
 
 def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
@@ -125,6 +125,8 @@ def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
     engine.setup()
 
     assert captured_kwargs["enable_lora"] is True
+    assert captured_kwargs["max_loras"] == 1
+    assert captured_kwargs["max_cpu_loras"] == 1
     assert captured_kwargs["fully_sharded_loras"] is True
     assert captured_kwargs["max_lora_rank"] == 32
 

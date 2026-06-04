@@ -325,10 +325,12 @@ class BaseTrainer:
 
     def _setup_optimizer(self) -> None:
         from wavelet.trainer.optim import setup_optimizer
+        from wavelet.trainer.lora import enforce_single_lora_adapter
 
         if not self.model:
             raise RuntimeError("Model must be set up before optimizer")
 
+        enforce_single_lora_adapter(self.model)
         self.optimizer = setup_optimizer(
             self.config.optim,
             self.model.named_parameters(),

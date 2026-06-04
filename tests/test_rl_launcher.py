@@ -271,6 +271,8 @@ def test_inference_server_enables_fully_sharded_loras() -> None:
     args = _serve_args(config)
 
     assert args.enable_lora is True
+    assert args.max_loras == 1
+    assert args.max_cpu_loras == 1
     assert args.fully_sharded_loras is True
     assert args.max_lora_rank == 32
 
@@ -673,10 +675,10 @@ def test_http_openai_payload_sets_vllm_request_fields() -> None:
     payload = engine._openai_payload(
         record,
         [10, 11],
-        policy_model_name="policy-000123",
+        policy_model_name="policy",
     )
 
-    assert payload["model"] == "policy-000123"
+    assert payload["model"] == "policy"
     assert payload["return_token_ids"] is True
     assert payload["top_k"] == 20
     assert payload["min_p"] == 0.05

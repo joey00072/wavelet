@@ -85,8 +85,6 @@ inference:
     gpu_memory_utilization: 0.9
     max_model_len: 8192
     enforce_eager: false
-    max_loras: 1
-    max_cpu_loras: 1
     max_lora_rank: 32
   http:
     request_timeout_seconds: 900.0
