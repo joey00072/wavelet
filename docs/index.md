@@ -16,8 +16,6 @@ training or inference runs.
 - [Orchestrator diagnostics](orchestrator.skill.md): inspect scheduling,
   rollout generation, scoring, filtering, and rollout materialization without
   starting the trainer.
-- [Reverse-text smoke path](reverse_text_smoke.md): deterministic tiny-run
-  commands before expensive RL.
 - [Agent trajectory artifacts](agent_trajectory.md): token provenance contract
   for custom multi-turn and tool rollouts.
 - [WebUI](../webui/README.md): run the browser dashboard for the RL state server.
@@ -37,8 +35,16 @@ uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json
 uv run python -m wavelet rl @ examples/reverse_text/rl.yaml
 ```
 
-For a deterministic debug-only pass, use the
-[reverse-text smoke path](reverse_text_smoke.md) before launching RL.
+For a deterministic debug-only pass before launching RL:
+
+```bash
+uv run python -m wavelet debug orchestrator inspect @ examples/reverse_text/rl.yaml --json
+uv run python -m wavelet debug orchestrator sample \
+  @ examples/reverse_text/rl.yaml --step 0 --examples 2 --json
+```
+
+Run the sample command twice with the same `--step` and `--examples`; selected
+rows should match because the example uses a fixed seed.
 
 For a math SFT-to-RL path:
 
