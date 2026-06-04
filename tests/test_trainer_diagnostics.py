@@ -9,6 +9,7 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_trainer_debug import main as trainer_debug_main
 from wavelet.trainer.diagnostics import (
     build_runtime_parity_report,
+    export_rollout_token_debug,
     inspect_rollout_batch,
 )
 
@@ -84,6 +85,80 @@ def test_trainer_debug_inspect_outputs_json(tmp_path: Path, capsys) -> None:
     report = json.loads(capsys.readouterr().out)
     assert report["ok"] is True
     assert report["summary"]["trainable_tokens"] == 1
+
+
+def test_export_rollout_token_debug_writes_compact_jsonl(tmp_path: Path) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "target_ids": [2, 3, 4],
+                "loss_mask": [False, True, True],
+                "inference_logprobs": [-0.2, -0.3],
+                "teacher_logprobs": [-0.1, -0.2],
+                "temperatures": [0.7, 0.7],
+                "advantage": 0.5,
+                "reward": 1.0,
+                "metadata": {
+                    "example_id": "ex-1",
+                    "trajectory_id": "tr-1",
+                    "rollout_key": "rk-1",
+                },
+            }
+        ],
+    )
+    write_path = tmp_path / "debug" / "tokens.jsonl"
+
+    report = export_rollout_token_debug(
+        RLConfig(),
+        rollout_path=rollout_path,
+        write_path=write_path,
+    )
+
+    rows = [json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()]
+    assert report["ok"] is True
+    assert report["rows_exported"] == 1
+    assert rows[0]["example_id"] == "ex-1"
+    assert rows[0]["trajectory_id"] == "tr-1"
+    assert rows[0]["rollout_key"] == "rk-1"
+    assert rows[0]["trainable_indexes"] == [1, 2]
+    assert rows[0]["trainable_target_ids"] == [3, 4]
+    assert rows[0]["inference_logprobs"] == [-0.2, -0.3]
+
+
+def test_trainer_debug_tokens_writes_export(tmp_path: Path, capsys) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2],
+                "target_ids": [2, 3],
+                "loss_mask": [False, True],
+                "inference_logprobs": [-0.2],
+            }
+        ],
+    )
+    write_path = tmp_path / "tokens.jsonl"
+
+    assert (
+        trainer_debug_main(
+            [
+                "tokens",
+                "--rollout-path",
+                str(rollout_path),
+                "--write-tokens",
+                str(write_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    rows = [json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()]
+    assert report["rows_exported"] == 1
+    assert rows[0]["trainable_target_ids"] == [3]
 
 
 def test_runtime_parity_report_passes_within_threshold(tmp_path: Path) -> None:

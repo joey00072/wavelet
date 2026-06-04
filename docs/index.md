@@ -90,6 +90,19 @@ and teacher logprobs when present. It proves the saved batch is structurally
 ready for trainer replay; it does not compare model logprobs or run an optimizer
 step.
 
+Export a compact token sidecar when a batch needs closer inspection:
+
+```bash
+uv run python -m wavelet debug trainer tokens \
+  --rollout-path outputs/my_run/rollouts/step-000000/rollouts.jsonl \
+  --write-tokens outputs/my_run/debug/trainer-step-000000-tokens.jsonl \
+  --json @ examples/reverse_text/rl.yaml
+```
+
+The token sidecar contains token ids, loss masks, trainable target ids,
+rollout-time logprobs, temperatures, rewards, advantages, and row provenance.
+It is intended for debugging and should stay under the run output directory.
+
 When trainer-side logprobs have been exported into the rollout JSONL, compare
 them with rollout-time logprobs:
 
@@ -161,4 +174,4 @@ uv run python scripts/project_size.py --write docs/project_size.jsonl
 
 The snapshot records file count, total lines, source lines, Python function/class
 counts, a rough complexity proxy, and the largest files. It intentionally skips
-`ref/`, generated outputs, caches, virtualenvs, and WandB artifacts.
+external checkouts, generated outputs, caches, virtualenvs, and WandB artifacts.

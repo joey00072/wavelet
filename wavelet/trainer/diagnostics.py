@@ -164,6 +164,65 @@ def build_runtime_parity_report(
     }
 
 
+def export_rollout_token_debug(
+    config: RLConfig,
+    *,
+    write_path: Path,
+    rollout_path: Path | None = None,
+    queue_step: int | None = None,
+    max_rows: int | None = None,
+) -> dict[str, Any]:
+    path = _resolve_rollout_path(config, rollout_path=rollout_path, queue_step=queue_step)
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    rows_scanned = 0
+    rows_exported = 0
+    total_tokens = 0
+    trainable_tokens = 0
+    write_path.parent.mkdir(parents=True, exist_ok=True)
+    with write_path.open("w", encoding="utf-8") as handle:
+        for row_index, payload in _iter_jsonl(path):
+            if max_rows is not None and rows_scanned >= max_rows:
+                break
+            rows_scanned += 1
+            row_errors, row_warnings, stats = _inspect_row(
+                payload,
+                row_index=row_index,
+                inference_logprobs_column=config.data.inference_logprobs_column,
+                teacher_logprobs_column=config.data.teacher_logprobs_column,
+            )
+            errors.extend(row_errors)
+            warnings.extend(row_warnings)
+            total_tokens += stats["tokens"]
+            trainable_tokens += stats["trainable_tokens"]
+            if row_errors:
+                continue
+            token_row = _token_debug_row(
+                payload,
+                row_index=row_index,
+                inference_logprobs_column=config.data.inference_logprobs_column,
+                teacher_logprobs_column=config.data.teacher_logprobs_column,
+            )
+            handle.write(json.dumps(token_row, sort_keys=True) + "\n")
+            rows_exported += 1
+
+    return {
+        "path": str(path),
+        "write_path": str(write_path),
+        "queue_step": queue_step,
+        "rows_scanned": rows_scanned,
+        "rows_exported": rows_exported,
+        "truncated": max_rows is not None and rows_scanned >= max_rows,
+        "summary": {
+            "total_tokens": total_tokens,
+            "trainable_tokens": trainable_tokens,
+        },
+        "errors": errors,
+        "warnings": warnings,
+        "ok": not errors,
+    }
+
+
 def _resolve_rollout_path(
     config: RLConfig,
     *,
@@ -311,6 +370,41 @@ def _sample_row(
         "tokens": stats["tokens"],
         "trainable_tokens": stats["trainable_tokens"],
         "reward": payload.get("reward"),
+    }
+
+
+def _token_debug_row(
+    payload: dict[str, Any],
+    *,
+    row_index: int,
+    inference_logprobs_column: str,
+    teacher_logprobs_column: str,
+) -> dict[str, Any]:
+    input_ids = _sequence(payload.get("input_ids")) or []
+    target_ids = _sequence(payload.get("target_ids")) or []
+    loss_mask = [bool(value) for value in _sequence(payload.get("loss_mask")) or []]
+    trainable_indexes = [
+        index for index, trainable in enumerate(loss_mask) if bool(trainable)
+    ]
+    metadata = payload.get("metadata")
+    return {
+        "row": row_index,
+        "example_id": _metadata_value(metadata, "example_id"),
+        "trajectory_id": _metadata_value(metadata, "trajectory_id"),
+        "rollout_key": _metadata_value(metadata, "rollout_key"),
+        "input_ids": [int(value) for value in input_ids],
+        "target_ids": [int(value) for value in target_ids],
+        "loss_mask": loss_mask,
+        "trainable_indexes": trainable_indexes,
+        "trainable_target_ids": [int(target_ids[index]) for index in trainable_indexes],
+        "reward": payload.get("reward"),
+        "advantage": payload.get("advantage"),
+        "inference_logprobs": _float_sequence(
+            payload.get(inference_logprobs_column)
+        ),
+        "teacher_logprobs": _float_sequence(payload.get(teacher_logprobs_column)),
+        "temperatures": _float_sequence(payload.get("temperatures"))
+        or _float_sequence(payload.get("temperature")),
     }
 
 
