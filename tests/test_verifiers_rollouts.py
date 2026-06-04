@@ -97,8 +97,14 @@ def test_verifier_step_converts_to_trainable_record() -> None:
             "group_key": '{"env_name":"alphabet-sort","example_id":"7"}',
             "rollout_key": '{"env_name":"alphabet-sort","example_id":"7"}:0',
             "sample_index": 0,
+            "trajectory_id": '{"env_name":"alphabet-sort","example_id":"7"}:0',
+            "num_turns": 1,
+            "tool_calls": 0,
+            "elapsed_sec": None,
             "stop_condition": "done",
             "is_truncated": False,
+            "error": None,
+            "reward_components": None,
         },
     }
     assert record.prompt[1]["step_loss_mask"] == 0
@@ -804,13 +810,24 @@ def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
         "harness_name": "local-runner",
         "harness_type": "agent",
         "harness_version": "1",
+        "trajectory_id": "traj-7",
+        "elapsed_seconds": 1.25,
+        "reward_components": {"exact": 1.0},
+        "is_truncated": True,
+        "error": None,
         "reward": 1.0,
         "advantage": 0.5,
         "sampling_args": {"temperature": 1.0},
         "trajectory": [
             {
                 "prompt": [{"role": "user", "content": "fix"}],
-                "completion": [{"role": "assistant", "content": "patch"}],
+                "completion": [
+                    {
+                        "role": "assistant",
+                        "content": "patch",
+                        "tool_calls": [{"id": "call-1"}],
+                    }
+                ],
                 "tokens": {
                     "prompt_ids": [1],
                     "prompt_mask": [0],
@@ -831,7 +848,19 @@ def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
         "type": "agent",
         "version": "1",
     }
-    assert record.metadata["rollout"]["sample_index"] == 0
+    assert record.metadata["rollout"] == {
+        "group_key": '{"env_name":"repair","example_id":"case-7"}',
+        "rollout_key": '{"env_name":"repair","example_id":"case-7"}:0',
+        "sample_index": 0,
+        "trajectory_id": "traj-7",
+        "num_turns": 1,
+        "tool_calls": 1,
+        "elapsed_sec": 1.25,
+        "stop_condition": None,
+        "is_truncated": True,
+        "error": None,
+        "reward_components": {"exact": 1.0},
+    }
 
 
 def test_verifier_tool_response_length_penalty_shapes_advantages() -> None:

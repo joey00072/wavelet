@@ -25,3 +25,11 @@ messages, tool calls, tool results, verifier traces, parser errors, sandbox
 paths, screenshots, and timing. The compact trainer path should contain token
 ids, target ids, loss masks, rollout logprobs, rewards, advantages, policy step,
 trajectory/session ids, and enough metadata to replay or inspect the rollout.
+
+When a custom rollout emits trainer rows, use these metadata conventions:
+
+- `task`: task name plus `example_id`
+- `harness`: execution adapter name, type, and version when known
+- `rollout`: `group_key`, `rollout_key`, `trajectory_id`, `num_turns`,
+  `tool_calls`, `elapsed_sec`, `error`, `is_truncated`, `stop_condition`, and
+  `reward_components` when available
