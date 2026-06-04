@@ -9,6 +9,7 @@ from typing import Any
 from wavelet.configs.rl_config import RLConfig
 from wavelet.trainer.diagnostics import (
     build_runtime_parity_report,
+    export_rollout_token_debug,
     inspect_rollout_batch,
 )
 from wavelet.utils.config import load_config
@@ -23,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "action",
-        choices=["inspect", "parity"],
+        choices=["inspect", "parity", "tokens"],
         help="Diagnostic action to run.",
     )
     parser.add_argument("--rollout-path", type=Path, default=None)
@@ -33,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trainer-logprobs-column", default="trainer_logprobs")
     parser.add_argument("--threshold", type=float, default=1e-3)
     parser.add_argument("--write-report", type=Path, default=None)
+    parser.add_argument("--write-tokens", type=Path, default=None)
     parser.add_argument("--json", action="store_true", dest="json_output")
     args, config_args = parser.parse_known_args(argv)
 
@@ -42,6 +44,8 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--sample-limit must be >= 0")
     if args.threshold < 0.0:
         raise SystemExit("--threshold must be >= 0")
+    if args.action == "tokens" and args.write_tokens is None:
+        raise SystemExit("tokens action requires --write-tokens")
 
     config = load_config(RLConfig, config_args)
     if args.action == "inspect":
@@ -52,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             max_rows=args.max_rows,
             sample_limit=args.sample_limit,
         )
-    else:
+    elif args.action == "parity":
         report = build_runtime_parity_report(
             config,
             rollout_path=args.rollout_path,
@@ -60,6 +64,14 @@ def main(argv: list[str] | None = None) -> int:
             trainer_logprobs_column=args.trainer_logprobs_column,
             max_rows=args.max_rows,
             threshold=args.threshold,
+        )
+    else:
+        report = export_rollout_token_debug(
+            config,
+            write_path=args.write_tokens,
+            rollout_path=args.rollout_path,
+            queue_step=args.queue_step,
+            max_rows=args.max_rows,
         )
     if args.write_report is not None:
         args.write_report.parent.mkdir(parents=True, exist_ok=True)
@@ -82,6 +94,9 @@ def _print_report(report: dict[str, Any], *, json_output: bool) -> None:
     if "summary" in report:
         for key, value in report["summary"].items():
             print(f"{key}: {value}")
+    for key in ("rows_exported", "write_path"):
+        if key in report:
+            print(f"{key}: {report[key]}")
     for key in ("token_count", "max_abs_diff", "mean_abs_diff", "skip_reason"):
         if key in report:
             print(f"{key}: {report[key]}")
@@ -99,7 +114,7 @@ def _print_report(report: dict[str, Any], *, json_output: bool) -> None:
 
 
 def _exit_code(report: dict[str, Any], *, action: str) -> int:
-    if action == "inspect":
+    if action in {"inspect", "tokens"}:
         return 0 if report["ok"] else 1
     if report["errors"]:
         return 1
