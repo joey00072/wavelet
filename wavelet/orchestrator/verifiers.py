@@ -21,6 +21,7 @@ from wavelet.orchestrator.advantage import (
 )
 from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.patches import apply_verifier_openai_patches
+from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import (
     rollout_chunk_examples as _rollout_chunk_examples,
@@ -1543,6 +1544,11 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                     ),
                     "turn_count": len(output.get("trajectory") or []),
                     "_wavelet_rollout_count": 1 if sample_index == 0 else 0,
+                    **rollout_task_harness_metadata(
+                        output,
+                        group_key=group_key,
+                        sample_index=sample_index,
+                    ),
                 },
                 source=str(output.get("env_name") or output.get("task") or "verifier"),
             )

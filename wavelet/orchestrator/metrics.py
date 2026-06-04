@@ -11,6 +11,11 @@ from statistics import mean, pstdev
 from typing import Any
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.orchestrator.rollout_metadata import (
+    metadata_harness_name,
+    metadata_task_name,
+)
+from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +59,63 @@ def log_rollout_metrics(
         )
     )
     _append_metrics(config.output_dir, metrics, step=step)
+    _append_rollout_trace(
+        config,
+        rows,
+        metrics,
+        step=step,
+        policy_step=policy_step,
+        queue_step=queue_step,
+        optimizer_step=optimizer_step,
+    )
     _wandb_log(config, metrics, step=step)
     return metrics
+
+
+def _append_rollout_trace(
+    config: RLConfig,
+    rows: list[dict[str, Any]],
+    metrics: dict[str, float],
+    *,
+    step: int,
+    policy_step: int | None,
+    queue_step: int | None,
+    optimizer_step: int | None,
+) -> None:
+    task_names = sorted(
+        {
+            name
+            for row in rows
+            if (name := metadata_task_name(_metadata(row))) is not None
+        }
+    )
+    harness_names = sorted(
+        {
+            name
+            for row in rows
+            if (name := metadata_harness_name(_metadata(row))) is not None
+        }
+    )
+    append_trace_event_best_effort(
+        config.output_dir,
+        make_trace_event(
+            subsystem="orchestrator",
+            event="rollout_metrics_logged",
+            step=step,
+            queue_step=queue_step,
+            optimizer_step=optimizer_step,
+            policy_step=policy_step,
+            task=",".join(task_names) if task_names else None,
+            harness=",".join(harness_names) if harness_names else None,
+            details={
+                "samples": metrics["progress/samples"],
+                "tokens": metrics["progress/tokens"],
+                "trainable": metrics["fate/all/trainable"],
+                "filtered": metrics["fate/all/filtered"],
+                "errored": metrics["fate/all/errored"],
+            },
+        ),
+    )
 
 
 def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
