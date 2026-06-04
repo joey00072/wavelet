@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -360,13 +361,22 @@ def test_publish_adapter_policy_snapshot_copies_adapter(tmp_path: Path) -> None:
     output_dir = tmp_path / "out"
     config = RLConfig().policy_transfer
 
-    step_dir = publish_adapter_policy_snapshot(output_dir, config, adapter, step=0)
+    step_dir = publish_adapter_policy_snapshot(
+        output_dir,
+        config,
+        adapter,
+        step=0,
+        metadata={"precision": {"trainer": {"torch_dtype": "bfloat16"}}},
+    )
 
     assert (step_dir / "STABLE").exists()
     assert (
         step_dir / "adapter" / "adapter_model.safetensors"
     ).read_bytes() == b"weights"
     assert (step_dir / "policy.json").exists()
+    meta = json.loads((step_dir / "policy.json").read_text(encoding="utf-8"))
+    assert meta["source_adapter_path"] == str(adapter)
+    assert meta["precision"]["trainer"]["torch_dtype"] == "bfloat16"
 
 
 def test_inference_server_auto_enables_qwen_tool_parser() -> None:

@@ -330,6 +330,7 @@ def publish_adapter_policy_snapshot(
     adapter_path: Path,
     *,
     step: int = 0,
+    metadata: dict[str, object] | None = None,
 ) -> Path:
     policy_dir = resolve_policy_dir(output_dir, config)
     step_dir = get_policy_step_dir(policy_dir, step)
@@ -354,6 +355,8 @@ def publish_adapter_policy_snapshot(
         "kind": "adapter",
         "source_adapter_path": str(adapter_path),
     }
+    if metadata:
+        meta.update(metadata)
     (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
     (tmp_dir / STABLE_BATCH_MARKER).touch()
     tmp_dir.replace(step_dir)
