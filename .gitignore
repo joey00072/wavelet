@@ -56,6 +56,8 @@ ref/
 ref*
 .vscode/
 AGENT.md
+goal.md
 progress.md
 plan.md
 tools/prime_rl_compat/
+worklog.md

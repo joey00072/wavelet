@@ -120,3 +120,13 @@ For code changes, run a targeted test for the changed behavior, then:
 uvx ruff check wavelet tests
 git diff --check
 ```
+
+Track project size when a change adds or removes meaningful surface area:
+
+```bash
+uv run python scripts/project_size.py --write docs/project_size.jsonl
+```
+
+The snapshot records file count, total lines, source lines, Python function/class
+counts, a rough complexity proxy, and the largest files. It intentionally skips
+`ref/`, generated outputs, caches, virtualenvs, and WandB artifacts.

@@ -97,6 +97,9 @@ small smoke config that can prove the pipeline before long runs.
 - Auto-fix lint issues: `uv run ruff check . --fix`
 - Format (Ruff formatter): `uv run ruff format .`
 - Type check (if mypy/pyright configured): `uv run mypy .`
+- Project size snapshot: `uv run python scripts/project_size.py --write docs/project_size.jsonl`
+  This counts tracked source/docs/config files while excluding `ref/`, run outputs,
+  caches, virtualenvs, and WandB artifacts.
 
 ### Test
 
