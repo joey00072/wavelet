@@ -16,6 +16,8 @@ training or inference runs.
 - [Orchestrator diagnostics](orchestrator.skill.md): inspect scheduling,
   rollout generation, scoring, filtering, and rollout materialization without
   starting the trainer.
+- [Agent trajectory artifacts](agent_trajectory.md): token provenance contract
+  for custom multi-turn and tool rollouts.
 - [WebUI](../webui/README.md): run the browser dashboard for the RL state server.
 - [Agent instructions](../AGENTS.md): repository rules for coding agents and
   contributors.
