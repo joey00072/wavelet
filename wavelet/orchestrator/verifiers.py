@@ -12,6 +12,7 @@ from typing import Any
 
 from wavelet.configs.rl_config import RLEvalEnvConfig
 from wavelet.data.rl_dataset import RLExample, load_rl_records
+from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.advantage import (
     group_reward_advantages,
     length_penalty_cost_for_output,
@@ -1567,135 +1568,37 @@ def _interleave_output(
     if not trajectory:
         return []
     has_error = output.get("error") is not None
-    prepared = [
-        _step_tokens(output, step, index) for index, step in enumerate(trajectory)
+    segments = [
+        _step_token_segment(output, step, index)
+        for index, step in enumerate(trajectory)
+    ]
+    return [
+        sample.as_dict()
+        for sample in merge_token_segments(
+            segments,
+            temperature=temperature,
+            mask_outputs=has_error,
+        )
     ]
 
-    def make_sample(tokens: dict[str, Any]) -> dict[str, list[Any]]:
-        prompt_ids = list(tokens["prompt_ids"])
-        completion_ids = list(tokens["completion_ids"])
-        completion_mask = (
-            [False] * len(tokens["completion_mask"])
-            if has_error
-            else [bool(value) for value in tokens["completion_mask"]]
-        )
-        return _shift_sample(
-            prompt_ids,
-            [bool(value) for value in tokens["prompt_mask"]],
-            completion_ids,
-            completion_mask,
-            [float(value) for value in tokens["completion_logprobs"]],
-            temperature,
-        )
 
-    def extend_sample(
-        sample: dict[str, list[Any]],
-        prefix_len: int,
-        tokens: dict[str, Any],
-    ) -> dict[str, list[Any]]:
-        prefix_ids = list(tokens["prompt_ids"])[:prefix_len]
-        new_prompt_ids = list(tokens["prompt_ids"])[prefix_len:]
-        completion_ids = list(tokens["completion_ids"])
-        completion_mask = (
-            [False] * len(tokens["completion_mask"])
-            if has_error
-            else [bool(value) for value in tokens["completion_mask"]]
-        )
-        extension_ids = new_prompt_ids + completion_ids
-        extension_mask = [False] * len(new_prompt_ids) + completion_mask
-        extension_logprobs = [0.0] * len(new_prompt_ids) + [
-            float(value) for value in tokens["completion_logprobs"]
-        ]
-        extension = _shift_sample(
-            [],
-            [],
-            extension_ids,
-            extension_mask,
-            extension_logprobs,
-            temperature,
-        )
-        if prefix_ids and extension_ids:
-            sample["input_ids"].append(prefix_ids[-1])
-            sample["target_ids"].append(extension_ids[0])
-            sample["loss_mask"].append(extension_mask[0])
-            sample["inference_logprobs"].append(extension_logprobs[0])
-            sample["temperatures"].append(temperature)
-        for key in (
-            "input_ids",
-            "target_ids",
-            "loss_mask",
-            "inference_logprobs",
-            "temperatures",
-        ):
-            sample[key].extend(extension[key])
-        return sample
-
-    active: list[tuple[list[int], dict[str, list[Any]]]] = []
-    first = prepared[0]
-    active.append((first["prompt_ids"] + first["completion_ids"], make_sample(first)))
-    for tokens in prepared[1:]:
-        prompt_ids = tokens["prompt_ids"]
-        for index, (prefix, sample) in enumerate(active):
-            if prompt_ids[: len(prefix)] == prefix:
-                active[index] = (
-                    tokens["prompt_ids"] + tokens["completion_ids"],
-                    extend_sample(sample, len(prefix), tokens),
-                )
-                break
-        else:
-            active.append(
-                (tokens["prompt_ids"] + tokens["completion_ids"], make_sample(tokens))
-            )
-    return [sample for _, sample in active]
-
-
-def _step_tokens(
+def _step_token_segment(
     output: dict[str, Any], step: dict[str, Any], index: int
-) -> dict[str, Any]:
+) -> TokenSegment:
     tokens = step.get("tokens")
     if tokens is None:
         raise ValueError(
             f"Verifier rollout for example {output.get('example_id')} step {index} "
             "is missing token data."
         )
-    return {
-        "prompt_ids": [int(token_id) for token_id in tokens["prompt_ids"]],
-        "prompt_mask": [bool(value) for value in tokens["prompt_mask"]],
-        "completion_ids": [int(token_id) for token_id in tokens["completion_ids"]],
-        "completion_mask": [bool(value) for value in tokens["completion_mask"]],
-        "completion_logprobs": [
-            float(value) for value in tokens["completion_logprobs"]
-        ],
-    }
-
-
-def _shift_sample(
-    prompt_ids: list[int],
-    prompt_mask: list[bool],
-    completion_ids: list[int],
-    completion_mask: list[bool],
-    completion_logprobs: list[float],
-    temperature: float,
-) -> dict[str, list[Any]]:
-    full_ids = prompt_ids + completion_ids
-    full_mask = prompt_mask + completion_mask
-    full_logprobs = [0.0] * len(prompt_ids) + completion_logprobs
-    full_temperatures = [temperature] * len(full_ids)
-    if len(full_ids) < 2:
-        return {
-            "input_ids": [],
-            "target_ids": [],
-            "loss_mask": [],
-            "inference_logprobs": [],
-            "temperatures": [],
-        }
-    return {
-        "input_ids": full_ids[:-1],
-        "target_ids": full_ids[1:],
-        "loss_mask": full_mask[1:],
-        "inference_logprobs": full_logprobs[1:],
-        "temperatures": full_temperatures[1:],
-    }
+    return TokenSegment(
+        prompt_ids=[int(token_id) for token_id in tokens["prompt_ids"]],
+        prompt_loss_mask=[bool(value) for value in tokens["prompt_mask"]],
+        output_ids=[int(token_id) for token_id in tokens["completion_ids"]],
+        output_loss_mask=[bool(value) for value in tokens["completion_mask"]],
+        output_logprobs=[float(value) for value in tokens["completion_logprobs"]],
+        turn_id=str(step.get("turn_id", index)),
+    )
 
 
 def _messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
