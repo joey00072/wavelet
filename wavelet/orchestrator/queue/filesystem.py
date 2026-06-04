@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
@@ -25,6 +26,7 @@ from wavelet.orchestrator.queue.types import (
 
 
 logger = logging.getLogger(__name__)
+_COPY_CHUNK_BYTES = 1024 * 1024
 
 
 def resolve_queue_dir(output_dir: Path, config: RLTransportConfig) -> Path:
@@ -56,6 +58,18 @@ def _parse_step(path: Path) -> int | None:
         return None
 
 
+def _copy_payload(source_path: Path, target_path: Path) -> tuple[int, float]:
+    started_at = time.monotonic()
+    payload_bytes = 0
+    with source_path.open("rb") as source, target_path.open("wb") as target:
+        while chunk := source.read(_COPY_CHUNK_BYTES):
+            payload_bytes += len(chunk)
+            target.write(chunk)
+        target.flush()
+        os.fsync(target.fileno())
+    return payload_bytes, time.monotonic() - started_at
+
+
 class FileSystemRolloutSender:
     def __init__(self, output_dir: Path, config: RLTransportConfig) -> None:
         self.config = config
@@ -80,7 +94,7 @@ class FileSystemRolloutSender:
         step_dir.mkdir(parents=True, exist_ok=True)
         target_path = step_dir / self.config.rollout_filename
         tmp_path = step_dir / f"{self.config.rollout_filename}.tmp"
-        tmp_path.write_bytes(Path(source_path).read_bytes())
+        payload_bytes, transfer_seconds = _copy_payload(Path(source_path), tmp_path)
         tmp_path.replace(target_path)
         metadata_provided = any(
             value is not None
@@ -109,6 +123,8 @@ class FileSystemRolloutSender:
                 reward_mean=reward_mean,
                 producer_id=producer_id,
                 created_at=created_at,
+                payload_bytes=payload_bytes,
+                transfer_seconds=transfer_seconds,
             )
             try:
                 write_manifest(step_dir, manifest)
@@ -123,6 +139,10 @@ class FileSystemRolloutSender:
                     optimizer_step=optimizer_step,
                     policy_step=policy_step,
                     producer_id=producer_id,
+                    details={
+                        "payload_bytes": payload_bytes,
+                        "transfer_seconds": transfer_seconds,
+                    },
                 ),
             )
         (step_dir / STABLE_BATCH_MARKER).touch()
