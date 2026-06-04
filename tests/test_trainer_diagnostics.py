@@ -3,9 +3,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_trainer_debug import main as trainer_debug_main
-from wavelet.trainer.diagnostics import inspect_rollout_batch
+from wavelet.trainer.diagnostics import (
+    build_runtime_parity_report,
+    inspect_rollout_batch,
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> Path:
@@ -79,3 +84,109 @@ def test_trainer_debug_inspect_outputs_json(tmp_path: Path, capsys) -> None:
     report = json.loads(capsys.readouterr().out)
     assert report["ok"] is True
     assert report["summary"]["trainable_tokens"] == 1
+
+
+def test_runtime_parity_report_passes_within_threshold(tmp_path: Path) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "target_ids": [2, 3, 4],
+                "loss_mask": [False, True, True],
+                "inference_logprobs": [-0.2, -0.3],
+                "trainer_logprobs": [-0.2005, -0.2995],
+            }
+        ],
+    )
+
+    report = build_runtime_parity_report(
+        RLConfig(),
+        rollout_path=rollout_path,
+        threshold=0.001,
+    )
+
+    assert report["passed"] is True
+    assert report["skipped"] is False
+    assert report["token_count"] == 2
+    assert report["max_abs_diff"] == pytest.approx(0.0005)
+
+
+def test_runtime_parity_report_fails_outside_threshold(tmp_path: Path) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2],
+                "target_ids": [2, 3],
+                "loss_mask": [False, True],
+                "inference_logprobs": [-0.2],
+                "trainer_logprobs": [-0.4],
+            }
+        ],
+    )
+
+    report = build_runtime_parity_report(
+        RLConfig(),
+        rollout_path=rollout_path,
+        threshold=0.01,
+    )
+
+    assert report["passed"] is False
+    assert report["skipped"] is False
+    assert report["max_abs_diff"] == 0.2
+
+
+def test_runtime_parity_report_skips_without_trainer_logprobs(tmp_path: Path) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2],
+                "target_ids": [2, 3],
+                "loss_mask": [False, True],
+                "inference_logprobs": [-0.2],
+            }
+        ],
+    )
+
+    report = build_runtime_parity_report(RLConfig(), rollout_path=rollout_path)
+
+    assert report["passed"] is False
+    assert report["skipped"] is True
+    assert report["skip_reason"] == "all checked rows are missing trainer logprobs"
+
+
+def test_trainer_debug_parity_writes_report(tmp_path: Path, capsys) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2],
+                "target_ids": [2, 3],
+                "loss_mask": [False, True],
+                "inference_logprobs": [-0.2],
+                "trainer_logprobs": [-0.2],
+            }
+        ],
+    )
+    report_path = tmp_path / "reports" / "parity.json"
+
+    assert (
+        trainer_debug_main(
+            [
+                "parity",
+                "--rollout-path",
+                str(rollout_path),
+                "--write-report",
+                str(report_path),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    printed = json.loads(capsys.readouterr().out)
+    written = json.loads(report_path.read_text(encoding="utf-8"))
+    assert printed["passed"] is True
+    assert written["passed"] is True

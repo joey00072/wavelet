@@ -90,6 +90,20 @@ and teacher logprobs when present. It proves the saved batch is structurally
 ready for trainer replay; it does not compare model logprobs or run an optimizer
 step.
 
+When trainer-side logprobs have been exported into the rollout JSONL, compare
+them with rollout-time logprobs:
+
+```bash
+uv run python -m wavelet debug trainer parity \
+  --rollout-path outputs/my_run/rollouts/step-000000/rollouts.jsonl \
+  --trainer-logprobs-column trainer_logprobs \
+  --write-report outputs/my_run/parity/runtime-step-000000.json \
+  --json @ examples/reverse_text/rl.yaml
+```
+
+If trainer logprobs are absent, the parity report records an explicit skip
+reason instead of silently claiming parity.
+
 ### Run Split RL Processes
 
 Use the split commands when the trainer needs distributed launch or when
