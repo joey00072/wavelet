@@ -17,6 +17,10 @@ DEBUG_COMMANDS = {
         "wavelet.entrypoints.rl_orchestrator_debug",
         "Inspect and benchmark RL orchestration",
     ),
+    "trainer": (
+        "wavelet.entrypoints.rl_trainer_debug",
+        "Inspect trainer inputs and replay artifacts",
+    ),
 }
 
 

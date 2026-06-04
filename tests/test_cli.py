@@ -41,7 +41,9 @@ def test_debug_usage_does_not_eagerly_import_debug_entrypoints(
     assert "preflight" in output
     assert "inference" in output
     assert "orchestrator" in output
+    assert "trainer" in output
     assert "wavelet.entrypoints.rl_debug" in sys.modules
     assert "wavelet.entrypoints.rl_preflight_debug" not in sys.modules
     assert "wavelet.entrypoints.rl_inference_debug" not in sys.modules
     assert "wavelet.entrypoints.rl_orchestrator_debug" not in sys.modules
+    assert "wavelet.entrypoints.rl_trainer_debug" not in sys.modules
