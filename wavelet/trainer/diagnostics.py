@@ -67,6 +67,103 @@ def inspect_rollout_batch(
     }
 
 
+def build_runtime_parity_report(
+    config: RLConfig,
+    *,
+    rollout_path: Path | None = None,
+    queue_step: int | None = None,
+    trainer_logprobs_column: str = "trainer_logprobs",
+    max_rows: int | None = None,
+    threshold: float = 1e-3,
+) -> dict[str, Any]:
+    path = _resolve_rollout_path(config, rollout_path=rollout_path, queue_step=queue_step)
+    errors: list[dict[str, Any]] = []
+    rows_checked = 0
+    token_count = 0
+    max_abs_diff = 0.0
+    abs_diff_sum = 0.0
+    rows_missing_trainer_logprobs = 0
+    rows_missing_inference_logprobs = 0
+
+    for row_index, payload in _iter_jsonl(path):
+        if max_rows is not None and rows_checked >= max_rows:
+            break
+        if "_wavelet_parse_error" in payload:
+            errors.append(
+                {
+                    "row": row_index,
+                    "field": "jsonl",
+                    "message": str(payload["_wavelet_parse_error"]),
+                }
+            )
+            continue
+        rows_checked += 1
+        loss_mask = _sequence(payload.get("loss_mask"))
+        trainable_tokens = sum(bool(value) for value in loss_mask or [])
+        inference_logprobs = _float_sequence(
+            payload.get(config.data.inference_logprobs_column)
+        )
+        trainer_logprobs = _float_sequence(payload.get(trainer_logprobs_column))
+        if inference_logprobs is None:
+            rows_missing_inference_logprobs += 1
+            continue
+        if trainer_logprobs is None:
+            rows_missing_trainer_logprobs += 1
+            continue
+        if len(inference_logprobs) != trainable_tokens:
+            errors.append(
+                {
+                    "row": row_index,
+                    "field": config.data.inference_logprobs_column,
+                    "message": "logprob count must match trainable token count",
+                }
+            )
+            continue
+        if len(trainer_logprobs) != trainable_tokens:
+            errors.append(
+                {
+                    "row": row_index,
+                    "field": trainer_logprobs_column,
+                    "message": "trainer logprob count must match trainable token count",
+                }
+            )
+            continue
+        for inference_logprob, trainer_logprob in zip(
+            inference_logprobs,
+            trainer_logprobs,
+            strict=True,
+        ):
+            diff = abs(trainer_logprob - inference_logprob)
+            max_abs_diff = max(max_abs_diff, diff)
+            abs_diff_sum += diff
+            token_count += 1
+
+    skipped = token_count == 0 and not errors
+    return {
+        "path": str(path),
+        "queue_step": queue_step,
+        "threshold": threshold,
+        "rows_checked": rows_checked,
+        "token_count": token_count,
+        "max_abs_diff": max_abs_diff if token_count else None,
+        "mean_abs_diff": abs_diff_sum / token_count if token_count else None,
+        "passed": bool(token_count and max_abs_diff <= threshold and not errors),
+        "skipped": skipped,
+        "skip_reason": _parity_skip_reason(
+            rows_checked=rows_checked,
+            rows_missing_inference_logprobs=rows_missing_inference_logprobs,
+            rows_missing_trainer_logprobs=rows_missing_trainer_logprobs,
+            token_count=token_count,
+            errors=errors,
+        ),
+        "coverage": {
+            "rows_missing_inference_logprobs": rows_missing_inference_logprobs,
+            "rows_missing_trainer_logprobs": rows_missing_trainer_logprobs,
+        },
+        "errors": errors,
+    }
+
+
 def _resolve_rollout_path(
     config: RLConfig,
     *,
@@ -225,6 +322,31 @@ def _metadata_value(metadata: object, key: str) -> object | None:
 
 def _sequence(value: object) -> list[Any] | None:
     return value if isinstance(value, list) else None
+
+
+def _float_sequence(value: object) -> list[float] | None:
+    if not isinstance(value, list):
+        return None
+    return [float(item) for item in value]
+
+
+def _parity_skip_reason(
+    *,
+    rows_checked: int,
+    rows_missing_inference_logprobs: int,
+    rows_missing_trainer_logprobs: int,
+    token_count: int,
+    errors: list[dict[str, Any]],
+) -> str | None:
+    if errors or token_count:
+        return None
+    if rows_checked == 0:
+        return "no rows checked"
+    if rows_missing_inference_logprobs == rows_checked:
+        return "all checked rows are missing inference logprobs"
+    if rows_missing_trainer_logprobs == rows_checked:
+        return "all checked rows are missing trainer logprobs"
+    return "no comparable logprob pairs"
 
 
 def _empty_stats() -> dict[str, Any]:
