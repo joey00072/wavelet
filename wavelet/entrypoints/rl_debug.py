@@ -5,6 +5,10 @@ import sys
 
 
 DEBUG_COMMANDS = {
+    "preflight": (
+        "wavelet.entrypoints.rl_preflight_debug",
+        "Validate cheap RL launch prerequisites",
+    ),
     "inference": (
         "wavelet.entrypoints.rl_inference_debug",
         "Inspect and probe RL inference",
