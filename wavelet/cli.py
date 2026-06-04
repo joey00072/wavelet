@@ -20,34 +20,14 @@ PUBLIC_COMMANDS = {
     ),
 }
 
-HIDDEN_COMMANDS = {
-    "inference-debug": (
-        "wavelet.entrypoints.rl_inference_debug",
-        "Inspect and probe RL inference",
-    ),
-    "orchestrator-debug": (
-        "wavelet.entrypoints.rl_orchestrator_debug",
-        "Inspect and benchmark RL orchestration",
-    ),
+INTERNAL_COMMANDS = {
     "native-inference-server": (
         "wavelet.entrypoints.native_inference_server",
         "Run native vLLM inference server",
     ),
-    "rl-vllm-native-server": (
-        "wavelet.entrypoints.native_inference_server",
-        "Run native vLLM inference server",
-    ),
-    "rl-vllm-server": (
-        "wavelet.entrypoints.inference_server",
-        "Run OpenAI-compatible inference server",
-    ),
-    "rl-vllm-openai-server": (
-        "wavelet.entrypoints.inference_server",
-        "Run OpenAI-compatible inference server",
-    ),
 }
 
-COMMANDS = PUBLIC_COMMANDS | HIDDEN_COMMANDS
+COMMANDS = PUBLIC_COMMANDS | INTERNAL_COMMANDS
 
 
 def main() -> int:
