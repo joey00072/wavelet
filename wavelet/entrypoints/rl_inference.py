@@ -12,13 +12,14 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.queue import (
-    QueueEvent,
     FileSystemPolicyReceiver,
     FileSystemRolloutSender,
+    QueueEvent,
     append_event_best_effort,
     publish_adapter_policy_snapshot,
     utc_now,
 )
+from wavelet.orchestrator.policy_metadata import policy_metadata
 from wavelet.orchestrator.metrics import log_rollout_metrics
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import (
@@ -75,6 +76,12 @@ def main(argv: list[str] | None = None) -> int:
             config.policy_transfer,
             config.model.adapter_path,
             step=0,
+            metadata=policy_metadata(
+                config=config,
+                format_version=1,
+                step=0,
+                kind="adapter",
+            ),
         )
     inference_engine = create_policy_inference_engine(config)
     inference_engine.setup()

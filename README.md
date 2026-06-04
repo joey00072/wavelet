@@ -50,6 +50,8 @@ Current distributed scope is experimental:
 - QLoRA config is accepted for LoRA adapter training with replicated DDP;
   preflight rejects unsupported full-model 4-bit, FSDP, tensor-parallel, and
   `colocate_sleep` combinations
+- exported policies record trainer, adapter, and inference precision metadata
+  beside the policy artifact for later parity checks
 - tensor-parallel model loading/saving now works for full-model paths when the
   selected architecture exposes a `transformers` TP plan
 - EP and CP are still not wired into the model kernels or attention stack

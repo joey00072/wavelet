@@ -39,6 +39,7 @@ from wavelet.orchestrator.queue import (
     resolve_policy_dir,
     utc_now,
 )
+from wavelet.orchestrator.policy_metadata import policy_metadata
 from wavelet.trainer.base import BaseTrainer
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.lora import sync_hf_tp_lora_replicated_grads
@@ -687,12 +688,13 @@ class RLTrainer(BaseTrainer):
         export_model = None
         state_dict = None
         if self.world.is_main:
-            meta = {
-                "format_version": 1,
-                "step": export_step,
-                "kind": saved_path.name,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            meta = policy_metadata(
+                config=self.config,
+                format_version=1,
+                step=export_step,
+                kind=saved_path.name,
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
             (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
         self.offload_after_refit()
         if self.world.world_size > 1:
@@ -747,12 +749,13 @@ class RLTrainer(BaseTrainer):
             named_tensors = [] if state_dict is None else list(state_dict.items())
             update_info = update_info_for_named_tensors(named_tensors)
             (tmp_dir / NCCL_UPDATE_INFO_FILENAME).write_text(json.dumps(update_info))
-            meta = {
-                "format_version": 1,
-                "step": export_step,
-                "kind": "nccl",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
+            meta = policy_metadata(
+                config=self.config,
+                format_version=1,
+                step=export_step,
+                kind="nccl",
+                created_at=datetime.now(timezone.utc).isoformat(),
+            )
             (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
             (tmp_dir / STABLE_BATCH_MARKER).touch()
             tmp_dir.replace(step_dir)
