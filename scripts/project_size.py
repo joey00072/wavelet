@@ -134,6 +134,7 @@ def list_project_files(root: Path) -> list[Path]:
     return sorted(
         path
         for path in paths
+        if path.is_file()
         if path.suffix in COUNTED_SUFFIXES and not _ignored(root, path)
     )
 

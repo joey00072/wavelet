@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from scripts import project_size
 from scripts.project_size import list_project_files, measure_file, summarize
 
 
@@ -10,6 +11,23 @@ def test_project_size_ignores_ref_outputs_and_caches(tmp_path: Path) -> None:
         directory = tmp_path / ignored
         directory.mkdir()
         (directory / "ignored.py").write_text("def ignored():\n    return 2\n")
+
+    files = list_project_files(tmp_path)
+
+    assert [path.relative_to(tmp_path).as_posix() for path in files] == [
+        "wavelet/app.py"
+    ]
+
+
+def test_project_size_skips_deleted_git_paths(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "wavelet" / "app.py"
+    source.parent.mkdir()
+    source.write_text("def run():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        project_size,
+        "_git_files",
+        lambda root: [Path("wavelet/app.py"), Path("docs/deleted.md")],
+    )
 
     files = list_project_files(tmp_path)
 

@@ -36,18 +36,11 @@ When a custom rollout emits trainer rows, use these metadata conventions:
 
 ## Custom Rollout Boundary
 
-Keep task logic separate from execution mechanics:
+Keep task data and rewards separate from execution mechanics. Source rows own
+prompts, hidden bindings, expected answers, and task-owned tools; harness code
+owns model calls, tool loops, sandboxes, retries, metrics, and cleanup.
 
-- Source rows define prompts, hidden task data, expected answers, and task-owned
-  tools or bindings.
-- The rollout function drives model calls, tool loops, sandboxes, and retries.
-- Reward code scores the finished trajectory and records reward components.
-- Metrics summarize timing, truncation, parser failures, tool calls, and cleanup.
-- Cleanup tears down sandboxes, temp files, network handles, or subprocesses
-  even when reward or parsing fails.
-
-Custom harnesses should emit tool metadata in sidecars or row metadata: tool
-name, call id, redacted argument summary, duration, success or error, result
-size, and whether tool calls ran sequentially or in parallel. Timeout and
-cleanup failures should become visible rollout metadata; they should not silently
-turn into trainable tokens.
+Custom harnesses should emit compact tool metadata in sidecars or row metadata:
+tool name, call id, redacted argument summary, duration, success or error,
+result size, and sequential or parallel execution. Timeout and cleanup failures
+should become visible rollout metadata, not trainable tokens.
