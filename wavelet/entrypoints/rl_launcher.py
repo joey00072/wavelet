@@ -638,6 +638,7 @@ def _run_integrated_launcher(config: RLConfig) -> int:
             config.output_dir,
             config.transport,
             start_step=getattr(trainer, "step", 0),
+            events_dir=config.output_dir / "events",
         )
         policy_receiver = FileSystemPolicyReceiver(
             config.output_dir,

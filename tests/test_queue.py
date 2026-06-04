@@ -98,3 +98,29 @@ def test_publish_with_metadata_writes_manifest(tmp_path: Path) -> None:
     assert events[0].details is not None
     assert events[0].details["payload_bytes"] == 3
     assert events[0].details["transfer_seconds"] >= 0
+
+
+def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
+    config = RLTransportConfig(poll_interval_seconds=0.001)
+    sender = FileSystemRolloutSender(tmp_path, config)
+    source = _write_source(tmp_path / "rollouts.jsonl", "{}\n")
+    sender.publish(source, step=0)
+    receiver = FileSystemRolloutReceiver(
+        tmp_path,
+        config,
+        events_dir=tmp_path / "events",
+        consumer_id="trainer",
+    )
+
+    assert receiver.wait().step == 0
+
+    events, parse_errors = tail_events(tmp_path / "events", limit=1)
+    assert parse_errors == 0
+    assert len(events) == 1
+    assert events[0].kind == "rollout_received"
+    assert events[0].queue_step == 0
+    assert events[0].consumer_id == "trainer"
+    assert events[0].details is not None
+    assert events[0].details["mode"] == "wait"
+    assert events[0].details["payload_bytes"] == 3
+    assert events[0].details["wait_seconds"] >= 0

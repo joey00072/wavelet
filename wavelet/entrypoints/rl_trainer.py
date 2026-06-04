@@ -101,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
                         config.output_dir,
                         config.transport,
                         start_step=trainer.step * _chunks_per_step(config),
+                        events_dir=_receiver_events_dir_if_main(trainer),
                     )
                     _run_streaming_rollout_training(
                         config,
@@ -114,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
                     config.output_dir,
                     config.transport,
                     start_step=trainer.step,
+                    events_dir=_receiver_events_dir_if_main(trainer),
                 )
                 while trainer.step < target_step:
                     loop_started_at = perf_counter()
@@ -351,6 +353,12 @@ def _record_rollout_consumed_if_main(
         optimizer_step_completed=optimizer_step_completed,
         events_dir=trainer.config.output_dir / "events",
     )
+
+
+def _receiver_events_dir_if_main(trainer: RLTrainer) -> Path | None:
+    if not _is_main_trainer_process(trainer):
+        return None
+    return trainer.config.output_dir / "events"
 
 
 def _is_main_trainer_process(trainer: RLTrainer) -> bool:
