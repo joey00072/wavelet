@@ -4,7 +4,7 @@ import json
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
-from wavelet.entrypoints.rl_inference_debug import main as inference_debug_main
+from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.inference import diagnostics
 from wavelet.inference.diagnostics import (
     continuous_batch_probe,
@@ -71,7 +71,7 @@ def test_summarize_records_reports_logprob_and_token_coverage() -> None:
 
 
 def test_inference_debug_inspect_outputs_json(capsys) -> None:
-    assert inference_debug_main(["inspect", "--json"]) == 0
+    assert debug_main(["inference", "inspect", "--json"]) == 0
 
     report = json.loads(capsys.readouterr().out)
     assert report["inference"]["mode"] == "vllm_http"

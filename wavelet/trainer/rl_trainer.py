@@ -18,7 +18,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.jsonl import count_nonempty_jsonl_rows
+from wavelet.data.rl_dataset import count_nonempty_jsonl_rows
 from wavelet.data.loading import Example
 from wavelet.data.rl_dataset import (
     PackedRLDataset,

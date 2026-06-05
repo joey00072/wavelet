@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 
 import torch
 from torch import nn
@@ -12,8 +12,9 @@ from wavelet.configs.sft import OptimizerConfig
 
 def setup_optimizer(
     config: OptimizerConfig,
-    named_params: Sequence[tuple[str, nn.Parameter]],
+    named_params: Iterable[tuple[str, nn.Parameter]],
 ) -> Optimizer:
+    named_params = list(named_params)
     _validate_single_trainable_lora_adapter(named_params)
     params = [param for _, param in named_params if param.requires_grad]
 

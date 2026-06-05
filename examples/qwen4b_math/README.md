@@ -45,6 +45,29 @@ Run training:
 uv run python -m wavelet rl @ examples/qwen4b_math/rl.yaml
 ```
 
+## Two-GPU INT4 Smoke
+
+`rl_int4_2gpu_smoke.yaml` is a minimal QLoRA smoke version inspired by Orbit's
+2-GPU INT4 Qwen3-4B path. It uses bitsandbytes 4-bit LoRA training on GPU `1`
+and one quantized vLLM server on GPU `0`. The smoke keeps the rollout step,
+batch size, context, and completion budget small; it is intended to prove the
+train/inference/policy-transfer path before scaling the full `rl.yaml` recipe.
+
+Prepare one local math row, then preflight:
+
+```bash
+uv run python examples/qwen4b_math/prepare_rl_data.py --examples 1
+uv run python -m wavelet debug preflight \
+  @ examples/qwen4b_math/rl_int4_2gpu_smoke.yaml --json
+```
+
+Run the smoke on two visible GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+uv run python -m wavelet rl @ examples/qwen4b_math/rl_int4_2gpu_smoke.yaml
+```
+
 The original 30B recipe uses 32k context, expert parallelism, custom kernels,
 multi-node training, and tensor-parallel inference. This 4B recipe keeps the
 same math/verifier structure but uses 8k context and single-node FSDP settings

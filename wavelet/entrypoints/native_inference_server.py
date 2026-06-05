@@ -6,11 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.inference.diagnostics import inference_debug_state
-from wavelet.inference.serialization import (
+from wavelet.data.rl_dataset import (
     rl_examples_from_payload,
     rl_examples_to_payload,
 )
+from wavelet.inference.diagnostics import inference_debug_state
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.utils.config import load_config
 

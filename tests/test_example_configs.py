@@ -126,6 +126,26 @@ def test_qwen30b_math_uses_full_reference_completion_budget() -> None:
     assert config.inference.vllm.max_model_len == 32768
 
 
+def test_qwen4b_math_int4_smoke_uses_two_gpu_qlora_shape() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/qwen4b_math/rl_int4_2gpu_smoke.yaml"))
+    )
+
+    assert config.model.name == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config.model.load_in_4bit is True
+    assert config.fsdp.enabled is False
+    assert config.lora is not None
+    assert config.lora.rank == 16
+    assert config.optim.type == "paged_adamw_8bit"
+    assert config.optim.implementation == "for-loop"
+    assert config.inference.vllm.quantization == "bitsandbytes"
+    assert config.inference.vllm.load_format == "bitsandbytes"
+    assert config.launcher.inference_cuda_visible_devices == "0"
+    assert config.launcher.trainer_cuda_visible_devices == "1"
+    assert config.launcher.trainer_num_processes == 1
+    assert config.max_steps == 1
+
+
 def test_reverse_text_rl_matches_reference_core_hyperparams() -> None:
     config = RLConfig.model_validate(load_yaml(Path("examples/reverse_text/rl.yaml")))
 

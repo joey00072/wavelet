@@ -9,7 +9,7 @@ from time import perf_counter
 import torch
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.jsonl import count_nonempty_jsonl_rows
+from wavelet.data.rl_dataset import count_nonempty_jsonl_rows
 from wavelet.distributed.world import barrier
 from wavelet.orchestrator.queue import (
     FileSystemRolloutReceiver,
@@ -23,7 +23,7 @@ from wavelet.orchestrator.schedule import (
 )
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.utils.config import load_config
-from wavelet.utils.perf import emit_perf
+from wavelet.utils.monitoring import emit_perf
 
 
 @dataclass

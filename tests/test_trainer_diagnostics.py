@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.entrypoints.rl_trainer_debug import main as trainer_debug_main
+from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.trainer.diagnostics import (
     build_runtime_parity_report,
     export_rollout_token_debug,
@@ -80,7 +80,10 @@ def test_trainer_debug_inspect_outputs_json(tmp_path: Path, capsys) -> None:
         ],
     )
 
-    assert trainer_debug_main(["inspect", "--rollout-path", str(rollout_path), "--json"]) == 0
+    assert (
+        debug_main(["trainer", "inspect", "--rollout-path", str(rollout_path), "--json"])
+        == 0
+    )
 
     report = json.loads(capsys.readouterr().out)
     assert report["ok"] is True
@@ -142,8 +145,9 @@ def test_trainer_debug_tokens_writes_export(tmp_path: Path, capsys) -> None:
     write_path = tmp_path / "tokens.jsonl"
 
     assert (
-        trainer_debug_main(
+        debug_main(
             [
+                "trainer",
                 "tokens",
                 "--rollout-path",
                 str(rollout_path),
@@ -248,8 +252,9 @@ def test_trainer_debug_parity_writes_report(tmp_path: Path, capsys) -> None:
     report_path = tmp_path / "reports" / "parity.json"
 
     assert (
-        trainer_debug_main(
+        debug_main(
             [
+                "trainer",
                 "parity",
                 "--rollout-path",
                 str(rollout_path),

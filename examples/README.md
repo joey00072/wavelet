@@ -7,7 +7,7 @@ that are expected to run on this host.
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL. |
 | `reverse_text` | working | 0.6B LoRA RL plus SFT config; use `docs/index.md` for smoke commands. |
-| `qwen4b_math` | working | Single-node 4B math adaptation. |
+| `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
 | `hendrycks_sanity` | runnable | 1.5B math sanity config. |
 | `wiki_search` | runnable with env deps | Requires `wiki-search` environment setup. |
 | `wordle` | runnable after external env install | Requires the Wordle environment installed outside `uv sync`. |
