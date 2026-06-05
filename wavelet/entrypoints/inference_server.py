@@ -46,7 +46,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.diagnostics import inference_debug_state
 from wavelet.utils.config import load_config
-from wavelet.utils.perf import emit_perf
+from wavelet.utils.monitoring import emit_perf
 
 
 _CONFIG: RLConfig | None = None

@@ -5,7 +5,7 @@ from dataclasses import replace
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
-from wavelet.entrypoints.rl_orchestrator_debug import main as orchestrator_debug_main
+from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.orchestrator.diagnostics import (
     orchestrator_debug_state,
     probe_orchestrator,
@@ -114,7 +114,7 @@ def test_with_orchestrator_limits_overrides_probe_size() -> None:
 
 
 def test_orchestrator_debug_inspect_outputs_json(capsys) -> None:
-    assert orchestrator_debug_main(["inspect", "--json"]) == 0
+    assert debug_main(["orchestrator", "inspect", "--json"]) == 0
 
     report = json.loads(capsys.readouterr().out)
     assert report["schedule"]["target_steps"] == 1

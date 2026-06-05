@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from wavelet.utils.perf import emit_perf
+from wavelet.utils.monitoring import emit_perf
 
 
 def test_emit_perf_preserves_line_shape(monkeypatch, capsys) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.entrypoints import rl_preflight_debug
+from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.orchestrator.preflight import build_preflight_report
 
 
@@ -98,7 +98,7 @@ def test_preflight_cli_returns_nonzero_for_errors(tmp_path, capsys) -> None:
         encoding="utf-8",
     )
 
-    assert rl_preflight_debug.main(["--json", "@", str(config_path)]) == 1
+    assert debug_main(["preflight", "--json", "@", str(config_path)]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["ok"] is False
 

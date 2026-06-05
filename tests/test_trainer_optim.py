@@ -36,3 +36,11 @@ def test_optimizer_allows_single_trainable_lora_adapter() -> None:
     optimizer = setup_optimizer(OptimizerConfig(type="adamw"), params)
 
     assert len(optimizer.param_groups[0]["params"]) == 2
+
+
+def test_optimizer_accepts_named_parameter_iterator() -> None:
+    module = torch.nn.Linear(2, 1)
+
+    optimizer = setup_optimizer(OptimizerConfig(type="adamw"), module.named_parameters())
+
+    assert len(optimizer.param_groups[0]["params"]) == 2

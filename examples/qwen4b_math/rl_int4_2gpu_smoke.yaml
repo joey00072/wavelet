@@ -1,0 +1,155 @@
+model:
+  name: "Qwen/Qwen3-4B-Instruct-2507"
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  load_in_4bit: true
+  gradient_checkpointing: true
+  allow_tf32: true
+  fused_lm_head_token_chunk_size: auto
+
+data:
+  source: local
+  path: outputs/qwen4b_math_data/rl_train.jsonl
+  batch_size: 1
+  micro_batch_size: 1
+  pack_sequences: true
+  pad_to_multiple_of: 1
+  seq_len: 4096
+  max_examples: 1
+  shuffle: false
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 0.001
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: math-env
+  verifier_env_args:
+    math_verify_max_workers: 4
+    math_verify_timeout: 30
+  verifier_model: Qwen/Qwen3-4B-Instruct-2507
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: group_reward
+  normalize_group_advantages: false
+  examples_per_step: 1
+  rollouts_per_example: 1
+  oversampling_factor: 1.0
+  rollout_chunk_examples: 1
+  filter_zero_advantage: false
+  zero_advantage_max_retries: 0
+  max_async_level: 0
+  max_off_policy_steps: 0
+
+eval:
+  interval: 100
+  num_examples: 1
+  rollouts_per_example: 1
+  eval_base_model: false
+  final_eval: false
+  env: []
+
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 1.0
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 128
+    do_sample: true
+    num_generations: 1
+    seed: null
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  vllm:
+    server_backend: openai
+    gpu_memory_utilization: 0.8
+    max_model_len: 4096
+    enforce_eager: true
+    quantization: bitsandbytes
+    load_format: bitsandbytes
+    max_lora_rank: 16
+  http:
+    port: 8000
+    request_timeout_seconds: 600.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+
+ckpt:
+  mode: disabled
+
+fsdp:
+  enabled: false
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: 1
+  cp: 1
+  tp: 1
+  ep: 1
+  cpu_offload: false
+  reshard_after_forward: false
+
+optim:
+  type: paged_adamw_8bit
+  implementation: for-loop
+  lr: 3e-5
+  weight_decay: 0.0
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+max_grad_norm: 1.0
+max_steps: 1
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 1
+    sample_ratio: 1.0
+    max_samples: 2
+  wandb:
+    enabled: false
+    project: wavelet-qwen4b-math
+    name: wavelet-qwen4b-math-int4-2gpu-smoke
+    mode: disabled
+
+launcher:
+  mode: process
+  backend: local
+  inference_num_replicas: 1
+  inference_cuda_visible_devices: "0"
+  trainer_num_processes: 1
+  trainer_cuda_visible_devices: "1"
+
+output_dir: outputs/qwen4b_math_int4_2gpu_smoke
+clean_output_dir: true

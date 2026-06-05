@@ -16,7 +16,7 @@ from wavelet.data.rl_dataset import RLExample
 from wavelet.data.tokenization import build_sample
 from wavelet.inference.policy import PolicyInferenceEngine, RLInference, token_ids
 from wavelet.trainer.model import setup_tokenizer
-from wavelet.utils.perf import emit_perf, perf_enabled
+from wavelet.utils.monitoring import emit_perf, perf_enabled
 
 
 @dataclass

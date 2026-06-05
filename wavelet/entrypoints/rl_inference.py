@@ -32,7 +32,7 @@ from wavelet.orchestrator.schedule import (
 )
 from wavelet.orchestrator.state_server import OrchestratorRunState, maybe_state_server
 from wavelet.utils.config import load_config
-from wavelet.utils.perf import emit_perf
+from wavelet.utils.monitoring import emit_perf
 
 
 def _preload_rollout_resources(config: RLConfig) -> None:

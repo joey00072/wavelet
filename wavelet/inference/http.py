@@ -14,12 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample
-from wavelet.inference.policy import PolicyInferenceEngine, RLInference
-from wavelet.inference.serialization import (
+from wavelet.data.rl_dataset import (
+    RLExample,
     rl_examples_from_payload,
     rl_examples_to_payload,
 )
+from wavelet.inference.policy import PolicyInferenceEngine, RLInference
 from wavelet.trainer.model import setup_tokenizer
 from wavelet.utils.policy_transfer import NCCL_READY_MARKER
 

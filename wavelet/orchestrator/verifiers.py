@@ -26,7 +26,7 @@ from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import (
     rollout_chunk_examples as _rollout_chunk_examples,
 )
-from wavelet.utils.perf import emit_perf
+from wavelet.utils.monitoring import emit_perf
 
 
 _ENV_CACHE: dict[tuple[str, str], Any] = {}
