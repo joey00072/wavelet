@@ -146,6 +146,57 @@ def test_qwen4b_math_int4_smoke_uses_two_gpu_qlora_shape() -> None:
     assert config.max_steps == 1
 
 
+def test_moe_reverse_text_sft_uses_int4_moe_qlora_shape() -> None:
+    config = SFTConfig.model_validate(
+        load_yaml(Path("examples/moe_reverse_text/sft.yaml"))
+    )
+
+    assert config.model.name == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert config.model.trust_remote_code is True
+    assert config.model.load_in_4bit is True
+    assert config.model.kbit_cast_non_quantized_to_float32 is False
+    assert config.fsdp.enabled is False
+    assert config.lora is not None
+    assert config.lora.rank == 16
+    assert set(config.lora.target_modules) == {
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    }
+    assert config.optim.type == "paged_adamw_8bit"
+    assert config.deployment.num_gpus == 1
+    assert config.max_steps == 2
+
+
+def test_moe_reverse_text_rl_starts_from_sft_adapter_on_two_gpus() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/moe_reverse_text/rl.yaml"))
+    )
+
+    assert config.model.name == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert config.model.adapter_path == Path("outputs/moe_reverse_text_sft/adapter")
+    assert config.model.trust_remote_code is True
+    assert config.model.load_in_4bit is True
+    assert config.model.kbit_cast_non_quantized_to_float32 is False
+    assert config.fsdp.enabled is False
+    assert config.lora is not None
+    assert config.lora.rank == 16
+    assert config.optim.type == "paged_adamw_8bit"
+    assert config.inference.vllm.quantization is None
+    assert config.inference.vllm.load_format is None
+    assert config.orchestrator.verifier_env_id == "reverse-text"
+    assert config.eval is not None
+    assert config.eval.final_eval is True
+    assert config.launcher.inference_cuda_visible_devices == "0"
+    assert config.launcher.trainer_cuda_visible_devices == "1"
+    assert config.launcher.trainer_num_processes == 1
+    assert config.max_steps == 2
+
+
 def test_reverse_text_rl_matches_reference_core_hyperparams() -> None:
     config = RLConfig.model_validate(load_yaml(Path("examples/reverse_text/rl.yaml")))
 
@@ -157,6 +208,29 @@ def test_reverse_text_rl_matches_reference_core_hyperparams() -> None:
     assert config.orchestrator.rollouts_per_example == 16
     assert config.inference.sampling.max_completion_tokens == 128
     assert config.optim.lr == pytest.approx(3e-6)
+
+
+def test_reverse_text_int4_4b_tracks_reward_eval_shape() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/reverse_text/rl_int4_4b.yaml"))
+    )
+
+    assert config.model.name == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config.model.load_in_4bit is True
+    assert config.fsdp.enabled is False
+    assert config.lora is not None
+    assert config.lora.rank == 16
+    assert config.optim.type == "paged_adamw_8bit"
+    assert config.inference.vllm.quantization == "bitsandbytes"
+    assert config.inference.vllm.load_format == "bitsandbytes"
+    assert config.eval is not None
+    assert config.eval.eval_base_model is True
+    assert config.eval.final_eval is True
+    assert config.eval.interval == 25
+    assert config.eval.num_examples == 16
+    assert config.launcher.inference_cuda_visible_devices == "0"
+    assert config.launcher.trainer_cuda_visible_devices == "1"
+    assert config.max_steps == 100
 
 
 @pytest.mark.parametrize(

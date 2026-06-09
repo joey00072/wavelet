@@ -172,10 +172,15 @@ def test_model_logprobs_uses_fp32_for_bfloat16_logits() -> None:
         },
         attention_mask=None,
     )
-    expected = logits.float().log_softmax(dim=-1).gather(
-        dim=-1,
-        index=targets.unsqueeze(-1),
-    ).squeeze(-1)
+    expected = (
+        logits.float()
+        .log_softmax(dim=-1)
+        .gather(
+            dim=-1,
+            index=targets.unsqueeze(-1),
+        )
+        .squeeze(-1)
+    )
 
     assert actual.dtype == torch.float32
     assert torch.allclose(actual, expected)
@@ -276,6 +281,30 @@ def test_distributed_qlora_uses_current_cuda_device_map(monkeypatch) -> None:
 
     assert captured_kwargs["device_map"] == {"": 2}
     assert "quantization_config" in captured_kwargs
+
+
+def test_prepare_kbit_model_can_skip_float32_cast() -> None:
+    class FakeKbitModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+            self.input_grads_enabled = False
+
+        def enable_input_require_grads(self) -> None:
+            self.input_grads_enabled = True
+
+    model = FakeKbitModel()
+
+    prepared = model_utils.prepare_kbit_model(
+        model,  # type: ignore[arg-type]
+        gradient_checkpointing=True,
+        cast_non_quantized_to_float32=False,
+    )
+
+    assert prepared is model
+    assert model.linear.weight.dtype is torch.bfloat16
+    assert model.linear.weight.requires_grad is False
+    assert model.input_grads_enabled is True
 
 
 def test_qlora_ddp_does_not_move_quantized_model(monkeypatch) -> None:

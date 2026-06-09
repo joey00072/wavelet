@@ -1,0 +1,71 @@
+model:
+  name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  load_in_4bit: true
+  kbit_cast_non_quantized_to_float32: false
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: local
+  path: outputs/moe_reverse_text_data/sft_train.jsonl
+  batch_size: 2
+  micro_batch_size: 1
+  seq_len: 1024
+  pack_function: pad
+  max_examples: 16
+  shuffle: true
+  seed: 42
+
+optim:
+  type: paged_adamw_8bit
+  implementation: for-loop
+  lr: 2e-5
+  weight_decay: 0.0
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+fsdp:
+  enabled: false
+
+loss_impl: torch
+
+max_grad_norm: 1.0
+max_steps: 2
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 1
+    sample_ratio: 1.0
+    max_samples: 2
+  wandb:
+    enabled: false
+    project: wavelet-moe-reverse-text
+    name: wavelet-moe-reverse-text-sft
+    mode: disabled
+
+deployment:
+  type: single_node
+  num_gpus: 1
+
+output_dir: outputs/moe_reverse_text_sft
+clean_output_dir: true
