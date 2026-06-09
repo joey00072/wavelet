@@ -1,0 +1,160 @@
+model:
+  name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  adapter_path: outputs/moe_reverse_text_sft/adapter
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  load_in_4bit: true
+  kbit_cast_non_quantized_to_float32: false
+  gradient_checkpointing: true
+  allow_tf32: true
+  fused_lm_head_token_chunk_size: auto
+
+data:
+  source: local
+  path: outputs/moe_reverse_text_data/rl_train.jsonl
+  batch_size: 2
+  micro_batch_size: 1
+  pack_sequences: true
+  pad_to_multiple_of: 1
+  seq_len: 1024
+  max_examples: 16
+  shuffle: false
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 0.001
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: reverse-text
+  verifier_model: Qwen/Qwen3-30B-A3B-Instruct-2507
+  verifier_client_type: openai_chat_completions_token
+  advantage_mode: reward
+  normalize_group_advantages: false
+  examples_per_step: 1
+  rollouts_per_example: 1
+  oversampling_factor: 1.0
+  rollout_chunk_examples: 1
+  filter_zero_advantage: false
+  zero_advantage_max_retries: 0
+  max_async_level: 0
+  max_off_policy_steps: 0
+
+eval:
+  interval: 2
+  num_examples: 2
+  rollouts_per_example: 1
+  eval_base_model: false
+  final_eval: true
+  env:
+    - id: reverse-text
+      name: reverse-text
+      num_examples: 2
+      rollouts_per_example: 1
+
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 1.0
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 64
+    do_sample: true
+    num_generations: 1
+    seed: 42
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  vllm:
+    server_backend: openai
+    gpu_memory_utilization: 0.8
+    max_model_len: 1024
+    enforce_eager: true
+    max_lora_rank: 16
+    trust_remote_code: true
+  http:
+    port: 8000
+    request_timeout_seconds: 600.0
+    startup_timeout_seconds: 1200.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+  poll_interval_seconds: 0.05
+
+ckpt:
+  mode: disabled
+
+fsdp:
+  enabled: false
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: 1
+  cp: 1
+  tp: 1
+  ep: 1
+  cpu_offload: false
+  reshard_after_forward: false
+
+optim:
+  type: paged_adamw_8bit
+  implementation: for-loop
+  lr: 2e-5
+  weight_decay: 0.0
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+max_grad_norm: 1.0
+max_steps: 2
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 1
+    sample_ratio: 1.0
+    max_samples: 2
+  wandb:
+    enabled: false
+    project: wavelet-moe-reverse-text
+    name: wavelet-moe-reverse-text-rl
+    mode: disabled
+
+launcher:
+  mode: process
+  backend: local
+  inference_num_replicas: 1
+  inference_cuda_visible_devices: "0"
+  trainer_num_processes: 1
+  trainer_cuda_visible_devices: "1"
+
+output_dir: outputs/moe_reverse_text_rl
+clean_output_dir: true

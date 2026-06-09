@@ -47,6 +47,37 @@ def resolve_dtype(name: str) -> torch.dtype | str:
     return mapping[name]
 
 
+def prepare_kbit_model(
+    model: PreTrainedModel,
+    *,
+    gradient_checkpointing: bool,
+    cast_non_quantized_to_float32: bool,
+) -> PreTrainedModel:
+    if cast_non_quantized_to_float32:
+        return prepare_model_for_kbit_training(
+            model,
+            use_gradient_checkpointing=gradient_checkpointing,
+        )
+
+    for param in model.parameters():
+        param.requires_grad = False
+    if gradient_checkpointing:
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+        elif hasattr(model, "get_input_embeddings"):
+
+            def make_inputs_require_grad(
+                module: nn.Module,
+                inputs: tuple[torch.Tensor, ...],
+                output: torch.Tensor,
+            ) -> None:
+                del module, inputs
+                output.requires_grad_(True)
+
+            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+    return model
+
+
 def setup_tokenizer(config: ModelConfig) -> PreTrainedTokenizerBase:
     if config.name == DEBUG_MODEL_NAME:
         return build_debug_tokenizer(model_max_length=4096)
@@ -264,9 +295,10 @@ def setup_model(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
     if config.load_in_4bit and not model_is_prequantized:
-        model = prepare_model_for_kbit_training(
+        model = prepare_kbit_model(
             model,
-            use_gradient_checkpointing=config.gradient_checkpointing,
+            gradient_checkpointing=config.gradient_checkpointing,
+            cast_non_quantized_to_float32=(config.kbit_cast_non_quantized_to_float32),
         )
         # Embedding and lm_head are NOT 4-bit quantized (full precision), but
         # flash attention expects bfloat16 inputs. Cast them so hidden states

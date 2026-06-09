@@ -39,6 +39,7 @@ class ModelConfig(BaseModel):
     torch_dtype: Literal["auto", "float32", "float16", "bfloat16"] = "bfloat16"
     attn_implementation: Literal["auto", "flash_attention_2", "sdpa", "eager"] = "auto"
     load_in_4bit: bool = False
+    kbit_cast_non_quantized_to_float32: bool = True
     gradient_checkpointing: bool = True
     meta_device_init: bool = False
     allow_tf32: bool = True

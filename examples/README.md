@@ -6,7 +6,8 @@ that are expected to run on this host.
 | Example | Status | Notes |
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL. |
-| `reverse_text` | working | 0.6B LoRA RL plus SFT config; use `docs/index.md` for smoke commands. |
+| `reverse_text` | working | 0.6B LoRA RL plus SFT config; includes a 2-GPU INT4 QLoRA 4B experiment. |
+| `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
 | `hendrycks_sanity` | runnable | 1.5B math sanity config. |
 | `wiki_search` | runnable with env deps | Requires `wiki-search` environment setup. |
