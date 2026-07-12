@@ -48,6 +48,7 @@ from wavelet.trainer.nccl_broadcast import (
     update_info_for_named_tensors,
 )
 from wavelet.trainer.rl_loss import compute_loss, selective_log_softmax
+from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.monitoring import RunMonitor
 from wavelet.utils.policy_transfer import NCCL_READY_MARKER, NCCL_UPDATE_INFO_FILENAME
 from wavelet.utils.pathing import resolve_resume_checkpoint
@@ -353,11 +354,11 @@ class RLTrainer(BaseTrainer):
             while self.step < target_step:
                 for batch in self.dataloader:
                     batch = self._prepare_batch(batch)
-                    metrics = self._train_step(batch)
-                    if metrics is None:
+                    output = self._train_step(batch)
+                    if not output.stepped:
                         continue
 
-                    self._log_train_metrics(metrics, progress)
+                    self._log_train_metrics(output.metrics, progress)
                     self._maybe_checkpoint()
                     progress.update(1)
                     if self.step >= target_step:
@@ -493,8 +494,9 @@ class RLTrainer(BaseTrainer):
             if index >= self._loaded_micro_batch_count:
                 break
             batch = self._prepare_batch(batch)
-            metrics = self._train_step(batch)
-            if metrics is not None:
+            output = self._train_step(batch)
+            if output.stepped:
+                metrics = output.metrics
                 progress = tqdm(total=1, disable=not self.world.is_main)
                 self._log_train_metrics(metrics, progress)
                 self._maybe_checkpoint()
@@ -906,7 +908,7 @@ class RLTrainer(BaseTrainer):
             for key, value in batch.items()
         }
 
-    def _train_step(self, batch: dict[str, Tensor]) -> dict[str, float] | None:
+    def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
             raise RuntimeError("Trainer not set up")
 
@@ -927,11 +929,14 @@ class RLTrainer(BaseTrainer):
                 # Make the zero loss explicitly depend on this rank's forward pass
                 # so backward still traverses the sharded graph with zero grads.
                 loss = trainer_logprobs.sum() * 0.0
-                raw_metrics = self._zero_loss_metrics(loss)
+                loss_output = LossOutput(
+                    loss=loss,
+                    metrics=self._zero_loss_metrics(loss),
+                )
             else:
                 inference_logprobs = self._inference_logprobs(batch, attention_mask)
                 teacher_logprobs = self._teacher_logprobs(batch)
-                loss, raw_metrics = compute_loss(
+                loss_output = compute_loss(
                     trainer_logprobs,
                     inference_logprobs,
                     teacher_logprobs,
@@ -941,6 +946,8 @@ class RLTrainer(BaseTrainer):
                     loss_scale=self._optimizer_batch_loss_scale,
                     position_ids=batch["position_ids"],
                 )
+            loss = loss_output.loss
+            raw_metrics = loss_output.metrics
 
             if torch.isnan(loss):
                 logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
@@ -955,7 +962,13 @@ class RLTrainer(BaseTrainer):
                     self._optimizer_batch_loss_scale = (
                         self._estimate_optimizer_batch_loss_scale()
                     )
-                return None
+                return TrainOutput(
+                    loss=loss_output,
+                    stepped=False,
+                    step=self.step,
+                    micro_step=self._micro_step,
+                    skipped=True,
+                )
 
             sync_context = self._maybe_no_sync()
             with sync_context:
@@ -980,7 +993,12 @@ class RLTrainer(BaseTrainer):
         self._micro_step += 1
         self._accumulated_micro_batches += 1
         if self._accumulated_micro_batches < self.accumulation_steps:
-            return None
+            return TrainOutput(
+                loss=loss_output,
+                stepped=False,
+                step=self.step,
+                micro_step=self._micro_step,
+            )
 
         grad_norm = None
         self._apply_gradient_accumulation_loss_scale()
@@ -1019,7 +1037,13 @@ class RLTrainer(BaseTrainer):
         metrics = self._finalize_synced_metrics(metrics)
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
         self._gradient_accumulation_loss_scale = None
-        return metrics
+        return TrainOutput(
+            loss=loss_output,
+            stepped=True,
+            step=self.step,
+            micro_step=self._micro_step,
+            metrics=metrics,
+        )
 
     def _sync_tensor_parallel_lora_grads(self) -> None:
         if self.model is None:

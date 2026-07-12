@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
-
 import torch
 from torch import Tensor
 
 from wavelet.configs.rl_config import RLLossConfig
+from wavelet.trainer.types import LossOutput
 
 
 @dataclass
@@ -16,12 +15,6 @@ class LossInputs:
     teacher_logprobs: Tensor | None
     advantages: Tensor
     loss_mask: Tensor
-
-
-@dataclass
-class LossOutputs:
-    loss: Tensor
-    metrics: dict[str, Tensor]
 
 
 def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
@@ -53,7 +46,7 @@ def _tensor_stats(values: Tensor) -> dict[str, Tensor]:
     }
 
 
-def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutputs:
+def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
     trainer_logprobs = inputs.trainer_logprobs
     inference_logprobs = inputs.inference_logprobs
     teacher_logprobs = inputs.teacher_logprobs
@@ -101,7 +94,7 @@ def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput
     }
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)
-    return LossOutputs(loss=loss, metrics=metrics)
+    return LossOutput(loss=loss, metrics=metrics)
 
 
 def _sequence_spans(position_ids: Tensor, seq_len: int) -> list[tuple[int, int]]:
@@ -128,7 +121,7 @@ def compute_loss(
     *,
     loss_scale: int | float | Tensor | None = None,
     position_ids: Tensor | None = None,
-) -> tuple[Tensor, dict[str, Any]]:
+) -> LossOutput:
     total_loss: Tensor | None = None
     metric_values: dict[str, list[Tensor]] = {}
     sequence_count = 0
@@ -196,4 +189,4 @@ def compute_loss(
         stacked = torch.stack(values)
         for stat_name, stat_value in _tensor_stats(stacked).items():
             metrics[f"{key}/{stat_name}"] = stat_value
-    return scaled_loss, metrics
+    return LossOutput(loss=scaled_loss, metrics=metrics)
