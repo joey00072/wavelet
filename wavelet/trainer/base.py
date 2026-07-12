@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import logging
 import os
 import random
 import tempfile
 from datetime import timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.optim import Optimizer
@@ -18,9 +19,15 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from wavelet.configs.sft import SFTConfig
 from wavelet.distributed.parallel_dims import ParallelDims
 from wavelet.distributed.world import World, distributed_uses_cuda, get_world, set_world
+from wavelet.trainer.ckpt import CheckpointManager, TrainerState
+from wavelet.utils.monitoring import RunMonitor
+from wavelet.utils.pathing import resolve_resume_checkpoint
 
 if TYPE_CHECKING:
     from wavelet.configs.rl_config import RLConfig
+
+
+logger = logging.getLogger(__name__)
 
 
 class BaseTrainer:
@@ -31,12 +38,19 @@ class BaseTrainer:
         self.dataset: IterableDataset | None = None
         self.optimizer: Optimizer | None = None
         self.scheduler: LRScheduler | None = None
+        self.dataloader: Any = None
         self.world: World | None = None
         self.parallel_dims: ParallelDims | None = None
         self.output_dir = Path(config.output_dir)
         self.act_offload_ctx: contextlib.AbstractContextManager = (
             contextlib.nullcontext()
         )
+        self.monitor: RunMonitor | None = None
+        self.step = 0
+        self._micro_step = 0
+        self.accumulation_steps = 1
+        self.ckpt_manager: CheckpointManager | None = None
+        self.resume_checkpoint_dir: Path | None = None
 
     def setup(self) -> None:
         self._setup_seed()
@@ -46,6 +60,73 @@ class BaseTrainer:
         self._setup_data()
         self._setup_optimizer()
         self._setup_scheduler()
+        self._validate_ready()
+        self._setup_run()
+
+    def _validate_ready(self) -> None:
+        if (
+            self.model is None
+            or self.optimizer is None
+            or self.dataloader is None
+            or self.world is None
+        ):
+            raise RuntimeError("Trainer not set up. Call setup() first.")
+
+    def _after_resume(self) -> None:
+        pass
+
+    def _setup_run(self) -> None:
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        config = self.config.monitor
+        self.monitor = RunMonitor(
+            output_dir=self.output_dir,
+            enabled=config.enabled,
+            write_events=config.write_events,
+            write_metrics_jsonl=config.write_metrics_jsonl,
+            write_metrics_csv=config.write_metrics_csv,
+            write_run_metadata=config.write_run_metadata,
+            write_heartbeat=config.write_heartbeat,
+            log_cuda_memory=config.log_cuda_memory,
+            log_disk_usage=config.log_disk_usage,
+            wandb=config.wandb,
+        )
+        assert self.model is not None
+        assert self.optimizer is not None
+        assert self.world is not None
+        self.ckpt_manager = CheckpointManager(
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            self.config.ckpt,
+            self.output_dir,
+            self.world,
+        )
+        if self.config.ckpt is not None and self.config.ckpt.resume_step is not None:
+            self.resume_checkpoint_dir = resolve_resume_checkpoint(
+                self.output_dir,
+                self.config.ckpt.resume_step,
+            )
+            state = self.ckpt_manager.load(
+                self.resume_checkpoint_dir,
+                dataloader=self.dataloader,
+            )
+            if state.micro_step != state.step * self.accumulation_steps:
+                raise ValueError(
+                    "Checkpoint micro_step does not match the expected optimizer-step "
+                    "boundary for this trainer configuration."
+                )
+            self.step = state.step
+            self._micro_step = state.micro_step
+            self._after_resume()
+        self.monitor.start_run(
+            run_config=self.config.model_dump(mode="json", exclude_none=True),
+            world=self.world,
+            resumed_from=(
+                str(self.resume_checkpoint_dir)
+                if self.resume_checkpoint_dir is not None
+                else None
+            ),
+        )
 
     def _setup_seed(self) -> None:
         seed = self.config.seed
@@ -392,3 +473,53 @@ class BaseTrainer:
         if self.config.max_steps is not None:
             return self.config.max_steps
         return self.config.epochs * 1000
+
+    def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if self.world is None:
+            raise RuntimeError("World not set up")
+        return {
+            key: value.to(self.world.device, non_blocking=True)
+            for key, value in batch.items()
+        }
+
+    def _maybe_checkpoint(self) -> None:
+        if self.ckpt_manager is None:
+            return
+        if self.monitor is None:
+            raise RuntimeError("Monitor not set up. Call setup() first.")
+        self.ckpt_manager.poll_pending_save()
+        did_save = self.ckpt_manager.save(
+            TrainerState(step=self.step, micro_step=self._micro_step),
+            dataloader=self.dataloader,
+        )
+        if did_save:
+            self.monitor.log_event(
+                "checkpoint_triggered",
+                step=self.step,
+                payload={
+                    "mode": self.config.ckpt.mode
+                    if self.config.ckpt
+                    else "disabled"
+                },
+            )
+
+    def _get_lr(self) -> float:
+        if self.optimizer is None:
+            return 0.0
+        return self.optimizer.param_groups[0]["lr"]
+
+    def _save_model(self) -> None:
+        if self.world is None or self.model is None or self.tokenizer is None:
+            return
+        from wavelet.trainer.model import export_model_for_save, save_model
+
+        saveable_model, state_dict = export_model_for_save(self.model)
+        save_model(
+            saveable_model,
+            self.tokenizer,
+            self.output_dir,
+            state_dict=state_dict,
+            is_main_process=self.world.is_main,
+        )
+        if self.world.is_main:
+            logger.info("Model saved to %s", self.output_dir)
