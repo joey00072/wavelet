@@ -270,50 +270,12 @@ class RLTrainer(BaseTrainer):
     def _after_resume(self) -> None:
         self._accumulated_micro_batches = 0
 
-    def train(self) -> None:
-        target_step = self.config.max_steps or 1000
-        self.train_until(target_step, finish_run=True)
-
-    def train_until(self, target_step: int, *, finish_run: bool = False) -> None:
-        if self.model is None or self.optimizer is None or self.dataloader is None:
-            raise RuntimeError("Trainer not set up. Call setup() first.")
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
-        if self._run_closed:
-            raise RuntimeError("Trainer run has already been finalized.")
-
-        self.model.train()
-        remaining_steps = max(target_step - self.step, 0)
-        progress = tqdm(total=remaining_steps, disable=not self.world.is_main)
-
-        try:
-            while self.step < target_step:
-                for batch in self.dataloader:
-                    batch = self._prepare_batch(batch)
-                    output = self._train_step(batch)
-                    if not output.stepped:
-                        continue
-
-                    self._log_train_metrics(output.metrics, progress)
-                    self._maybe_checkpoint()
-                    progress.update(1)
-                    if self.step >= target_step:
-                        break
-
-            if self.ckpt_manager is not None:
-                self.ckpt_manager.wait_for_pending_save()
-        except Exception:
-            self._finish_if_requested(finish_run, status="failed")
-            raise
-        finally:
-            progress.close()
-        self._finish_if_requested(finish_run, status="completed")
-
-    def _log_train_metrics(self, metrics: dict[str, float], progress: tqdm) -> None:
+    def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
         if self.monitor is None:
             raise RuntimeError("Monitor not set up. Call setup() first.")
         if self.step % self.config.log.log_every != 0:
             return
+        metrics = output.metrics
         metrics["lr"] = self._get_lr()
         metrics["optim/lr"] = metrics["lr"]
         metrics["progress/step"] = float(self.step)
@@ -324,15 +286,6 @@ class RLTrainer(BaseTrainer):
             kl=f"{metrics['mismatch_kl']:.4f}",
             lr=f"{metrics['lr']:.2e}",
         )
-
-    def _finish_if_requested(self, finish_run: bool, *, status: str) -> None:
-        if finish_run:
-            if self.monitor is None:
-                raise RuntimeError("Monitor not set up. Call setup() first.")
-            self.monitor.finish(status=status, step=self.step)
-            self._run_closed = True
-            if status == "completed":
-                self._save_model()
 
     def load_rollout_path(self, rollout_path: Path) -> None:
         rollout_path = Path(rollout_path)
@@ -415,7 +368,7 @@ class RLTrainer(BaseTrainer):
             if output.stepped:
                 metrics = output.metrics
                 progress = tqdm(total=1, disable=not self.world.is_main)
-                self._log_train_metrics(metrics, progress)
+                self._log_train_output(output, progress)
                 self._maybe_checkpoint()
                 progress.update(1)
                 progress.close()

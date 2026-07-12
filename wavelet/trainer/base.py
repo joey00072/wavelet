@@ -14,12 +14,14 @@ import torch
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import IterableDataset
+from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from wavelet.configs.sft import SFTConfig
 from wavelet.distributed.parallel_dims import ParallelDims
 from wavelet.distributed.world import World, distributed_uses_cuda, get_world, set_world
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
+from wavelet.trainer.types import TrainOutput
 from wavelet.utils.monitoring import RunMonitor
 from wavelet.utils.pathing import resolve_resume_checkpoint
 
@@ -51,6 +53,7 @@ class BaseTrainer:
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
+        self._run_closed = False
 
     def setup(self) -> None:
         self._setup_seed()
@@ -134,6 +137,58 @@ class BaseTrainer:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+
+    def train(self) -> None:
+        self.train_until(self.config.max_steps or 1000, finish_run=True)
+
+    def train_until(self, target_step: int, *, finish_run: bool = False) -> None:
+        self._validate_ready()
+        if self.monitor is None:
+            raise RuntimeError("Monitor not set up. Call setup() first.")
+        if self._run_closed:
+            raise RuntimeError("Trainer run has already been finalized.")
+        assert self.model is not None
+        assert self.world is not None
+        self.model.train()
+        progress = tqdm(
+            total=max(target_step - self.step, 0),
+            disable=not self.world.is_main,
+        )
+        try:
+            while self.step < target_step:
+                for batch in self.dataloader:
+                    output = self._train_step(self._prepare_batch(batch))
+                    if not output.stepped:
+                        continue
+                    self._log_train_output(output, progress)
+                    self._maybe_checkpoint()
+                    progress.update(1)
+                    if self.step >= target_step:
+                        break
+            if self.ckpt_manager is not None:
+                self.ckpt_manager.wait_for_pending_save()
+        except Exception:
+            self._finish_if_requested(finish_run, status="failed")
+            raise
+        finally:
+            progress.close()
+        self._finish_if_requested(finish_run, status="completed")
+
+    def _train_step(self, batch: dict[str, torch.Tensor]) -> TrainOutput:
+        raise NotImplementedError
+
+    def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
+        raise NotImplementedError
+
+    def _finish_if_requested(self, finish_run: bool, *, status: str) -> None:
+        if not finish_run:
+            return
+        if self.monitor is None:
+            raise RuntimeError("Monitor not set up. Call setup() first.")
+        self.monitor.finish(status=status, step=self.step)
+        self._run_closed = True
+        if status == "completed":
+            self._save_model()
 
     def _setup_distributed(self) -> None:
         fsdp_config = getattr(self.config, "fsdp", None)

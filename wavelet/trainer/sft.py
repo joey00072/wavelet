@@ -45,47 +45,15 @@ class SFTTrainer(BaseTrainer):
             )
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
-    def train(self) -> None:
-        if self.model is None or self.optimizer is None or self.dataloader is None:
-            raise RuntimeError("Trainer not set up. Call setup() first.")
-
-        self.model.train()
-        max_steps = self.config.max_steps or 1000
-        status = "completed"
-
-        # self.step counts optimizer steps; progress bar is in optimizer-step units
-        progress = tqdm(total=max_steps, disable=not self.world.is_main)
-        try:
-            while self.step < max_steps:
-                for batch in self.dataloader:
-                    batch = self._prepare_batch(batch)
-                    output = self._train_step(batch)
-                    if not output.stepped:
-                        continue
-
-                    if self.step % self.config.log.log_every == 0:
-                        loss_val = output.loss.loss.item()
-                        lr_val = self._get_lr()
-                        metrics = {"loss": loss_val, "lr": lr_val}
-                        self.monitor.log(metrics, self.step)
-                        progress.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr_val:.2e}")
-
-                    self._maybe_checkpoint()
-
-                    progress.update(1)
-
-                    if self.step >= max_steps:
-                        break
-
-            if self.ckpt_manager is not None:
-                self.ckpt_manager.wait_for_pending_save()
-            self._save_model()
-        except Exception:
-            status = "failed"
-            raise
-        finally:
-            progress.close()
-            self.monitor.finish(status=status, step=self.step)
+    def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
+        if self.monitor is None:
+            raise RuntimeError("Monitor not set up. Call setup() first.")
+        if self.step % self.config.log.log_every != 0:
+            return
+        loss = output.loss.loss.item()
+        lr = self._get_lr()
+        self.monitor.log({"loss": loss, "lr": lr}, self.step)
+        progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None:
