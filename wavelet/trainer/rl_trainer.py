@@ -34,8 +34,11 @@ from wavelet.orchestrator.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
     QueueEvent,
+    RolloutBatch,
     append_event_best_effort,
     get_policy_step_dir,
+    record_rollout_claim,
+    record_rollout_consumed,
     resolve_policy_dir,
     utc_now,
 )
@@ -332,6 +335,45 @@ class RLTrainer(BaseTrainer):
             optimizer_batch_size
         )
         self._validate_reference_policy_support()
+
+    def record_rollout_claim(
+        self,
+        batch: RolloutBatch,
+        *,
+        trainer_step_before: int,
+    ) -> None:
+        if not self.is_main_process():
+            return
+        record_rollout_claim(
+            batch,
+            trainer_step_before=trainer_step_before,
+            events_dir=self.output_dir / "events",
+        )
+
+    def record_rollout_consumed(
+        self,
+        batch: RolloutBatch,
+        *,
+        trainer_step_before: int,
+        optimizer_step_completed: bool,
+    ) -> None:
+        if not self.is_main_process():
+            return
+        record_rollout_consumed(
+            batch,
+            trainer_step_before=trainer_step_before,
+            trainer_step_after=self.step,
+            optimizer_step_completed=optimizer_step_completed,
+            events_dir=self.output_dir / "events",
+        )
+
+    def rollout_events_dir(self) -> Path | None:
+        if not self.is_main_process():
+            return None
+        return self.output_dir / "events"
+
+    def is_main_process(self) -> bool:
+        return self.world is None or self.world.is_main
 
     def _current_micro_batch_count(self, optimizer_batch_size: int) -> int:
         if isinstance(self.dataset, PackedRLDataset):
