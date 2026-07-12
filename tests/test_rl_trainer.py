@@ -4,6 +4,7 @@ import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import ModelConfig
+from wavelet.data.batch import RLBatch
 from wavelet.distributed.world import World
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.model import _fsdp_mixed_precision
@@ -47,6 +48,30 @@ class _LogprobModel:
     def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
         self.kwargs = kwargs
         return {"logprobs": self.logprobs}
+
+
+def _model_batch(
+    input_ids: torch.Tensor,
+    *,
+    temperatures: torch.Tensor,
+) -> RLBatch:
+    batch_size, seq_len = input_ids.shape
+    token_shape = (batch_size, seq_len)
+    return RLBatch(
+        input_ids=input_ids,
+        attention_mask=torch.ones(token_shape, dtype=torch.long),
+        position_ids=input_ids,
+        target_ids=input_ids,
+        loss_mask=torch.ones(token_shape, dtype=torch.bool),
+        advantages=torch.zeros(token_shape),
+        rewards=torch.zeros(batch_size),
+        has_inference_logprobs=torch.zeros(batch_size, dtype=torch.bool),
+        inference_logprobs=torch.zeros(token_shape),
+        has_teacher_logprobs=torch.zeros(batch_size, dtype=torch.bool),
+        teacher_logprobs=torch.zeros(token_shape),
+        temperatures=temperatures,
+        sample_counts=torch.ones(batch_size, dtype=torch.long),
+    )
 
 
 def test_packed_causal_attention_mask_blocks_cross_sample_attention() -> None:
@@ -164,12 +189,7 @@ def test_model_logprobs_uses_fp32_for_bfloat16_logits() -> None:
     trainer.model = model  # type: ignore[assignment]
 
     actual = trainer._model_logprobs(  # noqa: SLF001
-        {
-            "input_ids": targets,
-            "position_ids": targets,
-            "target_ids": targets,
-            "temperatures": temperatures,
-        },
+        _model_batch(targets, temperatures=temperatures),
         attention_mask=None,
     )
     expected = (
@@ -198,12 +218,10 @@ def test_model_logprobs_casts_chunked_output_to_fp32() -> None:
     trainer.model = model  # type: ignore[assignment]
 
     actual = trainer._model_logprobs(  # noqa: SLF001
-        {
-            "input_ids": torch.ones((2, 3), dtype=torch.long),
-            "position_ids": torch.ones((2, 3), dtype=torch.long),
-            "target_ids": torch.ones((2, 3), dtype=torch.long),
-            "temperatures": torch.ones((2, 3), dtype=torch.float32),
-        },
+        _model_batch(
+            torch.ones((2, 3), dtype=torch.long),
+            temperatures=torch.ones((2, 3), dtype=torch.float32),
+        ),
         attention_mask=None,
     )
 

@@ -18,6 +18,7 @@ from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from wavelet.configs.sft import SFTConfig
+from wavelet.data.batch import TensorBatch
 from wavelet.distributed.parallel_dims import ParallelDims
 from wavelet.distributed.world import World, distributed_uses_cuda, get_world, set_world
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
@@ -174,7 +175,7 @@ class BaseTrainer:
             progress.close()
         self._finish_if_requested(finish_run, status="completed")
 
-    def _train_step(self, batch: dict[str, torch.Tensor]) -> TrainOutput:
+    def _train_step(self, batch: TensorBatch) -> TrainOutput:
         raise NotImplementedError
 
     def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
@@ -529,13 +530,10 @@ class BaseTrainer:
             return self.config.max_steps
         return self.config.epochs * 1000
 
-    def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def _prepare_batch(self, batch: TensorBatch) -> TensorBatch:
         if self.world is None:
             raise RuntimeError("World not set up")
-        return {
-            key: value.to(self.world.device, non_blocking=True)
-            for key, value in batch.items()
-        }
+        return batch.to(self.world.device)
 
     def _maybe_checkpoint(self) -> None:
         if self.ckpt_manager is None:

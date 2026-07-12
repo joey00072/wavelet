@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import torch
-from torch import Tensor
 
+from wavelet.data.batch import SFTBatch
 from wavelet.data.tokenization import Sample
 
 IGNORE_INDEX = -100
@@ -13,7 +13,7 @@ def collate_batch(
     *,
     pad_token_id: int,
     include_attention_mask: bool = True,
-) -> dict[str, Tensor]:
+) -> SFTBatch:
     max_len = max(len(item["input_ids"]) for item in batch)
 
     input_ids_out = []
@@ -54,11 +54,11 @@ def collate_batch(
         ] + [IGNORE_INDEX] * pad_len
         labels_out.append(torch.tensor(labels, dtype=torch.long))
 
-    batch_out = {
-        "input_ids": torch.stack(input_ids_out),
-        "position_ids": torch.stack(position_ids_out),
-        "labels": torch.stack(labels_out),
-    }
-    if include_attention_mask:
-        batch_out["attention_mask"] = torch.stack(attention_mask_out)
-    return batch_out
+    return SFTBatch(
+        input_ids=torch.stack(input_ids_out),
+        position_ids=torch.stack(position_ids_out),
+        labels=torch.stack(labels_out),
+        attention_mask=(
+            torch.stack(attention_mask_out) if include_attention_mask else None
+        ),
+    )

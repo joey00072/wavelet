@@ -9,13 +9,12 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 import torch
-from torch import Tensor
 from torch.utils.data import IterableDataset, get_worker_info
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from wavelet.configs.rl_config import RLDataConfig
-from wavelet.data.collation import IGNORE_INDEX
+from wavelet.data.batch import RLBatch
 from wavelet.data.loading import Example
 from wavelet.data.tokenization import build_sample
 
@@ -31,23 +30,6 @@ class RLSample(TypedDict):
     temperatures: list[float]
     reward: float | None
     sample_count: NotRequired[int]
-
-
-class RLBatch(TypedDict):
-    input_ids: Tensor
-    attention_mask: Tensor
-    position_ids: Tensor
-    target_ids: Tensor
-    labels: Tensor
-    loss_mask: Tensor
-    advantages: Tensor
-    rewards: Tensor
-    has_inference_logprobs: Tensor
-    inference_logprobs: Tensor
-    has_teacher_logprobs: Tensor
-    teacher_logprobs: Tensor
-    temperatures: Tensor
-    sample_counts: Tensor
 
 
 @dataclass
@@ -835,7 +817,6 @@ def collate_rl_batch(
     attention_mask_out = []
     position_ids_out = []
     target_ids_out = []
-    labels_out = []
     loss_mask_out = []
     advantages_out = []
     rewards_out = []
@@ -899,11 +880,6 @@ def collate_rl_batch(
         target_ids_out.append(
             torch.tensor(item["target_ids"] + [0] * pad_len, dtype=torch.long)
         )
-        labels = [
-            target_id if trainable else IGNORE_INDEX
-            for target_id, trainable in zip(item["target_ids"], mask, strict=True)
-        ] + [IGNORE_INDEX] * pad_len
-        labels_out.append(torch.tensor(labels, dtype=torch.long))
         loss_mask_out.append(torch.tensor(mask + [False] * pad_len, dtype=torch.bool))
         advantages_out.append(
             torch.tensor(expanded_advantages + [0.0] * pad_len, dtype=torch.float32)
@@ -933,22 +909,21 @@ def collate_rl_batch(
             torch.tensor(expanded_temperatures + [1.0] * pad_len, dtype=torch.float32)
         )
 
-    return {
-        "input_ids": torch.stack(input_ids_out),
-        "attention_mask": torch.stack(attention_mask_out),
-        "position_ids": torch.stack(position_ids_out),
-        "target_ids": torch.stack(target_ids_out),
-        "labels": torch.stack(labels_out),
-        "loss_mask": torch.stack(loss_mask_out),
-        "advantages": torch.stack(advantages_out),
-        "rewards": torch.stack(rewards_out),
-        "has_inference_logprobs": torch.stack(has_inference_out),
-        "inference_logprobs": torch.stack(inference_logprobs_out),
-        "has_teacher_logprobs": torch.stack(has_teacher_out),
-        "teacher_logprobs": torch.stack(teacher_logprobs_out),
-        "temperatures": torch.stack(temperatures_out),
-        "sample_counts": torch.stack(sample_counts_out),
-    }
+    return RLBatch(
+        input_ids=torch.stack(input_ids_out),
+        attention_mask=torch.stack(attention_mask_out),
+        position_ids=torch.stack(position_ids_out),
+        target_ids=torch.stack(target_ids_out),
+        loss_mask=torch.stack(loss_mask_out),
+        advantages=torch.stack(advantages_out),
+        rewards=torch.stack(rewards_out),
+        has_inference_logprobs=torch.stack(has_inference_out),
+        inference_logprobs=torch.stack(inference_logprobs_out),
+        has_teacher_logprobs=torch.stack(has_teacher_out),
+        teacher_logprobs=torch.stack(teacher_logprobs_out),
+        temperatures=torch.stack(temperatures_out),
+        sample_counts=torch.stack(sample_counts_out),
+    )
 
 
 def setup_rl_dataset(
