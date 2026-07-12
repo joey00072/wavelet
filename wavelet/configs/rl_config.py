@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from wavelet.configs.sft import (
-    LossMaskConfig,
+    TrainingDataConfig,
     TrainerConfig,
 )
 
@@ -19,41 +19,16 @@ def _normalize_legacy_sampling_fields(value: object) -> object:
     return value
 
 
-class RLDataConfig(BaseModel):
-    source: Literal["local", "hf", "fake"] = "local"
+class RLDataConfig(TrainingDataConfig):
     path: Path | list[Path] = Path("outputs/unsloth_math_data/rl_train.jsonl")
-    hf_name: str | None = None
-    hf_subsets: list[str] | None = None
-    hf_splits: list[str] | None = None
-    probabilities: list[float] | None = None
-    stopping_strategy: Literal["first_exhausted", "all_exhausted"] = "first_exhausted"
-    batch_size: int = Field(default=4, ge=1)
-    micro_batch_size: int = Field(default=1, ge=1)
     pack_sequences: bool = False
     pad_to_multiple_of: int = Field(default=1, ge=1)
-    num_workers: int = Field(default=0, ge=0)
-    pin_memory: bool = True
-    seq_len: int = Field(default=128, ge=8)
-    shuffle: bool = True
-    seed: int = 0
-    max_examples: int | None = Field(default=None, ge=1)
-    prompt_column: str = "prompt"
-    completion_column: str = "completion"
-    messages_column: str = "messages"
-    system_prompt: str | None = None
-    merge_messages_thinking: bool = False
-    tools_column: str = "tools"
-    chat_template_kwargs_column: str = "chat_template_kwargs"
     advantage_column: str = "advantage"
     reward_column: str = "reward"
     inference_logprobs_column: str = "inference_logprobs"
     teacher_logprobs_column: str = "teacher_logprobs"
     temperature_column: str = "temperature"
     metadata_column: str = "metadata"
-    fake_vocab_size: int = Field(default=32000, ge=8)
-    fake_length: Literal["fixed", "variable"] = "fixed"
-    fake_input_ids: Literal["random", "increasing"] = "random"
-    loss_mask: LossMaskConfig = LossMaskConfig()
 
     @model_validator(mode="before")
     @classmethod
@@ -66,20 +41,6 @@ class RLDataConfig(BaseModel):
         ):
             value["inference_logprobs_column"] = value.pop("reference_logprobs_column")
         return value
-
-    @model_validator(mode="after")
-    def validate_batch_sizes(self) -> "RLDataConfig":
-        if self.batch_size % self.micro_batch_size != 0:
-            raise ValueError("batch_size must be divisible by micro_batch_size")
-        if self.hf_subsets is not None and self.hf_splits is not None:
-            if len(self.hf_subsets) != len(self.hf_splits):
-                raise ValueError("hf_subsets and hf_splits must have the same length")
-        if self.source == "hf" and self.hf_name is None:
-            raise ValueError("hf_name is required when data.source='hf'")
-        if self.source == "local" and self.hf_name is not None:
-            raise ValueError("hf_name is only valid when data.source='hf'")
-        return self
-
 
 class RLLossConfig(BaseModel):
     type: Literal["dppo"] = "dppo"
