@@ -41,7 +41,6 @@ from wavelet.orchestrator.queue import (
 )
 from wavelet.orchestrator.policy_metadata import policy_metadata
 from wavelet.trainer.base import BaseTrainer
-from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.lora import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.nccl_broadcast import (
     NCCLWeightBroadcaster,
@@ -49,9 +48,7 @@ from wavelet.trainer.nccl_broadcast import (
 )
 from wavelet.trainer.rl_loss import compute_loss, selective_log_softmax
 from wavelet.trainer.types import LossOutput, TrainOutput
-from wavelet.utils.monitoring import RunMonitor
 from wavelet.utils.policy_transfer import NCCL_READY_MARKER, NCCL_UPDATE_INFO_FILENAME
-from wavelet.utils.pathing import resolve_resume_checkpoint
 
 
 logger = logging.getLogger(__name__)
@@ -228,10 +225,6 @@ class RLTrainer(BaseTrainer):
     def __init__(self, config: RLConfig) -> None:
         super().__init__(config)
         self.config = config
-        self.dataloader = None
-        self.monitor: RunMonitor | None = None
-        self.step = 0
-        self._micro_step = 0
         self._accumulated_micro_batches = 0
         self._reward_accum: list[float] = []
         self._rollout_metric_accum: list[dict[str, float]] = []
@@ -240,9 +233,6 @@ class RLTrainer(BaseTrainer):
         self._optimizer_batch_loss_scale: float | None = None
         self._gradient_accumulation_loss_scale: float | None = None
         self._loaded_micro_batch_count = 0
-        self.accumulation_steps = 1
-        self.ckpt_manager: CheckpointManager | None = None
-        self.resume_checkpoint_dir: Path | None = None
         self._run_closed = False
         self._nccl_broadcaster_executor: ThreadPoolExecutor | None = None
         self._nccl_broadcaster_future: Future[NCCLWeightBroadcaster] | None = None
@@ -273,66 +263,12 @@ class RLTrainer(BaseTrainer):
             self.accumulation_steps = self._packed_dataloader_batch_count()
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
 
-    def setup(self) -> None:
-        super().setup()
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.monitor = RunMonitor(
-            output_dir=self.output_dir,
-            enabled=self.config.monitor.enabled,
-            write_events=self.config.monitor.write_events,
-            write_metrics_jsonl=self.config.monitor.write_metrics_jsonl,
-            write_metrics_csv=self.config.monitor.write_metrics_csv,
-            write_run_metadata=self.config.monitor.write_run_metadata,
-            write_heartbeat=self.config.monitor.write_heartbeat,
-            log_cuda_memory=self.config.monitor.log_cuda_memory,
-            log_disk_usage=self.config.monitor.log_disk_usage,
-            wandb=self.config.monitor.wandb,
-        )
-        if (
-            self.model is None
-            or self.optimizer is None
-            or self.dataloader is None
-            or self.world is None
-        ):
-            raise RuntimeError("Trainer not set up. Call setup() first.")
-
+    def _validate_ready(self) -> None:
+        super()._validate_ready()
         self._validate_reference_policy_support()
 
-        self.ckpt_manager = CheckpointManager(
-            self.model,
-            self.optimizer,
-            self.scheduler,
-            self.config.ckpt,
-            self.output_dir,
-            self.world,
-        )
-        if self.config.ckpt is not None and self.config.ckpt.resume_step is not None:
-            self.resume_checkpoint_dir = resolve_resume_checkpoint(
-                self.output_dir,
-                self.config.ckpt.resume_step,
-            )
-            trainer_state = self.ckpt_manager.load(
-                self.resume_checkpoint_dir,
-                dataloader=self.dataloader,
-            )
-            if trainer_state.micro_step != trainer_state.step * self.accumulation_steps:
-                raise ValueError(
-                    "Checkpoint micro_step does not match the expected optimizer-step "
-                    "boundary for this trainer configuration."
-                )
-            self.step = trainer_state.step
-            self._micro_step = trainer_state.micro_step
-            self._accumulated_micro_batches = 0
-
-        self.monitor.start_run(
-            run_config=self.config.model_dump(mode="json", exclude_none=True),
-            world=self.world,
-            resumed_from=(
-                str(self.resume_checkpoint_dir)
-                if self.resume_checkpoint_dir is not None
-                else None
-            ),
-        )
+    def _after_resume(self) -> None:
+        self._accumulated_micro_batches = 0
 
     def train(self) -> None:
         target_step = self.config.max_steps or 1000
@@ -387,25 +323,6 @@ class RLTrainer(BaseTrainer):
             loss=f"{metrics['loss']:.4f}",
             kl=f"{metrics['mismatch_kl']:.4f}",
             lr=f"{metrics['lr']:.2e}",
-        )
-
-    def _maybe_checkpoint(self) -> None:
-        if self.ckpt_manager is None:
-            return
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
-
-        self.ckpt_manager.poll_pending_save()
-        did_save = self.ckpt_manager.save(
-            TrainerState(step=self.step, micro_step=self._micro_step),
-            dataloader=self.dataloader,
-        )
-        if not did_save:
-            return
-        self.monitor.log_event(
-            "checkpoint_triggered",
-            step=self.step,
-            payload={"mode": self.config.ckpt.mode if self.config.ckpt else "disabled"},
         )
 
     def _finish_if_requested(self, finish_run: bool, *, status: str) -> None:
@@ -899,14 +816,6 @@ class RLTrainer(BaseTrainer):
             self.accumulation_steps,
             normalization=self.config.loss.normalization,
         )
-
-    def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        if self.world is None:
-            raise RuntimeError("World not set up")
-        return {
-            key: value.to(self.world.device, non_blocking=True)
-            for key, value in batch.items()
-        }
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
@@ -1405,11 +1314,6 @@ class RLTrainer(BaseTrainer):
             metrics["reward_mean"] = metrics["reward/all/mean"]
         return metrics
 
-    def _get_lr(self) -> float:
-        if self.optimizer is None:
-            return 0.0
-        return self.optimizer.param_groups[0]["lr"]
-
     def _save_model(self) -> None:
         if not self.world:
             return
@@ -1417,7 +1321,6 @@ class RLTrainer(BaseTrainer):
             return
 
         from wavelet.trainer.lora import save_lora_adapter_snapshot_from_fsdp
-        from wavelet.trainer.model import export_model_for_save, save_model
 
         if (
             self.config.lora is not None
@@ -1434,14 +1337,4 @@ class RLTrainer(BaseTrainer):
                 self.tokenizer.save_pretrained(saved_path)
                 logger.info(f"Model saved to {self.output_dir}")
             return
-
-        saveable_model, state_dict = export_model_for_save(self.model)
-        save_model(
-            saveable_model,
-            self.tokenizer,
-            self.output_dir,
-            state_dict=state_dict,
-            is_main_process=self.world.is_main,
-        )
-        if self.world.is_main:
-            logger.info(f"Model saved to {self.output_dir}")
+        super()._save_model()
