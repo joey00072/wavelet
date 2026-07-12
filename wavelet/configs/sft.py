@@ -57,9 +57,9 @@ class LossMaskConfig(BaseModel):
     tool: bool = False
 
 
-class DataConfig(BaseModel):
+class TrainingDataConfig(BaseModel):
     source: Literal["local", "hf", "fake"] = "local"
-    path: Path | list[Path] = Path("outputs/unsloth_math_data/sft_train.jsonl")
+    path: Path | list[Path] = Path("outputs/data.jsonl")
     hf_name: str | None = None
     hf_subsets: list[str] | None = None
     hf_splits: list[str] | None = None
@@ -73,12 +73,9 @@ class DataConfig(BaseModel):
     shuffle: bool = True
     seed: int = 0
     max_examples: int | None = Field(default=None, ge=1)
-    pack_function: Literal["pad", "cat", "stack"] = "pad"
     fake_vocab_size: int = Field(default=32000, ge=8)
     fake_length: Literal["fixed", "variable"] = "fixed"
     fake_input_ids: Literal["random", "increasing"] = "random"
-    stack_bucket_multiple: int = Field(default=256, ge=1)
-    stack_bucket_timeout: int = Field(default=10, ge=1)
     prompt_column: str = "prompt"
     completion_column: str = "completion"
     messages_column: str = "messages"
@@ -89,7 +86,7 @@ class DataConfig(BaseModel):
     loss_mask: LossMaskConfig = LossMaskConfig()
 
     @model_validator(mode="after")
-    def validate_batch_sizes(self) -> "DataConfig":
+    def validate_source(self):
         if self.batch_size % self.micro_batch_size != 0:
             raise ValueError("batch_size must be divisible by micro_batch_size")
         if self.hf_subsets is not None and self.hf_splits is not None:
@@ -99,6 +96,17 @@ class DataConfig(BaseModel):
             raise ValueError("hf_name is required when data.source='hf'")
         if self.source == "local" and self.hf_name is not None:
             raise ValueError("hf_name is only valid when data.source='hf'")
+        return self
+
+
+class DataConfig(TrainingDataConfig):
+    path: Path | list[Path] = Path("outputs/unsloth_math_data/sft_train.jsonl")
+    pack_function: Literal["pad", "cat", "stack"] = "pad"
+    stack_bucket_multiple: int = Field(default=256, ge=1)
+    stack_bucket_timeout: int = Field(default=10, ge=1)
+
+    @model_validator(mode="after")
+    def validate_stack_packing(self):
         if self.pack_function == "stack":
             max_area = self.seq_len * self.micro_batch_size
             if max_area % self.stack_bucket_multiple != 0:
