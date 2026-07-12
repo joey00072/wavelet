@@ -7,6 +7,7 @@ import torch
 
 from wavelet.configs.rl_config import RLLossConfig
 from wavelet.trainer.rl_loss import compute_loss
+from wavelet.trainer.types import LossOutput
 
 
 def test_loss_scale_matches_token_normalization() -> None:
@@ -17,7 +18,7 @@ def test_loss_scale_matches_token_normalization() -> None:
     loss_mask = torch.tensor([[True, True, True, True]])
     position_ids = torch.tensor([[0, 1, 2, 0]])
 
-    loss, _ = compute_loss(
+    output = compute_loss(
         trainer_logprobs,
         inference_logprobs,
         None,
@@ -28,7 +29,8 @@ def test_loss_scale_matches_token_normalization() -> None:
         position_ids=position_ids,
     )
 
-    assert loss.item() == pytest.approx(-1.25)
+    assert isinstance(output, LossOutput)
+    assert output.loss.item() == pytest.approx(-1.25)
 
 
 def test_sequence_normalization_remains_available() -> None:
@@ -39,7 +41,7 @@ def test_sequence_normalization_remains_available() -> None:
     loss_mask = torch.tensor([[True, True, True, True]])
     position_ids = torch.tensor([[0, 1, 2, 0]])
 
-    loss, _ = compute_loss(
+    output = compute_loss(
         trainer_logprobs,
         inference_logprobs,
         None,
@@ -50,7 +52,7 @@ def test_sequence_normalization_remains_available() -> None:
         position_ids=position_ids,
     )
 
-    assert loss.item() == pytest.approx(-0.5)
+    assert output.loss.item() == pytest.approx(-0.5)
 
 
 def test_packed_loss_metrics_are_averaged_per_sequence() -> None:
@@ -61,7 +63,7 @@ def test_packed_loss_metrics_are_averaged_per_sequence() -> None:
     advantages = torch.zeros_like(trainer_logprobs)
     position_ids = torch.tensor([[0, 1, 2, 0]])
 
-    _, metrics = compute_loss(
+    output = compute_loss(
         trainer_logprobs,
         inference_logprobs,
         None,
@@ -73,6 +75,6 @@ def test_packed_loss_metrics_are_averaged_per_sequence() -> None:
     )
 
     expected_second_sequence_kl = 2.0 - math.log(2.0) - 1.0
-    assert metrics["mismatch_kl"].item() == pytest.approx(
+    assert output.metrics["mismatch_kl"].item() == pytest.approx(
         expected_second_sequence_kl / 2
     )

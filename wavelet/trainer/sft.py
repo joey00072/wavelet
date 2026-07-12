@@ -13,6 +13,7 @@ from wavelet.data.dataloader import setup_dataloader
 from wavelet.trainer.base import BaseTrainer
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.lora import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.monitoring import RunMonitor
 from wavelet.utils.pathing import resolve_resume_checkpoint
 
@@ -127,15 +128,12 @@ class SFTTrainer(BaseTrainer):
             while self.step < max_steps:
                 for batch in self.dataloader:
                     batch = self._prepare_batch(batch)
-                    loss = self._train_step(batch)
-
-                    # _train_step returns None while accumulating; non-None signals
-                    # that an optimizer step just fired (loss is ready to log).
-                    if loss is None:
+                    output = self._train_step(batch)
+                    if not output.stepped:
                         continue
 
                     if self.step % self.config.log.log_every == 0:
-                        loss_val = loss.item()
+                        loss_val = output.loss.loss.item()
                         lr_val = self._get_lr()
                         metrics = {"loss": loss_val, "lr": lr_val}
                         self.monitor.log(metrics, self.step)
@@ -178,7 +176,7 @@ class SFTTrainer(BaseTrainer):
             raise RuntimeError("World not set up")
         return {k: v.to(self.world.device, non_blocking=True) for k, v in batch.items()}
 
-    def _train_step(self, batch: dict[str, Tensor]) -> Tensor | None:
+    def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None:
             raise RuntimeError("Model not set up")
 
@@ -201,19 +199,26 @@ class SFTTrainer(BaseTrainer):
                     position_ids=batch["position_ids"],
                     shift_labels=batch["labels"],
                 )
-                loss = outputs.loss
+                loss_output = LossOutput(loss=outputs.loss)
             else:
                 outputs = self.model(
                     input_ids=batch["input_ids"],
                     attention_mask=attn_mask,
                     position_ids=batch["position_ids"],
                 )
-                loss = self.compute_loss(outputs.logits, batch["labels"])
+                loss_output = self.compute_loss(outputs.logits, batch["labels"])
+            loss = loss_output.loss
 
             if torch.isnan(loss):
                 logger.warning(f"NaN loss at step {self.step}, skipping backward")
                 self._micro_step += 1
-                return None
+                return TrainOutput(
+                    loss=loss_output,
+                    stepped=False,
+                    step=self.step,
+                    micro_step=self._micro_step,
+                    skipped=True,
+                )
 
             (loss / self.accumulation_steps).backward()
 
@@ -229,11 +234,27 @@ class SFTTrainer(BaseTrainer):
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.step += 1
-            return loss
+            return TrainOutput(
+                loss=loss_output,
+                stepped=True,
+                step=self.step,
+                micro_step=self._micro_step,
+                metrics={"loss": float(loss.detach().item())},
+            )
 
-        return None
+        return TrainOutput(
+            loss=loss_output,
+            stepped=False,
+            step=self.step,
+            micro_step=self._micro_step,
+        )
 
-    def compute_loss(self, logits: Tensor, labels: Tensor, chunk: int = 256) -> Tensor:
+    def compute_loss(
+        self,
+        logits: Tensor,
+        labels: Tensor,
+        chunk: int = 256,
+    ) -> LossOutput:
         """Chunked cross-entropy loss.
 
         Slices the sequence into chunks of `chunk` tokens and accumulates the
@@ -246,7 +267,7 @@ class SFTTrainer(BaseTrainer):
         total_loss = logits.new_zeros(())
         valid = (flat_labels != -100).sum()
         if valid == 0:
-            return total_loss
+            return LossOutput(loss=total_loss)
 
         for start in range(0, B * L, chunk):
             end = min(start + chunk, B * L)
@@ -258,7 +279,11 @@ class SFTTrainer(BaseTrainer):
             total_loss = total_loss + chunk_loss
 
         del logits
-        return total_loss / valid.float()
+        loss = total_loss / valid.float()
+        return LossOutput(
+            loss=loss,
+            metrics={"nll": loss.detach(), "tokens/train": valid.detach()},
+        )
 
     def _get_lr(self) -> float:
         if self.optimizer is None:
