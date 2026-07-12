@@ -8,7 +8,6 @@ from torch import Tensor
 from tqdm import tqdm
 
 from wavelet.configs.sft import SFTConfig
-from wavelet.data.batch import SFTBatch
 from wavelet.data.dataloader import setup_dataloader
 from wavelet.trainer.base import BaseTrainer
 from wavelet.trainer.lora import sync_hf_tp_lora_replicated_grads
@@ -56,14 +55,14 @@ class SFTTrainer(BaseTrainer):
         self.monitor.log({"loss": loss, "lr": lr}, self.step)
         progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")
 
-    def _train_step(self, batch: SFTBatch) -> TrainOutput:
+    def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None:
             raise RuntimeError("Model not set up")
 
         # With cat packing all tokens are real (no padding), so attention_mask
         # is all-ones. Passing None lets transformers use is_causal=True which
         # enables the memory-efficient SDPA kernel instead of the O(L²) math backend.
-        attn_mask = batch.attention_mask
+        attn_mask = batch.get("attention_mask")
         if attn_mask is not None and attn_mask.all():
             attn_mask = None
 
@@ -74,19 +73,19 @@ class SFTTrainer(BaseTrainer):
                 # so we pass them as shift_labels to skip liger's built-in shift.
                 # This avoids a double-shift that would compute loss 2 tokens ahead.
                 outputs = self.model(
-                    input_ids=batch.input_ids,
+                    input_ids=batch["input_ids"],
                     attention_mask=attn_mask,
-                    position_ids=batch.position_ids,
-                    shift_labels=batch.labels,
+                    position_ids=batch["position_ids"],
+                    shift_labels=batch["labels"],
                 )
                 loss_output = LossOutput(loss=outputs.loss)
             else:
                 outputs = self.model(
-                    input_ids=batch.input_ids,
+                    input_ids=batch["input_ids"],
                     attention_mask=attn_mask,
-                    position_ids=batch.position_ids,
+                    position_ids=batch["position_ids"],
                 )
-                loss_output = self.compute_loss(outputs.logits, batch.labels)
+                loss_output = self.compute_loss(outputs.logits, batch["labels"])
             loss = loss_output.loss
 
             if torch.isnan(loss):

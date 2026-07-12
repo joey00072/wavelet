@@ -18,7 +18,6 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from tqdm import tqdm
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.batch import RLBatch
 from wavelet.data.rl_dataset import count_nonempty_jsonl_rows
 from wavelet.data.loading import Example
 from wavelet.data.rl_dataset import (
@@ -813,14 +812,14 @@ class RLTrainer(BaseTrainer):
             normalization=self.config.loss.normalization,
         )
 
-    def _train_step(self, batch: RLBatch) -> TrainOutput:
+    def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
             raise RuntimeError("Trainer not set up")
 
         attention_mask = _packed_training_attention_mask(
             self.model,
-            batch.attention_mask,
-            batch.position_ids,
+            batch["attention_mask"],
+            batch["position_ids"],
         )
         if attention_mask is not None and attention_mask.is_floating_point():
             mask_dtype = _torch_dtype_from_name(self.config.model.torch_dtype)
@@ -829,7 +828,7 @@ class RLTrainer(BaseTrainer):
 
         with self.act_offload_ctx:
             trainer_logprobs = self._model_logprobs(batch, attention_mask)
-            if not batch.loss_mask.bool().any():
+            if not batch["loss_mask"].bool().any():
                 # Dummy packed batches keep FSDP ranks aligned after filtering.
                 # Make the zero loss explicitly depend on this rank's forward pass
                 # so backward still traverses the sharded graph with zero grads.
@@ -845,11 +844,11 @@ class RLTrainer(BaseTrainer):
                     trainer_logprobs,
                     inference_logprobs,
                     teacher_logprobs,
-                    batch.advantages,
-                    batch.loss_mask,
+                    batch["advantages"],
+                    batch["loss_mask"],
                     self.config.loss,
                     loss_scale=self._optimizer_batch_loss_scale,
-                    position_ids=batch.position_ids,
+                    position_ids=batch["position_ids"],
                 )
             loss = loss_output.loss
             raw_metrics = loss_output.metrics
@@ -884,8 +883,8 @@ class RLTrainer(BaseTrainer):
                 backward_loss.backward()
 
         reward_mean = self._reward_mean(
-            batch.rewards,
-            sample_counts=batch.sample_counts,
+            batch["rewards"],
+            sample_counts=batch.get("sample_counts"),
         )
         if reward_mean is not None:
             self._reward_accum.append(reward_mean)
@@ -970,10 +969,10 @@ class RLTrainer(BaseTrainer):
         return {key: zero for key in ZERO_LOSS_METRIC_KEYS}
 
     def _inference_logprobs(
-        self, batch: RLBatch, attention_mask: Tensor | None
+        self, batch: dict[str, Tensor], attention_mask: Tensor | None
     ) -> Tensor:
-        inference_logprobs = batch.inference_logprobs.clone()
-        has_inference = batch.has_inference_logprobs.bool()
+        inference_logprobs = batch["inference_logprobs"].clone()
+        has_inference = batch["has_inference_logprobs"].bool()
         if has_inference.all():
             return inference_logprobs
 
@@ -1000,27 +999,27 @@ class RLTrainer(BaseTrainer):
 
     def _model_logprobs(
         self,
-        batch: RLBatch,
+        batch: dict[str, Tensor],
         attention_mask: Tensor | None,
     ) -> Tensor:
         if self.model is None:
             raise RuntimeError("Model not set up")
         model_kwargs = {
-            "input_ids": batch.input_ids,
+            "input_ids": batch["input_ids"],
             "attention_mask": attention_mask,
-            "position_ids": batch.position_ids,
+            "position_ids": batch["position_ids"],
         }
         if self.config.model.fused_lm_head_token_chunk_size != "disabled":
-            model_kwargs["labels"] = batch.target_ids
-            model_kwargs["temperature"] = batch.temperatures
+            model_kwargs["labels"] = batch["target_ids"]
+            model_kwargs["temperature"] = batch["temperatures"]
 
         with self._model_forward_context():
             outputs = self.model(**model_kwargs)
         if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
             return outputs["logprobs"].float().contiguous()
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
-        scaled_logits = logits.float() / batch.temperatures.float().unsqueeze(-1)
-        return selective_log_softmax(scaled_logits, batch.target_ids)
+        scaled_logits = logits.float() / batch["temperatures"].float().unsqueeze(-1)
+        return selective_log_softmax(scaled_logits, batch["target_ids"])
 
     def _model_forward_context(self):
         if (
@@ -1031,14 +1030,14 @@ class RLTrainer(BaseTrainer):
             return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         return contextlib.nullcontext()
 
-    def _teacher_logprobs(self, batch: RLBatch) -> Tensor | None:
-        if not batch.has_teacher_logprobs.bool().any():
+    def _teacher_logprobs(self, batch: dict[str, Tensor]) -> Tensor | None:
+        if not batch["has_teacher_logprobs"].bool().any():
             return None
-        if not batch.has_teacher_logprobs.bool().all():
+        if not batch["has_teacher_logprobs"].bool().all():
             raise ValueError(
                 "teacher_logprobs must be provided for either all samples in a batch or none."
             )
-        return batch.teacher_logprobs
+        return batch["teacher_logprobs"]
 
     def _reward_mean(
         self,
@@ -1058,31 +1057,38 @@ class RLTrainer(BaseTrainer):
                 )
         return float(rewards[valid].mean().item())
 
-    def _batch_rollout_metrics(self, batch: RLBatch) -> dict[str, float]:
-        loss_mask = batch.loss_mask.bool()
+    def _batch_rollout_metrics(self, batch: dict[str, Tensor]) -> dict[str, float]:
+        loss_mask = batch["loss_mask"].bool()
         seq_lens = loss_mask.sum(dim=1).float()
-        sample_counts = batch.sample_counts
-        rollout_count = float(sample_counts.sum().item())
+        sample_counts = batch.get("sample_counts")
+        rollout_count = (
+            float(sample_counts.sum().item())
+            if sample_counts is not None
+            else float(batch["input_ids"].shape[0])
+        )
         metrics: dict[str, float] = {
             "rollout/count": rollout_count,
-            "micro_batch/count": float(batch.input_ids.shape[0]),
+            "micro_batch/count": float(batch["input_ids"].shape[0]),
             "tokens/train": float(loss_mask.sum().item()),
-            "tokens/model": float(batch.input_ids.numel()),
+            "tokens/model": float(batch["input_ids"].numel()),
             "seq_len/all/mean": float(seq_lens.mean().item()),
             "seq_len/all/max": float(seq_lens.max().item()),
             "seq_len/all/min": float(seq_lens.min().item()),
         }
 
-        rewards = batch.rewards
+        rewards = batch["rewards"]
         valid_rewards = rewards[~torch.isnan(rewards)]
         if valid_rewards.numel() > 0:
-            valid = ~torch.isnan(rewards)
-            weights = sample_counts[valid].float().clamp_min(0)
-            if weights.sum() > 0:
-                reward_mean = float(
-                    (rewards[valid].float() * weights).sum().item()
-                    / weights.sum().item()
-                )
+            if sample_counts is not None:
+                valid = ~torch.isnan(rewards)
+                weights = sample_counts[valid].float().clamp_min(0)
+                if weights.sum() > 0:
+                    reward_mean = float(
+                        (rewards[valid].float() * weights).sum().item()
+                        / weights.sum().item()
+                    )
+                else:
+                    reward_mean = float(valid_rewards.mean().item())
             else:
                 reward_mean = float(valid_rewards.mean().item())
             metrics.update(
@@ -1093,7 +1099,7 @@ class RLTrainer(BaseTrainer):
                 }
             )
 
-        advantages = batch.advantages[loss_mask]
+        advantages = batch["advantages"][loss_mask]
         if advantages.numel() > 0:
             metrics.update(
                 {
