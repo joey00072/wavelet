@@ -16,7 +16,6 @@ from wavelet.entrypoints.rl_inference import (
 from wavelet.entrypoints.rl_launcher import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
-    _is_main_trainer_process as _launcher_is_main_trainer_process,
     _role_specs,
     _sleep_vllm_http_servers,
     _trainer_device_group,
@@ -25,7 +24,6 @@ from wavelet.entrypoints.rl_launcher import (
 from wavelet.entrypoints.rl_trainer import (
     _StreamingChunkAccumulator,
     _dummy_rollout_row,
-    _is_main_trainer_process as _entrypoint_is_main_trainer_process,
     _should_step_streaming_rollouts,
     _use_streaming_rollout_chunks,
 )
@@ -36,6 +34,7 @@ from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import chunks_per_step, rollout_chunk_examples
+from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.utils.policy_transfer import NCCL_READY_MARKER
 
 
@@ -61,11 +60,9 @@ def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
 
 
 def test_queue_lifecycle_records_are_rank_zero_only() -> None:
-    assert _entrypoint_is_main_trainer_process(_FakeTrainer(is_main=None))
-    assert _entrypoint_is_main_trainer_process(_FakeTrainer(is_main=True))
-    assert not _entrypoint_is_main_trainer_process(_FakeTrainer(is_main=False))
-    assert _launcher_is_main_trainer_process(_FakeTrainer(is_main=True))
-    assert not _launcher_is_main_trainer_process(_FakeTrainer(is_main=False))
+    assert RLTrainer.is_main_process(_FakeTrainer(is_main=None))
+    assert RLTrainer.is_main_process(_FakeTrainer(is_main=True))
+    assert not RLTrainer.is_main_process(_FakeTrainer(is_main=False))
 
 
 def test_sleep_colocate_launcher_defaults_trainer_to_inference_devices() -> None:

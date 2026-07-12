@@ -25,8 +25,6 @@ from wavelet.orchestrator.queue import (
     FileSystemPolicyReceiver,
     FileSystemRolloutReceiver,
     RolloutBatch,
-    record_rollout_claim,
-    record_rollout_consumed,
 )
 from wavelet.orchestrator.schedule import target_steps as _target_steps
 from wavelet.utils.config import load_config
@@ -357,8 +355,7 @@ def _load_and_train_received_batch(
     timings: StepTimes,
 ) -> None:
     trainer_step_before = trainer.step
-    _record_rollout_claim_if_main(
-        trainer,
+    trainer.record_rollout_claim(
         received,
         trainer_step_before=trainer_step_before,
     )
@@ -369,11 +366,9 @@ def _load_and_train_received_batch(
     train_started_at = perf_counter()
     trainer.train_until(trainer.step + 1)
     timings.train_until = perf_counter() - train_started_at
-    _record_rollout_consumed_if_main(
-        trainer,
+    trainer.record_rollout_consumed(
         received,
         trainer_step_before=trainer_step_before,
-        trainer_step_after=trainer.step,
         optimizer_step_completed=True,
     )
 
@@ -400,44 +395,6 @@ def _log_step_times(
         },
         trainer.step,
     )
-
-
-def _record_rollout_claim_if_main(
-    trainer: RLTrainer,
-    batch: RolloutBatch,
-    *,
-    trainer_step_before: int,
-) -> None:
-    if not _is_main_trainer_process(trainer):
-        return
-    record_rollout_claim(
-        batch,
-        trainer_step_before=trainer_step_before,
-        events_dir=trainer.config.output_dir / "events",
-    )
-
-
-def _record_rollout_consumed_if_main(
-    trainer: RLTrainer,
-    batch: RolloutBatch,
-    *,
-    trainer_step_before: int,
-    trainer_step_after: int,
-    optimizer_step_completed: bool,
-) -> None:
-    if not _is_main_trainer_process(trainer):
-        return
-    record_rollout_consumed(
-        batch,
-        trainer_step_before=trainer_step_before,
-        trainer_step_after=trainer_step_after,
-        optimizer_step_completed=optimizer_step_completed,
-        events_dir=trainer.config.output_dir / "events",
-    )
-
-
-def _is_main_trainer_process(trainer: RLTrainer) -> bool:
-    return trainer.world is None or trainer.world.is_main
 
 
 def _role_specs(

@@ -14,8 +14,6 @@ from wavelet.distributed.world import barrier
 from wavelet.orchestrator.queue import (
     FileSystemRolloutReceiver,
     RolloutBatch,
-    record_rollout_claim,
-    record_rollout_consumed,
 )
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
@@ -101,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
                         config.output_dir,
                         config.transport,
                         start_step=trainer.step * _chunks_per_step(config),
-                        events_dir=_receiver_events_dir_if_main(trainer),
+                        events_dir=trainer.rollout_events_dir(),
                     )
                     _run_streaming_rollout_training(
                         config,
@@ -115,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
                     config.output_dir,
                     config.transport,
                     start_step=trainer.step,
-                    events_dir=_receiver_events_dir_if_main(trainer),
+                    events_dir=trainer.rollout_events_dir(),
                 )
                 while trainer.step < target_step:
                     loop_started_at = perf_counter()
@@ -123,8 +121,7 @@ def main(argv: list[str] | None = None) -> int:
                     batch = receiver.wait()
                     wait_seconds = perf_counter() - wait_started_at
                     trainer_step_before = trainer.step
-                    _record_rollout_claim_if_main(
-                        trainer,
+                    trainer.record_rollout_claim(
                         batch,
                         trainer_step_before=trainer_step_before,
                     )
@@ -135,11 +132,9 @@ def main(argv: list[str] | None = None) -> int:
                     trainer.prepare_for_training()
                     trainer.train_until(trainer.step + 1)
                     train_seconds = perf_counter() - train_started_at
-                    _record_rollout_consumed_if_main(
-                        trainer,
+                    trainer.record_rollout_consumed(
                         batch,
                         trainer_step_before=trainer_step_before,
-                        trainer_step_after=trainer.step,
                         optimizer_step_completed=True,
                     )
                     export_started_at = perf_counter()
@@ -201,8 +196,7 @@ def _run_streaming_rollout_training(
         batch = receiver.wait_available()
         wait_seconds = perf_counter() - wait_started_at
         trainer_step_before = trainer.step
-        _record_rollout_claim_if_main(
-            trainer,
+        trainer.record_rollout_claim(
             batch,
             trainer_step_before=trainer_step_before,
         )
@@ -273,11 +267,9 @@ def _run_streaming_rollout_training(
         _validate_distributed_step_sync(trainer, metrics is not None)
         train_seconds = perf_counter() - train_started_at
         for loaded_batch in loaded_batches:
-            _record_rollout_consumed_if_main(
-                trainer,
+            trainer.record_rollout_consumed(
                 loaded_batch,
                 trainer_step_before=trainer_step_before,
-                trainer_step_after=trainer.step,
                 optimizer_step_completed=metrics is not None,
             )
 
@@ -319,50 +311,6 @@ def _should_step_streaming_rollouts(
     chunks_per_step: int,
 ) -> bool:
     return accumulated_chunks >= chunks_per_step
-
-
-def _record_rollout_claim_if_main(
-    trainer: RLTrainer,
-    batch: RolloutBatch,
-    *,
-    trainer_step_before: int,
-) -> None:
-    if not _is_main_trainer_process(trainer):
-        return
-    record_rollout_claim(
-        batch,
-        trainer_step_before=trainer_step_before,
-        events_dir=trainer.config.output_dir / "events",
-    )
-
-
-def _record_rollout_consumed_if_main(
-    trainer: RLTrainer,
-    batch: RolloutBatch,
-    *,
-    trainer_step_before: int,
-    trainer_step_after: int,
-    optimizer_step_completed: bool,
-) -> None:
-    if not _is_main_trainer_process(trainer):
-        return
-    record_rollout_consumed(
-        batch,
-        trainer_step_before=trainer_step_before,
-        trainer_step_after=trainer_step_after,
-        optimizer_step_completed=optimizer_step_completed,
-        events_dir=trainer.config.output_dir / "events",
-    )
-
-
-def _receiver_events_dir_if_main(trainer: RLTrainer) -> Path | None:
-    if not _is_main_trainer_process(trainer):
-        return None
-    return trainer.config.output_dir / "events"
-
-
-def _is_main_trainer_process(trainer: RLTrainer) -> bool:
-    return trainer.world is None or trainer.world.is_main
 
 
 def _log_step_perf_metrics(
