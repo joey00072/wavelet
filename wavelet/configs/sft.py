@@ -229,10 +229,8 @@ class GenerateConfig(BaseModel):
     max_new_tokens: int = Field(default=24, ge=1)
 
 
-class SFTConfig(BaseModel):
+class TrainerConfig(BaseModel):
     model: ModelConfig = ModelConfig()
-    data: DataConfig = DataConfig()
-    val: SFTValConfig | None = None
     optim: OptimizerConfig = OptimizerConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     max_grad_norm: float = Field(default=1.0, ge=0.0)
@@ -241,16 +239,39 @@ class SFTConfig(BaseModel):
     lora: LoRAConfig | None = LoRAConfig()
     log: LogConfig = LogConfig()
     monitor: MonitorConfig = MonitorConfig()
-    generate: GenerateConfig = GenerateConfig()
-    deployment: SingleNodeDeploymentConfig = SingleNodeDeploymentConfig()
     fsdp: FSDPConfig = FSDPConfig()
-    output_dir: Path = Path("outputs/unsloth_math_sft")
+    output_dir: Path = Path("outputs/train")
     clean_output_dir: bool = False
     dry_run: bool = False
     epochs: int = Field(default=1, ge=1)
-    max_steps: int | None = Field(default=None, ge=1)
+    max_steps: int | None = Field(default=None, ge=0)
     seed: int = 0
     activation_offloading: ActivationOffloadingConfig | None = None
+
+    @model_validator(mode="after")
+    def resolve_checkpoint_output_dir(self):
+        if self.ckpt is not None and self.ckpt.output_dir is not None:
+            self.output_dir = self.ckpt.output_dir
+        return self
+
+    @model_validator(mode="after")
+    def validate_checkpoint_config(self):
+        if self.ckpt is None:
+            return self
+        if self.ckpt.resume_step is not None and self.ckpt.resume_step < -1:
+            raise ValueError("ckpt.resume_step must be >= -1")
+        if self.ckpt.mode != "disabled" and self.ckpt.interval is None:
+            raise ValueError("ckpt.interval is required when checkpointing is enabled")
+        return self
+
+
+class SFTConfig(TrainerConfig):
+    data: DataConfig = DataConfig()
+    val: SFTValConfig | None = None
+    generate: GenerateConfig = GenerateConfig()
+    deployment: SingleNodeDeploymentConfig = SingleNodeDeploymentConfig()
+    output_dir: Path = Path("outputs/unsloth_math_sft")
+    max_steps: int | None = Field(default=None, ge=1)
 
     def validate_pack_function(self):
         if self.fsdp.cp > 1 and self.data.pack_function != "cat":
@@ -289,20 +310,4 @@ class SFTConfig(BaseModel):
             and self.val.data.micro_batch_size != 1
         ):
             raise ValueError("Validation micro batch size must be 1 when CP is enabled")
-        return self
-
-    @model_validator(mode="after")
-    def resolve_checkpoint_output_dir(self):
-        if self.ckpt is not None and self.ckpt.output_dir is not None:
-            self.output_dir = self.ckpt.output_dir
-        return self
-
-    @model_validator(mode="after")
-    def validate_checkpoint_config(self):
-        if self.ckpt is None:
-            return self
-        if self.ckpt.resume_step is not None and self.ckpt.resume_step < -1:
-            raise ValueError("ckpt.resume_step must be >= -1")
-        if self.ckpt.mode != "disabled" and self.ckpt.interval is None:
-            raise ValueError("ckpt.interval is required when checkpointing is enabled")
         return self

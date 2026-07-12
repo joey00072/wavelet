@@ -6,16 +6,8 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 from wavelet.configs.sft import (
-    ActivationOffloadingConfig,
-    CheckpointConfig,
-    FSDPConfig,
-    LogConfig,
-    LoRAConfig,
     LossMaskConfig,
-    ModelConfig,
-    MonitorConfig,
-    OptimizerConfig,
-    SchedulerConfig,
+    TrainerConfig,
 )
 
 
@@ -425,19 +417,9 @@ class RLLauncherConfig(BaseModel):
     colocate_memory_wait_margin: float = Field(default=0.05, ge=0.0, le=0.5)
 
 
-class RLConfig(BaseModel):
-    model: ModelConfig = ModelConfig()
+class RLConfig(TrainerConfig):
     data: RLDataConfig = RLDataConfig()
     loss: RLLossConfig = RLLossConfig()
-    optim: OptimizerConfig = OptimizerConfig()
-    scheduler: SchedulerConfig = SchedulerConfig()
-    max_grad_norm: float = Field(default=1.0, ge=0.0)
-    loss_impl: Literal["liger", "torch", "liger_fused"] = "torch"
-    ckpt: CheckpointConfig | None = None
-    lora: LoRAConfig | None = LoRAConfig()
-    log: LogConfig = LogConfig()
-    monitor: MonitorConfig = MonitorConfig()
-    fsdp: FSDPConfig = FSDPConfig()
     orchestrator: RLOrchestratorConfig = RLOrchestratorConfig()
     eval: RLEvalConfig | None = None
     inference: RLInferenceConfig = RLInferenceConfig()
@@ -446,28 +428,7 @@ class RLConfig(BaseModel):
     policy_transfer: RLPolicyTransferConfig = RLPolicyTransferConfig()
     launcher: RLLauncherConfig = RLLauncherConfig()
     output_dir: Path = Path("outputs/unsloth_math_rl")
-    clean_output_dir: bool = False
-    dry_run: bool = False
-    epochs: int = Field(default=1, ge=1)
     max_steps: int | None = Field(default=None, ge=0)
-    seed: int = 0
-    activation_offloading: ActivationOffloadingConfig | None = None
-
-    @model_validator(mode="after")
-    def resolve_checkpoint_output_dir(self) -> "RLConfig":
-        if self.ckpt is not None and self.ckpt.output_dir is not None:
-            self.output_dir = self.ckpt.output_dir
-        return self
-
-    @model_validator(mode="after")
-    def validate_checkpoint_config(self) -> "RLConfig":
-        if self.ckpt is None:
-            return self
-        if self.ckpt.resume_step is not None and self.ckpt.resume_step < -1:
-            raise ValueError("ckpt.resume_step must be >= -1")
-        if self.ckpt.mode != "disabled" and self.ckpt.interval is None:
-            raise ValueError("ckpt.interval is required when checkpointing is enabled")
-        return self
 
     @model_validator(mode="after")
     def validate_rollout_modes(self) -> "RLConfig":
