@@ -123,7 +123,10 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     grouped = _group_by_example(rows)
     seq_lens = [_seq_len(row) for row in rows]
     decode_lens = [_decode_len(row) for row in rows]
-    prefill_lens = [max(seq_len - decode_len, 0) for seq_len, decode_len in zip(seq_lens, decode_lens, strict=True)]
+    prefill_lens = [
+        max(seq_len - decode_len, 0)
+        for seq_len, decode_len in zip(seq_lens, decode_lens, strict=True)
+    ]
     rewards = [_float_or_none(row.get("reward")) for row in rows]
     advantages = [_float_or_none(row.get("advantage")) for row in rows]
     is_truncated = [_bool_metric(_metadata(row).get("is_truncated")) for row in rows]
@@ -137,9 +140,15 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         "progress/decode_tokens": float(sum(decode_lens)),
         "progress/samples": float(len(rows)),
         "progress/problems": float(len(grouped)),
-        "progress/ckpt_step": float(inputs.policy_step if inputs.policy_step is not None else inputs.step),
-        "progress/queue_step": float(inputs.queue_step if inputs.queue_step is not None else inputs.step),
-        "progress/optimizer_step": float(inputs.optimizer_step if inputs.optimizer_step is not None else inputs.step),
+        "progress/ckpt_step": float(
+            inputs.policy_step if inputs.policy_step is not None else inputs.step
+        ),
+        "progress/queue_step": float(
+            inputs.queue_step if inputs.queue_step is not None else inputs.step
+        ),
+        "progress/optimizer_step": float(
+            inputs.optimizer_step if inputs.optimizer_step is not None else inputs.step
+        ),
         "filters/all/is_filtered": float(mean(_filtered_flags(rows))) if rows else 0.0,
         "step": float(inputs.step),
     }
@@ -151,57 +160,119 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         metrics["progress/chunk_index"] = float(inputs.chunk_index)
 
     metrics.update(_series_stats("seq_len/all", _grouped_means(grouped, _seq_len)))
-    metrics.update(_series_stats("prefill_len/all", _grouped_means_from_values(grouped, prefill_lens)))
-    metrics.update(_series_stats("decode_len/all", _grouped_means_from_values(grouped, decode_lens)))
-    metrics.update(_series_stats("is_truncated/all", _grouped_means_from_values(grouped, is_truncated), include_min=False))
-    metrics.update(_series_stats("samples_per_rollout/all", _grouped_means_from_values(grouped, sample_counts)))
-    metrics.update(_series_stats("num_turns/all", _grouped_means_from_values(grouped, turn_counts)))
+    metrics.update(
+        _series_stats(
+            "prefill_len/all", _grouped_means_from_values(grouped, prefill_lens)
+        )
+    )
+    metrics.update(
+        _series_stats(
+            "decode_len/all", _grouped_means_from_values(grouped, decode_lens)
+        )
+    )
+    metrics.update(
+        _series_stats(
+            "is_truncated/all",
+            _grouped_means_from_values(grouped, is_truncated),
+            include_min=False,
+        )
+    )
+    metrics.update(
+        _series_stats(
+            "samples_per_rollout/all",
+            _grouped_means_from_values(grouped, sample_counts),
+        )
+    )
+    metrics.update(
+        _series_stats("num_turns/all", _grouped_means_from_values(grouped, turn_counts))
+    )
 
     reward_by_example = _grouped_means_from_values(grouped, rewards)
     metrics.update(_series_stats("reward/all", reward_by_example))
     advantage_values = [value for value in advantages if value is not None]
     metrics.update(_series_stats("advantage/all", advantage_values))
 
-    solve_none, solve_all, effective = _solve_rates(grouped, inputs.rollouts_per_example)
+    solve_none, solve_all, effective = _solve_rates(
+        grouped, inputs.rollouts_per_example
+    )
     metrics["solve_none/all"] = solve_none
     metrics["solve_all/all"] = solve_all
     metrics["effective_batch_size/all"] = effective
 
-    stop_conditions = [_metadata(row).get("stop_condition") for row in rows]
-    generation_truncated = [
-        truncated and stop_condition != "prompt_too_long"
-        for truncated, stop_condition in zip(is_truncated, stop_conditions, strict=True)
-    ]
-    metrics["stop_condition/all/generation_truncated"] = float(mean(generation_truncated)) if generation_truncated else 0.0
-    for condition, rate in _category_rates(value for value in stop_conditions if value is not None).items():
-        metrics[f"stop_condition/all/{condition}"] = rate
-
-    for env_name, env_rows in _group_by_env(rows).items():
-        env_grouped = _group_by_example(env_rows)
-        metrics[f"batch/{env_name}"] = len(env_rows) / max(len(rows), 1)
-        metrics.update(_fate_metrics(f"fate/{env_name}", _fate_counts(env_rows)))
-        metrics.update(_series_stats(f"seq_len/{env_name}", _grouped_means(env_grouped, _seq_len)))
-        metrics.update(_series_stats(f"decode_len/{env_name}", _grouped_means(env_grouped, _decode_len)))
-        metrics.update(_series_stats(f"reward/{env_name}", _grouped_means(env_grouped, lambda row: _float_or_none(row.get("reward")))))
-        env_solve_none, env_solve_all, env_effective = _solve_rates(env_grouped, inputs.rollouts_per_example)
-        metrics[f"solve_none/{env_name}"] = env_solve_none
-        metrics[f"solve_all/{env_name}"] = env_solve_all
-        metrics[f"effective_batch_size/{env_name}"] = env_effective
-        env_truncated = [_bool_metric(_metadata(row).get("is_truncated")) for row in env_rows]
-        env_stop = [_metadata(row).get("stop_condition") for row in env_rows]
-        metrics[f"stop_condition/{env_name}/generation_truncated"] = (
-            float(mean([flag and sc != "prompt_too_long" for flag, sc in zip(env_truncated, env_stop, strict=True)]))
-            if env_rows
-            else 0.0
-        )
-        for condition, rate in _category_rates(value for value in env_stop if value is not None).items():
-            metrics[f"stop_condition/{env_name}/{condition}"] = rate
+    _add_stop_condition_metrics(metrics, rows, prefix="stop_condition/all")
+    _add_environment_metrics(
+        metrics,
+        rows,
+        rollouts_per_example=inputs.rollouts_per_example,
+    )
 
     if inputs.timings:
         for key, value in inputs.timings.items():
             metrics[f"time/{key}"] = float(value)
 
     return metrics
+
+
+def _add_environment_metrics(
+    metrics: dict[str, float],
+    rows: list[dict[str, Any]],
+    *,
+    rollouts_per_example: int,
+) -> None:
+    for env_name, env_rows in _group_by_env(rows).items():
+        grouped = _group_by_example(env_rows)
+        metrics[f"batch/{env_name}"] = len(env_rows) / max(len(rows), 1)
+        metrics.update(_fate_metrics(f"fate/{env_name}", _fate_counts(env_rows)))
+        metrics.update(
+            _series_stats(f"seq_len/{env_name}", _grouped_means(grouped, _seq_len))
+        )
+        metrics.update(
+            _series_stats(
+                f"decode_len/{env_name}",
+                _grouped_means(grouped, _decode_len),
+            )
+        )
+        metrics.update(
+            _series_stats(
+                f"reward/{env_name}",
+                _grouped_means(
+                    grouped,
+                    lambda row: _float_or_none(row.get("reward")),
+                ),
+            )
+        )
+        solve_none, solve_all, effective = _solve_rates(
+            grouped,
+            rollouts_per_example,
+        )
+        metrics[f"solve_none/{env_name}"] = solve_none
+        metrics[f"solve_all/{env_name}"] = solve_all
+        metrics[f"effective_batch_size/{env_name}"] = effective
+        _add_stop_condition_metrics(
+            metrics,
+            env_rows,
+            prefix=f"stop_condition/{env_name}",
+        )
+
+
+def _add_stop_condition_metrics(
+    metrics: dict[str, float],
+    rows: list[dict[str, Any]],
+    *,
+    prefix: str,
+) -> None:
+    stop_conditions = [_metadata(row).get("stop_condition") for row in rows]
+    truncated = [_bool_metric(_metadata(row).get("is_truncated")) for row in rows]
+    generation_truncated = [
+        flag and stop_condition != "prompt_too_long"
+        for flag, stop_condition in zip(truncated, stop_conditions, strict=True)
+    ]
+    metrics[f"{prefix}/generation_truncated"] = (
+        float(mean(generation_truncated)) if generation_truncated else 0.0
+    )
+    rates = _category_rates(value for value in stop_conditions if value is not None)
+    for condition, rate in rates.items():
+        metrics[f"{prefix}/{condition}"] = rate
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -282,11 +353,15 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
 
 
-def _group_by_example(rows: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+def _group_by_example(
+    rows: list[dict[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         env_name = str(row.get("env_name") or row.get("source") or "all")
-        example_id = str(row.get("example_id") or _metadata(row).get("group_key") or len(grouped))
+        example_id = str(
+            row.get("example_id") or _metadata(row).get("group_key") or len(grouped)
+        )
         grouped[(env_name, example_id)].append(row)
     return dict(grouped)
 
@@ -355,9 +430,13 @@ def _solve_rates(
         return 0.0, 0.0, 0.0
     reward_sums = []
     for rows in grouped.values():
-        reward_sums.append(sum(_float_or_none(row.get("reward")) or 0.0 for row in rows))
+        reward_sums.append(
+            sum(_float_or_none(row.get("reward")) or 0.0 for row in rows)
+        )
     solve_none = sum(value == 0.0 for value in reward_sums) / len(reward_sums)
-    solve_all = sum(value >= rollouts_per_example for value in reward_sums) / len(reward_sums)
+    solve_all = sum(value >= rollouts_per_example for value in reward_sums) / len(
+        reward_sums
+    )
     return solve_none, solve_all, 1.0 - solve_none - solve_all
 
 
@@ -414,7 +493,9 @@ def _turn_count(row: dict[str, Any]) -> int:
 
 
 def _filtered_flags(rows: list[dict[str, Any]]) -> list[float]:
-    return [float(bool(_metadata(row).get("_wavelet_filtered_rollout"))) for row in rows]
+    return [
+        float(bool(_metadata(row).get("_wavelet_filtered_rollout"))) for row in rows
+    ]
 
 
 def _fate_counts(rows: list[dict[str, Any]]) -> dict[str, int]:

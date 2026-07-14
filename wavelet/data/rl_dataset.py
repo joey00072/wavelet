@@ -3,102 +3,34 @@ from __future__ import annotations
 import random
 from collections import defaultdict
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any
 
-import torch
-from torch import Tensor
 from torch.utils.data import IterableDataset, get_worker_info
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
 from wavelet.configs.rl_config import RLDataConfig
-from wavelet.data.collation import IGNORE_INDEX
-from wavelet.data.loading import Example
+from wavelet.data.loading import Example, load_data_payloads, normalize_record
+from wavelet.data.rl_collation import collate_rl_batch as collate_rl_batch
+from wavelet.data.rl_packing import (
+    pack_samples,
+    pad_bins_for_distribution,
+    trainable_sequence_count,
+    trainable_token_count,
+)
+from wavelet.data.rl_types import (
+    RLBatch as RLBatch,
+    RLExample as RLExample,
+    RLSample as RLSample,
+    rl_example_from_payload as rl_example_from_payload,
+    rl_example_to_payload as rl_example_to_payload,
+    rl_examples_from_payload as rl_examples_from_payload,
+    rl_examples_to_payload as rl_examples_to_payload,
+)
 from wavelet.data.tokenization import build_sample
-
-
-class RLSample(TypedDict):
-    input_ids: list[int]
-    position_ids: list[int]
-    target_ids: list[int]
-    loss_mask: list[bool]
-    advantages: list[float]
-    inference_logprobs: NotRequired[list[float]]
-    teacher_logprobs: NotRequired[list[float]]
-    temperatures: list[float]
-    reward: float | None
-    sample_count: NotRequired[int]
-
-
-class RLBatch(TypedDict):
-    input_ids: Tensor
-    attention_mask: Tensor
-    position_ids: Tensor
-    target_ids: Tensor
-    labels: Tensor
-    loss_mask: Tensor
-    advantages: Tensor
-    rewards: Tensor
-    has_inference_logprobs: Tensor
-    inference_logprobs: Tensor
-    has_teacher_logprobs: Tensor
-    teacher_logprobs: Tensor
-    temperatures: Tensor
-    sample_counts: Tensor
-
-
-@dataclass
-class RLExample:
-    prompt: list[dict[str, str]]
-    completion: list[dict[str, str]]
-    advantage: float | list[float] | None
-    reward: float | None
-    input_ids: list[int] | None = None
-    target_ids: list[int] | None = None
-    loss_mask: list[bool] | None = None
-    target_completion: list[dict[str, str]] | None = None
-    inference_logprobs: list[float] | None = None
-    teacher_logprobs: list[float] | None = None
-    temperatures: float | list[float] | None = None
-    tools: list[dict[str, Any]] | None = None
-    chat_template_kwargs: dict[str, Any] | None = None
-    metadata: dict[str, Any] | None = None
-    source: str = "dataset"
-
-
-def rl_example_to_payload(record: RLExample) -> dict[str, Any]:
-    return asdict(record)
-
-
-def rl_example_from_payload(payload: dict[str, Any]) -> RLExample:
-    return RLExample(
-        prompt=payload["prompt"],
-        completion=payload["completion"],
-        advantage=payload.get("advantage"),
-        reward=payload.get("reward"),
-        input_ids=payload.get("input_ids"),
-        target_ids=payload.get("target_ids"),
-        loss_mask=payload.get("loss_mask"),
-        target_completion=payload.get("target_completion"),
-        inference_logprobs=payload.get("inference_logprobs"),
-        teacher_logprobs=payload.get("teacher_logprobs"),
-        temperatures=payload.get("temperatures"),
-        tools=payload.get("tools"),
-        chat_template_kwargs=payload.get("chat_template_kwargs"),
-        metadata=payload.get("metadata"),
-        source=payload.get("source") or "dataset",
-    )
-
-
-def rl_examples_to_payload(records: list[RLExample]) -> list[dict[str, Any]]:
-    return [rl_example_to_payload(record) for record in records]
-
-
-def rl_examples_from_payload(payloads: list[dict[str, Any]]) -> list[RLExample]:
-    return [rl_example_from_payload(payload) for payload in payloads]
 
 
 def count_nonempty_jsonl_rows(
@@ -182,7 +114,11 @@ def _trim_loss_mask_to_sequence(
 
 
 def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
-    if record.input_ids is None or record.target_ids is None or record.loss_mask is None:
+    if (
+        record.input_ids is None
+        or record.target_ids is None
+        or record.loss_mask is None
+    ):
         return None
 
     input_ids = [int(token_id) for token_id in record.input_ids[:seq_len]]
@@ -236,7 +172,9 @@ def prepare_rl_sample(
 
     base_sample["loss_mask"] = _trim_loss_mask_to_sequence(
         base_sample["loss_mask"],
-        record.inference_logprobs if isinstance(record.inference_logprobs, list) else None,
+        record.inference_logprobs
+        if isinstance(record.inference_logprobs, list)
+        else None,
     )
     num_trainable_tokens = sum(base_sample["loss_mask"])
     advantages = _coerce_advantages(
@@ -284,9 +222,7 @@ def prepare_rl_sample(
 
 
 def _normalize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLExample:
-    from wavelet.data import loading as loading_mod
-
-    base: Example = loading_mod._normalize_record(payload, config)  # noqa: SLF001
+    base: Example = normalize_record(payload, config)
     advantage = payload.get(config.advantage_column)
     reward_value = payload.get(config.reward_column)
     reward = None if reward_value is None else float(reward_value)
@@ -323,21 +259,7 @@ def _normalize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLExa
 
 
 def load_rl_records(config: RLDataConfig) -> list[RLExample]:
-    from wavelet.data import loading as loading_mod
-
-    if config.source == "hf":
-        payload_groups = loading_mod._load_hf_payload_groups(config)  # noqa: SLF001
-    elif config.source == "fake":
-        payload_groups = loading_mod._load_fake_payload_groups(config)  # noqa: SLF001
-    else:
-        payload_groups = loading_mod._load_local_payload_groups(config)  # noqa: SLF001
-
-    payloads = loading_mod._mix_payload_groups(  # noqa: SLF001
-        payload_groups,
-        probabilities=config.probabilities,
-        stopping_strategy=config.stopping_strategy,
-        seed=config.seed,
-    )
+    payloads = load_data_payloads(config)
     rows = [_normalize_rl_record(payload, config) for payload in payloads]
     if config.max_examples is not None:
         rows = rows[: config.max_examples]
@@ -420,9 +342,9 @@ class RLDataset(IterableDataset[RLSample]):
             if sample is None:
                 continue
             if normalization == "sequence":
-                total += _sample_trainable_sequence_count(sample)
+                total += trainable_sequence_count(sample)
             else:
-                total += _sample_trainable_count(sample)
+                total += trainable_token_count(sample)
             collected += 1
         return max(total, 1)
 
@@ -473,142 +395,6 @@ class RLDataset(IterableDataset[RLSample]):
             self.data_rank * worker_info.num_workers + worker_info.id,
             self.data_world_size * worker_info.num_workers,
         )
-
-
-def _sample_trainable_count(sample: RLSample) -> int:
-    return sum(bool(value) for value in sample["loss_mask"])
-
-
-def _sample_trainable_sequence_count(sample: RLSample) -> int:
-    loss_mask = sample["loss_mask"]
-    if not any(bool(value) for value in loss_mask):
-        return 0
-    starts = [
-        index
-        for index, position_id in enumerate(sample["position_ids"][: len(loss_mask)])
-        if position_id == 0
-    ]
-    if not starts:
-        return 1
-    if starts[0] != 0:
-        starts.insert(0, 0)
-    ends = [*starts[1:], len(loss_mask)]
-    return sum(
-        any(bool(value) for value in loss_mask[start:end])
-        for start, end in zip(starts, ends, strict=True)
-    )
-
-
-def _packed_sample(samples: list[RLSample], *, pad_to_multiple_of: int) -> RLSample:
-    input_ids: list[int] = []
-    target_ids: list[int] = []
-    position_ids: list[int] = []
-    loss_mask: list[bool] = []
-    advantages: list[float] = []
-    inference_logprobs: list[float] = []
-    teacher_logprobs: list[float] = []
-    temperatures: list[float] = []
-    rewards = [
-        float(sample["reward"])
-        for sample in samples
-        if sample["reward"] is not None
-    ]
-    sample_count = sum(int(sample.get("sample_count", 1)) for sample in samples)
-    has_inference = all("inference_logprobs" in sample for sample in samples)
-    has_teacher = all("teacher_logprobs" in sample for sample in samples)
-
-    for sample in samples:
-        input_ids.extend(sample["input_ids"])
-        target_ids.extend(sample["target_ids"])
-        position_ids.extend(sample["position_ids"])
-        loss_mask.extend(sample["loss_mask"])
-        advantages.extend(sample["advantages"])
-        temperatures.extend(sample["temperatures"])
-        if has_inference:
-            inference_logprobs.extend(sample["inference_logprobs"])
-        if has_teacher:
-            teacher_logprobs.extend(sample["teacher_logprobs"])
-
-    if pad_to_multiple_of > 1:
-        pad_len = (-len(input_ids)) % pad_to_multiple_of
-        if pad_len:
-            input_ids.extend([1] * pad_len)
-            target_ids.extend([0] * pad_len)
-            position_ids.extend(range(pad_len))
-            loss_mask.extend([False] * pad_len)
-
-    packed: RLSample = {
-        "input_ids": input_ids,
-        "position_ids": position_ids,
-        "target_ids": target_ids,
-        "loss_mask": loss_mask,
-        "advantages": advantages,
-        "temperatures": temperatures,
-        "reward": sum(rewards) / len(rewards) if rewards else None,
-        "sample_count": sample_count,
-    }
-    if has_inference:
-        packed["inference_logprobs"] = inference_logprobs
-    if has_teacher:
-        packed["teacher_logprobs"] = teacher_logprobs
-    return packed
-
-
-def _dummy_packed_sample(source: RLSample) -> RLSample:
-    """Create a zero-loss micro-batch used to equalize distributed pack counts."""
-    dummy: RLSample = {
-        "input_ids": list(source["input_ids"]),
-        "position_ids": list(source["position_ids"]),
-        "target_ids": list(source["target_ids"]),
-        "loss_mask": [False] * len(source["loss_mask"]),
-        "advantages": [],
-        "temperatures": [],
-        "reward": None,
-        "sample_count": 0,
-    }
-    if "inference_logprobs" in source:
-        dummy["inference_logprobs"] = []
-    if "teacher_logprobs" in source:
-        dummy["teacher_logprobs"] = []
-    return dummy
-
-
-def _pad_packed_bins_for_distribution(
-    bins: list[RLSample],
-    *,
-    data_world_size: int,
-) -> list[RLSample]:
-    if data_world_size <= 1 or not bins:
-        return bins
-    pad_count = (-len(bins)) % data_world_size
-    if pad_count == 0:
-        return bins
-    return [*bins, *(_dummy_packed_sample(bins[0]) for _ in range(pad_count))]
-
-
-def _pack_rl_samples(
-    samples: list[RLSample],
-    *,
-    seq_len: int,
-    pad_to_multiple_of: int,
-) -> list[RLSample]:
-    indexed = sorted(enumerate(samples), key=lambda item: -len(item[1]["input_ids"]))
-    bins: list[list[RLSample]] = []
-    bin_lengths: list[int] = []
-    for _, sample in indexed:
-        sample_len = len(sample["input_ids"])
-        for index, current_len in enumerate(bin_lengths):
-            if current_len + sample_len <= seq_len:
-                bins[index].append(sample)
-                bin_lengths[index] += sample_len
-                break
-        else:
-            bins.append([sample])
-            bin_lengths.append(sample_len)
-    return [
-        _packed_sample(items, pad_to_multiple_of=pad_to_multiple_of)
-        for items in bins
-    ]
 
 
 @dataclass
@@ -670,9 +456,9 @@ class PackedRLDataset(IterableDataset[RLSample]):
         normalization: str = "token",
     ) -> float:
         counter = (
-            _sample_trainable_sequence_count
+            trainable_sequence_count
             if normalization == "sequence"
-            else _sample_trainable_count
+            else trainable_token_count
         )
         total = sum(counter(sample) for sample in self._bins_for_epoch(self.epoch))
         return max(float(total), 1.0)
@@ -724,13 +510,13 @@ class PackedRLDataset(IterableDataset[RLSample]):
             self.num_tokens[source] += len(sample["input_ids"])
             samples.append(sample)
 
-        packed = _pack_rl_samples(
+        packed = pack_samples(
             samples,
             seq_len=self.seq_len,
             pad_to_multiple_of=self.data_config.pad_to_multiple_of,
         )
         _, data_world_size = self._effective_data_partition()
-        packed = _pad_packed_bins_for_distribution(
+        packed = pad_bins_for_distribution(
             packed,
             data_world_size=data_world_size,
         )
@@ -804,153 +590,6 @@ class FakeRLDataset(IterableDataset[RLSample]):
             }
 
 
-def _expand_trainable_values(
-    values: list[float] | None,
-    *,
-    mask: list[bool],
-    default: float,
-) -> list[float]:
-    expanded: list[float] = []
-    trainable_index = 0
-    for trainable in mask:
-        if trainable:
-            if values is None:
-                expanded.append(default)
-            else:
-                expanded.append(float(values[trainable_index]))
-            trainable_index += 1
-        else:
-            expanded.append(default)
-    return expanded
-
-
-def collate_rl_batch(
-    batch: list[RLSample],
-    *,
-    pad_token_id: int,
-) -> RLBatch:
-    max_len = max(len(item["input_ids"]) for item in batch)
-
-    input_ids_out = []
-    attention_mask_out = []
-    position_ids_out = []
-    target_ids_out = []
-    labels_out = []
-    loss_mask_out = []
-    advantages_out = []
-    rewards_out = []
-    has_inference_out = []
-    inference_logprobs_out = []
-    has_teacher_out = []
-    teacher_logprobs_out = []
-    temperatures_out = []
-    sample_counts_out = []
-
-    for item in batch:
-        seq_len = len(item["input_ids"])
-        pad_len = max_len - seq_len
-        mask = list(item["loss_mask"])
-        num_trainable = sum(mask)
-        if len(item["advantages"]) != num_trainable:
-            raise ValueError(
-                "advantages must align with the number of trainable tokens in the sample"
-            )
-        if len(item["temperatures"]) != num_trainable:
-            raise ValueError(
-                "temperatures must align with the number of trainable tokens in the sample"
-            )
-
-        inference_logprobs = item.get("inference_logprobs")
-        if inference_logprobs is not None and len(inference_logprobs) != num_trainable:
-            raise ValueError(
-                "inference_logprobs must align with the number of trainable tokens in the sample"
-            )
-
-        teacher_logprobs = item.get("teacher_logprobs")
-        if teacher_logprobs is not None and len(teacher_logprobs) != num_trainable:
-            raise ValueError(
-                "teacher_logprobs must align with the number of trainable tokens in the sample"
-            )
-
-        expanded_advantages = _expand_trainable_values(
-            item["advantages"], mask=mask, default=0.0
-        )
-        expanded_inference = _expand_trainable_values(
-            inference_logprobs, mask=mask, default=0.0
-        )
-        expanded_teacher = _expand_trainable_values(
-            teacher_logprobs, mask=mask, default=0.0
-        )
-        expanded_temperatures = _expand_trainable_values(
-            item["temperatures"], mask=mask, default=1.0
-        )
-
-        input_ids_out.append(
-            torch.tensor(item["input_ids"] + [pad_token_id] * pad_len, dtype=torch.long)
-        )
-        attention_mask_out.append(
-            torch.tensor([1] * seq_len + [0] * pad_len, dtype=torch.long)
-        )
-        position_ids_out.append(
-            torch.tensor(
-                item["position_ids"] + list(range(seq_len, max_len)), dtype=torch.long
-            )
-        )
-        target_ids_out.append(
-            torch.tensor(item["target_ids"] + [0] * pad_len, dtype=torch.long)
-        )
-        labels = [
-            target_id if trainable else IGNORE_INDEX
-            for target_id, trainable in zip(item["target_ids"], mask, strict=True)
-        ] + [IGNORE_INDEX] * pad_len
-        labels_out.append(torch.tensor(labels, dtype=torch.long))
-        loss_mask_out.append(torch.tensor(mask + [False] * pad_len, dtype=torch.bool))
-        advantages_out.append(
-            torch.tensor(expanded_advantages + [0.0] * pad_len, dtype=torch.float32)
-        )
-        rewards_out.append(
-            torch.tensor(
-                float("nan") if item["reward"] is None else float(item["reward"]),
-                dtype=torch.float32,
-            )
-        )
-        sample_counts_out.append(
-            torch.tensor(int(item.get("sample_count", 1)), dtype=torch.long)
-        )
-        has_inference_out.append(
-            torch.tensor(inference_logprobs is not None, dtype=torch.bool)
-        )
-        inference_logprobs_out.append(
-            torch.tensor(expanded_inference + [0.0] * pad_len, dtype=torch.float32)
-        )
-        has_teacher_out.append(
-            torch.tensor(teacher_logprobs is not None, dtype=torch.bool)
-        )
-        teacher_logprobs_out.append(
-            torch.tensor(expanded_teacher + [0.0] * pad_len, dtype=torch.float32)
-        )
-        temperatures_out.append(
-            torch.tensor(expanded_temperatures + [1.0] * pad_len, dtype=torch.float32)
-        )
-
-    return {
-        "input_ids": torch.stack(input_ids_out),
-        "attention_mask": torch.stack(attention_mask_out),
-        "position_ids": torch.stack(position_ids_out),
-        "target_ids": torch.stack(target_ids_out),
-        "labels": torch.stack(labels_out),
-        "loss_mask": torch.stack(loss_mask_out),
-        "advantages": torch.stack(advantages_out),
-        "rewards": torch.stack(rewards_out),
-        "has_inference_logprobs": torch.stack(has_inference_out),
-        "inference_logprobs": torch.stack(inference_logprobs_out),
-        "has_teacher_logprobs": torch.stack(has_teacher_out),
-        "teacher_logprobs": torch.stack(teacher_logprobs_out),
-        "temperatures": torch.stack(temperatures_out),
-        "sample_counts": torch.stack(sample_counts_out),
-    }
-
-
 def setup_rl_dataset(
     tokenizer: PreTrainedTokenizerBase,
     config: RLDataConfig,
@@ -968,8 +607,7 @@ def setup_rl_dataset(
         )
     records = load_rl_records(config)
     has_rl_targets = all(
-        record.advantage is not None or record.reward is not None
-        for record in records
+        record.advantage is not None or record.reward is not None for record in records
     )
     if config.pack_sequences and has_rl_targets:
         return PackedRLDataset(

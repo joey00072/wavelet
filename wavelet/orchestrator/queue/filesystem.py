@@ -50,7 +50,7 @@ def get_policy_step_dir(policy_dir: Path, step: int) -> Path:
     return policy_dir / f"{STEP_DIR_PREFIX}{step:06d}"
 
 
-def _parse_step(path: Path) -> int | None:
+def parse_step(path: Path) -> int | None:
     if not path.is_dir() or not path.name.startswith(STEP_DIR_PREFIX):
         return None
     try:
@@ -130,7 +130,9 @@ class FileSystemRolloutSender:
             try:
                 write_manifest(step_dir, manifest)
             except Exception as exc:  # pragma: no cover - fail-open observability
-                logger.warning("Failed to write rollout manifest for step %s: %s", step, exc)
+                logger.warning(
+                    "Failed to write rollout manifest for step %s: %s", step, exc
+                )
             append_event_best_effort(
                 events_dir or (self.output_dir / "events"),
                 QueueEvent(
@@ -236,7 +238,7 @@ class FileSystemRolloutReceiver:
         if not self.queue_dir.exists():
             return steps
         for candidate in self.queue_dir.iterdir():
-            step = _parse_step(candidate)
+            step = parse_step(candidate)
             if step is None:
                 continue
             if not self._is_stable_step_dir(candidate):
@@ -378,7 +380,7 @@ class FileSystemPolicyReceiver:
         if not self.policy_dir.exists():
             return steps
         for candidate in self.policy_dir.iterdir():
-            step = _parse_step(candidate)
+            step = parse_step(candidate)
             if step is None:
                 continue
             if not self._is_stable_policy_dir(candidate):

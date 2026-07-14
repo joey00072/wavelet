@@ -103,40 +103,8 @@ class WaveletCheckpointFunction(torch.autograd.Function):
                 "Use .backward() instead."
             )
 
-        # Restore saved tensors, moving CPU copies back to GPU.
-        inputs: list = list(ctx.inputs)
-        saved = list(ctx.saved_tensors)
-        for k, (idx, (was_offloaded, device, _)) in enumerate(
-            zip(ctx.tensor_indices, ctx.offload_info)
-        ):
-            if was_offloaded:
-                saved[k] = saved[k].to(device, non_blocking=False)
-            inputs[idx] = saved[k]
-
-        # Rebuild requires_grad info from offload_info.
-        idx_to_rg: dict[int, bool] = {
-            idx: rg for idx, (_, __, rg) in zip(ctx.tensor_indices, ctx.offload_info)
-        }
-
-        # Restore RNG state.
-        rng_devices: list[int] = []
-        if ctx.preserve_rng_state and ctx.had_cuda_in_fwd:
-            rng_devices = ctx.fwd_gpu_devices
-
-        with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
-            if ctx.preserve_rng_state:
-                torch.set_rng_state(ctx.fwd_cpu_state)
-                if ctx.had_cuda_in_fwd:
-                    _set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
-
-            detached = tuple(
-                inp.detach().requires_grad_(idx_to_rg.get(i, False))
-                if torch.is_tensor(inp)
-                else inp
-                for i, inp in enumerate(inputs)
-            )
-            with torch.enable_grad():
-                outputs = ctx.run_function(*detached)
+        inputs = _restore_checkpoint_inputs(ctx)
+        detached, outputs = _recompute_checkpoint_outputs(ctx, inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -159,6 +127,44 @@ class WaveletCheckpointFunction(torch.autograd.Function):
             inp.grad if torch.is_tensor(inp) and inp.requires_grad else None
             for inp in detached
         )
+
+
+def _restore_checkpoint_inputs(ctx) -> list:
+    """Restore saved activations to their original devices."""
+    inputs = list(ctx.inputs)
+    saved = list(ctx.saved_tensors)
+    for saved_index, (input_index, offload_info) in enumerate(
+        zip(ctx.tensor_indices, ctx.offload_info)
+    ):
+        was_offloaded, device, _ = offload_info
+        if was_offloaded:
+            saved[saved_index] = saved[saved_index].to(device, non_blocking=False)
+        inputs[input_index] = saved[saved_index]
+    return inputs
+
+
+def _recompute_checkpoint_outputs(ctx, inputs: list) -> tuple[tuple, object]:
+    requires_grad = {
+        index: value
+        for index, (_, _, value) in zip(ctx.tensor_indices, ctx.offload_info)
+    }
+    rng_devices = (
+        ctx.fwd_gpu_devices if ctx.preserve_rng_state and ctx.had_cuda_in_fwd else []
+    )
+    with torch.random.fork_rng(devices=rng_devices, enabled=ctx.preserve_rng_state):
+        if ctx.preserve_rng_state:
+            torch.set_rng_state(ctx.fwd_cpu_state)
+            if ctx.had_cuda_in_fwd:
+                _set_device_states(ctx.fwd_gpu_devices, ctx.fwd_gpu_states)
+        detached = tuple(
+            value.detach().requires_grad_(requires_grad.get(index, False))
+            if torch.is_tensor(value)
+            else value
+            for index, value in enumerate(inputs)
+        )
+        with torch.enable_grad():
+            outputs = ctx.run_function(*detached)
+    return detached, outputs
 
 
 # ── patch / unpatch ───────────────────────────────────────────────────────────

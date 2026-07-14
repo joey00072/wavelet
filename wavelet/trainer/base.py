@@ -32,6 +32,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _lora_dtype(dtype: str) -> torch.dtype | None:
+    if dtype == "bfloat16":
+        return torch.bfloat16
+    if dtype == "float16":
+        return torch.float16
+    return None
+
+
 class BaseTrainer:
     def __init__(self, config: SFTConfig | "RLConfig") -> None:
         self.config = config
@@ -287,28 +295,13 @@ class BaseTrainer:
             apply_lora,
             prepare_hf_tp_lora_for_training,
         )
-        from wavelet.trainer.model import (
-            apply_liger_kernel,
-            maybe_wrap_ddp,
-            maybe_wrap_fsdp,
-            setup_model,
-        )
+        from wavelet.trainer.model import apply_liger_kernel, setup_model
 
         # Apply Liger kernel patches before from_pretrained so the class methods
         # are in place when model weights are loaded.
         apply_liger_kernel(self.config.loss_impl, self.config.model.name)
         fsdp_config = getattr(self.config, "fsdp", None)
-        if self.config.model.load_in_4bit and fsdp_config is not None:
-            if fsdp_config.enabled:
-                raise NotImplementedError(
-                    "QLoRA training uses replicated DDP in Wavelet. Disable FSDP "
-                    "for model.load_in_4bit=true."
-                )
-        if self.config.model.load_in_4bit and self._uses_sleep_colocation():
-            raise NotImplementedError(
-                "QLoRA does not support colocate_sleep yet because bitsandbytes "
-                "4-bit modules cannot be moved between CPU and GPU."
-            )
+        self._validate_model_execution_mode(fsdp_config)
         model = setup_model(
             self.config.model,
             max_seq_length=self.config.data.seq_len,
@@ -324,12 +317,7 @@ class BaseTrainer:
         # attention doesn't have to upcast fp32 LoRA outputs at every layer.
         # "auto" → align adapters to whatever dtype the base weights loaded as.
         cfg_dtype = self.config.model.torch_dtype
-        if cfg_dtype == "bfloat16":
-            lora_dtype: torch.dtype | None = torch.bfloat16
-        elif cfg_dtype == "float16":
-            lora_dtype = torch.float16
-        else:
-            lora_dtype = None  # "auto"/"float32": use match_base_dtype instead
+        lora_dtype = _lora_dtype(cfg_dtype)
         model = apply_lora(
             model,
             self.config.lora,
@@ -346,31 +334,55 @@ class BaseTrainer:
             self.act_offload_ctx = maybe_activation_offloading(
                 self.config.activation_offloading
             )
-        # Optional kernel patches on the standard backend (post-PEFT).
-        mconf = self.config.model
-        if (
-            mconf.fused_lora_mlp
-            or mconf.fused_lora_qkv
-            or mconf.fused_lora_o
-            or mconf.smart_gc
-        ):
-            from wavelet.kernels.patch import (
-                patch_fused_mlp,
-                patch_fused_qkv,
-                patch_fused_o,
-                patch_smart_gc,
+        self._apply_optional_model_kernels(model)
+        self.model = self._wrap_distributed_model(model, fsdp_config)
+
+    def _validate_model_execution_mode(self, fsdp_config: Any) -> None:
+        if self.config.model.load_in_4bit and getattr(fsdp_config, "enabled", False):
+            raise NotImplementedError(
+                "QLoRA training uses replicated DDP in Wavelet. Disable FSDP "
+                "for model.load_in_4bit=true."
+            )
+        if self.config.model.load_in_4bit and self._uses_sleep_colocation():
+            raise NotImplementedError(
+                "QLoRA does not support colocate_sleep yet because bitsandbytes "
+                "4-bit modules cannot be moved between CPU and GPU."
             )
 
-            if mconf.fused_lora_mlp:
-                patch_fused_mlp(model)
-            if mconf.fused_lora_qkv:
-                patch_fused_qkv(model)
-            # patch_fused_o is standalone; safe to combine with patch_fused_qkv
-            # (o_proj.forward becomes the fused closure, called normally by both paths)
-            if mconf.fused_lora_o:
-                patch_fused_o(model)
-            if mconf.smart_gc:
-                patch_smart_gc(model, seq_len=self.config.data.seq_len)
+    def _apply_optional_model_kernels(self, model: PreTrainedModel) -> None:
+        mconf = self.config.model
+        if not any(
+            (
+                mconf.fused_lora_mlp,
+                mconf.fused_lora_qkv,
+                mconf.fused_lora_o,
+                mconf.smart_gc,
+            )
+        ):
+            return
+        from wavelet.kernels.patch import (
+            patch_fused_mlp,
+            patch_fused_o,
+            patch_fused_qkv,
+            patch_smart_gc,
+        )
+
+        if mconf.fused_lora_mlp:
+            patch_fused_mlp(model)
+        if mconf.fused_lora_qkv:
+            patch_fused_qkv(model)
+        if mconf.fused_lora_o:
+            patch_fused_o(model)
+        if mconf.smart_gc:
+            patch_smart_gc(model, seq_len=self.config.data.seq_len)
+
+    def _wrap_distributed_model(
+        self,
+        model: PreTrainedModel,
+        fsdp_config: Any,
+    ) -> PreTrainedModel:
+        from wavelet.trainer.model import maybe_wrap_ddp, maybe_wrap_fsdp
+
         if (
             self.world
             and (fsdp_config is None or not fsdp_config.enabled)
@@ -403,7 +415,7 @@ class BaseTrainer:
                 world=self.world,
                 parallel_dims=self.parallel_dims,
             )
-        self.model = model
+        return model
 
     def _setup_data(self) -> None:
         from wavelet.data.dataset import setup_dataset
@@ -552,9 +564,7 @@ class BaseTrainer:
                 "checkpoint_triggered",
                 step=self.step,
                 payload={
-                    "mode": self.config.ckpt.mode
-                    if self.config.ckpt
-                    else "disabled"
+                    "mode": self.config.ckpt.mode if self.config.ckpt else "disabled"
                 },
             )
 

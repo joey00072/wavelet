@@ -538,7 +538,23 @@ class RLTrainer(BaseTrainer):
         policy_dir = resolve_policy_dir(self.output_dir, self.config.policy_transfer)
         step_dir = get_policy_step_dir(policy_dir, export_step)
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
+        self._prepare_export_directory(tmp_dir, step_dir)
+        saved_path = self._save_filesystem_policy(tmp_dir)
+        if self.world.is_main:
+            self._write_policy_metadata(
+                tmp_dir,
+                export_step=export_step,
+                kind=saved_path.name,
+            )
+        self.offload_after_refit()
+        self._publish_export_directory(
+            tmp_dir,
+            step_dir,
+            export_step=export_step,
+        )
+        return step_dir
 
+    def _save_filesystem_policy(self, tmp_dir: Path) -> Path:
         from wavelet.trainer.lora import (
             save_lora_adapter_snapshot,
             save_lora_adapter_snapshot_from_fsdp,
@@ -548,85 +564,79 @@ class RLTrainer(BaseTrainer):
             save_model,
         )
 
-        export_model = None
-        state_dict = None
         if (
             self.config.lora is not None
             and self.config.policy_transfer.lightweight_lora
             and isinstance(self.model, FSDP)
         ):
-            if tmp_dir.exists() and self.world.is_main:
-                shutil.rmtree(tmp_dir)
-            if step_dir.exists() and self.world.is_main:
-                shutil.rmtree(step_dir)
-            if self.world.is_main:
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-            saved_path = save_lora_adapter_snapshot_from_fsdp(
+            return save_lora_adapter_snapshot_from_fsdp(
                 self.model,
                 tmp_dir,
                 is_main_process=self.world.is_main,
                 parallel_dims=self.parallel_dims,
             )
-        else:
-            export_dtype = None
-            if self.config.lora is None:
-                export_dtype = torch.bfloat16
-            export_model, state_dict = export_model_for_save(
-                self.model,
-                state_dict_dtype=export_dtype,
+        export_dtype = torch.bfloat16 if self.config.lora is None else None
+        export_model, state_dict = export_model_for_save(
+            self.model,
+            state_dict_dtype=export_dtype,
+        )
+        if self.config.policy_transfer.lightweight_lora and isinstance(
+            export_model, PeftModel
+        ):
+            return save_lora_adapter_snapshot(
+                export_model,
+                tmp_dir,
+                state_dict=state_dict,
+                is_main_process=self.world.is_main,
+                parallel_dims=self.parallel_dims,
             )
-            if self.world.is_main:
-                if tmp_dir.exists():
-                    shutil.rmtree(tmp_dir)
-                if step_dir.exists():
-                    shutil.rmtree(step_dir)
-                tmp_dir.mkdir(parents=True, exist_ok=True)
-            if self.config.policy_transfer.lightweight_lora and isinstance(
-                export_model, PeftModel
-            ):
-                saved_path = save_lora_adapter_snapshot(
-                    export_model,
-                    tmp_dir,
-                    state_dict=state_dict,
-                    is_main_process=self.world.is_main,
-                    parallel_dims=self.parallel_dims,
-                )
-            else:
-                saved_path = save_model(
-                    export_model,
-                    self.tokenizer,
-                    tmp_dir,
-                    state_dict=state_dict,
-                    is_main_process=self.world.is_main,
-                )
-        export_model = None
-        state_dict = None
-        if self.world.is_main:
-            meta = policy_metadata(
-                config=self.config,
-                format_version=1,
-                step=export_step,
-                kind=saved_path.name,
-                created_at=datetime.now(timezone.utc).isoformat(),
-            )
-            (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
-        self.offload_after_refit()
+        return save_model(
+            export_model,
+            self.tokenizer,
+            tmp_dir,
+            state_dict=state_dict,
+            is_main_process=self.world.is_main,
+        )
+
+    def _prepare_export_directory(self, tmp_dir: Path, step_dir: Path) -> None:
+        if not self.world.is_main:
+            return
+        for path in (tmp_dir, step_dir):
+            if path.exists():
+                shutil.rmtree(path)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    def _write_policy_metadata(
+        self,
+        tmp_dir: Path,
+        *,
+        export_step: int,
+        kind: str,
+    ) -> None:
+        metadata = policy_metadata(
+            config=self.config,
+            format_version=1,
+            step=export_step,
+            kind=kind,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(metadata))
+
+    def _publish_export_directory(
+        self,
+        tmp_dir: Path,
+        step_dir: Path,
+        *,
+        export_step: int,
+    ) -> None:
         if self.world.world_size > 1:
             barrier(self.world)
         if self.world.is_main:
             (tmp_dir / STABLE_BATCH_MARKER).touch()
             tmp_dir.replace(step_dir)
-            append_event_best_effort(
-                self.config.output_dir / "events",
-                QueueEvent(
-                    time=utc_now(),
-                    kind="policy_export_completed",
-                    policy_step=export_step,
-                ),
-            )
+            self._record_policy_export(export_step)
         if self.world.world_size > 1:
             barrier(self.world)
-        return step_dir
 
     def _export_nccl_policy(self, export_step: int) -> Path:
         if self.model is None:
@@ -642,64 +652,88 @@ class RLTrainer(BaseTrainer):
         policy_dir = resolve_policy_dir(self.output_dir, self.config.policy_transfer)
         step_dir = get_policy_step_dir(policy_dir, export_step)
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
-
+        self._prepare_export_directory(tmp_dir, step_dir)
+        state_dict = self._nccl_export_state_dict(export_step)
         if self.world.is_main:
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir)
-            if step_dir.exists():
-                shutil.rmtree(step_dir)
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-
-        state_dict = None
-        if export_step > 0:
-            from wavelet.trainer.model import export_model_for_save
-
-            _, state_dict = export_model_for_save(
-                self.model,
-                state_dict_dtype=torch.bfloat16,
+            self._write_nccl_export(
+                tmp_dir,
+                step_dir,
+                export_step=export_step,
+                state_dict=state_dict,
             )
-
-        if self.world.is_main:
-            named_tensors = [] if state_dict is None else list(state_dict.items())
-            update_info = update_info_for_named_tensors(named_tensors)
-            (tmp_dir / NCCL_UPDATE_INFO_FILENAME).write_text(json.dumps(update_info))
-            meta = policy_metadata(
-                config=self.config,
-                format_version=1,
-                step=export_step,
-                kind="nccl",
-                created_at=datetime.now(timezone.utc).isoformat(),
-            )
-            (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
-            (tmp_dir / STABLE_BATCH_MARKER).touch()
-            tmp_dir.replace(step_dir)
-            if export_step > 0:
-                self._start_nccl_broadcaster()
 
         self.offload_after_refit()
-
-        if export_step > 0 and self.world.is_main:
-            self._wait_for_nccl_ready(step_dir)
-            if state_dict is None:
-                raise RuntimeError("Missing state dict for NCCL policy broadcast.")
-            broadcaster = self._nccl_broadcaster()
-            broadcaster.broadcast_named_tensors(state_dict.items())
-
-        state_dict = None
+        self._broadcast_nccl_export(
+            step_dir,
+            export_step=export_step,
+            state_dict=state_dict,
+        )
         if self.world.world_size > 1:
             barrier(self.world)
         if self.world.is_main:
-            append_event_best_effort(
-                self.config.output_dir / "events",
-                QueueEvent(
-                    time=utc_now(),
-                    kind="policy_export_completed",
-                    policy_step=export_step,
-                ),
-            )
+            self._record_policy_export(export_step)
         if self.world.world_size > 1:
             barrier(self.world)
         return step_dir
+
+    def _nccl_export_state_dict(
+        self,
+        export_step: int,
+    ) -> dict[str, Tensor] | None:
+        if export_step == 0:
+            return None
+        from wavelet.trainer.model import export_model_for_save
+
+        _, state_dict = export_model_for_save(
+            self.model,
+            state_dict_dtype=torch.bfloat16,
+        )
+        return state_dict
+
+    def _write_nccl_export(
+        self,
+        tmp_dir: Path,
+        step_dir: Path,
+        *,
+        export_step: int,
+        state_dict: dict[str, Tensor] | None,
+    ) -> None:
+        named_tensors = [] if state_dict is None else list(state_dict.items())
+        update_info = update_info_for_named_tensors(named_tensors)
+        (tmp_dir / NCCL_UPDATE_INFO_FILENAME).write_text(json.dumps(update_info))
+        self._write_policy_metadata(
+            tmp_dir,
+            export_step=export_step,
+            kind="nccl",
+        )
+        (tmp_dir / STABLE_BATCH_MARKER).touch()
+        tmp_dir.replace(step_dir)
+        if export_step > 0:
+            self._start_nccl_broadcaster()
+
+    def _broadcast_nccl_export(
+        self,
+        step_dir: Path,
+        *,
+        export_step: int,
+        state_dict: dict[str, Tensor] | None,
+    ) -> None:
+        if export_step == 0 or not self.world.is_main:
+            return
+        self._wait_for_nccl_ready(step_dir)
+        if state_dict is None:
+            raise RuntimeError("Missing state dict for NCCL policy broadcast.")
+        self._nccl_broadcaster().broadcast_named_tensors(state_dict.items())
+
+    def _record_policy_export(self, export_step: int) -> None:
+        append_event_best_effort(
+            self.config.output_dir / "events",
+            QueueEvent(
+                time=utc_now(),
+                kind="policy_export_completed",
+                policy_step=export_step,
+            ),
+        )
 
     def _wait_for_nccl_ready(self, step_dir: Path) -> None:
         ready_path = step_dir / NCCL_READY_MARKER
@@ -827,72 +861,12 @@ class RLTrainer(BaseTrainer):
                 attention_mask = attention_mask.to(dtype=mask_dtype)
 
         with self.act_offload_ctx:
-            trainer_logprobs = self._model_logprobs(batch, attention_mask)
-            if not batch["loss_mask"].bool().any():
-                # Dummy packed batches keep FSDP ranks aligned after filtering.
-                # Make the zero loss explicitly depend on this rank's forward pass
-                # so backward still traverses the sharded graph with zero grads.
-                loss = trainer_logprobs.sum() * 0.0
-                loss_output = LossOutput(
-                    loss=loss,
-                    metrics=self._zero_loss_metrics(loss),
-                )
-            else:
-                inference_logprobs = self._inference_logprobs(batch, attention_mask)
-                teacher_logprobs = self._teacher_logprobs(batch)
-                loss_output = compute_loss(
-                    trainer_logprobs,
-                    inference_logprobs,
-                    teacher_logprobs,
-                    batch["advantages"],
-                    batch["loss_mask"],
-                    self.config.loss,
-                    loss_scale=self._optimizer_batch_loss_scale,
-                    position_ids=batch["position_ids"],
-                )
-            loss = loss_output.loss
-            raw_metrics = loss_output.metrics
+            loss_output = self._forward_rl_loss(batch, attention_mask)
+            if torch.isnan(loss_output.loss):
+                return self._skip_nan_loss(loss_output)
+            self._backward_rl_loss(loss_output.loss)
 
-            if torch.isnan(loss):
-                logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
-                self._micro_step += 1
-                self._accumulated_micro_batches += 1
-                if self._accumulated_micro_batches >= self.accumulation_steps:
-                    self._reward_accum.clear()
-                    self._rollout_metric_accum.clear()
-                    self._train_loss_accum.clear()
-                    self._train_metric_accum.clear()
-                    self._accumulated_micro_batches = 0
-                    self._optimizer_batch_loss_scale = (
-                        self._estimate_optimizer_batch_loss_scale()
-                    )
-                return TrainOutput(
-                    loss=loss_output,
-                    stepped=False,
-                    step=self.step,
-                    micro_step=self._micro_step,
-                    skipped=True,
-                )
-
-            sync_context = self._maybe_no_sync()
-            with sync_context:
-                if self._optimizer_batch_loss_scale is None:
-                    backward_loss = loss / self.accumulation_steps
-                else:
-                    backward_loss = loss
-                backward_loss.backward()
-
-        reward_mean = self._reward_mean(
-            batch["rewards"],
-            sample_counts=batch.get("sample_counts"),
-        )
-        if reward_mean is not None:
-            self._reward_accum.append(reward_mean)
-        self._rollout_metric_accum.append(self._batch_rollout_metrics(batch))
-        self._train_loss_accum.append(float(loss.detach().item()))
-        self._train_metric_accum.append(
-            {key: float(value.detach().item()) for key, value in raw_metrics.items()}
-        )
+        self._record_micro_batch_metrics(batch, loss_output)
 
         self._micro_step += 1
         self._accumulated_micro_batches += 1
@@ -904,17 +878,98 @@ class RLTrainer(BaseTrainer):
                 micro_step=self._micro_step,
             )
 
-        grad_norm = None
+        grad_norm = self._apply_optimizer_step()
+        metrics = self._finalize_optimizer_metrics(grad_norm)
+        return TrainOutput(
+            loss=loss_output,
+            stepped=True,
+            step=self.step,
+            micro_step=self._micro_step,
+            metrics=metrics,
+        )
+
+    def _forward_rl_loss(
+        self,
+        batch: dict[str, Tensor],
+        attention_mask: Tensor | None,
+    ) -> LossOutput:
+        trainer_logprobs = self._model_logprobs(batch, attention_mask)
+        if not batch["loss_mask"].bool().any():
+            loss = trainer_logprobs.sum() * 0.0
+            return LossOutput(loss=loss, metrics=self._zero_loss_metrics(loss))
+        return compute_loss(
+            trainer_logprobs,
+            self._inference_logprobs(batch, attention_mask),
+            self._teacher_logprobs(batch),
+            batch["advantages"],
+            batch["loss_mask"],
+            self.config.loss,
+            loss_scale=self._optimizer_batch_loss_scale,
+            position_ids=batch["position_ids"],
+        )
+
+    def _backward_rl_loss(self, loss: Tensor) -> None:
+        with self._maybe_no_sync():
+            backward_loss = (
+                loss / self.accumulation_steps
+                if self._optimizer_batch_loss_scale is None
+                else loss
+            )
+            backward_loss.backward()
+
+    def _skip_nan_loss(self, loss_output: LossOutput) -> TrainOutput:
+        logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
+        self._micro_step += 1
+        self._accumulated_micro_batches += 1
+        if self._accumulated_micro_batches >= self.accumulation_steps:
+            self._reward_accum.clear()
+            self._rollout_metric_accum.clear()
+            self._train_loss_accum.clear()
+            self._train_metric_accum.clear()
+            self._accumulated_micro_batches = 0
+            self._optimizer_batch_loss_scale = (
+                self._estimate_optimizer_batch_loss_scale()
+            )
+        return TrainOutput(
+            loss=loss_output,
+            stepped=False,
+            step=self.step,
+            micro_step=self._micro_step,
+            skipped=True,
+        )
+
+    def _record_micro_batch_metrics(
+        self,
+        batch: dict[str, Tensor],
+        loss_output: LossOutput,
+    ) -> None:
+        reward_mean = self._reward_mean(
+            batch["rewards"],
+            sample_counts=batch.get("sample_counts"),
+        )
+        if reward_mean is not None:
+            self._reward_accum.append(reward_mean)
+        self._rollout_metric_accum.append(self._batch_rollout_metrics(batch))
+        self._train_loss_accum.append(float(loss_output.loss.detach().item()))
+        self._train_metric_accum.append(
+            {
+                key: float(value.detach().item())
+                for key, value in loss_output.metrics.items()
+            }
+        )
+
+    def _apply_optimizer_step(self) -> float | None:
         self._apply_gradient_accumulation_loss_scale()
         self._sync_tensor_parallel_lora_grads()
-        if self.config.max_grad_norm > 0:
-            grad_norm = self._clip_grad_norm()
+        grad_norm = self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
         self.optimizer.step()
         self.scheduler.step()
         self.optimizer.zero_grad(set_to_none=True)
         self.step += 1
         self._accumulated_micro_batches = 0
+        return grad_norm
 
+    def _finalize_optimizer_metrics(self, grad_norm: float | None) -> dict[str, float]:
         if self._gradient_accumulation_loss_scale is not None:
             logged_loss = sum(self._train_loss_accum) / max(
                 self._gradient_accumulation_loss_scale,
@@ -941,13 +996,7 @@ class RLTrainer(BaseTrainer):
         metrics = self._finalize_synced_metrics(metrics)
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
         self._gradient_accumulation_loss_scale = None
-        return TrainOutput(
-            loss=loss_output,
-            stepped=True,
-            step=self.step,
-            micro_step=self._micro_step,
-            metrics=metrics,
-        )
+        return metrics
 
     def _sync_tensor_parallel_lora_grads(self) -> None:
         if self.model is None:
@@ -1128,52 +1177,69 @@ class RLTrainer(BaseTrainer):
             values = [metrics[key] for metrics in micro_metrics if key in metrics]
             if not values:
                 continue
-            if key.endswith("/max"):
-                aggregated[key] = max(values)
-            elif key.endswith("/min"):
-                aggregated[key] = min(values)
-            elif key == "reward/all/mean":
-                weighted_sum = 0.0
-                total_weight = 0.0
-                for metrics in micro_metrics:
-                    if key not in metrics:
-                        continue
-                    weight = metrics.get("rollout/count", 1.0)
-                    weighted_sum += metrics[key] * weight
-                    total_weight += weight
-                if total_weight > 0:
-                    aggregated[key] = weighted_sum / total_weight
-                else:
-                    aggregated[key] = sum(values) / len(values)
-                aggregated["_reward_weighted_sum"] = weighted_sum
-                aggregated["_reward_weight"] = total_weight
-            elif key in {
-                "tokens/train",
-                "tokens/model",
-                "rollout/count",
-                "micro_batch/count",
-            }:
-                aggregated[key] = sum(values)
-            else:
-                aggregated[key] = sum(values) / len(values)
-        advantage_count = sum(
-            metrics.get("_advantage_count", 0.0) for metrics in micro_metrics
-        )
-        if advantage_count > 0:
-            advantage_sum = sum(
-                metrics.get("_advantage_sum", 0.0) for metrics in micro_metrics
+            aggregated[key] = self._aggregate_rollout_metric_value(
+                key,
+                values,
+                micro_metrics,
+                aggregated,
             )
-            advantage_sumsq = sum(
-                metrics.get("_advantage_sumsq", 0.0) for metrics in micro_metrics
-            )
-            advantage_mean = advantage_sum / advantage_count
-            advantage_var = max(
-                advantage_sumsq / advantage_count - advantage_mean**2,
-                0.0,
-            )
-            aggregated["advantage/all/mean"] = advantage_mean
-            aggregated["advantage/all/std"] = advantage_var**0.5
+        self._add_aggregate_advantage_stats(aggregated, micro_metrics)
         return aggregated
+
+    @staticmethod
+    def _aggregate_rollout_metric_value(
+        key: str,
+        values: list[float],
+        micro_metrics: list[dict[str, float]],
+        aggregated: dict[str, float],
+    ) -> float:
+        if key.endswith("/max"):
+            return max(values)
+        if key.endswith("/min"):
+            return min(values)
+        if key == "reward/all/mean":
+            weighted_sum = sum(
+                metrics[key] * metrics.get("rollout/count", 1.0)
+                for metrics in micro_metrics
+                if key in metrics
+            )
+            total_weight = sum(
+                metrics.get("rollout/count", 1.0)
+                for metrics in micro_metrics
+                if key in metrics
+            )
+            aggregated["_reward_weighted_sum"] = weighted_sum
+            aggregated["_reward_weight"] = total_weight
+            return (
+                weighted_sum / total_weight
+                if total_weight > 0
+                else sum(values) / len(values)
+            )
+        if key in {
+            "tokens/train",
+            "tokens/model",
+            "rollout/count",
+            "micro_batch/count",
+        }:
+            return sum(values)
+        return sum(values) / len(values)
+
+    @staticmethod
+    def _add_aggregate_advantage_stats(
+        aggregated: dict[str, float],
+        micro_metrics: list[dict[str, float]],
+    ) -> None:
+        count = sum(metrics.get("_advantage_count", 0.0) for metrics in micro_metrics)
+        if count <= 0:
+            return
+        total = sum(metrics.get("_advantage_sum", 0.0) for metrics in micro_metrics)
+        total_squares = sum(
+            metrics.get("_advantage_sumsq", 0.0) for metrics in micro_metrics
+        )
+        mean = total / count
+        variance = max(total_squares / count - mean**2, 0.0)
+        aggregated["advantage/all/mean"] = mean
+        aggregated["advantage/all/std"] = variance**0.5
 
     def _aggregate_train_metrics(
         self,
@@ -1189,9 +1255,7 @@ class RLTrainer(BaseTrainer):
                 aggregated[key] = sum(values) / len(values)
         return aggregated
 
-    def _standard_metric_aliases(
-        self, metrics: dict[str, float]
-    ) -> dict[str, float]:
+    def _standard_metric_aliases(self, metrics: dict[str, float]) -> dict[str, float]:
         aliases = {
             alias: metrics[key]
             for key, alias in TRAIN_METRIC_ALIASES.items()

@@ -41,24 +41,13 @@ def length_penalty_cost_for_record(record: RLExample, penalty: object) -> float:
                 if record.loss_mask is not None
                 else 0
             )
-        return (
-            penalty.completion_weight * float(completion_tokens)
-            + penalty.tool_response_weight
-            * float(_metadata_number(metadata, "tool_response_token_count"))
+        return penalty.completion_weight * float(
+            completion_tokens
+        ) + penalty.tool_response_weight * float(
+            _metadata_number(metadata, "tool_response_token_count")
         )
     if isinstance(penalty, TurnsLengthPenaltyConfig):
         return float(_metadata_number(record.metadata or {}, "turn_count", default=1.0))
-    return 0.0
-
-
-def length_penalty_cost_for_output(output: dict[str, Any], penalty: object) -> float:
-    if isinstance(penalty, TokensLengthPenaltyConfig):
-        return (
-            penalty.completion_weight * float(_output_completion_token_count(output))
-            + penalty.tool_response_weight * float(output_tool_response_token_count(output))
-        )
-    if isinstance(penalty, TurnsLengthPenaltyConfig):
-        return float(len(output.get("trajectory") or []))
     return 0.0
 
 

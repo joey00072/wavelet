@@ -13,9 +13,12 @@ from pathlib import Path
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample, load_rl_records
 from wavelet.inference.policy import RLInference
-from wavelet.orchestrator.advantage import (
-    group_reward_advantages,
-    length_penalty_cost_for_record,
+from wavelet.orchestrator.algorithms import (
+    algorithm_epsilon,
+    algorithm_scope,
+    build_algorithm,
+    score_algorithm_records,
+    uses_group_advantages,
 )
 from wavelet.orchestrator.reward import RLRewardScorer
 from wavelet.orchestrator.queue import FileSystemRolloutSender, RolloutBatch
@@ -346,58 +349,13 @@ class RLOrchestrator:
         return trimmed
 
     def _assign_advantages(self, records: list[RLExample]) -> list[RLExample]:
-        mode = self.config.orchestrator.advantage_mode
-        if mode == "passthrough":
-            return records
-        if mode == "reward":
-            return [
-                self._replace_advantage(record, record.reward)
-                if record.advantage is None
-                else record
-                for record in records
-            ]
-        if mode != "group_reward":
-            raise ValueError(f"Unsupported advantage mode: {mode}")
-        if records and all(record.advantage is not None for record in records):
-            return records
-
-        grouped: dict[str, list[RLExample]] = {}
-        for record in records:
-            grouped.setdefault(self._group_key(record), []).append(record)
-
-        updated: list[RLExample] = []
-        group_advantages: dict[str, dict[int, float]] = {}
-        for key, group in grouped.items():
-            rewards = [item.reward for item in group]
-            if any(reward is None for reward in rewards):
-                raise ValueError(
-                    "group_reward advantages require rewards for all rollouts."
-                )
-            reward_values = [float(reward) for reward in rewards if reward is not None]
-            penalty = self.config.orchestrator.length_penalty
-            costs = (
-                [length_penalty_cost_for_record(item, penalty) for item in group]
-                if penalty is not None
-                else None
-            )
-            advantages = group_reward_advantages(
-                reward_values,
-                costs=costs,
-                normalize=self.config.orchestrator.normalize_group_advantages,
-                epsilon=self.config.orchestrator.advantage_epsilon,
-            )
-            group_advantages[key] = {
-                id(item): advantage for item, advantage in zip(group, advantages)
-            }
-
-        for record in records:
-            updated.append(
-                self._replace_advantage(
-                    record,
-                    group_advantages[self._group_key(record)][id(record)],
-                )
-            )
-        return updated
+        algorithm = build_algorithm(self.config.algo)
+        return score_algorithm_records(
+            algorithm,
+            records,
+            scope=algorithm_scope(self.config.algo),
+            group_key=self._group_key,
+        )
 
     def _should_retry_zero_advantage(self, records: list[RLExample]) -> bool:
         return not self._filter_zero_advantage_records(records)
@@ -407,9 +365,9 @@ class RLOrchestrator:
     ) -> list[RLExample]:
         if not self.config.orchestrator.filter_zero_advantage:
             return records
-        if self.config.orchestrator.advantage_mode != "group_reward":
+        if not uses_group_advantages(self.config.algo):
             return records
-        epsilon = self.config.orchestrator.advantage_epsilon
+        epsilon = algorithm_epsilon(self.config.algo)
         return [
             record
             for record in records
@@ -451,7 +409,7 @@ class RLOrchestrator:
         records: list[RLExample],
     ) -> list[RLExample]:
         if (
-            self.config.orchestrator.advantage_mode != "group_reward"
+            not uses_group_advantages(self.config.algo)
             or self.config.orchestrator.rollouts_per_example <= 1
         ):
             return records

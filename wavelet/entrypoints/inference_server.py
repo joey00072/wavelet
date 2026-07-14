@@ -178,35 +178,13 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 fitted_request = next_request
         return await super().create_chat_completion(fitted_request, raw_request)
 
-    async def create_chat_completion_with_tokens(
+    async def _render_with_context_fit(
         self,
         request: ChatCompletionRequestWithTokens,
-        raw_request: Request | None = None,
     ):
-        request = _fit_chat_request_to_prompt_tokens(
-            request,
-            max_model_len=self.model_config.max_model_len,
-            prompt_tokens=len(request.tokens),
-        )
-        tokenizer = self.renderer.tokenizer
-        assert tokenizer is not None
-        reasoning_parser: ReasoningParser | None = None
-        try:
-            if self.reasoning_parser_cls:
-                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request.chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
-                reasoning_parser = self.reasoning_parser_cls(
-                    tokenizer,
-                    chat_template_kwargs=chat_template_kwargs,
-                )
-        except RuntimeError as exc:
-            return self.create_error_response(str(exc))
-
         for _ in range(4):
             try:
-                rendered = await self.render_chat_request(request)
+                return request, await self.render_chat_request(request)
             except VLLMValidationError as exc:
                 fitted_request = _fit_chat_request_to_context(
                     request,
@@ -216,113 +194,104 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 if fitted_request is request:
                     raise
                 request = fitted_request
-                continue
-            if isinstance(rendered, ErrorResponse):
-                return rendered
-            break
-        else:
-            rendered = await self.render_chat_request(request)
-            if isinstance(rendered, ErrorResponse):
-                return rendered
-        conversation, engine_prompts = rendered
-        engine_prompts[0]["prompt_token_ids"] = request.tokens
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
-        request_metadata = RequestResponseMetadata(request_id=request_id)
-        if raw_request:
-            raw_request.state.request_metadata = request_metadata
+        return request, await self.render_chat_request(request)
 
-        try:
-            lora_request = self._maybe_get_adapters(
-                request,
-                supports_default_mm_loras=True,
-            )
-            model_name = self.models.model_name(lora_request)
-        except (ValueError, TypeError, RuntimeError) as exc:
-            return self.create_error_response(exc)
-
+    async def _token_generators(
+        self,
+        request: ChatCompletionRequestWithTokens,
+        engine_prompts,
+        *,
+        request_id: str,
+        raw_request: Request | None,
+        lora_request,
+        reasoning_parser: ReasoningParser | None,
+    ) -> list[Any]:
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
         generators = []
-        try:
-            for index, engine_prompt in enumerate(engine_prompts):
-                prompt_token_ids = self._extract_prompt_components(
-                    engine_prompt
-                ).token_ids
-                sub_request_id = (
-                    request_id if len(engine_prompts) == 1 else f"{request_id}_{index}"
+        for index, engine_prompt in enumerate(engine_prompts):
+            prompt_token_ids = self._extract_prompt_components(engine_prompt).token_ids
+            sub_request_id = (
+                request_id if len(engine_prompts) == 1 else f"{request_id}_{index}"
+            )
+            prompt_len = self._extract_prompt_len(engine_prompt)
+            max_model_len = self.model_config.max_model_len
+            if prompt_len >= max_model_len:
+                raise VLLMValidationError(
+                    f"This model's maximum context length is {max_model_len} tokens. "
+                    f"However, your request has {prompt_len} input tokens.",
+                    parameter="input_tokens",
+                    value=prompt_len,
                 )
-                prompt_len = self._extract_prompt_len(engine_prompt)
-                max_model_len = self.model_config.max_model_len
-                if prompt_len >= max_model_len:
-                    raise VLLMValidationError(
-                        f"This model's maximum context length is {max_model_len} "
-                        f"tokens. However, your request has {prompt_len} input tokens.",
-                        parameter="input_tokens",
-                        value=prompt_len,
-                    )
-                max_tokens = get_max_tokens(
-                    max_model_len,
-                    request.max_completion_tokens
-                    if request.max_completion_tokens is not None
-                    else request.max_tokens,
-                    prompt_len,
-                    self.default_sampling_params,
-                    self.override_max_tokens,
-                )
-                if request.use_beam_search:
-                    sampling_params: SamplingParams | BeamSearchParams = (
-                        request.to_beam_search_params(
-                            max_tokens,
-                            self.default_sampling_params,
-                        )
-                    )
-                else:
-                    sampling_params = request.to_sampling_params(
+            max_tokens = get_max_tokens(
+                max_model_len,
+                request.max_completion_tokens
+                if request.max_completion_tokens is not None
+                else request.max_tokens,
+                prompt_len,
+                self.default_sampling_params,
+                self.override_max_tokens,
+            )
+            if request.use_beam_search:
+                sampling_params: SamplingParams | BeamSearchParams = (
+                    request.to_beam_search_params(
                         max_tokens,
                         self.default_sampling_params,
                     )
-                self._log_inputs(
-                    sub_request_id,
-                    engine_prompt,
+                )
+            else:
+                sampling_params = request.to_sampling_params(
+                    max_tokens,
+                    self.default_sampling_params,
+                )
+            self._log_inputs(
+                sub_request_id,
+                engine_prompt,
+                params=sampling_params,
+                lora_request=lora_request,
+            )
+            trace_headers = (
+                None
+                if raw_request is None
+                else await self._get_trace_headers(raw_request.headers)
+            )
+            if isinstance(sampling_params, BeamSearchParams):
+                generator = self.beam_search(
+                    prompt=engine_prompt,
+                    request_id=sub_request_id,
                     params=sampling_params,
                     lora_request=lora_request,
+                    trace_headers=trace_headers,
                 )
-                trace_headers = (
-                    None
-                    if raw_request is None
-                    else await self._get_trace_headers(raw_request.headers)
+            else:
+                reasoning_ended = (
+                    reasoning_parser.is_reasoning_end(prompt_token_ids or [])
+                    if reasoning_parser
+                    else None
                 )
-                if isinstance(sampling_params, BeamSearchParams):
-                    generator = self.beam_search(
-                        prompt=engine_prompt,
-                        request_id=sub_request_id,
-                        params=sampling_params,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                    )
-                else:
-                    reasoning_ended = (
-                        reasoning_parser.is_reasoning_end(prompt_token_ids or [])
-                        if reasoning_parser
-                        else None
-                    )
-                    generator = self.engine_client.generate(
-                        engine_prompt,
-                        sampling_params,
-                        sub_request_id,
-                        lora_request=lora_request,
-                        trace_headers=trace_headers,
-                        priority=request.priority,
-                        data_parallel_rank=data_parallel_rank,
-                        reasoning_ended=reasoning_ended,
-                    )
-                generators.append(generator)
-        except ValueError as exc:
-            return self.create_error_response(exc)
+                generator = self.engine_client.generate(
+                    engine_prompt,
+                    sampling_params,
+                    sub_request_id,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    priority=request.priority,
+                    data_parallel_rank=data_parallel_rank,
+                    reasoning_ended=reasoning_ended,
+                )
+            generators.append(generator)
+        return generators
 
-        assert len(generators) == 1
-        (result_generator,) = generators
+    async def _finish_token_completion(
+        self,
+        request,
+        result_generator,
+        request_id,
+        model_name,
+        conversation,
+        tokenizer,
+        request_metadata,
+        reasoning_parser,
+    ):
         if request.stream:
             return self.chat_completion_stream_generator(
                 request,
@@ -349,6 +318,78 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
             raise
         except ValueError as exc:
             return self.create_error_response(exc)
+
+    async def create_chat_completion_with_tokens(
+        self,
+        request: ChatCompletionRequestWithTokens,
+        raw_request: Request | None = None,
+    ):
+        request = _fit_chat_request_to_prompt_tokens(
+            request,
+            max_model_len=self.model_config.max_model_len,
+            prompt_tokens=len(request.tokens),
+        )
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        reasoning_parser: ReasoningParser | None = None
+        try:
+            if self.reasoning_parser_cls:
+                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                    request.chat_template_kwargs,
+                    self.default_chat_template_kwargs,
+                )
+                reasoning_parser = self.reasoning_parser_cls(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+        except RuntimeError as exc:
+            return self.create_error_response(str(exc))
+
+        request, rendered = await self._render_with_context_fit(request)
+        if isinstance(rendered, ErrorResponse):
+            return rendered
+        conversation, engine_prompts = rendered
+        engine_prompts[0]["prompt_token_ids"] = request.tokens
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        request_metadata = RequestResponseMetadata(request_id=request_id)
+        if raw_request:
+            raw_request.state.request_metadata = request_metadata
+
+        try:
+            lora_request = self._maybe_get_adapters(
+                request,
+                supports_default_mm_loras=True,
+            )
+            model_name = self.models.model_name(lora_request)
+        except (ValueError, TypeError, RuntimeError) as exc:
+            return self.create_error_response(exc)
+
+        try:
+            generators = await self._token_generators(
+                request,
+                engine_prompts,
+                request_id=request_id,
+                raw_request=raw_request,
+                lora_request=lora_request,
+                reasoning_parser=reasoning_parser,
+            )
+        except ValueError as exc:
+            return self.create_error_response(exc)
+
+        assert len(generators) == 1
+        (result_generator,) = generators
+        return await self._finish_token_completion(
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+            reasoning_parser,
+        )
 
 
 def _fit_chat_request_to_context(
@@ -747,46 +788,73 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
     policy_dir = Path(payload["policy_dir"])
     step = int(payload["step"])
     if _CONFIG.lora is None:
-        if _CONFIG.policy_transfer.type == "nccl":
-            weight_dir = policy_dir
-        else:
-            weight_dir = policy_dir / "model"
-            if not weight_dir.exists():
-                weight_dir = policy_dir
-        weight_path = str(weight_dir.resolve())
-        if step == 0:
-            raw_request.app.state.policy_step = step
-            raw_request.app.state.policy_weight_path = weight_path
-            return {"status": "ok", "policy_step": step, "weight_path": weight_path}
-        if (
-            getattr(raw_request.app.state, "policy_step", None) == step
-            and getattr(raw_request.app.state, "policy_weight_path", None)
-            == weight_path
-        ):
-            return {"status": "ok", "policy_step": step, "weight_path": weight_path}
-        if _CONFIG.policy_transfer.type == "nccl":
-            await _engine_client(raw_request).collective_rpc(
-                "init_broadcaster",
-                args=(
-                    _CONFIG.policy_transfer.nccl_host,
-                    _CONFIG.policy_transfer.nccl_port,
-                    _CONFIG.policy_transfer.nccl_rank_offset,
-                    _CONFIG.policy_transfer.nccl_inference_world_size,
-                    _CONFIG.policy_transfer.nccl_timeout_seconds,
-                ),
-            )
-        await _engine_client(raw_request).collective_rpc(
-            "update_weights_from_path",
-            args=(weight_path,),
+        return await _load_full_model_policy(
+            raw_request,
+            policy_dir=policy_dir,
+            step=step,
+            config=_CONFIG,
         )
+    return await _load_adapter_policy(
+        raw_request,
+        policy_dir=policy_dir,
+        step=step,
+        load_inplace=bool(payload.get("load_inplace", False)),
+        config=_CONFIG,
+    )
+
+
+async def _load_full_model_policy(
+    raw_request: Request,
+    *,
+    policy_dir: Path,
+    step: int,
+    config: RLConfig,
+) -> dict[str, Any]:
+    weight_dir = policy_dir
+    if config.policy_transfer.type != "nccl" and (policy_dir / "model").exists():
+        weight_dir = policy_dir / "model"
+    weight_path = str(weight_dir.resolve())
+    response = {"status": "ok", "policy_step": step, "weight_path": weight_path}
+    unchanged = (
+        getattr(raw_request.app.state, "policy_step", None) == step
+        and getattr(raw_request.app.state, "policy_weight_path", None) == weight_path
+    )
+    if step == 0 or unchanged:
         raw_request.app.state.policy_step = step
         raw_request.app.state.policy_weight_path = weight_path
-        return {"status": "ok", "policy_step": step, "weight_path": weight_path}
+        return response
 
-    adapter_name = _CONFIG.policy_transfer.adapter_name
+    client = _engine_client(raw_request)
+    if config.policy_transfer.type == "nccl":
+        await client.collective_rpc(
+            "init_broadcaster",
+            args=(
+                config.policy_transfer.nccl_host,
+                config.policy_transfer.nccl_port,
+                config.policy_transfer.nccl_rank_offset,
+                config.policy_transfer.nccl_inference_world_size,
+                config.policy_transfer.nccl_timeout_seconds,
+            ),
+        )
+    await client.collective_rpc("update_weights_from_path", args=(weight_path,))
+    raw_request.app.state.policy_step = step
+    raw_request.app.state.policy_weight_path = weight_path
+    return response
+
+
+async def _load_adapter_policy(
+    raw_request: Request,
+    *,
+    policy_dir: Path,
+    step: int,
+    load_inplace: bool,
+    config: RLConfig,
+):
+    adapter_name = config.policy_transfer.adapter_name
     adapter_dir = policy_dir / "adapter"
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
+
     adapter_path = str(adapter_dir.resolve())
     if (
         getattr(raw_request.app.state, "policy_step", None) == step
@@ -798,7 +866,7 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
         LoadLoRAAdapterRequest(
             lora_name=adapter_name,
             lora_path=adapter_path,
-            load_inplace=bool(payload.get("load_inplace", False)),
+            load_inplace=load_inplace,
         )
     )
     if isinstance(response, ErrorResponse):
@@ -909,9 +977,9 @@ def _patch_build_app() -> None:
     api_server.build_app = custom_build_app
 
 
-def _serve_args(config: RLConfig) -> Namespace:
+def _base_serve_argv(config: RLConfig) -> list[str]:
     vllm_config = config.inference.vllm
-    argv = [
+    return [
         "--host",
         config.inference.http.host,
         "--port",
@@ -934,6 +1002,10 @@ def _serve_args(config: RLConfig) -> Namespace:
         "vllm",
         "--no-enable-log-requests",
     ]
+
+
+def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
+    vllm_config = config.inference.vllm
     if vllm_config.quantization is not None:
         argv.extend(["--quantization", vllm_config.quantization])
     if vllm_config.load_format is not None:
@@ -956,6 +1028,10 @@ def _serve_args(config: RLConfig) -> Namespace:
         argv.append("--trust-remote-code")
     if config.model.chat_template is not None:
         argv.extend(["--chat-template", config.model.chat_template])
+
+
+def _append_parser_serve_args(argv: list[str], config: RLConfig) -> None:
+    vllm_config = config.inference.vllm
     tool_call_parser = _resolve_tool_call_parser(
         config.model.name,
         vllm_config.tool_call_parser,
@@ -969,21 +1045,33 @@ def _serve_args(config: RLConfig) -> Namespace:
         argv.append("--enforce-eager")
     if config.launcher.mode == "colocate_sleep":
         argv.append("--enable-sleep-mode")
-    if config.lora is not None:
-        max_lora_rank = vllm_config.max_lora_rank or config.lora.rank
-        argv.append("--enable-lora")
-        argv.extend(
-            [
-                "--max-loras",
-                "1",
-                "--max-cpu-loras",
-                "1",
-                "--max-lora-rank",
-                str(max_lora_rank),
-            ]
-        )
-        if vllm_config.fully_sharded_loras:
-            argv.append("--fully-sharded-loras")
+
+
+def _append_lora_serve_args(argv: list[str], config: RLConfig) -> None:
+    if config.lora is None:
+        return
+    vllm_config = config.inference.vllm
+    max_lora_rank = vllm_config.max_lora_rank or config.lora.rank
+    argv.extend(
+        [
+            "--enable-lora",
+            "--max-loras",
+            "1",
+            "--max-cpu-loras",
+            "1",
+            "--max-lora-rank",
+            str(max_lora_rank),
+        ]
+    )
+    if vllm_config.fully_sharded_loras:
+        argv.append("--fully-sharded-loras")
+
+
+def _serve_args(config: RLConfig) -> Namespace:
+    argv = _base_serve_argv(config)
+    _append_optional_serve_args(argv, config)
+    _append_parser_serve_args(argv, config)
+    _append_lora_serve_args(argv, config)
 
     parser = FlexibleArgumentParser(
         description="Wavelet vLLM OpenAI-compatible RL server."

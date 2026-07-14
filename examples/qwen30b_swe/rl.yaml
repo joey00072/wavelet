@@ -19,6 +19,9 @@ data:
 loss:
   type: dppo
 
+algo:
+  type: grpo
+
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
@@ -35,7 +38,6 @@ orchestrator:
     sandbox_command_timeout: 30
   verifier_model: Qwen/Qwen3-30B-A3B-Thinking-2507
   verifier_client_type: openai_chat_completions_token
-  advantage_mode: group_reward
   examples_per_step: 64
   rollouts_per_example: 8
   oversampling_factor: 2.0

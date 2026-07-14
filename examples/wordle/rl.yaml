@@ -22,14 +22,15 @@ loss:
   dppo_mask_low: 0.2
   kl_tau: 0.001
 
+algo:
+  type: grpo
+
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
   verifier_env_id: primeintellect/wordle
   verifier_model: PrimeIntellect/Qwen3-1.7B-Wordle-SFT
   verifier_client_type: openai_chat_completions_token
-  advantage_mode: group_reward
-  normalize_group_advantages: false
   examples_per_step: 64
   rollouts_per_example: 16
   oversampling_factor: 1.0

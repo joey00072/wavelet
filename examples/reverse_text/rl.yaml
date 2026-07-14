@@ -24,14 +24,16 @@ loss:
   dppo_mask_low: 0.2
   kl_tau: 1e-3
 
+algo:
+  type: grpo
+  normalize_advantages: false
+
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
   verifier_env_id: reverse-text
   verifier_model: PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT
   verifier_client_type: openai_chat_completions_token
-  advantage_mode: group_reward
-  normalize_group_advantages: false
   examples_per_step: 128
   rollouts_per_example: 16
   filter_zero_advantage: true

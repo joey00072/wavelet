@@ -147,14 +147,15 @@ class OptimizerConfig(BaseModel):
     def normalize_betas(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
-        raw_betas = value.pop("betas", None)
+        normalized = dict(value)
+        raw_betas = normalized.pop("betas", None)
         if raw_betas is None:
-            return value
+            return normalized
         if not isinstance(raw_betas, (list, tuple)) or len(raw_betas) != 2:
             raise ValueError("optim.betas must be a 2-item list like [0.9, 0.999]")
-        value.setdefault("betas1", raw_betas[0])
-        value.setdefault("betas2", raw_betas[1])
-        return value
+        normalized.setdefault("betas1", raw_betas[0])
+        normalized.setdefault("betas2", raw_betas[1])
+        return normalized
 
 
 class SchedulerConfig(BaseModel):
@@ -281,7 +282,8 @@ class SFTConfig(TrainerConfig):
     output_dir: Path = Path("outputs/unsloth_math_sft")
     max_steps: int | None = Field(default=None, ge=1)
 
-    def validate_pack_function(self):
+    @model_validator(mode="after")
+    def validate_pack_function(self) -> "SFTConfig":
         if self.fsdp.cp > 1 and self.data.pack_function != "cat":
             raise ValueError("Packing function must be 'cat' when CP is enabled")
         if (

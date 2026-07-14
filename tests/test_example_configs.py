@@ -62,6 +62,7 @@ def test_reverse_text_rl_matches_reference_training_shape() -> None:
     assert config.model.name == "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
     assert config.model.torch_dtype == "float32"
     assert config.data.seq_len == 2048
+    assert config.algo.type == "grpo"
     assert config.orchestrator.examples_per_step == 128
     assert config.orchestrator.rollouts_per_example == 16
     assert config.inference.sampling.max_completion_tokens == 128

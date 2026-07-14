@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from wavelet.configs.sft import (
     TrainingDataConfig,
@@ -14,9 +14,10 @@ from wavelet.configs.sft import (
 def _normalize_legacy_sampling_fields(value: object) -> object:
     if not isinstance(value, dict):
         return value
-    if "max_tokens" in value and "max_completion_tokens" not in value:
-        value["max_completion_tokens"] = value.pop("max_tokens")
-    return value
+    normalized = dict(value)
+    if "max_tokens" in normalized and "max_completion_tokens" not in normalized:
+        normalized["max_completion_tokens"] = normalized.pop("max_tokens")
+    return normalized
 
 
 class RLDataConfig(TrainingDataConfig):
@@ -35,12 +36,16 @@ class RLDataConfig(TrainingDataConfig):
     def normalize_legacy_columns(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
+        normalized = dict(value)
         if (
-            "reference_logprobs_column" in value
-            and "inference_logprobs_column" not in value
+            "reference_logprobs_column" in normalized
+            and "inference_logprobs_column" not in normalized
         ):
-            value["inference_logprobs_column"] = value.pop("reference_logprobs_column")
-        return value
+            normalized["inference_logprobs_column"] = normalized.pop(
+                "reference_logprobs_column"
+            )
+        return normalized
+
 
 class RLLossConfig(BaseModel):
     type: Literal["dppo"] = "dppo"
@@ -56,9 +61,10 @@ class RLLossConfig(BaseModel):
     def normalize_legacy_loss_fields(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
-        if "advantage_scale" in value and "adv_tau" not in value:
-            value["adv_tau"] = value.pop("advantage_scale")
-        return value
+        normalized = dict(value)
+        if "advantage_scale" in normalized and "adv_tau" not in normalized:
+            normalized["adv_tau"] = normalized.pop("advantage_scale")
+        return normalized
 
 
 class RLTransportConfig(BaseModel):
@@ -292,18 +298,71 @@ class RLStateServerConfig(BaseModel):
     max_events: int = Field(default=2000, ge=100)
 
 
-class TokensLengthPenaltyConfig(BaseModel):
+class _StrictConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class TokensLengthPenaltyConfig(_StrictConfig):
     type: Literal["tokens"] = "tokens"
     completion_weight: float = Field(default=1.0, ge=0.0)
     tool_response_weight: float = Field(default=1.0, ge=0.0)
 
 
-class TurnsLengthPenaltyConfig(BaseModel):
+class TurnsLengthPenaltyConfig(_StrictConfig):
     type: Literal["turns"] = "turns"
 
 
 LengthPenaltyConfig = Annotated[
     TokensLengthPenaltyConfig | TurnsLengthPenaltyConfig,
+    Field(discriminator="type"),
+]
+
+
+def _normalize_length_penalty(value: object) -> object:
+    if isinstance(value, str) and value in {"tokens", "turns"}:
+        return {"type": value}
+    return value
+
+
+class PassthroughAlgorithmConfig(_StrictConfig):
+    type: Literal["passthrough"] = "passthrough"
+
+
+class RewardAlgorithmConfig(_StrictConfig):
+    type: Literal["reward"] = "reward"
+
+
+class GRPOAlgorithmConfig(_StrictConfig):
+    type: Literal["grpo"] = "grpo"
+    normalize_advantages: bool = False
+    epsilon: float = Field(default=1e-6, gt=0.0)
+    length_penalty: LengthPenaltyConfig | None = None
+
+
+class MaxRLAlgorithmConfig(_StrictConfig):
+    type: Literal["max_rl"] = "max_rl"
+
+
+AlgorithmScope = Literal["rollout", "group", "both"]
+
+
+class CustomAlgorithmConfig(_StrictConfig):
+    """Select a registered algorithm from a user-owned Python file."""
+
+    type: Literal["custom"] = "custom"
+    file: Path
+    algorithm: str = Field(min_length=1)
+    scope: AlgorithmScope
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+    epsilon: float = Field(default=1e-6, gt=0.0)
+
+
+RLAlgorithmConfig = Annotated[
+    PassthroughAlgorithmConfig
+    | RewardAlgorithmConfig
+    | GRPOAlgorithmConfig
+    | MaxRLAlgorithmConfig
+    | CustomAlgorithmConfig,
     Field(discriminator="type"),
 ]
 
@@ -346,10 +405,12 @@ class RLOrchestratorConfig(BaseModel):
     def normalize_legacy_orchestrator_fields(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
-        penalty = value.get("length_penalty")
-        if isinstance(penalty, str) and penalty in {"tokens", "turns"}:
-            value["length_penalty"] = {"type": penalty}
-        return value
+        normalized = dict(value)
+        if "length_penalty" in normalized:
+            normalized["length_penalty"] = _normalize_length_penalty(
+                normalized["length_penalty"]
+            )
+        return normalized
 
     @model_validator(mode="after")
     def validate_max_inflight_rollouts(self) -> "RLOrchestratorConfig":
@@ -378,9 +439,39 @@ class RLLauncherConfig(BaseModel):
     colocate_memory_wait_margin: float = Field(default=0.05, ge=0.0, le=0.5)
 
 
+def _normalize_algorithm_config(value: dict[str, Any]) -> dict[str, Any]:
+    """Infer file-backed algorithms and translate legacy advantage settings."""
+    normalized = dict(value)
+    if "algo" in normalized:
+        algo = normalized["algo"]
+        if isinstance(algo, dict) and "type" not in algo:
+            if "file" in algo or "algorithm" in algo:
+                normalized["algo"] = {"type": "custom", **algo}
+        return normalized
+
+    orchestrator = normalized.get("orchestrator")
+    if not isinstance(orchestrator, dict):
+        return normalized
+    mode = orchestrator.get("advantage_mode")
+    if mode is None:
+        return normalized
+    if mode != "group_reward":
+        normalized["algo"] = {"type": mode}
+        return normalized
+
+    normalized["algo"] = {
+        "type": "grpo",
+        "normalize_advantages": orchestrator.get("normalize_group_advantages", False),
+        "epsilon": orchestrator.get("advantage_epsilon", 1e-6),
+        "length_penalty": _normalize_length_penalty(orchestrator.get("length_penalty")),
+    }
+    return normalized
+
+
 class RLConfig(TrainerConfig):
     data: RLDataConfig = RLDataConfig()
     loss: RLLossConfig = RLLossConfig()
+    algo: RLAlgorithmConfig = PassthroughAlgorithmConfig()
     orchestrator: RLOrchestratorConfig = RLOrchestratorConfig()
     eval: RLEvalConfig | None = None
     inference: RLInferenceConfig = RLInferenceConfig()
@@ -390,6 +481,13 @@ class RLConfig(TrainerConfig):
     launcher: RLLauncherConfig = RLLauncherConfig()
     output_dir: Path = Path("outputs/unsloth_math_rl")
     max_steps: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_algorithm_config(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        return _normalize_algorithm_config(value)
 
     @model_validator(mode="after")
     def validate_rollout_modes(self) -> "RLConfig":

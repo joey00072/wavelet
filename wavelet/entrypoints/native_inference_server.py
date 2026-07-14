@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -19,20 +20,9 @@ def _server_engine_config(config: RLConfig) -> RLConfig:
     return config
 
 
-def _build_app(config: RLConfig):
-    try:
-        from fastapi import FastAPI, HTTPException
-    except ImportError as exc:
-        raise ImportError(
-            "The vLLM HTTP server requires FastAPI. Install dependencies with "
-            "`uv sync`."
-        ) from exc
-
-    engine = VLLMPolicyInferenceEngine(_server_engine_config(config))
-    app = FastAPI(title="Wavelet vLLM RL Server")
-
-    @app.on_event("startup")
-    def startup() -> None:
+def _lifespan(config: RLConfig, engine: Any):
+    @asynccontextmanager
+    async def lifespan(_app: Any):
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         if config.lora is not None:
@@ -50,11 +40,15 @@ def _build_app(config: RLConfig):
                     ),
                 }
             )
+        try:
+            yield
+        finally:
+            engine.close()
 
-    @app.on_event("shutdown")
-    def shutdown() -> None:
-        engine.close()
+    return lifespan
 
+
+def _register_status_routes(app: Any, config: RLConfig, engine: Any) -> None:
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {"status": "ok", "policy_step": engine.policy_step}
@@ -76,6 +70,8 @@ def _build_app(config: RLConfig):
     def resume() -> dict[str, str]:
         return {"status": "ok"}
 
+
+def _register_memory_routes(app: Any, engine: Any) -> None:
     @app.post("/sleep")
     def sleep(payload: dict[str, Any] | None = None) -> dict[str, str]:
         del payload
@@ -88,6 +84,12 @@ def _build_app(config: RLConfig):
         engine.wake(tags=tags)
         return {"status": "woke"}
 
+
+def _register_policy_routes(
+    app: Any,
+    engine: Any,
+    http_exception: type[Exception],
+) -> None:
     @app.post("/load_policy")
     def load_policy(payload: dict[str, Any]) -> dict[str, Any]:
         policy_dir = Path(payload["policy_dir"])
@@ -99,7 +101,7 @@ def _build_app(config: RLConfig):
     def load_lora_adapter(payload: dict[str, Any]) -> dict[str, Any]:
         raw_adapter_path = payload.get("lora_path") or payload.get("adapter_path")
         if raw_adapter_path is None:
-            raise HTTPException(
+            raise http_exception(
                 status_code=400,
                 detail="Expected lora_path or adapter_path.",
             )
@@ -121,7 +123,7 @@ def _build_app(config: RLConfig):
 
         policy_dir = payload.get("policy_dir") or payload.get("weight_dir")
         if policy_dir is None:
-            raise HTTPException(
+            raise http_exception(
                 status_code=400,
                 detail="Expected update_info, policy_dir, or weight_dir.",
             )
@@ -135,6 +137,8 @@ def _build_app(config: RLConfig):
         engine.init_weight_transfer(init_info)
         return {"status": "ok"}
 
+
+def _register_inference_routes(app: Any, engine: Any) -> None:
     @app.post("/annotate")
     def annotate(payload: dict[str, Any]) -> dict[str, Any]:
         records = rl_examples_from_payload(payload["records"])
@@ -157,6 +161,26 @@ def _build_app(config: RLConfig):
     @app.post("/tokenize")
     def tokenize(payload: dict[str, Any]) -> dict[str, Any]:
         return engine.tokenize_messages(payload)
+
+
+def _build_app(config: RLConfig):
+    try:
+        from fastapi import FastAPI, HTTPException
+    except ImportError as exc:
+        raise ImportError(
+            "The vLLM HTTP server requires FastAPI. Install dependencies with "
+            "`uv sync`."
+        ) from exc
+
+    engine = VLLMPolicyInferenceEngine(_server_engine_config(config))
+    app = FastAPI(
+        title="Wavelet vLLM RL Server",
+        lifespan=_lifespan(config, engine),
+    )
+    _register_status_routes(app, config, engine)
+    _register_memory_routes(app, engine)
+    _register_policy_routes(app, engine, HTTPException)
+    _register_inference_routes(app, engine)
 
     return app
 

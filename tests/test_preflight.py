@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.orchestrator.preflight import build_preflight_report
 
 
-def test_preflight_reports_unavailable_cuda_device(tmp_path, monkeypatch) -> None:
+CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
+
+
+def _write_local_data(tmp_path: Path) -> Path:
     data_path = tmp_path / "train.jsonl"
     data_path.write_text('{"prompt": "x", "completion": "y"}\n', encoding="utf-8")
+    return data_path
+
+
+def test_preflight_reports_unavailable_cuda_device(tmp_path, monkeypatch) -> None:
+    data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
         "wavelet.orchestrator.preflight._available_gpu_indices",
         lambda: {"0"},
@@ -52,9 +61,84 @@ def test_preflight_reports_missing_local_data(tmp_path) -> None:
     )
 
 
+def test_preflight_reports_unimportable_custom_algorithm(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    config = RLConfig(
+        algo={
+            "file": tmp_path / "algorithm_that_does_not_exist.py",
+            "algorithm": "Algorithm",
+            "scope": "group",
+        },
+        data={"source": "local", "path": data_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert report["summary"]["algo"]["type"] == "custom"
+    assert any(
+        check["name"] == "algorithm"
+        and check["status"] == "error"
+        and "algorithm_that_does_not_exist.py" in check["message"]
+        for check in report["checks"]
+    )
+
+
+def test_preflight_reports_custom_algorithm_syntax_error(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    algorithm_path = tmp_path / "broken_algorithm.py"
+    algorithm_path.write_text("def broken(:\n", encoding="utf-8")
+    config = RLConfig(
+        algo={
+            "file": algorithm_path,
+            "algorithm": "broken",
+            "scope": "rollout",
+        },
+        data={"source": "local", "path": data_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert any(
+        check["name"] == "algorithm"
+        and check["status"] == "error"
+        and "SyntaxError" in check["message"]
+        for check in report["checks"]
+    )
+
+
+def test_preflight_reports_custom_algorithm_constructor_error(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    config = RLConfig(
+        algo={
+            "file": CUSTOM_ALGORITHM_FILE,
+            "algorithm": "multiplier",
+            "scope": "group",
+        },
+        data={"source": "local", "path": data_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert any(
+        check["name"] == "algorithm"
+        and check["status"] == "error"
+        and "TypeError" in check["message"]
+        and "multiplier" in check["message"]
+        for check in report["checks"]
+    )
+
+
 def test_preflight_resolves_process_commands(tmp_path, monkeypatch) -> None:
-    data_path = tmp_path / "train.jsonl"
-    data_path.write_text('{"prompt": "x", "completion": "y"}\n', encoding="utf-8")
+    data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
         "wavelet.orchestrator.preflight._available_gpu_indices",
         lambda: {"0", "1"},
@@ -104,8 +188,7 @@ def test_preflight_cli_returns_nonzero_for_errors(tmp_path, capsys) -> None:
 
 
 def test_preflight_reports_qlora_without_lora(tmp_path, monkeypatch) -> None:
-    data_path = tmp_path / "train.jsonl"
-    data_path.write_text('{"prompt": "x", "completion": "y"}\n', encoding="utf-8")
+    data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
         "wavelet.orchestrator.preflight.importlib.util.find_spec",
         lambda name: object() if name == "bitsandbytes" else None,
@@ -134,8 +217,7 @@ def test_preflight_reports_missing_bitsandbytes_for_qlora(
     tmp_path,
     monkeypatch,
 ) -> None:
-    data_path = tmp_path / "train.jsonl"
-    data_path.write_text('{"prompt": "x", "completion": "y"}\n', encoding="utf-8")
+    data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
         "wavelet.orchestrator.preflight.importlib.util.find_spec",
         lambda name: None if name == "bitsandbytes" else object(),
@@ -151,8 +233,7 @@ def test_preflight_reports_missing_bitsandbytes_for_qlora(
 
     assert report["ok"] is False
     assert any(
-        check["name"] == "bitsandbytes_available"
-        and check["status"] == "error"
+        check["name"] == "bitsandbytes_available" and check["status"] == "error"
         for check in report["checks"]
     )
 
@@ -161,15 +242,16 @@ def test_preflight_warns_for_quantized_inference_without_qlora(
     tmp_path,
     monkeypatch,
 ) -> None:
-    data_path = tmp_path / "train.jsonl"
-    data_path.write_text('{"prompt": "x", "completion": "y"}\n', encoding="utf-8")
+    data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
         "wavelet.orchestrator.preflight._available_gpu_indices",
         lambda: {"0"},
     )
     config = RLConfig(
         data={"source": "local", "path": data_path},
-        inference={"vllm": {"quantization": "bitsandbytes", "load_format": "bitsandbytes"}},
+        inference={
+            "vllm": {"quantization": "bitsandbytes", "load_format": "bitsandbytes"}
+        },
         output_dir=tmp_path / "run",
         reward={"mode": "math_format"},
     )
@@ -185,8 +267,7 @@ def test_preflight_warns_for_quantized_inference_without_qlora(
 
 
 def test_preflight_reports_qlora_topology_errors(tmp_path, monkeypatch) -> None:
-    data_path = tmp_path / "train.jsonl"
-    data_path.write_text('{"prompt": "x", "completion": "y"}\n', encoding="utf-8")
+    data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
         "wavelet.orchestrator.preflight.importlib.util.find_spec",
         lambda name: object() if name == "bitsandbytes" else None,
@@ -203,8 +284,6 @@ def test_preflight_reports_qlora_topology_errors(tmp_path, monkeypatch) -> None:
 
     assert report["ok"] is False
     error_names = {
-        check["name"]
-        for check in report["checks"]
-        if check["status"] == "error"
+        check["name"] for check in report["checks"] if check["status"] == "error"
     }
     assert {"qlora_fsdp", "qlora_tensor_parallel"} <= error_names

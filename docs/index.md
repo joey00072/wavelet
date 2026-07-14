@@ -11,6 +11,12 @@ training or inference runs.
   split.
 - [Examples](../examples/README.md): runnable example status, environment notes,
   and verifier data preparation.
+- [RL algorithms](algorithms.md): named advantage assignment, configuration,
+  compatibility, and extension points.
+- [Architecture](architecture.md): package ownership, RL process flow,
+  scheduling, policy artifacts, and extension boundaries.
+- [Data pipeline](data_pipeline.md): source loading, normalization,
+  tokenization, RL packing, and collation contracts.
 - [Inference diagnostics](inference.skill.md): isolate model serving, policy
   loading, generation, logprobs, and throughput.
 - [Orchestrator diagnostics](orchestrator.skill.md): inspect scheduling,

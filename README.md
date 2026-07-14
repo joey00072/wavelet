@@ -12,6 +12,10 @@ Start with the [documentation index](docs/index.md) for the human and
 agent-readable map of workflows, diagnostics, and repository guidance.
 
 - [Examples](examples/README.md): runnable configs and environment notes
+- [Architecture](docs/architecture.md): subsystem ownership, process flow, and
+  extension boundaries
+- [Data pipeline](docs/data_pipeline.md): loading, tokenization, RL packing, and
+  collation contracts
 - Run preflight checks before expensive RL launches:
   `uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
   The report includes low-precision checks for QLoRA and vLLM quantized
@@ -20,6 +24,9 @@ agent-readable map of workflows, diagnostics, and repository guidance.
   logprobs, and throughput checks
 - [Orchestrator diagnostics](docs/orchestrator.skill.md): scheduling, rollout,
   reward, filtering, and materialization checks
+- [RL algorithms](docs/algorithms.md): configure GRPO, MaxRL, reward, or
+  passthrough advantage assignment, including algorithms from user-owned
+  Python files
 - [Agent instructions](AGENTS.md): repository rules for coding agents and
   contributors
 
@@ -42,6 +49,10 @@ Run the RL example:
 ```bash
 uv run python -m wavelet rl @ examples/unsloth_math/rl.yaml
 ```
+
+RL advantage assignment is selected explicitly with `algo.type`. The
+`reverse_text` example uses GRPO; see the [algorithm guide](docs/algorithms.md)
+for the supported choices and their contracts.
 
 Current distributed scope is experimental:
 

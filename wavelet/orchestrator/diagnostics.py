@@ -46,6 +46,7 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
         schedule["rollout_chunk_examples"] = rollout_chunk_examples(config)
         schedule["chunks_per_step"] = chunks_per_step(config)
     return {
+        "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "data": {
             "source": config.data.source,
             "path": str(config.data.path),
@@ -60,8 +61,6 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
             "verifier_env_id": config.orchestrator.verifier_env_id,
             "verifier_model": config.orchestrator.verifier_model,
             "verifier_client_type": config.orchestrator.verifier_client_type,
-            "advantage_mode": config.orchestrator.advantage_mode,
-            "normalize_group_advantages": config.orchestrator.normalize_group_advantages,
             "filter_zero_advantage": config.orchestrator.filter_zero_advantage,
             "zero_advantage_max_retries": config.orchestrator.zero_advantage_max_retries,
             "oversampling_factor": config.orchestrator.oversampling_factor,
