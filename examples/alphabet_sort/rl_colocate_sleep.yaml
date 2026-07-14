@@ -24,6 +24,9 @@ loss:
   dppo_mask_low: 0.2
   kl_tau: 0.001
 
+algo:
+  type: grpo
+
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
@@ -34,8 +37,6 @@ orchestrator:
     power_per_turn: false
   verifier_model: Qwen/Qwen3-4B-Instruct-2507
   verifier_client_type: openai_chat_completions_token
-  advantage_mode: group_reward
-  normalize_group_advantages: false
   examples_per_step: 32
   rollouts_per_example: 4
   filter_zero_advantage: false

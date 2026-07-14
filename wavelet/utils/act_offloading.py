@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 
 import psutil
@@ -35,78 +36,64 @@ class OffloadActivations(saved_tensors_hooks):
         self._is_first_forward_call = True
         self._is_first_backward_call = True
         self._warned_on_ram = False
+        super().__init__(self._pack_tensor, self._unpack_tensor)
 
-        def get_tensor_id() -> int:
-            self._tensor_id += 1
-            return self._tensor_id
+    def _next_tensor_id(self) -> int:
+        self._tensor_id += 1
+        return self._tensor_id
 
-        def tensor_num_bytes(tensor: torch.Tensor) -> int:
-            return tensor.element_size() * tensor.nelement()
-
-        def verify_sufficient_virtual_memory() -> None:
-            if self._warned_on_ram:
-                return
-            current_pct = psutil.virtual_memory().percent
-            if current_pct > self.virtual_memory_safe_pct:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "CPU memory usage is high during activation offloading: "
-                    "%s%% > %s%%",
-                    current_pct,
-                    self.virtual_memory_safe_pct,
-                )
-            self._warned_on_ram = True
-
-        def pack_tensor(activation: torch.Tensor) -> int:
-            if self._is_first_forward_call:
-                assert not self._tracker, (
-                    "Activation tracker should be empty at the start of a forward pass."
-                )
-                self._is_first_forward_call = False
-                self._is_first_backward_call = True
-
-            tensor_id = get_tensor_id()
-            num_bytes = tensor_num_bytes(activation)
-            should_offload = (
-                activation.device.type == "cuda"
-                and num_bytes >= self.min_tensor_size_bytes
-                and not isinstance(activation, torch.nn.Parameter)
-                and not (
-                    hasattr(torch.nn, "Buffer")
-                    and isinstance(activation, torch.nn.Buffer)
-                )
+    def _verify_virtual_memory(self) -> None:
+        if self._warned_on_ram:
+            return
+        current_pct = psutil.virtual_memory().percent
+        if current_pct > self.virtual_memory_safe_pct:
+            logging.getLogger(__name__).warning(
+                "CPU memory usage is high during activation offloading: %s%% > %s%%",
+                current_pct,
+                self.virtual_memory_safe_pct,
             )
+        self._warned_on_ram = True
 
-            if should_offload:
-                cpu_tensor = torch.empty_like(
-                    activation,
-                    pin_memory=self.use_pin_memory,
-                    device="cpu",
-                )
-                cpu_tensor.copy_(activation, non_blocking=True)
-                self._tracker[tensor_id] = (cpu_tensor, True)
-            else:
-                self._tracker[tensor_id] = (activation, False)
+    def _pack_tensor(self, activation: torch.Tensor) -> int:
+        if self._is_first_forward_call:
+            assert not self._tracker, (
+                "Activation tracker should be empty at the start of a forward pass."
+            )
+            self._is_first_forward_call = False
+            self._is_first_backward_call = True
 
-            return tensor_id
+        tensor_id = self._next_tensor_id()
+        num_bytes = activation.element_size() * activation.nelement()
+        should_offload = (
+            activation.device.type == "cuda"
+            and num_bytes >= self.min_tensor_size_bytes
+            and not isinstance(activation, torch.nn.Parameter)
+            and not (
+                hasattr(torch.nn, "Buffer") and isinstance(activation, torch.nn.Buffer)
+            )
+        )
+        if should_offload:
+            cpu_tensor = torch.empty_like(
+                activation,
+                pin_memory=self.use_pin_memory,
+                device="cpu",
+            )
+            cpu_tensor.copy_(activation, non_blocking=True)
+            self._tracker[tensor_id] = (cpu_tensor, True)
+        else:
+            self._tracker[tensor_id] = (activation, False)
+        return tensor_id
 
-        def unpack_tensor(tensor_id: int) -> torch.Tensor:
-            if self._is_first_backward_call:
-                self._is_first_backward_call = False
-                self._is_first_forward_call = True
-                if self.use_pin_memory:
-                    verify_sufficient_virtual_memory()
-
-            if tensor_id not in self._tracker:
-                raise KeyError(f"Untracked activation tensor id: {tensor_id}")
-
-            tensor, offloaded = self._tracker.pop(tensor_id)
-            if offloaded:
-                return tensor.to("cuda", non_blocking=True)
-            return tensor
-
-        super().__init__(pack_tensor, unpack_tensor)
+    def _unpack_tensor(self, tensor_id: int) -> torch.Tensor:
+        if self._is_first_backward_call:
+            self._is_first_backward_call = False
+            self._is_first_forward_call = True
+            if self.use_pin_memory:
+                self._verify_virtual_memory()
+        if tensor_id not in self._tracker:
+            raise KeyError(f"Untracked activation tensor id: {tensor_id}")
+        tensor, offloaded = self._tracker.pop(tensor_id)
+        return tensor.to("cuda", non_blocking=True) if offloaded else tensor
 
 
 def maybe_activation_offloading(

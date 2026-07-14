@@ -64,6 +64,33 @@ def _online_logsumexp_update(
     return new_max, new_sums
 
 
+def _validate_chunked_logprob_inputs(
+    hidden: Tensor,
+    weight: Tensor,
+    labels: Tensor,
+    inv_temperature: Tensor,
+    chunk_size: int,
+) -> None:
+    if hidden.dim() != 2:
+        raise ValueError(f"expected hidden [N, H], got {tuple(hidden.shape)}")
+    if weight.dim() != 2:
+        raise ValueError(f"expected weight [V, H], got {tuple(weight.shape)}")
+    if labels.dim() != 1:
+        raise ValueError(f"expected labels [N], got {tuple(labels.shape)}")
+    if inv_temperature.dim() != 1:
+        raise ValueError(
+            f"expected inv_temperature [N], got {tuple(inv_temperature.shape)}"
+        )
+    if hidden.shape[0] != labels.shape[0]:
+        raise ValueError("hidden and labels must have matching token count")
+    if hidden.shape[0] != inv_temperature.shape[0]:
+        raise ValueError("hidden and temperatures must have matching token count")
+    if hidden.shape[1] != weight.shape[1]:
+        raise ValueError("hidden and weight dimensions are incompatible")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+
 class _ChunkedLogprobFn(torch.autograd.Function):
     @staticmethod
     def forward(  # type: ignore[override]
@@ -74,24 +101,13 @@ class _ChunkedLogprobFn(torch.autograd.Function):
         inv_temperature: Tensor,
         chunk_size: int,
     ) -> Tensor:
-        if hidden.dim() != 2:
-            raise ValueError(f"expected hidden [N, H], got {tuple(hidden.shape)}")
-        if weight.dim() != 2:
-            raise ValueError(f"expected weight [V, H], got {tuple(weight.shape)}")
-        if labels.dim() != 1:
-            raise ValueError(f"expected labels [N], got {tuple(labels.shape)}")
-        if inv_temperature.dim() != 1:
-            raise ValueError(
-                f"expected inv_temperature [N], got {tuple(inv_temperature.shape)}"
-            )
-        if hidden.shape[0] != labels.shape[0]:
-            raise ValueError("hidden and labels must have matching token count")
-        if hidden.shape[0] != inv_temperature.shape[0]:
-            raise ValueError("hidden and temperatures must have matching token count")
-        if hidden.shape[1] != weight.shape[1]:
-            raise ValueError("hidden and weight dimensions are incompatible")
-        if chunk_size <= 0:
-            raise ValueError("chunk_size must be positive")
+        _validate_chunked_logprob_inputs(
+            hidden,
+            weight,
+            labels,
+            inv_temperature,
+            chunk_size,
+        )
 
         device = hidden.device
         token_count = hidden.shape[0]
@@ -114,7 +130,9 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                 dtype=torch.float32,
             )
             sums = torch.zeros(chunk_tokens, device=device, dtype=torch.float32)
-            target_logits = torch.zeros(chunk_tokens, device=device, dtype=torch.float32)
+            target_logits = torch.zeros(
+                chunk_tokens, device=device, dtype=torch.float32
+            )
 
             for vocab_start in range(0, vocab_size, vocab_chunk_size):
                 vocab_end = min(vocab_start + vocab_chunk_size, vocab_size)

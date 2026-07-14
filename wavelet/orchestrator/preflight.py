@@ -8,7 +8,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.rl_config import CustomAlgorithmConfig, RLConfig
+from wavelet.orchestrator.algorithms import build_algorithm
 from wavelet.orchestrator.placement import (
     device_group_size as _device_group_size,
     device_groups as _as_device_groups,
@@ -37,6 +38,7 @@ def build_preflight_report(config: RLConfig) -> dict[str, Any]:
         *_launcher_checks(config),
         *_port_checks(config),
         *_schedule_checks(config),
+        *_algorithm_checks(config),
         *_low_precision_checks(config),
     ]
     commands: list[dict[str, Any]] = []
@@ -68,6 +70,7 @@ def _summary(config: RLConfig) -> dict[str, Any]:
         "inference_mode": config.inference.mode,
         "inference_backend": config.inference.vllm.server_backend,
         "policy_transfer": config.policy_transfer.type,
+        "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "target_steps": target_steps(config),
         "low_precision": _low_precision_summary(config),
     }
@@ -88,7 +91,9 @@ def _paths(config: RLConfig) -> dict[str, str]:
     return {
         "output_dir": str(config.output_dir),
         "queue_dir": str(resolve_queue_dir(config.output_dir, config.transport)),
-        "policy_dir": str(resolve_policy_dir(config.output_dir, config.policy_transfer)),
+        "policy_dir": str(
+            resolve_policy_dir(config.output_dir, config.policy_transfer)
+        ),
         "events_dir": str(config.output_dir / "events"),
     }
 
@@ -121,7 +126,9 @@ def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:
                 message=f"data.source={config.data.source!r} does not require a local path preflight.",
             )
         ]
-    paths = config.data.path if isinstance(config.data.path, list) else [config.data.path]
+    paths = (
+        config.data.path if isinstance(config.data.path, list) else [config.data.path]
+    )
     checks: list[PreflightCheck] = []
     for index, path in enumerate(paths):
         exists = Path(path).exists()
@@ -350,6 +357,51 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
             )
         )
     return checks
+
+
+def _algorithm_checks(config: RLConfig) -> list[PreflightCheck]:
+    if not isinstance(config.algo, CustomAlgorithmConfig):
+        return [
+            PreflightCheck(
+                name="algorithm",
+                status="ok",
+                message=f"Built-in algorithm is available: {config.algo.type}",
+            )
+        ]
+    try:
+        build_algorithm(config.algo)
+    except (ImportError, OSError, SyntaxError, TypeError, ValueError) as exc:
+        return [
+            PreflightCheck(
+                name="algorithm",
+                status="error",
+                message=(
+                    f"Could not load custom algorithm {config.algo.algorithm!r} "
+                    f"from {str(config.algo.file)!r}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                details=_custom_algorithm_details(config.algo),
+            )
+        ]
+    return [
+        PreflightCheck(
+            name="algorithm",
+            status="ok",
+            message=(
+                f"Custom algorithm is loadable: {config.algo.algorithm} "
+                f"from {config.algo.file}"
+            ),
+            details=_custom_algorithm_details(config.algo),
+        )
+    ]
+
+
+def _custom_algorithm_details(config: CustomAlgorithmConfig) -> dict[str, Any]:
+    return {
+        "file": str(config.file),
+        "algorithm": config.algorithm,
+        "scope": config.scope,
+    }
 
 
 def _low_precision_checks(config: RLConfig) -> list[PreflightCheck]:

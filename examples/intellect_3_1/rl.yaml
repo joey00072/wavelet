@@ -20,13 +20,15 @@ data:
 loss:
   type: dppo
 
+algo:
+  type: grpo
+
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
   verifier_env_id: math-env
   verifier_model: PrimeIntellect/INTELLECT-3-Base
   verifier_client_type: openai_chat_completions_token
-  advantage_mode: group_reward
   examples_per_step: 128
   rollouts_per_example: 16
   oversampling_factor: 2.0

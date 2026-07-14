@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
+
 import torch
 from torch import Tensor
 
@@ -111,6 +113,75 @@ def _sequence_spans(position_ids: Tensor, seq_len: int) -> list[tuple[int, int]]
     ]
 
 
+def _iter_trainable_spans(
+    trainer_logprobs: Tensor,
+    inference_logprobs: Tensor,
+    teacher_logprobs: Tensor | None,
+    advantages: Tensor,
+    loss_mask: Tensor,
+    position_ids: Tensor | None,
+) -> Iterator[tuple[LossInputs, Tensor]]:
+    seq_len = trainer_logprobs.shape[1]
+    spans_by_row = (
+        [[(0, seq_len)] for _ in range(trainer_logprobs.shape[0])]
+        if position_ids is None
+        else [_sequence_spans(row, seq_len) for row in position_ids]
+    )
+    for row_index, spans in enumerate(spans_by_row):
+        for start, end in spans:
+            span_mask = loss_mask[row_index, start:end]
+            trainable_tokens = span_mask.sum()
+            if int(trainable_tokens.item()) == 0:
+                continue
+            yield (
+                LossInputs(
+                    trainer_logprobs=trainer_logprobs[row_index, start:end],
+                    inference_logprobs=inference_logprobs[row_index, start:end],
+                    teacher_logprobs=(
+                        None
+                        if teacher_logprobs is None
+                        else teacher_logprobs[row_index, start:end]
+                    ),
+                    advantages=advantages[row_index, start:end],
+                    loss_mask=span_mask,
+                ),
+                trainable_tokens,
+            )
+
+
+def _resolve_loss_scale(
+    loss_scale: int | float | Tensor | None,
+    *,
+    normalization: str,
+    sequence_count: int,
+    loss_mask: Tensor,
+    device: torch.device,
+) -> float | Tensor:
+    if loss_scale is None:
+        if normalization == "sequence":
+            return max(float(sequence_count), 1.0)
+        return torch.clamp_min(loss_mask.sum(), 1)
+    if isinstance(loss_scale, Tensor):
+        return torch.clamp_min(loss_scale.to(device), 1)
+    return max(float(loss_scale), 1.0)
+
+
+def _aggregate_loss_metrics(
+    metric_values: dict[str, list[Tensor]],
+) -> dict[str, Tensor]:
+    metrics = {
+        key: torch.stack(values).mean()
+        for key, values in metric_values.items()
+        if values
+    }
+    for key, values in metric_values.items():
+        if not values:
+            continue
+        for stat_name, stat_value in _tensor_stats(torch.stack(values)).items():
+            metrics[f"{key}/{stat_name}"] = stat_value
+    return metrics
+
+
 def compute_loss(
     trainer_logprobs: Tensor,
     inference_logprobs: Tensor,
@@ -126,67 +197,35 @@ def compute_loss(
     metric_values: dict[str, list[Tensor]] = {}
     sequence_count = 0
 
-    if position_ids is None:
-        spans_by_row = [
-            [(0, trainer_logprobs.shape[1])] for _ in range(trainer_logprobs.shape[0])
-        ]
-    else:
-        spans_by_row = [
-            _sequence_spans(row_position_ids, trainer_logprobs.shape[1])
-            for row_position_ids in position_ids
-        ]
-
-    for row_index, spans in enumerate(spans_by_row):
-        for start, end in spans:
-            span_loss_mask = loss_mask[row_index, start:end]
-            span_trainable_tokens = span_loss_mask.sum()
-            if int(span_trainable_tokens.item()) == 0:
-                continue
-            row_teacher = (
-                None
-                if teacher_logprobs is None
-                else teacher_logprobs[row_index, start:end]
-            )
-            outputs = default_loss_fn(
-                LossInputs(
-                    trainer_logprobs=trainer_logprobs[row_index, start:end],
-                    inference_logprobs=inference_logprobs[row_index, start:end],
-                    teacher_logprobs=row_teacher,
-                    advantages=advantages[row_index, start:end],
-                    loss_mask=span_loss_mask,
-                ),
-                loss_config,
-            )
-            if loss_config.normalization == "sequence":
-                span_loss = outputs.loss / torch.clamp_min(span_trainable_tokens, 1)
-                sequence_count += 1
-            else:
-                span_loss = outputs.loss
-            total_loss = span_loss if total_loss is None else total_loss + span_loss
-            for key, value in outputs.metrics.items():
-                metric_values.setdefault(key, []).append(value)
+    spans = _iter_trainable_spans(
+        trainer_logprobs,
+        inference_logprobs,
+        teacher_logprobs,
+        advantages,
+        loss_mask,
+        position_ids,
+    )
+    for span_inputs, trainable_tokens in spans:
+        outputs = default_loss_fn(span_inputs, loss_config)
+        span_loss = outputs.loss
+        if loss_config.normalization == "sequence":
+            span_loss = span_loss / torch.clamp_min(trainable_tokens, 1)
+            sequence_count += 1
+        total_loss = span_loss if total_loss is None else total_loss + span_loss
+        for key, value in outputs.metrics.items():
+            metric_values.setdefault(key, []).append(value)
 
     if total_loss is None:
         total_loss = trainer_logprobs.sum() * 0.0
-    if loss_scale is None:
-        if loss_config.normalization == "sequence":
-            scale = max(float(sequence_count), 1.0)
-        else:
-            scale = torch.clamp_min(loss_mask.sum(), 1)
-    elif isinstance(loss_scale, Tensor):
-        scale = torch.clamp_min(loss_scale.to(total_loss.device), 1)
-    else:
-        scale = max(float(loss_scale), 1.0)
+    scale = _resolve_loss_scale(
+        loss_scale,
+        normalization=loss_config.normalization,
+        sequence_count=sequence_count,
+        loss_mask=loss_mask,
+        device=total_loss.device,
+    )
     scaled_loss = total_loss / scale
-    metrics = {
-        key: torch.stack(values).mean()
-        for key, values in metric_values.items()
-        if values
-    }
-    for key, values in metric_values.items():
-        if not values:
-            continue
-        stacked = torch.stack(values)
-        for stat_name, stat_value in _tensor_stats(stacked).items():
-            metrics[f"{key}/{stat_name}"] = stat_value
-    return LossOutput(loss=scaled_loss, metrics=metrics)
+    return LossOutput(
+        loss=scaled_loss,
+        metrics=_aggregate_loss_metrics(metric_values),
+    )

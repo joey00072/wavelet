@@ -202,6 +202,131 @@ def setup_runtime(config: ModelConfig) -> None:
         torch.set_float32_matmul_precision("high")
 
 
+def _setup_debug_model(
+    config: ModelConfig,
+    *,
+    max_seq_length: int | None,
+    parallel_dims: ParallelDims | None,
+) -> PreTrainedModel:
+    if parallel_dims is not None and parallel_dims.tp_enabled:
+        raise NotImplementedError(
+            "Tensor parallel execution is not implemented for the debug model."
+        )
+    model = build_debug_model(max_seq_length=max_seq_length)
+    model.config.use_cache = False
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    if config.adapter_path is not None:
+        model = PeftModel.from_pretrained(
+            model,
+            config.adapter_path,
+            is_trainable=True,
+        )
+    return cast(PreTrainedModel, model)
+
+
+def _model_load_kwargs(
+    config: ModelConfig,
+    *,
+    distributed: bool,
+    parallel_dims: ParallelDims | None,
+) -> tuple[dict[str, Any], bool, str]:
+    attention = (
+        _best_attn_implementation()
+        if config.attn_implementation == "auto"
+        else config.attn_implementation
+    )
+    kwargs: dict[str, Any] = {
+        "trust_remote_code": config.trust_remote_code,
+        "dtype": resolve_dtype(config.torch_dtype),
+        "attn_implementation": attention,
+    }
+    _add_tensor_parallel_load_kwargs(kwargs, config, parallel_dims)
+    if config.meta_device_init:
+        kwargs["low_cpu_mem_usage"] = True
+    prequantized = _add_quantized_load_kwargs(
+        kwargs,
+        config,
+        distributed=distributed,
+    )
+    return kwargs, prequantized, attention
+
+
+def _add_tensor_parallel_load_kwargs(
+    kwargs: dict[str, Any],
+    config: ModelConfig,
+    parallel_dims: ParallelDims | None,
+) -> None:
+    if parallel_dims is None or not parallel_dims.tp_enabled:
+        return
+    if config.load_in_4bit:
+        raise NotImplementedError(
+            "QLoRA with trainer tensor parallelism is not supported. Use "
+            "replicated DDP training for 4-bit LoRA adapters."
+        )
+    if config.adapter_path is not None:
+        raise NotImplementedError(
+            "Loading PEFT adapters onto a tensor-parallel model is not implemented yet."
+        )
+    kwargs["tp_plan"] = "auto"
+    kwargs["device_mesh"] = parallel_dims.get_mesh("tp")
+
+
+def _add_quantized_load_kwargs(
+    kwargs: dict[str, Any],
+    config: ModelConfig,
+    *,
+    distributed: bool,
+) -> bool:
+    if not config.load_in_4bit:
+        return False
+    model_config = AutoConfig.from_pretrained(
+        config.name,
+        trust_remote_code=config.trust_remote_code,
+    )
+    prequantized = getattr(model_config, "quantization_config", None) is not None
+    if not prequantized:
+        compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+    kwargs["device_map"] = _quantized_device_map(distributed)
+    return prequantized
+
+
+def _load_pretrained_model(
+    config: ModelConfig,
+    kwargs: dict[str, Any],
+    *,
+    attention: str,
+) -> PreTrainedModel:
+    previous_verbosity = transformers_logging.get_verbosity()
+    suppress_warning = config.torch_dtype == "float32" and attention in {
+        "flash_attention_2",
+        "flash_attention_3",
+    }
+    if suppress_warning:
+        transformers_logging.set_verbosity_error()
+    try:
+        return AutoModelForCausalLM.from_pretrained(config.name, **kwargs)
+    finally:
+        if suppress_warning:
+            transformers_logging.set_verbosity(previous_verbosity)
+
+
+def _prepare_quantized_modules(model: PreTrainedModel, config: ModelConfig) -> None:
+    compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    for module_name in ("embed_tokens", "lm_head", "norm"):
+        for name, module in model.named_modules():
+            if name.endswith(module_name):
+                module.to(compute_dtype)
+
+
 def setup_model(
     config: ModelConfig,
     *,
@@ -210,85 +335,19 @@ def setup_model(
     parallel_dims: ParallelDims | None = None,
 ) -> PreTrainedModel:
     if config.name == DEBUG_MODEL_NAME:
-        if parallel_dims is not None and parallel_dims.tp_enabled:
-            raise NotImplementedError(
-                "Tensor parallel execution is not implemented for the debug model."
-            )
-        model = build_debug_model(max_seq_length=max_seq_length)
-        model.config.use_cache = False
-        if config.gradient_checkpointing:
-            model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False}
-            )
-        if config.adapter_path is not None:
-            model = PeftModel.from_pretrained(
-                model,
-                config.adapter_path,
-                is_trainable=True,
-            )
-        return cast(PreTrainedModel, model)
+        return _setup_debug_model(
+            config,
+            max_seq_length=max_seq_length,
+            parallel_dims=parallel_dims,
+        )
 
-    quantization_config = None
-    model_is_prequantized = False
     setup_runtime(config)
-    attn_implementation = (
-        _best_attn_implementation()
-        if config.attn_implementation == "auto"
-        else config.attn_implementation
+    model_kwargs, model_is_prequantized, attention = _model_load_kwargs(
+        config,
+        distributed=distributed,
+        parallel_dims=parallel_dims,
     )
-    model_kwargs: dict[str, Any] = {
-        "trust_remote_code": config.trust_remote_code,
-        "dtype": resolve_dtype(config.torch_dtype),
-        "attn_implementation": attn_implementation,
-    }
-    if parallel_dims is not None and parallel_dims.tp_enabled:
-        if config.load_in_4bit:
-            raise NotImplementedError(
-                "QLoRA with trainer tensor parallelism is not supported. Use "
-                "replicated DDP training for 4-bit LoRA adapters."
-            )
-        if config.adapter_path is not None:
-            raise NotImplementedError(
-                "Loading PEFT adapters onto a tensor-parallel model is not "
-                "implemented yet."
-            )
-        model_kwargs["tp_plan"] = "auto"
-        model_kwargs["device_mesh"] = parallel_dims.get_mesh("tp")
-    if config.meta_device_init:
-        model_kwargs["low_cpu_mem_usage"] = True
-    if config.load_in_4bit:
-        model_config = AutoConfig.from_pretrained(
-            config.name,
-            trust_remote_code=config.trust_remote_code,
-        )
-        model_is_prequantized = (
-            getattr(model_config, "quantization_config", None) is not None
-        )
-        if not model_is_prequantized:
-            compute_dtype = (
-                torch.bfloat16 if torch.cuda.is_available() else torch.float32
-            )
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=compute_dtype,
-            )
-            model_kwargs["quantization_config"] = quantization_config
-        model_kwargs["device_map"] = _quantized_device_map(distributed)
-
-    previous_transformers_verbosity = transformers_logging.get_verbosity()
-    suppress_float32_flash_warning = (
-        config.torch_dtype == "float32"
-        and attn_implementation in {"flash_attention_2", "flash_attention_3"}
-    )
-    if suppress_float32_flash_warning:
-        transformers_logging.set_verbosity_error()
-    try:
-        model = AutoModelForCausalLM.from_pretrained(config.name, **model_kwargs)
-    finally:
-        if suppress_float32_flash_warning:
-            transformers_logging.set_verbosity(previous_transformers_verbosity)
+    model = _load_pretrained_model(config, model_kwargs, attention=attention)
     model.config.use_cache = False
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable(
@@ -303,11 +362,7 @@ def setup_model(
         # Embedding and lm_head are NOT 4-bit quantized (full precision), but
         # flash attention expects bfloat16 inputs. Cast them so hidden states
         # start in bfloat16 and the "Casting fp32 inputs" warning disappears.
-        compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        for module_name in ("embed_tokens", "lm_head", "norm"):
-            for name, module in model.named_modules():
-                if name.endswith(module_name):
-                    module.to(compute_dtype)
+        _prepare_quantized_modules(model, config)
     if config.fused_lm_head_token_chunk_size != "disabled":
         from wavelet.trainer.lm_head import maybe_inject_chunked_lm_head
 

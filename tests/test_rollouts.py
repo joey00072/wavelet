@@ -247,3 +247,15 @@ def test_group_reward_zero_length_cost_falls_back_to_plain_reward() -> None:
     assert [record.advantage for record in updated] == pytest.approx(
         [1 / 3, 1 / 3, -2 / 3]
     )
+
+
+def test_native_orchestrator_dispatches_max_rl() -> None:
+    orchestrator = RLOrchestrator(RLConfig(algo={"type": "max_rl"}))
+    records = [
+        replace(_example(), reward=1.0, metadata={"group_key": "a"}),
+        replace(_example(), reward=0.0, metadata={"group_key": "a"}),
+    ]
+
+    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+
+    assert [record.advantage for record in updated] == pytest.approx([1.0, -1.0])

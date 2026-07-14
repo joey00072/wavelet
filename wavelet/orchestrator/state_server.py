@@ -6,6 +6,7 @@ import threading
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -74,7 +75,9 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _iter_jsonl_dicts(path: Path, *, limit: int) -> Iterator[tuple[int, dict[str, Any]]]:
+def _iter_jsonl_dicts(
+    path: Path, *, limit: int
+) -> Iterator[tuple[int, dict[str, Any]]]:
     if limit <= 0:
         return
     with path.open("r", encoding="utf-8") as handle:
@@ -176,6 +179,130 @@ def _finalize_stats(values: list[float]) -> dict[str, Any]:
         "mean": mean,
         "std": variance**0.5,
     }
+
+
+def _unavailable_rollout_inspection(
+    reason: str,
+    *,
+    queue_step: int | None,
+    path: Path | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "available": False,
+        "reason": reason,
+        "queue_step": queue_step,
+        "path": None if path is None else str(path),
+        "manifest": manifest,
+        "scanned_rows": 0,
+        "truncated": False,
+        "stats": {"reward": _empty_stats(), "advantage": _empty_stats()},
+        "samples": {
+            "random": [],
+            "min_reward": None,
+            "max_reward": None,
+            "near_mean_reward": None,
+        },
+    }
+
+
+@dataclass
+class _RolloutScan:
+    reward_values: list[float]
+    advantage_values: list[float]
+    random_rows: list[dict[str, Any]]
+    min_reward_row: dict[str, Any] | None
+    max_reward_row: dict[str, Any] | None
+    scanned_rows: int
+
+
+def _scan_rollouts(
+    path: Path,
+    *,
+    random_count: int,
+    seed: int | None,
+    max_scan_rows: int,
+    max_text_chars: int,
+) -> _RolloutScan:
+    rng = random.Random(seed)
+    rewards: list[float] = []
+    advantages: list[float] = []
+    random_rows: list[dict[str, Any]] = []
+    min_pair: tuple[float, dict[str, Any]] | None = None
+    max_pair: tuple[float, dict[str, Any]] | None = None
+    scanned_rows = 0
+
+    for scanned_rows, (row_index, row) in enumerate(
+        _iter_jsonl_dicts(path, limit=max_scan_rows),
+        start=1,
+    ):
+        compact = _compact_rollout_row(
+            row,
+            row_index=row_index,
+            max_text_chars=max_text_chars,
+        )
+        reward = _numeric(row, "reward")
+        if reward is not None:
+            rewards.append(reward)
+            if min_pair is None or reward < min_pair[0]:
+                min_pair = (reward, compact)
+            if max_pair is None or reward > max_pair[0]:
+                max_pair = (reward, compact)
+
+        advantage = _numeric(row, "advantage")
+        if advantage is not None:
+            advantages.append(advantage)
+
+        if len(random_rows) < random_count:
+            random_rows.append(compact)
+        elif random_count > 0:
+            replacement = rng.randint(0, scanned_rows - 1)
+            if replacement < random_count:
+                random_rows[replacement] = compact
+
+    return _RolloutScan(
+        reward_values=rewards,
+        advantage_values=advantages,
+        random_rows=random_rows,
+        min_reward_row=None if min_pair is None else min_pair[1],
+        max_reward_row=None if max_pair is None else max_pair[1],
+        scanned_rows=scanned_rows,
+    )
+
+
+def _nearest_reward_row(
+    path: Path,
+    *,
+    target: float | None,
+    max_scan_rows: int,
+    max_text_chars: int,
+) -> dict[str, Any] | None:
+    if target is None:
+        return None
+    nearest: tuple[float, dict[str, Any]] | None = None
+    for row_index, row in _iter_jsonl_dicts(path, limit=max_scan_rows):
+        reward = _numeric(row, "reward")
+        if reward is None:
+            continue
+        distance = abs(reward - target)
+        if nearest is None or distance < nearest[0]:
+            nearest = (
+                distance,
+                _compact_rollout_row(
+                    row,
+                    row_index=row_index,
+                    max_text_chars=max_text_chars,
+                ),
+            )
+    return None if nearest is None else nearest[1]
+
+
+def _file_exceeds_rows(path: Path, *, limit: int) -> bool:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return any(index >= limit for index, _ in enumerate(handle))
+    except OSError:
+        return False
 
 
 class OrchestratorRunState:
@@ -317,7 +444,9 @@ class OrchestratorRunState:
             self._state["rollouts"][key] = tail[-20:]
             events = list(self._state.get("events", []))
             events.append(item)
-            self._state["events"] = events[-self._config.orchestrator.state_server.max_events :]
+            self._state["events"] = events[
+                -self._config.orchestrator.state_server.max_events :
+            ]
             self._state["rollouts"].update(rollout_patch)
             self._state["updated_at"] = _now()
 
@@ -337,7 +466,9 @@ class OrchestratorRunState:
         limit: int,
     ) -> dict[str, Any] | None:
         try:
-            queue_dir = resolve_queue_dir(self._config.output_dir, self._config.transport)
+            queue_dir = resolve_queue_dir(
+                self._config.output_dir, self._config.transport
+            )
             policy_dir = resolve_policy_dir(
                 self._config.output_dir,
                 self._config.policy_transfer,
@@ -381,118 +512,40 @@ class OrchestratorRunState:
         max_text_chars: int,
     ) -> dict[str, Any]:
         queue_dir = resolve_queue_dir(self._config.output_dir, self._config.transport)
-        queue_step = step if step is not None else self._latest_stable_rollout_step(queue_dir)
+        queue_step = (
+            step if step is not None else self._latest_stable_rollout_step(queue_dir)
+        )
         if queue_step is None:
-            return {
-                "available": False,
-                "reason": "no stable rollout batches found",
-                "queue_step": None,
-                "path": None,
-                "manifest": None,
-                "scanned_rows": 0,
-                "truncated": False,
-                "stats": {"reward": _empty_stats(), "advantage": _empty_stats()},
-                "samples": {
-                    "random": [],
-                    "min_reward": None,
-                    "max_reward": None,
-                    "near_mean_reward": None,
-                },
-            }
+            return _unavailable_rollout_inspection(
+                "no stable rollout batches found",
+                queue_step=None,
+            )
 
         step_dir = get_step_dir(queue_dir, queue_step)
         rollout_path = step_dir / self._config.transport.rollout_filename
         stable = (step_dir / STABLE_BATCH_MARKER).exists()
         if not stable or not rollout_path.exists():
-            return {
-                "available": False,
-                "reason": f"rollout batch step {queue_step} is not stable",
-                "queue_step": queue_step,
-                "path": str(rollout_path),
-                "manifest": _read_json(step_dir / MANIFEST_FILENAME),
-                "scanned_rows": 0,
-                "truncated": False,
-                "stats": {"reward": _empty_stats(), "advantage": _empty_stats()},
-                "samples": {
-                    "random": [],
-                    "min_reward": None,
-                    "max_reward": None,
-                    "near_mean_reward": None,
-                },
-            }
-
-        rng = random.Random(seed)
-        reward_values: list[float] = []
-        advantage_values: list[float] = []
-        scanned_rows = 0
-        reservoir: list[dict[str, Any]] = []
-        min_reward_row: dict[str, Any] | None = None
-        max_reward_row: dict[str, Any] | None = None
-        min_reward: float | None = None
-        max_reward: float | None = None
-
-        for row_index, row in _iter_jsonl_dicts(rollout_path, limit=max_scan_rows):
-            scanned_rows += 1
-            reward = _numeric(row, "reward")
-            advantage = _numeric(row, "advantage")
-            if reward is not None:
-                reward_values.append(reward)
-                if min_reward is None or reward < min_reward:
-                    min_reward = reward
-                    min_reward_row = _compact_rollout_row(
-                        row,
-                        row_index=row_index,
-                        max_text_chars=max_text_chars,
-                    )
-                if max_reward is None or reward > max_reward:
-                    max_reward = reward
-                    max_reward_row = _compact_rollout_row(
-                        row,
-                        row_index=row_index,
-                        max_text_chars=max_text_chars,
-                    )
-            if advantage is not None:
-                advantage_values.append(advantage)
-
-            compact = _compact_rollout_row(
-                row,
-                row_index=row_index,
-                max_text_chars=max_text_chars,
+            return _unavailable_rollout_inspection(
+                f"rollout batch step {queue_step} is not stable",
+                queue_step=queue_step,
+                path=rollout_path,
+                manifest=_read_json(step_dir / MANIFEST_FILENAME),
             )
-            if len(reservoir) < random_count:
-                reservoir.append(compact)
-            elif random_count > 0:
-                replacement = rng.randint(0, scanned_rows - 1)
-                if replacement < random_count:
-                    reservoir[replacement] = compact
 
-        reward_stats = _finalize_stats(reward_values)
-        near_mean_row = None
-        reward_mean = reward_stats["mean"]
-        if reward_mean is not None:
-            best_distance: float | None = None
-            for row_index, row in _iter_jsonl_dicts(rollout_path, limit=max_scan_rows):
-                reward = _numeric(row, "reward")
-                if reward is None:
-                    continue
-                distance = abs(reward - reward_mean)
-                if best_distance is None or distance < best_distance:
-                    best_distance = distance
-                    near_mean_row = _compact_rollout_row(
-                        row,
-                        row_index=row_index,
-                        max_text_chars=max_text_chars,
-                    )
-
-        truncated = False
-        try:
-            with rollout_path.open("r", encoding="utf-8") as handle:
-                for index, _ in enumerate(handle):
-                    if index >= max_scan_rows:
-                        truncated = True
-                        break
-        except OSError:
-            truncated = False
+        scan = _scan_rollouts(
+            rollout_path,
+            random_count=random_count,
+            seed=seed,
+            max_scan_rows=max_scan_rows,
+            max_text_chars=max_text_chars,
+        )
+        reward_stats = _finalize_stats(scan.reward_values)
+        near_mean_row = _nearest_reward_row(
+            rollout_path,
+            target=reward_stats["mean"],
+            max_scan_rows=max_scan_rows,
+            max_text_chars=max_text_chars,
+        )
 
         return {
             "available": True,
@@ -500,16 +553,16 @@ class OrchestratorRunState:
             "queue_step": queue_step,
             "path": str(rollout_path),
             "manifest": _read_json(step_dir / MANIFEST_FILENAME),
-            "scanned_rows": scanned_rows,
-            "truncated": truncated,
+            "scanned_rows": scan.scanned_rows,
+            "truncated": _file_exceeds_rows(rollout_path, limit=max_scan_rows),
             "stats": {
                 "reward": reward_stats,
-                "advantage": _finalize_stats(advantage_values),
+                "advantage": _finalize_stats(scan.advantage_values),
             },
             "samples": {
-                "random": reservoir,
-                "min_reward": min_reward_row,
-                "max_reward": max_reward_row,
+                "random": scan.random_rows,
+                "min_reward": scan.min_reward_row,
+                "max_reward": scan.max_reward_row,
                 "near_mean_reward": near_mean_row,
             },
         }
@@ -536,6 +589,92 @@ class OrchestratorRunState:
             return list(self._state.get("events", []))[-limit:]
 
 
+def _build_state_app(
+    state: OrchestratorRunState,
+    *,
+    fastapi: Any,
+    query: Any,
+    cors_middleware: Any,
+) -> Any:
+    config = state._config.orchestrator.state_server
+    app = fastapi(title="Wavelet Orchestrator State", version="1.0")
+    app.add_middleware(
+        cors_middleware,
+        allow_origins=config.cors_allow_origins,
+        allow_credentials=False,
+        allow_methods=["GET"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/health")
+    async def health() -> dict[str, Any]:
+        snapshot = state.snapshot()
+        return {
+            "ok": snapshot.get("status") != "failed",
+            "status": snapshot.get("status"),
+            "phase": snapshot.get("phase"),
+            "updated_at": snapshot.get("updated_at"),
+        }
+
+    @app.get("/state")
+    async def state_snapshot() -> dict[str, Any]:
+        return state.snapshot()
+
+    @app.get("/queues")
+    async def queues(
+        detail: bool = query(default=False),
+        limit: int = query(default=100, ge=0, le=1000),
+    ) -> dict[str, Any]:
+        snapshot = state.queue_snapshot(detail=detail, limit=limit)
+        return snapshot or {
+            "summary": None,
+            "policy": None,
+            "rates": None,
+            "errors": {"queue_snapshot": "unavailable"},
+            "items": [],
+        }
+
+    @app.get("/config")
+    async def run_config() -> dict[str, Any]:
+        return state.sanitized_config()
+
+    @app.get("/metrics")
+    async def metrics(
+        limit: int = query(default=20, ge=1, le=200),
+    ) -> list[dict[str, Any]]:
+        return state.metrics(limit=limit)
+
+    @app.get("/events")
+    async def events(
+        limit: int = query(default=500, ge=1, le=5000),
+    ) -> list[dict[str, Any]]:
+        return state.events(limit=limit)
+
+    @app.get("/samples")
+    async def samples(
+        limit: int = query(default=10, ge=1, le=50),
+    ) -> list[dict[str, Any]]:
+        return state.samples(limit=limit)
+
+    @app.get("/rollouts/inspect")
+    async def rollout_inspection(
+        step: int | None = query(default=None, ge=0),
+        random_count: int = query(default=3, ge=0, le=20),
+        seed: int | None = query(default=None),
+        max_scan_rows: int = query(default=5000, ge=1, le=50000),
+        max_text_chars: int = query(default=4000, ge=200, le=20000),
+    ) -> dict[str, Any]:
+        return state.inspect_rollouts(
+            step=step,
+            random_count=random_count,
+            seed=seed,
+            max_scan_rows=max_scan_rows,
+            max_text_chars=max_text_chars,
+        )
+
+    return app
+
+
 class StateServerHandle:
     def __init__(self, state: OrchestratorRunState) -> None:
         self.state = state
@@ -560,82 +699,12 @@ class StateServerHandle:
                 "orchestrator.state_server.enabled requires fastapi and uvicorn."
             ) from exc
 
-        app = FastAPI(title="Wavelet Orchestrator State", version="1.0")
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=config.cors_allow_origins,
-            allow_credentials=False,
-            allow_methods=["GET"],
-            allow_headers=["*"],
+        app = _build_state_app(
+            self.state,
+            fastapi=FastAPI,
+            query=Query,
+            cors_middleware=CORSMiddleware,
         )
-
-        @app.get("/health")
-        async def health() -> dict[str, Any]:
-            snapshot = self.state.snapshot()
-            return {
-                "ok": snapshot.get("status") != "failed",
-                "status": snapshot.get("status"),
-                "phase": snapshot.get("phase"),
-                "updated_at": snapshot.get("updated_at"),
-            }
-
-        @app.get("/state")
-        async def state() -> dict[str, Any]:
-            return self.state.snapshot()
-
-        @app.get("/queues")
-        async def queues(
-            detail: bool = Query(default=False),
-            limit: int = Query(default=100, ge=0, le=1000),
-        ) -> dict[str, Any]:
-            snapshot = self.state.queue_snapshot(detail=detail, limit=limit)
-            if snapshot is None:
-                return {
-                    "summary": None,
-                    "policy": None,
-                    "rates": None,
-                    "errors": {"queue_snapshot": "unavailable"},
-                    "items": [],
-                }
-            return snapshot
-
-        @app.get("/config")
-        async def run_config() -> dict[str, Any]:
-            return self.state.sanitized_config()
-
-        @app.get("/metrics")
-        async def metrics(
-            limit: int = Query(default=20, ge=1, le=200),
-        ) -> list[dict[str, Any]]:
-            return self.state.metrics(limit=limit)
-
-        @app.get("/events")
-        async def events(
-            limit: int = Query(default=500, ge=1, le=5000),
-        ) -> list[dict[str, Any]]:
-            return self.state.events(limit=limit)
-
-        @app.get("/samples")
-        async def samples(
-            limit: int = Query(default=10, ge=1, le=50),
-        ) -> list[dict[str, Any]]:
-            return self.state.samples(limit=limit)
-
-        @app.get("/rollouts/inspect")
-        async def rollout_inspection(
-            step: int | None = Query(default=None, ge=0),
-            random_count: int = Query(default=3, ge=0, le=20),
-            seed: int | None = Query(default=None),
-            max_scan_rows: int = Query(default=5000, ge=1, le=50000),
-            max_text_chars: int = Query(default=4000, ge=200, le=20000),
-        ) -> dict[str, Any]:
-            return self.state.inspect_rollouts(
-                step=step,
-                random_count=random_count,
-                seed=seed,
-                max_scan_rows=max_scan_rows,
-                max_text_chars=max_text_chars,
-            )
 
         uvicorn_config = uvicorn.Config(
             app,

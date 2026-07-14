@@ -7,8 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from wavelet.orchestrator.queue.events import tail_events
-from wavelet.orchestrator.queue.filesystem import _parse_step
-from wavelet.orchestrator.queue.lifecycle import read_claim, read_consumed, read_manifest
+from wavelet.orchestrator.queue.filesystem import parse_step
+from wavelet.orchestrator.queue.lifecycle import (
+    read_claim,
+    read_consumed,
+    read_manifest,
+)
 from wavelet.orchestrator.queue.metrics import consume_rate, policy_lag, publish_rate
 from wavelet.orchestrator.queue.types import (
     STABLE_BATCH_MARKER,
@@ -50,7 +54,7 @@ def scan_queue_dir(
         )
 
     for candidate in sorted(queue_dir.iterdir(), key=lambda path: path.name):
-        queue_step = _parse_step(candidate)
+        queue_step = parse_step(candidate)
         if queue_step is None:
             continue
         items.append(
@@ -106,7 +110,7 @@ def scan_policy_dir(policy_dir: Path) -> PolicyQueueSnapshot:
     steps: list[int] = []
     incomplete_steps: list[int] = []
     for candidate in sorted(policy_dir.iterdir(), key=lambda path: path.name):
-        step = _parse_step(candidate)
+        step = parse_step(candidate)
         if step is None:
             continue
         if (candidate / STABLE_BATCH_MARKER).exists():

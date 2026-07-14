@@ -148,6 +148,19 @@ class RLRewardScorer:
         match = self._math_solution_regex().search(response)
         if match is not None:
             return match.group(1)
+        tagged_solution = self._fallback_tagged_solution(response)
+        if tagged_solution is not None:
+            return tagged_solution
+        answer_match = re.search(
+            r"(?:answer|solution|therefore|so)[^\n:=]*[:=]?\s*([^\n]+)$",
+            response.strip(),
+            flags=re.IGNORECASE,
+        )
+        if answer_match is not None:
+            return answer_match.group(1)
+        return _first_numeric_text(response.splitlines()[-1] if response else "")
+
+    def _fallback_tagged_solution(self, response: str) -> str | None:
         tagged = re.findall(
             rf"{re.escape(self.config.solution_start)}(.+?){re.escape(self.config.solution_end)}",
             response,
@@ -170,16 +183,6 @@ class RLRewardScorer:
         boxed = re.findall(r"\\boxed\{([^{}]+)\}", response)
         if boxed:
             return boxed[-1]
-        answer_match = re.search(
-            r"(?:answer|solution|therefore|so)[^\n:=]*[:=]?\s*([^\n]+)$",
-            response.strip(),
-            flags=re.IGNORECASE,
-        )
-        if answer_match is not None:
-            return answer_match.group(1)
-        guess = _first_numeric_text(response.splitlines()[-1] if response else "")
-        if guess is not None:
-            return guess
         return None
 
     def _score_math_format_bonus(self, response: str) -> float:
@@ -190,7 +193,10 @@ class RLRewardScorer:
             and response.count(self.config.solution_end) == 1
         ):
             return 0.06
-        if self.config.solution_start in response or self.config.solution_end in response:
+        if (
+            self.config.solution_start in response
+            or self.config.solution_end in response
+        ):
             return 0.02
         return 0.0
 
@@ -208,15 +214,24 @@ class RLRewardScorer:
         if guess_number is None:
             numeric_guess = _first_numeric_text(guess)
             guess_number = (
-                _parse_numeric_answer(numeric_guess) if numeric_guess is not None else None
+                _parse_numeric_answer(numeric_guess)
+                if numeric_guess is not None
+                else None
             )
-        if expected_number is None or guess_number is None:
+        return self._score_numeric_answer(guess_number, expected_number)
+
+    @staticmethod
+    def _score_numeric_answer(
+        guess: Decimal | None,
+        expected: Decimal | None,
+    ) -> float:
+        if expected is None or guess is None:
             return 0.0
-        if guess_number == expected_number:
+        if guess == expected:
             return 1.0
-        if expected_number == 0:
+        if expected == 0:
             return 0.0
-        relative_error = abs((guess_number - expected_number) / expected_number)
+        relative_error = abs((guess - expected) / expected)
         if relative_error <= Decimal("0.01"):
             return 0.35
         if relative_error <= Decimal("0.05"):
@@ -231,6 +246,10 @@ class RLRewardScorer:
         try:
             parsed_expected = parse(expected)
             parsed_guess = parse(guess)
-            return bool(parsed_expected and parsed_guess and verify(parsed_expected, parsed_guess))
+            return bool(
+                parsed_expected
+                and parsed_guess
+                and verify(parsed_expected, parsed_guess)
+            )
         except Exception:
             return False

@@ -236,30 +236,11 @@ def _run_streaming_rollout_training(
             chunks=loaded_chunks,
             loss_scale=trainer._optimizer_batch_loss_scale,
         )
-        should_step = accumulator.should_step(chunks_per_step=chunks_per_step)
-        remaining_chunks = max(chunks_per_step - accumulator.accumulated_chunks, 0)
-        loaded_micro_batches = trainer._loaded_micro_batch_count
-        if should_step:
-            trainer.accumulation_steps = (
-                trainer._accumulated_micro_batches + loaded_micro_batches
-            )
-        else:
-            trainer.accumulation_steps = (
-                trainer._accumulated_micro_batches
-                + loaded_micro_batches * max(remaining_chunks + 1, 2)
-            )
-        if accumulator.accumulated_loss_scale > 0.0:
-            # Normalize the whole optimizer step by the exact local unmasked
-            # token count. Streaming chunks arrive one at a time, so backprop
-            # raw chunk losses and divide accumulated gradients once before the
-            # optimizer step, when the exact denominator is known.
-            trainer._optimizer_batch_loss_scale = 1.0
-            trainer._gradient_accumulation_loss_scale = (
-                accumulator.accumulated_loss_scale
-            )
-        else:
-            trainer._optimizer_batch_loss_scale = None
-            trainer._gradient_accumulation_loss_scale = None
+        _configure_streaming_accumulation(
+            trainer,
+            accumulator,
+            chunks_per_step=chunks_per_step,
+        )
         load_seconds = perf_counter() - load_started_at
         train_started_at = perf_counter()
         trainer.prepare_for_training()
@@ -301,6 +282,33 @@ def _run_streaming_rollout_training(
             optimizer_step=int(metrics is not None),
             total=total_seconds,
         )
+
+
+def _configure_streaming_accumulation(
+    trainer: RLTrainer,
+    accumulator: _StreamingChunkAccumulator,
+    *,
+    chunks_per_step: int,
+) -> None:
+    should_step = accumulator.should_step(chunks_per_step=chunks_per_step)
+    remaining_chunks = max(chunks_per_step - accumulator.accumulated_chunks, 0)
+    loaded_micro_batches = trainer._loaded_micro_batch_count
+    if should_step:
+        trainer.accumulation_steps = (
+            trainer._accumulated_micro_batches + loaded_micro_batches
+        )
+    else:
+        trainer.accumulation_steps = (
+            trainer._accumulated_micro_batches
+            + loaded_micro_batches * max(remaining_chunks + 1, 2)
+        )
+
+    if accumulator.accumulated_loss_scale > 0.0:
+        trainer._optimizer_batch_loss_scale = 1.0
+        trainer._gradient_accumulation_loss_scale = accumulator.accumulated_loss_scale
+    else:
+        trainer._optimizer_batch_loss_scale = None
+        trainer._gradient_accumulation_loss_scale = None
 
 
 def _should_step_streaming_rollouts(

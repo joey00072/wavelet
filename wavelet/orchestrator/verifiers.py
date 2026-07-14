@@ -10,14 +10,19 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from wavelet.configs.rl_config import RLEvalEnvConfig
+from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
 from wavelet.data.rl_dataset import RLExample, load_rl_records
 from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.advantage import (
-    group_reward_advantages,
-    length_penalty_cost_for_output,
     output_completion_token_count,
     output_tool_response_token_count,
+)
+from wavelet.orchestrator.algorithms import (
+    algorithm_epsilon,
+    algorithm_scope,
+    build_algorithm,
+    score_algorithm_records,
+    uses_group_advantages,
 )
 from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.patches import apply_verifier_openai_patches
@@ -124,9 +129,8 @@ def generate_rollouts(
             max_retries=config.orchestrator.verifier_max_retries,
             target_groups=config.orchestrator.examples_per_step,
             filter_zero_advantage=config.orchestrator.filter_zero_advantage,
-            advantage_epsilon=config.orchestrator.advantage_epsilon,
-            normalize_group_advantages=config.orchestrator.normalize_group_advantages,
-            length_penalty=config.orchestrator.length_penalty,
+            advantage_epsilon=algorithm_epsilon(config.algo),
+            algorithm_config=config.algo,
             env_name=_env_name(env, fallback=env_id),
         )
     )
@@ -274,8 +278,6 @@ class VerifierRolloutScheduler:
         max_completed_groups = target_groups * (
             self.config.orchestrator.zero_advantage_max_retries + 1
         )
-        if not hasattr(self, "ready_groups"):
-            self.ready_groups = []
         self._sync_ready_group_ages()
 
         try:
@@ -295,27 +297,15 @@ class VerifierRolloutScheduler:
 
             while True:
                 if accepted_groups >= target_groups:
-                    records = [
-                        record
-                        for output in outputs
-                        for record in _records_from_output(output)
-                    ]
-                    records = _mark_zero_advantage_records_metric_only(
-                        records,
-                        self.config,
-                    )
-                    if _has_trainable_rollout_record(records):
+                    if self._has_trainable_batch(outputs):
                         break
                     attempt += 1
-                    if completed_groups >= max_completed_groups:
-                        raise RuntimeError(
-                            "Verifier scheduler could not produce enough trainable "
-                            "rollout groups after "
-                            f"{completed_groups} completed group(s): accepted "
-                            f"{accepted_groups}, rejected {rejected_groups}. "
-                            "Increase orchestrator.zero_advantage_max_retries, "
-                            "relax filtering, or check reward/model behavior."
-                        )
+                    self._raise_if_retries_exhausted(
+                        completed_groups=completed_groups,
+                        max_completed_groups=max_completed_groups,
+                        accepted_groups=accepted_groups,
+                        rejected_groups=rejected_groups,
+                    )
                     outputs = []
                     accepted_groups = 0
 
@@ -325,60 +315,23 @@ class VerifierRolloutScheduler:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
-                    request = self.pending.pop(task, None)
-                    self.pending_clients.pop(task, None)
-                    if request is None:
-                        continue
-                    group = self.groups.get(request.group_id)
-                    if group is None:
-                        continue
-                    group_outputs = _completed_group_outputs(task)
-                    if len(group_outputs) < request.rollout_count:
-                        if self.requires_group_scoring:
-                            group.completed_outputs.clear()
-                            group.rollouts_to_schedule = self.rollout_count
-                        else:
-                            group.rollouts_to_schedule += request.rollout_count - len(
-                                group_outputs
-                            )
-                    group.completed_outputs.extend(group_outputs)
-                    if len(group.completed_outputs) < self.rollout_count:
-                        continue
-
-                    completed_groups += 1
-                    group_outputs = group.completed_outputs
-                    self.groups.pop(request.group_id, None)
-                    _stamp_env_name(
-                        group_outputs,
-                        getattr(self, "env_name", "verifier"),
+                    accepted, completed, rejected = self._consume_completed_task(
+                        task,
+                        target_groups=target_groups,
+                        outputs=outputs,
+                        accepted_groups=accepted_groups,
                     )
-                    _assign_completed_group_advantages(group_outputs, self.config)
-                    if _is_complete_training_group(
-                        group_outputs,
-                        expected_rollouts=self.rollout_count,
+                    accepted_groups += accepted
+                    completed_groups += completed
+                    rejected_groups += rejected
+                    if self._should_stop_at_completed_limit(
+                        completed_groups=completed_groups,
+                        max_completed_groups=max_completed_groups,
+                        accepted_groups=accepted_groups,
+                        target_groups=target_groups,
+                        rejected_groups=rejected_groups,
                     ):
-                        if accepted_groups < target_groups:
-                            outputs.extend(group_outputs)
-                            accepted_groups += 1
-                        else:
-                            self.ready_groups.append(group_outputs)
-                            self.ready_group_off_policy_steps.append(0)
-                    else:
-                        rejected_groups += 1
-                    if (
-                        completed_groups >= max_completed_groups
-                        and accepted_groups < target_groups
-                    ):
-                        if accepted_groups > 0:
-                            break
-                        raise RuntimeError(
-                            "Verifier scheduler could not produce enough trainable "
-                            "rollout groups after "
-                            f"{completed_groups} completed group(s): accepted "
-                            f"{accepted_groups}, rejected {rejected_groups}. "
-                            "Increase orchestrator.zero_advantage_max_retries, "
-                            "relax filtering, or check reward/model behavior."
-                        )
+                        break
         except Exception:
             await self.aclose()
             raise
@@ -390,22 +343,87 @@ class VerifierRolloutScheduler:
         )
         completed_groups += drained_completed
         rejected_groups += drained_rejected
+        return self._finalize_batch(
+            outputs,
+            started_at=started_at,
+            attempts=attempt + 1,
+            accepted_groups=accepted_groups,
+            rejected_groups=rejected_groups,
+            completed_groups=completed_groups,
+        )
+
+    def _has_trainable_batch(self, outputs: list[dict[str, Any]]) -> bool:
+        records = [
+            record for output in outputs for record in _records_from_output(output)
+        ]
+        records = _mark_zero_advantage_records_metric_only(records, self.config)
+        return _has_trainable_rollout_record(records)
+
+    @staticmethod
+    def _raise_if_retries_exhausted(
+        *,
+        completed_groups: int,
+        max_completed_groups: int,
+        accepted_groups: int,
+        rejected_groups: int,
+    ) -> None:
+        if completed_groups < max_completed_groups:
+            return
+        raise RuntimeError(
+            "Verifier scheduler could not produce enough trainable rollout groups "
+            f"after {completed_groups} completed group(s): accepted "
+            f"{accepted_groups}, rejected {rejected_groups}. Increase "
+            "orchestrator.zero_advantage_max_retries, relax filtering, or check "
+            "reward/model behavior."
+        )
+
+    @classmethod
+    def _should_stop_at_completed_limit(
+        cls,
+        *,
+        completed_groups: int,
+        max_completed_groups: int,
+        accepted_groups: int,
+        target_groups: int,
+        rejected_groups: int,
+    ) -> bool:
+        if completed_groups < max_completed_groups or accepted_groups >= target_groups:
+            return False
+        if accepted_groups > 0:
+            return True
+        cls._raise_if_retries_exhausted(
+            completed_groups=completed_groups,
+            max_completed_groups=max_completed_groups,
+            accepted_groups=accepted_groups,
+            rejected_groups=rejected_groups,
+        )
+        return False
+
+    def _finalize_batch(
+        self,
+        outputs: list[dict[str, Any]],
+        *,
+        started_at: float,
+        attempts: int,
+        accepted_groups: int,
+        rejected_groups: int,
+        completed_groups: int,
+    ) -> list[RLExample]:
         self._fill_inflight()
         convert_started_at = perf_counter()
         records = [
             record for output in outputs for record in _records_from_output(output)
         ]
         records = _mark_zero_advantage_records_metric_only(records, self.config)
-        convert_seconds = perf_counter() - convert_started_at
         emit_perf(
             "verifier_scheduler",
-            attempts=attempt + 1,
+            attempts=attempts,
             accepted_groups=accepted_groups,
             rejected_groups=rejected_groups,
             completed_groups=completed_groups,
             inflight_rollouts=self.inflight_rollout_count,
             records=len(records),
-            convert=convert_seconds,
+            convert=perf_counter() - convert_started_at,
             total=perf_counter() - started_at,
         )
         return records
@@ -420,47 +438,65 @@ class VerifierRolloutScheduler:
         completed_groups = 0
         rejected_groups = 0
         for task in [task for task in self.pending if task.done()]:
-            request = self.pending.pop(task, None)
-            self.pending_clients.pop(task, None)
-            if request is None:
-                continue
-            group = self.groups.get(request.group_id)
-            if group is None:
-                continue
-            group_outputs = _completed_group_outputs(task)
-            if len(group_outputs) < request.rollout_count:
-                if self.requires_group_scoring:
-                    group.completed_outputs.clear()
-                    group.rollouts_to_schedule = self.rollout_count
-                else:
-                    group.rollouts_to_schedule += request.rollout_count - len(
-                        group_outputs
-                    )
-            group.completed_outputs.extend(group_outputs)
-            if len(group.completed_outputs) < self.rollout_count:
-                continue
-
-            completed_groups += 1
-            group_outputs = group.completed_outputs
-            self.groups.pop(request.group_id, None)
-            _stamp_env_name(group_outputs, getattr(self, "env_name", "verifier"))
-            _assign_completed_group_advantages(group_outputs, self.config)
-            if _is_complete_training_group(
-                group_outputs,
-                expected_rollouts=self.rollout_count,
-            ):
-                if accepted_groups < target_groups:
-                    outputs.extend(group_outputs)
-                    accepted_groups += 1
-                else:
-                    self.ready_groups.append(group_outputs)
-                    self.ready_group_off_policy_steps.append(0)
-            else:
-                rejected_groups += 1
+            accepted, completed, rejected = self._consume_completed_task(
+                task,
+                target_groups=target_groups,
+                outputs=outputs,
+                accepted_groups=accepted_groups,
+            )
+            accepted_groups += accepted
+            completed_groups += completed
+            rejected_groups += rejected
         self.rejected_groups_count = (
             getattr(self, "rejected_groups_count", 0) + rejected_groups
         )
         return completed_groups, rejected_groups
+
+    def _consume_completed_task(
+        self,
+        task: asyncio.Task[list[dict[str, Any]]],
+        *,
+        target_groups: int,
+        outputs: list[dict[str, Any]],
+        accepted_groups: int,
+    ) -> tuple[int, int, int]:
+        """Consume one finished request and classify its completed group."""
+        request = self.pending.pop(task, None)
+        self.pending_clients.pop(task, None)
+        if request is None:
+            return 0, 0, 0
+        group = self.groups.get(request.group_id)
+        if group is None:
+            return 0, 0, 0
+
+        group_outputs = _completed_group_outputs(task)
+        missing_rollouts = request.rollout_count - len(group_outputs)
+        if missing_rollouts > 0:
+            if self.requires_group_scoring:
+                group.completed_outputs.clear()
+                group.rollouts_to_schedule = self.rollout_count
+            else:
+                group.rollouts_to_schedule += missing_rollouts
+        group.completed_outputs.extend(group_outputs)
+        if len(group.completed_outputs) < self.rollout_count:
+            return 0, 0, 0
+
+        completed_outputs = group.completed_outputs
+        self.groups.pop(request.group_id, None)
+        _stamp_env_name(completed_outputs, getattr(self, "env_name", "verifier"))
+        _assign_completed_group_advantages(completed_outputs, self.config)
+        if not _is_complete_training_group(
+            completed_outputs,
+            expected_rollouts=self.rollout_count,
+        ):
+            return 0, 1, 1
+        if accepted_groups < target_groups:
+            outputs.extend(completed_outputs)
+            return 1, 1, 0
+
+        self.ready_groups.append(completed_outputs)
+        self.ready_group_off_policy_steps.append(0)
+        return 0, 1, 0
 
     async def mark_policy_update(self) -> int:
         max_off_policy_steps = self.config.orchestrator.max_off_policy_steps
@@ -522,6 +558,8 @@ class VerifierRolloutScheduler:
         return dropped_rollouts
 
     def _sync_ready_group_ages(self) -> None:
+        if not hasattr(self, "ready_groups"):
+            self.ready_groups = []
         if not hasattr(self, "ready_group_off_policy_steps"):
             self.ready_group_off_policy_steps = [0] * len(self.ready_groups)
             return
@@ -601,11 +639,7 @@ class VerifierRolloutScheduler:
                     sampling_args=self._sampling_args_for_current_policy(),
                     rollout_count=rollout_count,
                     max_retries=self.config.orchestrator.verifier_max_retries,
-                    normalize_group_advantages=(
-                        self.config.orchestrator.normalize_group_advantages
-                    ),
-                    advantage_epsilon=self.config.orchestrator.advantage_epsilon,
-                    length_penalty=self.config.orchestrator.length_penalty,
+                    algorithm_config=self.config.algo,
                 )
             )
         else:
@@ -983,63 +1017,111 @@ async def _run_all(
     target_groups: int | None,
     filter_zero_advantage: bool,
     advantage_epsilon: float,
-    normalize_group_advantages: bool,
-    length_penalty: object | None,
+    algorithm_config: RLAlgorithmConfig,
     env_name: str = "verifier",
 ) -> list[dict[str, Any]]:
     if not clients:
         raise ValueError("At least one verifier client is required.")
     if target_groups is None or len(records) <= target_groups:
-        if getattr(env, "requires_group_scoring", False):
-            tasks = []
-            for record_index, record in enumerate(records):
-                example = _verifier_example(record)
-                client = clients[record_index % len(clients)]
-                tasks.append(
-                    _run_group(
-                        vf,
-                        env,
-                        example,
-                        client=client,
-                        model=model,
-                        sampling_args=sampling_args,
-                        rollout_count=rollout_count,
-                        max_retries=max_retries,
-                        normalize_group_advantages=normalize_group_advantages,
-                        advantage_epsilon=advantage_epsilon,
-                        length_penalty=length_penalty,
-                    )
-                )
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            outputs = [
-                output
-                for result in results
-                if not isinstance(result, Exception)
-                for output in result
-            ]
-            _stamp_env_name(outputs, env_name)
-            return outputs
+        return await _run_complete_record_set(
+            vf,
+            env,
+            records,
+            clients=clients,
+            model=model,
+            sampling_args=sampling_args,
+            rollout_count=rollout_count,
+            max_retries=max_retries,
+            algorithm_config=algorithm_config,
+            env_name=env_name,
+        )
+    return await _run_until_target_groups(
+        vf,
+        env,
+        records,
+        clients=clients,
+        model=model,
+        sampling_args=sampling_args,
+        rollout_count=rollout_count,
+        max_retries=max_retries,
+        target_groups=target_groups,
+        filter_zero_advantage=filter_zero_advantage,
+        advantage_epsilon=advantage_epsilon,
+        algorithm_config=algorithm_config,
+        env_name=env_name,
+    )
 
-        tasks = []
-        for record_index, record in enumerate(records):
-            example = _verifier_example(record)
-            client = clients[record_index % len(clients)]
-            for _ in range(rollout_count):
-                tasks.append(
-                    env.run_rollout(
-                        vf.RolloutInput(**example),
-                        client=client,
-                        model=model,
-                        sampling_args=sampling_args,
-                        max_retries=max_retries,
-                        state_columns=["trajectory", "sampling_args"],
-                    )
-                )
+
+async def _run_complete_record_set(
+    vf,
+    env,
+    records: list[RLExample],
+    *,
+    clients: list[Any],
+    model: str,
+    sampling_args: dict[str, Any],
+    rollout_count: int,
+    max_retries: int,
+    algorithm_config: RLAlgorithmConfig,
+    env_name: str,
+) -> list[dict[str, Any]]:
+    if getattr(env, "requires_group_scoring", False):
+        tasks = [
+            _run_group(
+                vf,
+                env,
+                _verifier_example(record),
+                client=clients[index % len(clients)],
+                model=model,
+                sampling_args=sampling_args,
+                rollout_count=rollout_count,
+                max_retries=max_retries,
+                algorithm_config=algorithm_config,
+            )
+            for index, record in enumerate(records)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        outputs = [
+            output
+            for result in results
+            if not isinstance(result, Exception)
+            for output in result
+        ]
+    else:
+        tasks = [
+            env.run_rollout(
+                vf.RolloutInput(**_verifier_example(record)),
+                client=clients[index % len(clients)],
+                model=model,
+                sampling_args=sampling_args,
+                max_retries=max_retries,
+                state_columns=["trajectory", "sampling_args"],
+            )
+            for index, record in enumerate(records)
+            for _ in range(rollout_count)
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         outputs = _successful_rollout_outputs(results, require_trainable=False)
-        _stamp_env_name(outputs, env_name)
-        return outputs
+    _stamp_env_name(outputs, env_name)
+    return outputs
 
+
+async def _run_until_target_groups(
+    vf,
+    env,
+    records: list[RLExample],
+    *,
+    clients: list[Any],
+    model: str,
+    sampling_args: dict[str, Any],
+    rollout_count: int,
+    max_retries: int,
+    target_groups: int,
+    filter_zero_advantage: bool,
+    advantage_epsilon: float,
+    algorithm_config: RLAlgorithmConfig,
+    env_name: str,
+) -> list[dict[str, Any]]:
     group_tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
     for record_index, record in enumerate(records):
         example = _verifier_example(record)
@@ -1054,9 +1136,7 @@ async def _run_all(
                 sampling_args=sampling_args,
                 rollout_count=rollout_count,
                 max_retries=max_retries,
-                normalize_group_advantages=normalize_group_advantages,
-                advantage_epsilon=advantage_epsilon,
-                length_penalty=length_penalty,
+                algorithm_config=algorithm_config,
             )
         )
         group_tasks.append(task)
@@ -1101,9 +1181,7 @@ async def _run_group(
     sampling_args: dict[str, Any],
     rollout_count: int,
     max_retries: int,
-    normalize_group_advantages: bool,
-    advantage_epsilon: float,
-    length_penalty: object | None,
+    algorithm_config: RLAlgorithmConfig,
 ) -> list[dict[str, Any]]:
     if getattr(env, "requires_group_scoring", False):
         run_group = getattr(env, "run_group", None)
@@ -1122,12 +1200,7 @@ async def _run_group(
             state_columns=["trajectory", "sampling_args"],
         )
         outputs = _successful_rollout_outputs(list(result))
-        _assign_group_advantages(
-            outputs,
-            normalize_group_advantages=normalize_group_advantages,
-            advantage_epsilon=advantage_epsilon,
-            length_penalty=length_penalty,
-        )
+        _assign_group_advantages(outputs, algorithm_config=algorithm_config)
         return outputs
 
     tasks = [
@@ -1143,12 +1216,7 @@ async def _run_group(
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     outputs = _successful_rollout_outputs(results)
-    _assign_group_advantages(
-        outputs,
-        normalize_group_advantages=normalize_group_advantages,
-        advantage_epsilon=advantage_epsilon,
-        length_penalty=length_penalty,
-    )
+    _assign_group_advantages(outputs, algorithm_config=algorithm_config)
     return outputs
 
 
@@ -1212,18 +1280,7 @@ def _successful_rollout_outputs(
 
 
 def _assign_completed_group_advantages(outputs: list[dict[str, Any]], config) -> None:
-    if config.orchestrator.advantage_mode == "reward":
-        for output in outputs:
-            output["advantage"] = float(output["reward"])
-        return
-    if config.orchestrator.advantage_mode != "group_reward":
-        return
-    _assign_group_advantages(
-        outputs,
-        normalize_group_advantages=config.orchestrator.normalize_group_advantages,
-        advantage_epsilon=config.orchestrator.advantage_epsilon,
-        length_penalty=config.orchestrator.length_penalty,
-    )
+    _assign_group_advantages(outputs, algorithm_config=config.algo)
 
 
 def _completed_group_outputs(
@@ -1260,26 +1317,36 @@ def _truncate_error(text: str, *, max_chars: int = 500) -> str:
 def _assign_group_advantages(
     outputs: list[dict[str, Any]],
     *,
-    normalize_group_advantages: bool,
-    advantage_epsilon: float,
-    length_penalty: object | None,
+    algorithm_config: RLAlgorithmConfig,
 ) -> None:
     if not outputs:
         return
-    rewards = [float(output["reward"]) for output in outputs]
-    costs = (
-        [length_penalty_cost_for_output(output, length_penalty) for output in outputs]
-        if length_penalty is not None
-        else None
+    algorithm = build_algorithm(algorithm_config)
+    records = [_algorithm_record_from_output(output) for output in outputs]
+    scored = score_algorithm_records(
+        algorithm,
+        records,
+        scope=algorithm_scope(algorithm_config),
     )
-    advantages = group_reward_advantages(
-        rewards,
-        costs=costs,
-        normalize=normalize_group_advantages,
-        epsilon=advantage_epsilon,
+    for output, record in zip(outputs, scored, strict=True):
+        output["advantage"] = record.advantage
+
+
+def _algorithm_record_from_output(output: dict[str, Any]) -> RLExample:
+    return RLExample(
+        prompt=[],
+        completion=[],
+        advantage=(
+            float(output["advantage"]) if output.get("advantage") is not None else None
+        ),
+        reward=float(output["reward"]),
+        metadata={
+            "completion_token_count": output_completion_token_count(output),
+            "tool_response_token_count": output_tool_response_token_count(output),
+            "turn_count": len(output.get("trajectory") or []),
+        },
+        source=str(output.get("env_name") or output.get("task") or "verifier"),
     )
-    for output, advantage in zip(outputs, advantages, strict=True):
-        output["advantage"] = advantage
 
 
 def _has_trainable_advantage(
@@ -1340,9 +1407,9 @@ def _mark_zero_advantage_records_metric_only(
 ) -> list[RLExample]:
     if not config.orchestrator.filter_zero_advantage:
         return records
-    if config.orchestrator.advantage_mode != "group_reward":
+    if not uses_group_advantages(config.algo):
         return records
-    epsilon = config.orchestrator.advantage_epsilon
+    epsilon = algorithm_epsilon(config.algo)
     marked: list[RLExample] = []
     for record in records:
         if record.advantage is not None and abs(float(record.advantage)) > epsilon:
@@ -1471,32 +1538,14 @@ def _sampling_args_with_cache_salt(
 
 
 def _assign_rollout_advantages(outputs: list[dict[str, Any]], config) -> None:
-    if config.orchestrator.advantage_mode == "reward":
-        for output in outputs:
-            output["advantage"] = float(output["reward"])
-        return
-    if config.orchestrator.advantage_mode != "group_reward":
-        return
-
     grouped: dict[str, list[dict[str, Any]]] = {}
     for output in outputs:
         grouped.setdefault(_output_group_key(output), []).append(output)
     for group in grouped.values():
-        rewards = [float(output["reward"]) for output in group]
-        penalty = config.orchestrator.length_penalty
-        costs = (
-            [length_penalty_cost_for_output(output, penalty) for output in group]
-            if penalty is not None
-            else None
+        _assign_group_advantages(
+            group,
+            algorithm_config=config.algo,
         )
-        advantages = group_reward_advantages(
-            rewards,
-            costs=costs,
-            normalize=config.orchestrator.normalize_group_advantages,
-            epsilon=config.orchestrator.advantage_epsilon,
-        )
-        for output, advantage in zip(group, advantages, strict=True):
-            output["advantage"] = advantage
 
 
 def _records_from_output(output: dict[str, Any]) -> list[RLExample]:

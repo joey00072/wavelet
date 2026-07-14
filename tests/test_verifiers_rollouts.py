@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import random
 from types import MethodType
 from typing import Any
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.rl_config import GRPOAlgorithmConfig, RLConfig
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.verifiers import (
@@ -40,6 +41,9 @@ def _trainable_trajectory() -> list[dict[str, Any]]:
             }
         }
     ]
+
+
+CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
 
 
 def test_verifier_step_converts_to_trainable_record() -> None:
@@ -242,8 +246,7 @@ def test_run_all_uses_target_group_scheduler_when_dataset_is_larger() -> None:
             target_groups=1,
             filter_zero_advantage=False,
             advantage_epsilon=1e-6,
-            normalize_group_advantages=False,
-            length_penalty=None,
+            algorithm_config=GRPOAlgorithmConfig(),
         )
 
     outputs = asyncio.run(run())
@@ -300,9 +303,7 @@ def test_run_group_uses_env_group_scoring_when_required() -> None:
             sampling_args={},
             rollout_count=2,
             max_retries=0,
-            normalize_group_advantages=False,
-            advantage_epsilon=1e-6,
-            length_penalty=None,
+            algorithm_config=GRPOAlgorithmConfig(),
         )
         return env, outputs
 
@@ -372,8 +373,7 @@ def test_run_all_uses_group_scoring_without_target_scheduler() -> None:
             target_groups=1,
             filter_zero_advantage=False,
             advantage_epsilon=1e-6,
-            normalize_group_advantages=False,
-            length_penalty=None,
+            algorithm_config=GRPOAlgorithmConfig(),
             env_name="group-env",
         )
         return env, outputs
@@ -598,8 +598,7 @@ def test_successful_rollout_outputs_raises_on_rate_limit_exception() -> None:
         _successful_rollout_outputs(
             [
                 RuntimeError(
-                    "Error code: 429 - GoUsageLimitError: 5-hour usage limit "
-                    "reached"
+                    "Error code: 429 - GoUsageLimitError: 5-hour usage limit reached"
                 )
             ]
         )
@@ -1220,6 +1219,56 @@ def test_verifier_advantages_group_by_environment_and_example_id() -> None:
     assert outputs[1]["advantage"] == pytest.approx(-0.5)
     assert outputs[2]["advantage"] == pytest.approx(0.0)
     assert outputs[3]["advantage"] == pytest.approx(0.0)
+
+
+def test_verifier_group_advantages_preserve_normalization() -> None:
+    config = RLConfig(
+        orchestrator={
+            "advantage_mode": "group_reward",
+            "normalize_group_advantages": True,
+        }
+    )
+    outputs = [
+        {"example_id": 1, "reward": 1.0},
+        {"example_id": 1, "reward": 0.0},
+        {"example_id": 1, "reward": 0.0},
+    ]
+
+    _assign_rollout_advantages(outputs, config)
+
+    assert [output["advantage"] for output in outputs] == pytest.approx(
+        [2**0.5, -(0.5**0.5), -(0.5**0.5)]
+    )
+
+
+def test_verifier_group_advantages_dispatch_max_rl() -> None:
+    config = RLConfig(algo={"type": "max_rl"})
+    outputs = [
+        {"example_id": 1, "reward": 1.0},
+        {"example_id": 1, "reward": 0.0},
+    ]
+
+    _assign_rollout_advantages(outputs, config)
+
+    assert [output["advantage"] for output in outputs] == pytest.approx([1.0, -1.0])
+
+
+def test_verifier_group_advantages_dispatch_external_algorithm() -> None:
+    config = RLConfig(
+        algo={
+            "file": CUSTOM_ALGORITHM_FILE,
+            "algorithm": "reward_plus_one",
+            "scope": "group",
+        }
+    )
+    outputs = [
+        {"example_id": 1, "reward": 1.0},
+        {"example_id": 1, "reward": 0.0},
+    ]
+
+    _assign_rollout_advantages(outputs, config)
+
+    assert [output["advantage"] for output in outputs] == pytest.approx([2.0, 1.0])
 
 
 def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:

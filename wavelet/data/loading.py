@@ -240,7 +240,8 @@ def _mix_payload_groups(
     return [dict(row) for row in mixed]
 
 
-def _normalize_record(payload: dict[str, Any], config: DataConfig) -> Example:
+def normalize_record(payload: dict[str, Any], config: DataConfig) -> Example:
+    """Normalize one raw data row into Wavelet's shared message format."""
     tools = payload.get(config.tools_column)
     if tools is not None and not isinstance(tools, list):
         raise ValueError("tools must be a list when provided.")
@@ -298,20 +299,25 @@ def _normalize_record(payload: dict[str, Any], config: DataConfig) -> Example:
     )
 
 
-def load_records(config: DataConfig) -> list[Example]:
+def load_data_payloads(config: DataConfig) -> list[dict[str, Any]]:
+    """Load and mix raw rows from the configured data sources."""
     if config.source == "hf":
         payload_groups = _load_hf_payload_groups(config)
     elif config.source == "fake":
         payload_groups = _load_fake_payload_groups(config)
     else:
         payload_groups = _load_local_payload_groups(config)
-    payloads = _mix_payload_groups(
+    return _mix_payload_groups(
         payload_groups,
         probabilities=config.probabilities,
         stopping_strategy=config.stopping_strategy,
         seed=config.seed,
     )
-    rows = [_normalize_record(payload, config) for payload in payloads]
+
+
+def load_records(config: DataConfig) -> list[Example]:
+    payloads = load_data_payloads(config)
+    rows = [normalize_record(payload, config) for payload in payloads]
     if config.max_examples is not None:
         rows = rows[: config.max_examples]
     if not rows:

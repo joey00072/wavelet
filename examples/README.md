@@ -6,7 +6,7 @@ that are expected to run on this host.
 | Example | Status | Notes |
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL. |
-| `reverse_text` | working | 0.6B LoRA RL plus SFT config; includes a 2-GPU INT4 QLoRA 4B experiment. |
+| `reverse_text` | working | 0.6B LoRA RL with explicit GRPO plus SFT config; includes a 2-GPU INT4 QLoRA 4B experiment. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
 | `hendrycks_sanity` | runnable | 1.5B math sanity config. |
@@ -33,6 +33,11 @@ uv run python examples/prepare_verifier_rl_data.py \
 Some verifier packages are Python 3.12-only. Use `uv run --python 3.12
 --extra envs ...` for the examples that require `wiki-search`, `code-env`,
 `logic-env`, `mini-swe-agent-plus`, or `deepdive`.
+
+The canonical named-algorithm example is `examples/reverse_text/rl.yaml`. Its
+`algo` block can be changed to `type: max_rl` to use mean-normalized MaxRL
+advantages while keeping the same rollout and trainer path. See
+[RL algorithms](../docs/algorithms.md) for the full configuration contract.
 
 Environment-specific blockers found locally:
 

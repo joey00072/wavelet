@@ -65,16 +65,26 @@ def _preflight_main(argv: list[str]) -> int:
 
 def _inference_main(argv: list[str]) -> int:
     from wavelet.configs.rl_config import RLConfig
-    from wavelet.inference.diagnostics import (
-        continuous_batch_probe,
-        http_health,
-        inference_debug_state,
-        make_probe_examples,
-        probe_engine,
-    )
-    from wavelet.inference.policy import create_policy_inference_engine
+    from wavelet.inference.diagnostics import http_health, inference_debug_state
     from wavelet.utils.config import load_config
 
+    parser = _inference_parser()
+    args, config_args = parser.parse_known_args(argv)
+    _validate_inference_args(args)
+
+    config = load_config(RLConfig, config_args)
+    if args.action == "inspect":
+        _print_report(inference_debug_state(config), json_output=args.json_output)
+        return 0
+    if args.action == "health":
+        _print_report({"health": http_health(config)}, json_output=args.json_output)
+        return 0
+    if args.action == "continuous-batch":
+        return _run_continuous_batch_probe(config, args)
+    return _run_inference_engine_probe(config, args)
+
+
+def _inference_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wavelet debug inference",
         description="Inspect and probe RL inference without trainer/orchestrator.",
@@ -99,8 +109,10 @@ def _inference_main(argv: list[str]) -> int:
     parser.add_argument("--max-completion-tokens", type=int, default=128)
     parser.add_argument("--data-parallel-size", type=int, default=None)
     parser.add_argument("--json", action="store_true", dest="json_output")
-    args, config_args = parser.parse_known_args(argv)
+    return parser
 
+
+def _validate_inference_args(args: argparse.Namespace) -> None:
     if args.count < 1:
         raise SystemExit("--count must be >= 1")
     if args.warmup < 0:
@@ -116,38 +128,37 @@ def _inference_main(argv: list[str]) -> int:
     if args.data_parallel_size is not None and args.data_parallel_size < 1:
         raise SystemExit("--data-parallel-size must be >= 1")
 
-    config = load_config(RLConfig, config_args)
-    if args.action == "inspect":
-        _print_report(inference_debug_state(config), json_output=args.json_output)
-        return 0
-    if args.action == "health":
-        _print_report({"health": http_health(config)}, json_output=args.json_output)
-        return 0
-    if args.action == "continuous-batch":
-        requests, metrics = continuous_batch_probe(
-            config,
-            count=args.count,
-            concurrency=args.concurrency,
-            prompt=args.prompt,
-            max_completion_tokens=args.max_completion_tokens,
-            stagger_seconds=args.stagger_ms / 1000.0,
-            data_parallel_size=args.data_parallel_size,
-        )
-        _print_report(
-            {
-                "metrics": metrics.to_dict(),
-                "sample": [
-                    request.to_dict() for request in requests[: min(5, len(requests))]
-                ],
-                "errors": [
-                    request.to_dict()
-                    for request in requests
-                    if request.error is not None
-                ][:5],
-            },
-            json_output=args.json_output,
-        )
-        return 0
+
+def _run_continuous_batch_probe(config: Any, args: argparse.Namespace) -> int:
+    from wavelet.inference.diagnostics import continuous_batch_probe
+
+    requests, metrics = continuous_batch_probe(
+        config,
+        count=args.count,
+        concurrency=args.concurrency,
+        prompt=args.prompt,
+        max_completion_tokens=args.max_completion_tokens,
+        stagger_seconds=args.stagger_ms / 1000.0,
+        data_parallel_size=args.data_parallel_size,
+    )
+    _print_report(
+        {
+            "metrics": metrics.to_dict(),
+            "sample": [
+                request.to_dict() for request in requests[: min(5, len(requests))]
+            ],
+            "errors": [
+                request.to_dict() for request in requests if request.error is not None
+            ][:5],
+        },
+        json_output=args.json_output,
+    )
+    return 0
+
+
+def _run_inference_engine_probe(config: Any, args: argparse.Namespace) -> int:
+    from wavelet.inference.diagnostics import make_probe_examples, probe_engine
+    from wavelet.inference.policy import create_policy_inference_engine
 
     records = make_probe_examples(count=args.count, prompt=args.prompt)
     engine = create_policy_inference_engine(config)
@@ -378,29 +389,31 @@ def _print_trainer_report(report: dict[str, Any], *, json_output: bool) -> None:
         print(json.dumps(report, indent=2, sort_keys=True))
         return
     print(f"path: {report['path']}")
-    for key in ("ok", "passed", "skipped"):
-        if key in report:
-            print(f"{key}: {report[key]}")
+    _print_present_fields(report, ("ok", "passed", "skipped"))
     if "summary" in report:
         for key, value in report["summary"].items():
             print(f"{key}: {value}")
-    for key in ("rows_exported", "write_path"):
+    _print_present_fields(report, ("rows_exported", "write_path"))
+    _print_present_fields(
+        report,
+        ("token_count", "max_abs_diff", "mean_abs_diff", "skip_reason"),
+    )
+    _print_report_issues("errors", report["errors"])
+    _print_report_issues("warnings", report["warnings"])
+
+
+def _print_present_fields(report: dict[str, Any], keys: tuple[str, ...]) -> None:
+    for key in keys:
         if key in report:
             print(f"{key}: {report[key]}")
-    for key in ("token_count", "max_abs_diff", "mean_abs_diff", "skip_reason"):
-        if key in report:
-            print(f"{key}: {report[key]}")
-    if report["errors"]:
-        print("errors:")
-        for error in report["errors"]:
-            print(f"  row {error.get('row')}: {error.get('field')}: {error.get('message')}")
-    if report["warnings"]:
-        print("warnings:")
-        for warning in report["warnings"]:
-            print(
-                f"  row {warning.get('row')}: "
-                f"{warning.get('field')}: {warning.get('message')}"
-            )
+
+
+def _print_report_issues(label: str, issues: list[dict[str, Any]]) -> None:
+    if not issues:
+        return
+    print(f"{label}:")
+    for issue in issues:
+        print(f"  row {issue.get('row')}: {issue.get('field')}: {issue.get('message')}")
 
 
 def _trainer_exit_code(report: dict[str, Any], *, action: str) -> int:
