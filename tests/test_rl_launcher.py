@@ -8,12 +8,12 @@ import pytest
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
-from wavelet.entrypoints.rl_inference import (
+from wavelet.orchestrator.rollout_worker import (
     _colocated_trainer_device_ids,
     _use_streaming_native_scheduler,
     _wait_for_colocated_training_memory,
 )
-from wavelet.entrypoints.rl_launcher import (
+from wavelet.orchestrator.runtime import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
     _role_specs,
@@ -21,14 +21,13 @@ from wavelet.entrypoints.rl_launcher import (
     _trainer_device_group,
     _wait_for_vllm_http_server,
 )
-from wavelet.entrypoints.rl_trainer import (
+from wavelet.trainer.rl_worker import (
     _StreamingChunkAccumulator,
     _dummy_rollout_row,
     _should_step_streaming_rollouts,
     _use_streaming_rollout_chunks,
 )
-from wavelet.entrypoints.inference_server import _serve_args
-from wavelet.entrypoints.inference_server import _fit_chat_request_to_context
+from wavelet.inference.server import _fit_chat_request_to_context, _serve_args
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
@@ -439,7 +438,7 @@ def test_sleep_colocate_memory_wait_can_be_disabled(monkeypatch) -> None:
         raise AssertionError("memory query should be skipped")
 
     monkeypatch.setattr(
-        "wavelet.entrypoints.rl_inference._query_gpu_memory_mib",
+        "wavelet.orchestrator.rollout_worker._query_gpu_memory_mib",
         fail_query,
     )
 
@@ -454,7 +453,7 @@ def test_sleep_colocate_initial_sleep_targets_all_vllm_servers(monkeypatch) -> N
         calls.append(port)
 
     monkeypatch.setattr(
-        "wavelet.entrypoints.rl_launcher._sleep_vllm_http_server",
+        "wavelet.orchestrator.runtime._sleep_vllm_http_server",
         fake_sleep,
     )
 

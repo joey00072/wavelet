@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.entrypoints import native_inference_server
+from wavelet.inference import native_server
 
 
 class _FakeEngine:
@@ -23,12 +23,12 @@ def _endpoint(app, path: str):
 
 def test_native_server_registers_compatibility_routes(monkeypatch) -> None:
     monkeypatch.setattr(
-        native_inference_server,
+        native_server,
         "VLLMPolicyInferenceEngine",
         _FakeEngine,
     )
 
-    app = native_inference_server._build_app(RLConfig())
+    app = native_server._build_app(RLConfig())
     paths = {route.path for route in app.routes}
 
     assert {
@@ -47,11 +47,11 @@ def test_native_server_registers_compatibility_routes(monkeypatch) -> None:
 
 def test_load_policy_route_updates_engine(monkeypatch) -> None:
     monkeypatch.setattr(
-        native_inference_server,
+        native_server,
         "VLLMPolicyInferenceEngine",
         _FakeEngine,
     )
-    app = native_inference_server._build_app(RLConfig())
+    app = native_server._build_app(RLConfig())
 
     response = _endpoint(app, "/load_policy")({"policy_dir": "/tmp/policy", "step": 7})
 
@@ -60,11 +60,11 @@ def test_load_policy_route_updates_engine(monkeypatch) -> None:
 
 def test_update_weights_route_requires_a_source(monkeypatch) -> None:
     monkeypatch.setattr(
-        native_inference_server,
+        native_server,
         "VLLMPolicyInferenceEngine",
         _FakeEngine,
     )
-    app = native_inference_server._build_app(RLConfig())
+    app = native_server._build_app(RLConfig())
 
     try:
         _endpoint(app, "/update_weights")({})
