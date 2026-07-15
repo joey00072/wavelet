@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.entrypoints.rl_inference import (
+from wavelet.orchestrator.rollout_worker import (
     _load_policy_and_update_scheduler,
 )
 from wavelet.orchestrator.schedule import (
@@ -161,7 +161,7 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
             return 0
 
     monkeypatch.setattr(
-        "wavelet.entrypoints.rl_inference._load_policy_async",
+        "wavelet.orchestrator.rollout_worker._load_policy_async",
         fake_load_policy_async,
     )
 

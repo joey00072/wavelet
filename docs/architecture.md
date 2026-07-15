@@ -10,7 +10,7 @@ filesystem artifacts carry state between independently restartable processes.
 | --- | --- |
 | `wavelet.configs` | Pydantic schemas, legacy input normalization, and cross-field validation |
 | `wavelet.data` | Source loading, message normalization, tokenization, packing, and collation |
-| `wavelet.entrypoints` | Thin command adapters and process lifecycle |
+| `wavelet.entrypoints` | Thin command adapters that load a subsystem's `main` function |
 | `wavelet.orchestrator` | Example selection, rollout scheduling, scoring, algorithms, queues, metrics, and run state |
 | `wavelet.inference` | Native and vLLM policy inference, HTTP clients, policy loading, and diagnostics |
 | `wavelet.trainer` | Model setup, RL/SFT training, loss calculation, checkpointing, and policy export |
@@ -18,9 +18,13 @@ filesystem artifacts carry state between independently restartable processes.
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
 | `wavelet.utils` | Configuration loading, monitoring, paths, and activation offloading |
 
-Entrypoints should not become alternate implementations of these modules. A
-new command belongs in `wavelet.entrypoints`; its reusable behavior belongs in
-the subsystem it invokes.
+Entrypoints contain no runtime behavior. A new command belongs in
+`wavelet.entrypoints`, while its configuration, lifecycle, and reusable
+behavior belong to the subsystem it invokes. RL launch supervision lives in
+`wavelet.orchestrator.runtime`, rollout-worker scheduling in
+`wavelet.orchestrator.rollout_worker`, inference serving in
+`wavelet.inference.server`, and trainer worker loops in
+`wavelet.trainer.rl_worker`.
 
 ## RL Process Flow
 
@@ -40,8 +44,8 @@ source of truth for a completed batch or policy.
 
 ## Inference Scheduling
 
-`wavelet.entrypoints.rl_inference` exposes three scheduling strategies with the
-same policy-loading contract:
+`wavelet.orchestrator.rollout_worker` exposes three scheduling strategies with
+the same policy-loading contract:
 
 - Prefetch scheduling publishes complete optimizer-step batches in order.
 - Native chunk scheduling permits chunks to finish out of order while tracking

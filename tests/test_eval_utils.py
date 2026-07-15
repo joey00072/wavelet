@@ -4,8 +4,8 @@ import pytest
 
 from wavelet.configs.rl_config import RLEvalConfig
 from wavelet.configs.rl_config import RLConfig
-from wavelet.entrypoints.rl_inference import _final_eval_policy_step
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
+from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.verifiers import _eval_metrics
 
