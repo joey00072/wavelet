@@ -1,5 +1,7 @@
 from dataclasses import replace
+from pathlib import Path
 
+from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.http import HTTPPolicyInferenceEngine
 
@@ -42,3 +44,29 @@ def test_round_robin_annotation_restores_input_order() -> None:
         "5@server-2",
         "6@server-0",
     ]
+
+
+def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -> None:
+    engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
+    calls: list[tuple[str, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        engine,
+        "_request_all",
+        lambda method, path, payload: calls.append((method, path, payload)),
+    )
+
+    engine.load_policy(tmp_path / "policy", step=3)
+
+    assert calls == [
+        (
+            "POST",
+            "/load_policy",
+            {
+                "policy_dir": str(tmp_path / "policy"),
+                "step": 3,
+                "adapter_name": "policy",
+                "load_inplace": True,
+            },
+        )
+    ]
+    assert engine.policy_step == 3

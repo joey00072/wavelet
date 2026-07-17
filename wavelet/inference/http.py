@@ -70,22 +70,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         if self._uses_openai_rollouts() and self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name
             payload["load_inplace"] = True
-        if len(self.base_urls) == 1:
-            self._request("POST", "/load_policy", payload, base_url=self.base_url)
-        else:
-            with ThreadPoolExecutor(max_workers=len(self.base_urls)) as executor:
-                futures = [
-                    executor.submit(
-                        self._request,
-                        "POST",
-                        "/load_policy",
-                        payload,
-                        base_url=base_url,
-                    )
-                    for base_url in self.base_urls
-                ]
-                for future in futures:
-                    future.result()
+        self._request_all("POST", "/load_policy", payload)
         self.policy_step = step
         if self.config.lora is not None:
             self.policy_model_name = self.config.policy_transfer.adapter_name
