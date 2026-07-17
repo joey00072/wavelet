@@ -684,74 +684,32 @@ def evaluate_env(
     step: int,
     policy_step: int,
 ) -> dict[str, float]:
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise ImportError(
-            "Verifier evals require the 'verifiers' extra. Install with "
-            "`uv sync --extra verifiers`."
-        ) from exc
-    _ensure_verifier_openai_patches()
-
-    config = orchestrator.config
-    env, _env_cache_hit = _load_cached_env(
-        vf,
-        env_config.id,
-        env_config.args,
-        _verifier_extra_env_kwargs(config),
-    )
-    examples = env.get_eval_dataset(n=env_config.num_examples).to_list()
-    base_urls = _verifier_base_urls(config)
-    os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
-    clients = [
-        vf.ClientConfig(
-            client_idx=client_index,
-            client_type="openai_chat_completions",
-            api_base_url=base_url,
-            api_key_var=config.orchestrator.verifier_api_key_var,
-            extra_headers=extra_headers,
-        )
-        for client_index, (base_url, extra_headers) in enumerate(
-            _verifier_client_routes(base_urls, config.inference.vllm.data_parallel_size)
-        )
-    ]
-    if not clients:
-        raise ValueError("At least one verifier eval client is required.")
-
-    started_at = perf_counter()
-    outputs = asyncio.run(
-        _run_eval_examples(
-            vf,
-            env,
-            examples,
-            clients=clients,
-            model=config.orchestrator.verifier_model or config.model.name,
-            sampling_args=_sampling_args_with_cache_salt(
-                env_config.sampling.to_sampling_args(),
-                cache_salt=str(policy_step),
-            ),
-            rollouts_per_example=env_config.rollouts_per_example,
-            max_retries=env_config.max_retries,
+    return asyncio.run(
+        _evaluate_env_async(
+            orchestrator,
+            env_config,
+            step=step,
+            policy_step=policy_step,
         )
     )
-    elapsed = perf_counter() - started_at
-    env_name = env_config.resolved_name
-    output_path = config.output_dir / "evals" / f"step-{step:06d}" / f"{env_name}.jsonl"
-    _write_eval_rollouts(output_path, outputs)
-    metrics = _eval_metrics(
-        env_name,
-        outputs,
-        total_rollouts=len(examples) * env_config.rollouts_per_example,
-        elapsed_seconds=elapsed,
-        rollouts_per_example=env_config.rollouts_per_example,
-    )
-    metrics["progress/policy_step"] = float(policy_step)
-    metrics["step"] = float(step)
-    _append_eval_metrics(config.output_dir / "eval_metrics.jsonl", metrics)
-    return metrics
 
 
 async def evaluate_env_async(
+    orchestrator: RLOrchestrator,
+    env_config: RLEvalEnvConfig,
+    *,
+    step: int,
+    policy_step: int,
+) -> dict[str, float]:
+    return await _evaluate_env_async(
+        orchestrator,
+        env_config,
+        step=step,
+        policy_step=policy_step,
+    )
+
+
+async def _evaluate_env_async(
     orchestrator: RLOrchestrator,
     env_config: RLEvalEnvConfig,
     *,
