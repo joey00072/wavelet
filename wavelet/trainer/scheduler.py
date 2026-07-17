@@ -35,14 +35,15 @@ def _resolve_decay_steps(
 
 
 def _resolve_min_lr_factor(
-    scheduler_config: SchedulerConfig,
+    min_lr: float,
+    min_lr_factor: float | None,
     lr: float,
 ) -> float:
-    if scheduler_config.min_lr_factor is not None:
-        return scheduler_config.min_lr_factor
-    if scheduler_config.min_lr <= 0.0:
+    if min_lr_factor is not None:
+        return min_lr_factor
+    if min_lr <= 0.0:
         return 1e-8
-    return scheduler_config.min_lr / lr
+    return min_lr / lr
 
 
 def setup_scheduler(
@@ -111,15 +112,9 @@ def setup_constant_scheduler(
     min_lr_factor: float | None = None,
 ) -> LRScheduler:
     min_lr_factor = _resolve_min_lr_factor(
-        SchedulerConfig(
-            type="constant",
-            min_lr=min_lr,
-            min_lr_factor=min_lr_factor,
-            warmup_ratio=0.0,
-            warmup_steps=0,
-            decay_ratio=1.0,
-        ),
-        lr=lr,
+        min_lr,
+        min_lr_factor,
+        lr,
     )
 
     if total_steps <= 0:
@@ -161,16 +156,9 @@ def setup_linear_scheduler(
     min_lr_factor: float | None = None,
 ) -> LRScheduler:
     min_lr_factor = _resolve_min_lr_factor(
-        SchedulerConfig(
-            type="linear",
-            min_lr=min_lr,
-            min_lr_factor=min_lr_factor,
-            warmup_ratio=0.0,
-            warmup_steps=0,
-            decay_ratio=1.0,
-            decay_steps=decay_steps,
-        ),
-        lr=lr,
+        min_lr,
+        min_lr_factor,
+        lr,
     )
 
     if total_steps <= 0:
@@ -241,18 +229,7 @@ def setup_cosine_scheduler(
     if total_steps <= 0:
         raise ValueError("Cosine scheduler requires total_steps > 0")
 
-    min_lr_factor = _resolve_min_lr_factor(
-        SchedulerConfig(
-            type="cosine",
-            min_lr=min_lr,
-            min_lr_factor=min_lr_factor,
-            warmup_ratio=0.0,
-            warmup_steps=0,
-            decay_ratio=1.0,
-            decay_steps=decay_steps,
-        ),
-        lr=lr,
-    )
+    min_lr_factor = _resolve_min_lr_factor(min_lr, min_lr_factor, lr)
 
     schedulers: list[LRScheduler] = []
     milestones: list[int] = []
@@ -298,18 +275,7 @@ def setup_sqrt_scheduler(
     if total_steps <= 0:
         raise ValueError("SQRT scheduler requires total_steps > 0")
 
-    min_lr_factor = _resolve_min_lr_factor(
-        SchedulerConfig(
-            type="sqrt",
-            min_lr=min_lr,
-            min_lr_factor=min_lr_factor,
-            warmup_ratio=0.0,
-            warmup_steps=0,
-            decay_ratio=1.0,
-            decay_steps=decay_steps,
-        ),
-        lr=lr,
-    )
+    min_lr_factor = _resolve_min_lr_factor(min_lr, min_lr_factor, lr)
     decay_steps = max(decay_steps, 1)
 
     if warmup_steps < 0:
