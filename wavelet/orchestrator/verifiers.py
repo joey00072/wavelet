@@ -52,6 +52,18 @@ def _ensure_verifier_openai_patches() -> None:
     _OPENAI_PATCHES_APPLIED = True
 
 
+def _load_verifiers(feature: str):
+    try:
+        import verifiers as vf
+    except ImportError as exc:
+        raise ImportError(
+            f"Verifier {feature} require the 'verifiers' extra. Install with "
+            "`uv sync --extra verifiers`."
+        ) from exc
+    _ensure_verifier_openai_patches()
+    return vf
+
+
 @dataclass(slots=True)
 class _PendingVerifierRequest:
     group_id: int
@@ -73,14 +85,7 @@ def generate_rollouts(
     records: list[RLExample],
     _inference_engine,
 ) -> list[RLExample]:
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise ImportError(
-            "Verifier rollouts require the 'verifiers' extra. Install with "
-            "`uv sync --extra verifiers`."
-        ) from exc
-    _ensure_verifier_openai_patches()
+    vf = _load_verifiers("rollouts")
 
     config = orchestrator.config
     env_id = config.orchestrator.verifier_env_id
@@ -96,19 +101,7 @@ def generate_rollouts(
         _verifier_extra_env_kwargs(config),
     )
     env_load_seconds = perf_counter() - env_started_at
-    os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
-    clients = [
-        vf.ClientConfig(
-            client_idx=client_index,
-            client_type=config.orchestrator.verifier_client_type,
-            api_base_url=base_url,
-            api_key_var=config.orchestrator.verifier_api_key_var,
-            extra_headers=extra_headers,
-        )
-        for client_index, (base_url, extra_headers) in enumerate(
-            _verifier_client_routes(base_urls, config.inference.vllm.data_parallel_size)
-        )
-    ]
+    clients = _verifier_clients(vf, config, base_urls=base_urls)
     policy_step = getattr(_inference_engine, "policy_step", None)
     sampling_args = _sampling_args(
         config,
@@ -155,14 +148,7 @@ class VerifierRolloutScheduler:
     """Persistent verifier rollout scheduler for process-mode async RL."""
 
     def __init__(self, orchestrator: RLOrchestrator) -> None:
-        try:
-            import verifiers as vf
-        except ImportError as exc:
-            raise ImportError(
-                "Verifier rollouts require the 'verifiers' extra. Install with "
-                "`uv sync --extra verifiers`."
-            ) from exc
-        _ensure_verifier_openai_patches()
+        vf = _load_verifiers("rollouts")
 
         config = orchestrator.config
         env_id = config.orchestrator.verifier_env_id
@@ -188,25 +174,7 @@ class VerifierRolloutScheduler:
                 "orchestrator.examples_per_step is required for rolling verifier "
                 "scheduling."
             )
-        os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
-        base_urls = _verifier_base_urls(config)
-        self.clients = [
-            vf.ClientConfig(
-                client_idx=client_index,
-                client_type=config.orchestrator.verifier_client_type,
-                api_base_url=base_url,
-                api_key_var=config.orchestrator.verifier_api_key_var,
-                extra_headers=extra_headers,
-            )
-            for client_index, (base_url, extra_headers) in enumerate(
-                _verifier_client_routes(
-                    base_urls,
-                    config.inference.vllm.data_parallel_size,
-                )
-            )
-        ]
-        if not self.clients:
-            raise ValueError("At least one verifier client is required.")
+        self.clients = _verifier_clients(vf, config)
         self.records = load_rl_records(config.data)
         if not self.records:
             raise ValueError("Verifier scheduler requires at least one train record.")
@@ -716,14 +684,7 @@ async def _evaluate_env_async(
     step: int,
     policy_step: int,
 ) -> dict[str, float]:
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise ImportError(
-            "Verifier evals require the 'verifiers' extra. Install with "
-            "`uv sync --extra verifiers`."
-        ) from exc
-    _ensure_verifier_openai_patches()
+    vf = _load_verifiers("evals")
 
     config = orchestrator.config
     env, _env_cache_hit = _load_cached_env(
@@ -733,22 +694,12 @@ async def _evaluate_env_async(
         _verifier_extra_env_kwargs(config),
     )
     examples = env.get_eval_dataset(n=env_config.num_examples).to_list()
-    base_urls = _verifier_base_urls(config)
-    os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
-    clients = [
-        vf.ClientConfig(
-            client_idx=client_index,
-            client_type="openai_chat_completions",
-            api_base_url=base_url,
-            api_key_var=config.orchestrator.verifier_api_key_var,
-            extra_headers=extra_headers,
-        )
-        for client_index, (base_url, extra_headers) in enumerate(
-            _verifier_client_routes(base_urls, config.inference.vllm.data_parallel_size)
-        )
-    ]
-    if not clients:
-        raise ValueError("At least one verifier eval client is required.")
+    clients = _verifier_clients(
+        vf,
+        config,
+        client_type="openai_chat_completions",
+        client_label="verifier eval",
+    )
 
     started_at = perf_counter()
     outputs = await _run_eval_examples(
@@ -901,6 +852,34 @@ def _verifier_client_routes(
             )
             routes.append((base_url, headers))
     return routes
+
+
+def _verifier_clients(
+    vf,
+    config,
+    *,
+    base_urls: list[str] | None = None,
+    client_type: str | None = None,
+    client_label: str = "verifier",
+) -> list[Any]:
+    os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
+    routes = _verifier_client_routes(
+        base_urls or _verifier_base_urls(config),
+        config.inference.vllm.data_parallel_size,
+    )
+    clients = [
+        vf.ClientConfig(
+            client_idx=index,
+            client_type=client_type or config.orchestrator.verifier_client_type,
+            api_base_url=base_url,
+            api_key_var=config.orchestrator.verifier_api_key_var,
+            extra_headers=headers,
+        )
+        for index, (base_url, headers) in enumerate(routes)
+    ]
+    if not clients:
+        raise ValueError(f"At least one {client_label} client is required.")
+    return clients
 
 
 def _verifier_base_urls(config) -> list[str]:
