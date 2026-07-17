@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import replace
 from hashlib import sha1
 from pathlib import Path
@@ -31,8 +32,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         super().__init__(config)
         ports = config.inference.http.ports or [config.inference.http.port]
         self.base_urls = [
-            f"http://{config.inference.http.host}:{port}"
-            for port in ports
+            f"http://{config.inference.http.host}:{port}" for port in ports
         ]
         self.base_url = self.base_urls[0]
         self.tokenizer = None
@@ -53,8 +53,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 last_error = exc
                 time.sleep(1.0)
         raise TimeoutError(
-            "Timed out waiting for vLLM HTTP server(s) at "
-            f"{', '.join(self.base_urls)}."
+            f"Timed out waiting for vLLM HTTP server(s) at {', '.join(self.base_urls)}."
         ) from last_error
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
@@ -101,7 +100,11 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         output_hash = sha1(
             str(self.config.output_dir.resolve()).encode("utf-8")
         ).hexdigest()[:12]
-        return base_dir / f"wavelet-policy-cache-{os.getuid()}" / f"{os.getpid()}-{output_hash}"
+        return (
+            base_dir
+            / f"wavelet-policy-cache-{os.getuid()}"
+            / f"{os.getpid()}-{output_hash}"
+        )
 
     def _cache_lora_policy_dir(self, policy_dir: Path, *, step: int) -> Path:
         adapter_dir = policy_dir / "adapter"
@@ -139,7 +142,11 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
             return
         keep_names = {f"step-{step:06d}" for step in keep_steps if step >= 0}
         for child in self._policy_cache_root.iterdir():
-            if child.is_dir() and child.name.startswith("step-") and child.name not in keep_names:
+            if (
+                child.is_dir()
+                and child.name.startswith("step-")
+                and child.name not in keep_names
+            ):
                 shutil.rmtree(child, ignore_errors=True)
 
     def sleep(self) -> None:
@@ -155,54 +162,22 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         if self._uses_openai_rollouts():
             return self._annotate_openai(records)
         if len(self.base_urls) == 1 or len(records) <= 1:
-            response = self._request(
-                "POST",
-                "/annotate",
-                {"records": rl_examples_to_payload(records)},
-            )
-            self.policy_step = response.get("policy_step")
-            return rl_examples_from_payload(response["records"])
-
-        chunks: list[tuple[int, list[RLExample]]] = [
-            (index, []) for index in range(len(self.base_urls))
-        ]
-        for index, record in enumerate(records):
-            chunks[index % len(chunks)][1].append(record)
-
-        annotated_by_chunk: dict[int, list[RLExample]] = {}
-        with ThreadPoolExecutor(max_workers=len(self.base_urls)) as executor:
-            futures = {
-                executor.submit(
-                    self._request,
-                    "POST",
-                    "/annotate",
-                    {"records": rl_examples_to_payload(chunk)},
-                    base_url=self.base_urls[index],
-                ): index
-                for index, chunk in chunks
-                if chunk
-            }
-            for future, index in futures.items():
-                response = future.result()
-                self.policy_step = response.get("policy_step")
-                annotated_by_chunk[index] = rl_examples_from_payload(
-                    response["records"]
-                )
-
-        positions = {index: 0 for index in annotated_by_chunk}
-        merged: list[RLExample] = []
-        for index in range(len(records)):
-            chunk_index = index % len(self.base_urls)
-            position = positions[chunk_index]
-            merged.append(annotated_by_chunk[chunk_index][position])
-            positions[chunk_index] = position + 1
-        return merged
+            return self._annotate_single_server(records)
+        return self._annotate_round_robin(records, self._annotate_native_chunk)
 
     def _annotate_single_server(self, records: list[RLExample]) -> list[RLExample]:
+        return self._annotate_native_chunk(records, self.base_url)
+
+    def _annotate_native_chunk(
+        self,
+        records: list[RLExample],
+        base_url: str,
+    ) -> list[RLExample]:
         response = self._request(
             "POST",
             "/annotate",
             {"records": rl_examples_to_payload(records)},
+            base_url=base_url,
         )
         self.policy_step = response.get("policy_step")
         return rl_examples_from_payload(response["records"])
@@ -212,35 +187,38 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
             self.tokenizer = setup_tokenizer(self.config.model)
         if len(records) == 0:
             return []
-
-        chunks: list[tuple[int, list[RLExample]]] = [
-            (index, []) for index in range(len(self.base_urls))
-        ]
-        for index, record in enumerate(records):
-            chunks[index % len(chunks)][1].append(record)
-
         policy_model_name = self.policy_model_name
-        annotated_by_chunk: dict[int, list[RLExample]] = {}
+        return self._annotate_round_robin(
+            records,
+            lambda chunk, base_url: self._annotate_openai_chunk(
+                chunk,
+                base_url=base_url,
+                policy_model_name=policy_model_name,
+            ),
+        )
+
+    def _annotate_round_robin(
+        self,
+        records: list[RLExample],
+        annotate_chunk: Callable[[list[RLExample], str], list[RLExample]],
+    ) -> list[RLExample]:
+        chunks = [
+            records[index :: len(self.base_urls)]
+            for index in range(len(self.base_urls))
+        ]
         with ThreadPoolExecutor(max_workers=len(self.base_urls)) as executor:
             futures = {
-                executor.submit(
-                    self._annotate_openai_chunk,
-                    chunk,
-                    base_url=self.base_urls[index],
-                    policy_model_name=policy_model_name,
-                ): index
-                for index, chunk in chunks
+                executor.submit(annotate_chunk, chunk, self.base_urls[index]): index
+                for index, chunk in enumerate(chunks)
                 if chunk
             }
-            for future, index in futures.items():
-                annotated_by_chunk[index] = future.result()
-
-        positions = {index: 0 for index in annotated_by_chunk}
-        merged: list[RLExample] = []
+            annotated = {index: future.result() for future, index in futures.items()}
+        positions = [0] * len(chunks)
+        merged = []
         for index in range(len(records)):
             chunk_index = index % len(self.base_urls)
             position = positions[chunk_index]
-            merged.append(annotated_by_chunk[chunk_index][position])
+            merged.append(annotated[chunk_index][position])
             positions[chunk_index] = position + 1
         return merged
 
@@ -369,7 +347,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         choice: dict[str, Any],
         completion_ids: list[int],
     ) -> list[float]:
-        raw_logprobs = ((choice.get("logprobs") or {}).get("content") or [])
+        raw_logprobs = (choice.get("logprobs") or {}).get("content") or []
         values = [float(item.get("logprob", 0.0)) for item in raw_logprobs]
         if len(values) < len(completion_ids):
             values.extend([0.0] * (len(completion_ids) - len(values)))
