@@ -1127,19 +1127,8 @@ class RLTrainer(BaseTrainer):
 
         rewards = batch["rewards"]
         valid_rewards = rewards[~torch.isnan(rewards)]
-        if valid_rewards.numel() > 0:
-            if sample_counts is not None:
-                valid = ~torch.isnan(rewards)
-                weights = sample_counts[valid].float().clamp_min(0)
-                if weights.sum() > 0:
-                    reward_mean = float(
-                        (rewards[valid].float() * weights).sum().item()
-                        / weights.sum().item()
-                    )
-                else:
-                    reward_mean = float(valid_rewards.mean().item())
-            else:
-                reward_mean = float(valid_rewards.mean().item())
+        reward_mean = self._reward_mean(rewards, sample_counts=sample_counts)
+        if reward_mean is not None:
             metrics.update(
                 {
                     "reward/all/mean": reward_mean,
