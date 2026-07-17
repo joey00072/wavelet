@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Iterable
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -34,26 +36,8 @@ def scan_queue_dir(
 ) -> QueueSnapshot:
     now = datetime.now().astimezone()
     items: list[QueueItemSnapshot] = []
-    if not queue_dir.exists():
-        return QueueSnapshot(
-            ready_count=0,
-            claimed_count=0,
-            consumed_count=0,
-            incomplete_count=0,
-            unknown_count=0,
-            stale_ready_count=0,
-            abandoned_claim_count=0,
-            oldest_ready_age_seconds=None,
-            latest_queue_step=None,
-            latest_consumed_queue_step=None,
-            next_expected_trainer_queue_step=0,
-            event_parse_error_count=tail_events(events_dir, limit=5000)[1]
-            if events_dir is not None
-            else 0,
-            items=[],
-        )
-
-    for candidate in sorted(queue_dir.iterdir(), key=lambda path: path.name):
+    candidates = queue_dir.iterdir() if queue_dir.exists() else ()
+    for candidate in sorted(candidates, key=lambda path: path.name):
         queue_step = parse_step(candidate)
         if queue_step is None:
             continue
@@ -68,13 +52,10 @@ def scan_queue_dir(
             )
         )
 
-    ready = [item for item in items if item.status == "ready"]
-    claimed = [item for item in items if item.status == "claimed"]
-    consumed = [item for item in items if item.status == "consumed"]
-    incomplete = [item for item in items if item.status == "incomplete"]
-    stale_ready = [item for item in items if item.status == "stale"]
-    abandoned = [item for item in items if item.status == "abandoned_claim"]
-    known_consumed = {item.queue_step for item in consumed}
+    status_counts = Counter(item.status for item in items)
+    known_consumed = {
+        item.queue_step for item in items if item.status == "consumed"
+    }
     next_expected = 0
     while next_expected in known_consumed:
         next_expected += 1
@@ -84,14 +65,16 @@ def scan_queue_dir(
     )
     visible_items = items[-max(limit, 0) :] if detail else []
     return QueueSnapshot(
-        ready_count=len(ready),
-        claimed_count=len(claimed),
-        consumed_count=len(consumed),
-        incomplete_count=len(incomplete),
+        ready_count=status_counts["ready"],
+        claimed_count=status_counts["claimed"],
+        consumed_count=status_counts["consumed"],
+        incomplete_count=status_counts["incomplete"],
         unknown_count=sum(1 for item in items if item.parse_errors),
-        stale_ready_count=len(stale_ready),
-        abandoned_claim_count=len(abandoned),
-        oldest_ready_age_seconds=_oldest_age_seconds(ready + stale_ready),
+        stale_ready_count=status_counts["stale"],
+        abandoned_claim_count=status_counts["abandoned_claim"],
+        oldest_ready_age_seconds=_oldest_age_seconds(
+            item for item in items if item.status in {"ready", "stale"}
+        ),
         latest_queue_step=max((item.queue_step for item in items), default=None),
         latest_consumed_queue_step=max(known_consumed, default=None),
         next_expected_trainer_queue_step=next_expected,
@@ -218,7 +201,7 @@ def _read_optional(read_fn, step_dir: Path, label: str, errors: list[str]):
         return None
 
 
-def _oldest_age_seconds(items: list[QueueItemSnapshot]) -> float | None:
+def _oldest_age_seconds(items: Iterable[QueueItemSnapshot]) -> float | None:
     ages = [item.age_seconds for item in items if item.age_seconds is not None]
     return max(ages) if ages else None
 
