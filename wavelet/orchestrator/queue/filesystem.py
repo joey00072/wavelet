@@ -5,7 +5,9 @@ import logging
 import os
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
 from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
 from wavelet.orchestrator.queue.events import append_event_best_effort
@@ -28,6 +30,7 @@ from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trac
 
 logger = logging.getLogger(__name__)
 _COPY_CHUNK_BYTES = 1024 * 1024
+ItemT = TypeVar("ItemT")
 
 
 def resolve_queue_dir(output_dir: Path, config: RLTransportConfig) -> Path:
@@ -69,6 +72,84 @@ def _copy_payload(source_path: Path, target_path: Path) -> tuple[int, float]:
         target.flush()
         os.fsync(target.fileno())
     return payload_bytes, time.monotonic() - started_at
+
+
+def _wait_for_item(
+    find_item: Callable[[], ItemT | None],
+    *,
+    poll_interval_seconds: float,
+    idle_timeout_seconds: float | None,
+    timeout_message: str,
+) -> tuple[ItemT, float]:
+    started_at = time.monotonic()
+    deadline = (
+        None
+        if idle_timeout_seconds is None
+        else started_at + idle_timeout_seconds
+    )
+    while (item := find_item()) is None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(timeout_message)
+        time.sleep(poll_interval_seconds)
+    return item, time.monotonic() - started_at
+
+
+def _available_steps(root: Path, is_stable: Callable[[Path], bool]) -> list[int]:
+    if not root.exists():
+        return []
+    return sorted(
+        step
+        for candidate in root.iterdir()
+        if (step := parse_step(candidate)) is not None and is_stable(candidate)
+    )
+
+
+def _is_stable_dir(path: Path) -> bool:
+    return path.is_dir() and (path / STABLE_BATCH_MARKER).exists()
+
+
+def _record_received(
+    events_dir: Path | None,
+    *,
+    kind: str,
+    subsystem: str,
+    step: int,
+    consumer_id: str,
+    mode: str,
+    payload_bytes: int | None,
+    wait_seconds: float,
+    queue_step: int | None = None,
+    policy_step: int | None = None,
+) -> None:
+    if events_dir is None:
+        return
+    details = {
+        "mode": mode,
+        "payload_bytes": payload_bytes,
+        "wait_seconds": wait_seconds,
+    }
+    append_event_best_effort(
+        events_dir,
+        QueueEvent(
+            time=utc_now(),
+            kind=kind,
+            queue_step=queue_step,
+            policy_step=policy_step,
+            consumer_id=consumer_id,
+            details=details,
+        ),
+    )
+    append_trace_event_best_effort(
+        _trace_output_dir(events_dir),
+        make_trace_event(
+            subsystem=subsystem,
+            event=kind,
+            step=step,
+            queue_step=queue_step,
+            policy_step=policy_step,
+            details={"consumer_id": consumer_id, **details},
+        ),
+    )
 
 
 class FileSystemRolloutSender:
@@ -178,77 +259,47 @@ class FileSystemRolloutReceiver:
             raise FileNotFoundError(
                 f"No stable rollout batch available for step {self.next_step}."
             )
-        self.next_step += 1
-        self._record_received(batch, wait_seconds=0.0, mode="receive")
-        if self.config.cleanup_consumed:
-            marker = batch.step_dir / ".consumed"
-            marker.touch()
+        self._accept(batch, wait_seconds=0.0, mode="receive")
         return batch
 
     def wait(self) -> RolloutBatch:
-        started_at = time.monotonic()
-        deadline = None
-        if self.config.idle_timeout_seconds is not None:
-            deadline = time.monotonic() + self.config.idle_timeout_seconds
-        while True:
-            batch = self._stable_batch_for_step(self.next_step)
-            if batch is not None:
-                self.next_step += 1
-                self._record_received(
-                    batch,
-                    wait_seconds=time.monotonic() - started_at,
-                    mode="wait",
-                )
-                if self.config.cleanup_consumed:
-                    marker = batch.step_dir / ".consumed"
-                    marker.touch()
-                return batch
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for rollout batch step {self.next_step} in "
-                    f"'{self.queue_dir}'."
-                )
-            time.sleep(self.config.poll_interval_seconds)
+        batch, wait_seconds = _wait_for_item(
+            lambda: self._stable_batch_for_step(self.next_step),
+            poll_interval_seconds=self.config.poll_interval_seconds,
+            idle_timeout_seconds=self.config.idle_timeout_seconds,
+            timeout_message=(
+                f"Timed out waiting for rollout batch step {self.next_step} in "
+                f"'{self.queue_dir}'."
+            ),
+        )
+        self._accept(batch, wait_seconds=wait_seconds, mode="wait")
+        return batch
 
     def wait_available(self) -> RolloutBatch:
         """Return the oldest currently stable unconsumed batch at or after next_step."""
-        started_at = time.monotonic()
-        deadline = None
-        if self.config.idle_timeout_seconds is not None:
-            deadline = time.monotonic() + self.config.idle_timeout_seconds
-        while True:
-            batch = self._oldest_available_batch()
-            if batch is not None:
-                self._mark_consumed(batch)
-                self._record_received(
-                    batch,
-                    wait_seconds=time.monotonic() - started_at,
-                    mode="wait_available",
-                )
-                return batch
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for any rollout batch at or after step "
-                    f"{self.next_step} in '{self.queue_dir}'."
-                )
-            time.sleep(self.config.poll_interval_seconds)
+        batch, wait_seconds = _wait_for_item(
+            self._oldest_available_batch,
+            poll_interval_seconds=self.config.poll_interval_seconds,
+            idle_timeout_seconds=self.config.idle_timeout_seconds,
+            timeout_message=(
+                "Timed out waiting for any rollout batch at or after step "
+                f"{self.next_step} in '{self.queue_dir}'."
+            ),
+        )
+        self._mark_consumed(batch)
+        self._record_received(
+            batch,
+            wait_seconds=wait_seconds,
+            mode="wait_available",
+        )
+        return batch
 
     def available_steps(self) -> list[int]:
-        steps: list[int] = []
-        if not self.queue_dir.exists():
-            return steps
-        for candidate in self.queue_dir.iterdir():
-            step = parse_step(candidate)
-            if step is None:
-                continue
-            if not self._is_stable_step_dir(candidate):
-                continue
-            steps.append(step)
-        return sorted(steps)
+        return _available_steps(self.queue_dir, _is_stable_dir)
 
     def _stable_batch_for_step(self, step: int) -> RolloutBatch | None:
         step_dir = get_step_dir(self.queue_dir, step)
-        if not self._is_stable_step_dir(step_dir):
+        if not _is_stable_dir(step_dir):
             return None
         batch_path = step_dir / self.config.rollout_filename
         if not batch_path.exists():
@@ -271,6 +322,12 @@ class FileSystemRolloutReceiver:
             marker = batch.step_dir / ".consumed"
             marker.touch()
 
+    def _accept(self, batch: RolloutBatch, *, wait_seconds: float, mode: str) -> None:
+        self.next_step += 1
+        self._record_received(batch, wait_seconds=wait_seconds, mode=mode)
+        if self.config.cleanup_consumed:
+            (batch.step_dir / ".consumed").touch()
+
     def _record_received(
         self,
         batch: RolloutBatch,
@@ -278,46 +335,22 @@ class FileSystemRolloutReceiver:
         wait_seconds: float,
         mode: str,
     ) -> None:
-        if self.events_dir is None:
-            return
         consumer_id = self.consumer_id or process_identity("rl-trainer")
         try:
             payload_bytes = batch.path.stat().st_size
         except OSError:
             payload_bytes = None
-        append_event_best_effort(
+        _record_received(
             self.events_dir,
-            QueueEvent(
-                time=utc_now(),
-                kind="rollout_received",
-                queue_step=batch.step,
-                consumer_id=consumer_id,
-                details={
-                    "mode": mode,
-                    "payload_bytes": payload_bytes,
-                    "wait_seconds": wait_seconds,
-                },
-            ),
+            kind="rollout_received",
+            subsystem="trainer",
+            step=batch.step,
+            queue_step=batch.step,
+            consumer_id=consumer_id,
+            mode=mode,
+            payload_bytes=payload_bytes,
+            wait_seconds=wait_seconds,
         )
-        append_trace_event_best_effort(
-            _trace_output_dir(self.events_dir),
-            make_trace_event(
-                subsystem="trainer",
-                event="rollout_received",
-                step=batch.step,
-                queue_step=batch.step,
-                details={
-                    "consumer_id": consumer_id,
-                    "mode": mode,
-                    "payload_bytes": payload_bytes,
-                    "wait_seconds": wait_seconds,
-                },
-            ),
-        )
-
-    @staticmethod
-    def _is_stable_step_dir(step_dir: Path) -> bool:
-        return step_dir.is_dir() and (step_dir / STABLE_BATCH_MARKER).exists()
 
 
 class FileSystemPolicyReceiver:
@@ -345,52 +378,32 @@ class FileSystemPolicyReceiver:
             raise FileNotFoundError(
                 f"No stable policy snapshot available for step {self.next_step}."
             )
-        self.next_step += 1
-        self._record_received(snapshot, wait_seconds=0.0, mode="receive")
+        self._accept(snapshot, wait_seconds=0.0, mode="receive")
         return snapshot
 
     def wait(self) -> PolicySnapshot:
-        started_at = time.monotonic()
-        deadline = None
-        if self.config.idle_timeout_seconds is not None:
-            deadline = time.monotonic() + self.config.idle_timeout_seconds
-        while True:
-            snapshot = self._stable_policy_for_step(self.next_step)
-            if snapshot is not None:
-                self.next_step += 1
-                self._record_received(
-                    snapshot,
-                    wait_seconds=time.monotonic() - started_at,
-                    mode="wait",
-                )
-                return snapshot
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Timed out waiting for policy step {self.next_step} in "
-                    f"'{self.policy_dir}'."
-                )
-            time.sleep(self.config.poll_interval_seconds)
+        snapshot, wait_seconds = _wait_for_item(
+            lambda: self._stable_policy_for_step(self.next_step),
+            poll_interval_seconds=self.config.poll_interval_seconds,
+            idle_timeout_seconds=self.config.idle_timeout_seconds,
+            timeout_message=(
+                f"Timed out waiting for policy step {self.next_step} in "
+                f"'{self.policy_dir}'."
+            ),
+        )
+        self._accept(snapshot, wait_seconds=wait_seconds, mode="wait")
+        return snapshot
 
     def wait_for_step(self, step: int) -> PolicySnapshot:
         self.next_step = step
         return self.wait()
 
     def available_steps(self) -> list[int]:
-        steps: list[int] = []
-        if not self.policy_dir.exists():
-            return steps
-        for candidate in self.policy_dir.iterdir():
-            step = parse_step(candidate)
-            if step is None:
-                continue
-            if not self._is_stable_policy_dir(candidate):
-                continue
-            steps.append(step)
-        return sorted(steps)
+        return _available_steps(self.policy_dir, _is_stable_dir)
 
     def _stable_policy_for_step(self, step: int) -> PolicySnapshot | None:
         step_dir = get_policy_step_dir(self.policy_dir, step)
-        if not self._is_stable_policy_dir(step_dir):
+        if not _is_stable_dir(step_dir):
             return None
         return PolicySnapshot(step=step, step_dir=step_dir)
 
@@ -401,43 +414,29 @@ class FileSystemPolicyReceiver:
         wait_seconds: float,
         mode: str,
     ) -> None:
-        if self.events_dir is None:
-            return
         consumer_id = self.consumer_id or process_identity("rl-inference")
         payload_bytes = _directory_payload_bytes(snapshot.step_dir)
-        append_event_best_effort(
+        _record_received(
             self.events_dir,
-            QueueEvent(
-                time=utc_now(),
-                kind="policy_received",
-                policy_step=snapshot.step,
-                consumer_id=consumer_id,
-                details={
-                    "mode": mode,
-                    "payload_bytes": payload_bytes,
-                    "wait_seconds": wait_seconds,
-                },
-            ),
-        )
-        append_trace_event_best_effort(
-            _trace_output_dir(self.events_dir),
-            make_trace_event(
-                subsystem="inference",
-                event="policy_received",
-                step=snapshot.step,
-                policy_step=snapshot.step,
-                details={
-                    "consumer_id": consumer_id,
-                    "mode": mode,
-                    "payload_bytes": payload_bytes,
-                    "wait_seconds": wait_seconds,
-                },
-            ),
+            kind="policy_received",
+            subsystem="inference",
+            step=snapshot.step,
+            policy_step=snapshot.step,
+            consumer_id=consumer_id,
+            mode=mode,
+            payload_bytes=payload_bytes,
+            wait_seconds=wait_seconds,
         )
 
-    @staticmethod
-    def _is_stable_policy_dir(step_dir: Path) -> bool:
-        return step_dir.is_dir() and (step_dir / STABLE_BATCH_MARKER).exists()
+    def _accept(
+        self,
+        snapshot: PolicySnapshot,
+        *,
+        wait_seconds: float,
+        mode: str,
+    ) -> None:
+        self.next_step += 1
+        self._record_received(snapshot, wait_seconds=wait_seconds, mode=mode)
 
 
 def _directory_payload_bytes(path: Path) -> int:
