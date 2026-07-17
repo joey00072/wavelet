@@ -311,16 +311,6 @@ def _configure_streaming_accumulation(
         trainer._gradient_accumulation_loss_scale = None
 
 
-def _should_step_streaming_rollouts(
-    *,
-    accumulated_rows: int,
-    accumulated_chunks: int,
-    target_rollout_rows: int,
-    chunks_per_step: int,
-) -> bool:
-    return accumulated_chunks >= chunks_per_step
-
-
 def _log_step_perf_metrics(
     trainer: RLTrainer,
     metrics: dict[str, float],
