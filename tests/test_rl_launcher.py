@@ -24,7 +24,6 @@ from wavelet.orchestrator.runtime import (
 from wavelet.trainer.rl_worker import (
     _StreamingChunkAccumulator,
     _dummy_rollout_row,
-    _should_step_streaming_rollouts,
     _use_streaming_rollout_chunks,
 )
 from wavelet.inference.server import _fit_chat_request_to_context, _serve_args
@@ -163,39 +162,26 @@ def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
     counts[639] = 18
 
     steps = 0
-    accumulated_rows = 0
-    accumulated_chunks = 0
+    accumulator = _StreamingChunkAccumulator()
     for row_count in counts:
-        accumulated_rows += row_count
-        accumulated_chunks += 1
-        if _should_step_streaming_rollouts(
-            accumulated_rows=accumulated_rows,
-            accumulated_chunks=accumulated_chunks,
-            target_rollout_rows=128,
-            chunks_per_step=8,
-        ):
+        accumulator.mark_loaded(rows=row_count, chunks=1, loss_scale=0.0)
+        if accumulator.should_step(chunks_per_step=8):
             steps += 1
-            accumulated_rows = 0
-            accumulated_chunks = 0
+            accumulator.reset_after_optimizer_step()
 
     assert steps == 100
-    assert accumulated_rows == 0
-    assert accumulated_chunks == 0
+    assert accumulator.accumulated_rows == 0
+    assert accumulator.accumulated_chunks == 0
 
 
 def test_streaming_rollout_waits_for_full_chunk_group_when_rows_overshoot() -> None:
-    assert not _should_step_streaming_rollouts(
+    accumulator = _StreamingChunkAccumulator(
         accumulated_rows=1200,
         accumulated_chunks=7,
-        target_rollout_rows=1024,
-        chunks_per_step=8,
     )
-    assert _should_step_streaming_rollouts(
-        accumulated_rows=1300,
-        accumulated_chunks=8,
-        target_rollout_rows=1024,
-        chunks_per_step=8,
-    )
+    assert not accumulator.should_step(chunks_per_step=8)
+    accumulator.mark_loaded(rows=100, chunks=1, loss_scale=0.0)
+    assert accumulator.should_step(chunks_per_step=8)
 
 
 def test_streaming_chunk_accumulator_preserves_chunk_step_boundary(tmp_path) -> None:
