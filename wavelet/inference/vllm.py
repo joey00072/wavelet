@@ -101,6 +101,14 @@ def _vllm_dtype(config: RLConfig) -> str:
     return config.inference.vllm.dtype or config.model.torch_dtype
 
 
+def _sampling_params_type():
+    try:
+        from vllm import SamplingParams
+    except ImportError as exc:
+        raise ImportError("vLLM SamplingParams import failed.") from exc
+    return SamplingParams
+
+
 class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
     """Persistent vLLM rollout engine with LoRA policy snapshot switching."""
 
@@ -344,11 +352,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         started_at = perf_counter()
         if self.llm is None or self.tokenizer is None:
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
-        try:
-            from vllm import SamplingParams
-        except ImportError as exc:
-            raise ImportError("vLLM SamplingParams import failed.") from exc
-
+        sampling_params_type = _sampling_params_type()
         prompts: list[dict[str, list[int]]] = []
         prompt_id_rows: list[list[int]] = []
         sampling_params: list[Any] = []
@@ -373,7 +377,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             )
             prompt_id_rows.append(prompt_ids)
             prompts.append({"prompt_token_ids": prompt_ids})
-            sampling_params.append(SamplingParams(**sampling_kwargs))
+            sampling_params.append(sampling_params_type(**sampling_kwargs))
 
         prefill_tokens = sum(len(row) for row in prompt_id_rows)
         lora_request = self._lora_request
@@ -588,11 +592,6 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             torch.cuda.empty_cache()
 
     def _sampling_params(self):
-        try:
-            from vllm import SamplingParams
-        except ImportError as exc:
-            raise ImportError("vLLM SamplingParams import failed.") from exc
-
         sampling = self.config.inference.sampling
         kwargs: dict[str, Any] = {
             "n": sampling.num_generations,
@@ -616,7 +615,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         include_stop = extra_body.get("include_stop_str_in_output")
         if include_stop is not None:
             kwargs["include_stop_str_in_output"] = bool(include_stop)
-        return SamplingParams(**kwargs)
+        return _sampling_params_type()(**kwargs)
 
     def _load_adapter_policy(
         self, adapter_dir: Path, *, step: int | None = None
@@ -657,20 +656,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         fallback_records: list[RLExample] = []
         fallback_indexes: list[int] = []
         for index, record in enumerate(records):
-            sample = build_sample(
-                Example(
-                    prompt=record.prompt,
-                    completion=record.completion,
-                    tools=record.tools,
-                    chat_template_kwargs=record.chat_template_kwargs,
-                    source=record.source,
-                ),
-                self.tokenizer,
-                seq_len=self.config.data.seq_len,
-                loss_mask_config=self.config.data.loss_mask,
-            )
-            if sample is None:
-                raise ValueError("Generated rollout produced no trainable tokens.")
+            sample = self._build_record_sample(record)
             trainable_ids = [
                 int(token_id)
                 for token_id, trainable in zip(
@@ -724,20 +710,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         samples: list[dict[str, Any]] = []
         prompts: list[dict[str, list[int]]] = []
         for record in records:
-            sample = build_sample(
-                Example(
-                    prompt=record.prompt,
-                    completion=record.completion,
-                    tools=record.tools,
-                    chat_template_kwargs=record.chat_template_kwargs,
-                    source=record.source,
-                ),
-                self.tokenizer,
-                seq_len=self.config.data.seq_len,
-                loss_mask_config=self.config.data.loss_mask,
-            )
-            if sample is None:
-                raise ValueError("Generated rollout produced no trainable tokens.")
+            sample = self._build_record_sample(record)
             samples.append(sample)
             full_token_ids = list(sample["input_ids"]) + [sample["target_ids"][-1]]
             prompts.append({"prompt_token_ids": full_token_ids})
@@ -777,13 +750,25 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             )
         return annotated
 
-    def _prompt_logprob_params(self):
-        try:
-            from vllm import SamplingParams
-        except ImportError as exc:
-            raise ImportError("vLLM SamplingParams import failed.") from exc
+    def _build_record_sample(self, record: RLExample) -> dict[str, Any]:
+        sample = build_sample(
+            Example(
+                prompt=record.prompt,
+                completion=record.completion,
+                tools=record.tools,
+                chat_template_kwargs=record.chat_template_kwargs,
+                source=record.source,
+            ),
+            self.tokenizer,
+            seq_len=self.config.data.seq_len,
+            loss_mask_config=self.config.data.loss_mask,
+        )
+        if sample is None:
+            raise ValueError("Generated rollout produced no trainable tokens.")
+        return sample
 
-        return SamplingParams(
+    def _prompt_logprob_params(self):
+        return _sampling_params_type()(
             temperature=0.0,
             max_tokens=1,
             prompt_logprobs=1,
