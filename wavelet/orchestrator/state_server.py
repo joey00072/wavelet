@@ -5,18 +5,21 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from wavelet.configs.config import RLConfig
 from wavelet.monitor import (
+    METRICS_FILENAME,
     RolloutStateEventsMixin,
     _file_exceeds_rows,
     _nearest_reward_row,
     _read_json,
     _scan_rollouts,
     latest_stable_step,
+    prometheus_exposition,
     summary_stats,
     tail_jsonl_rows,
+    tail_metric_rows,
     unavailable_rollout_inspection,
 )
 from wavelet.monitor import redact as _redact
@@ -145,10 +148,16 @@ class OrchestratorRunState(RolloutStateEventsMixin):
 
     def algorithm_snapshot(self) -> dict[str, Any]:
         """Describe the configured algorithm graph and latest source observations."""
-        latest_rows = tail_jsonl_rows(
-            self._config.output_dir / "orchestrator_metrics.jsonl",
+        latest_rows = tail_metric_rows(
+            self._config.output_dir / METRICS_FILENAME,
             limit=1,
+            subsystem="orchestrator",
         )
+        if not latest_rows:
+            latest_rows = tail_jsonl_rows(
+                self._config.output_dir / "orchestrator_metrics.jsonl",
+                limit=1,
+            )
         latest = latest_rows[-1] if latest_rows else {}
         configured_sources = self._config.orchestrator.train_sources
         sources: list[dict[str, Any]] = []
@@ -216,10 +225,22 @@ class OrchestratorRunState(RolloutStateEventsMixin):
             "observed_step": _metric_number(latest.get("step")),
         }
 
-    def metrics(self, *, limit: int) -> list[dict[str, Any]]:
-        return tail_jsonl_rows(
-            self._config.output_dir / "metrics.jsonl",
+    def metrics(
+        self,
+        *,
+        limit: int,
+        subsystem: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return tail_metric_rows(
+            self._config.output_dir / METRICS_FILENAME,
             limit=limit,
+            subsystem=subsystem,
+        )
+
+    def prometheus_metrics(self, *, subsystem: str | None = None) -> str:
+        return prometheus_exposition(
+            self._config.output_dir / METRICS_FILENAME,
+            subsystem=subsystem,
         )
 
     def samples(self, *, limit: int) -> list[dict[str, Any]]:
@@ -315,6 +336,7 @@ def _build_state_app(
     fastapi: Any,
     query: Any,
     cors_middleware: Any,
+    plain_text_response: Any | None = None,
 ) -> Any:
     config = state._config.orchestrator.state_server
     app = fastapi(title="Wavelet Orchestrator State", version="1.1")
@@ -365,8 +387,23 @@ def _build_state_app(
     @app.get("/metrics")
     async def metrics(
         limit: int = query(default=20, ge=1, le=200),
-    ) -> list[dict[str, Any]]:
-        return state.metrics(limit=limit)
+        subsystem: Literal["trainer", "orchestrator", "eval"] | None = query(
+            default=None
+        ),
+        response_format: Literal["json", "prometheus"] = query(
+            default="json",
+            alias="format",
+        ),
+    ) -> Any:
+        if response_format == "prometheus":
+            body = state.prometheus_metrics(subsystem=subsystem)
+            if plain_text_response is None:
+                return body
+            return plain_text_response(
+                content=body,
+                media_type="text/plain; version=0.0.4",
+            )
+        return state.metrics(limit=limit, subsystem=subsystem)
 
     @app.get("/events")
     async def events(
@@ -486,6 +523,7 @@ class StateServerHandle:
             import uvicorn
             from fastapi import FastAPI, Query
             from fastapi.middleware.cors import CORSMiddleware
+            from fastapi.responses import PlainTextResponse
         except ImportError as exc:
             raise RuntimeError(
                 "orchestrator.state_server.enabled requires fastapi and uvicorn."
@@ -496,6 +534,7 @@ class StateServerHandle:
             fastapi=FastAPI,
             query=Query,
             cors_middleware=CORSMiddleware,
+            plain_text_response=PlainTextResponse,
         )
 
         uvicorn_config = uvicorn.Config(

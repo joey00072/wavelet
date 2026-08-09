@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import logging
 import math
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -26,6 +27,10 @@ from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trac
 from wavelet.trainer.distributed import World, get_world
 
 _SECRET_KEY_PARTS = ("api_key", "token", "secret", "password")
+METRICS_FILENAME = "metrics.jsonl"
+METRICS_CSV_FILENAME = "metrics.csv"
+METRICS_LOCK_FILENAME = "metrics.lock"
+MetricSubsystem = Literal["trainer", "orchestrator", "eval"]
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +98,140 @@ def tail_jsonl(
 def tail_jsonl_rows(path: Path, *, limit: int) -> list[dict[str, Any]]:
     """Return only valid tail records for state and UI endpoints."""
     return tail_jsonl(path, limit=limit)[0]
+
+
+def metric_subsystem(row: dict[str, Any]) -> str:
+    """Return a metric row's producer, including legacy trainer rows."""
+    value = row.get("subsystem")
+    return str(value) if value is not None else "trainer"
+
+
+def tail_metric_rows(
+    path: Path,
+    *,
+    limit: int,
+    subsystem: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return recent canonical metric rows, optionally filtered by producer."""
+    if subsystem is None:
+        return tail_jsonl_rows(path, limit=limit)
+    if limit <= 0 or not path.exists():
+        return []
+    rows: deque[dict[str, Any]] = deque(maxlen=limit)
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and metric_subsystem(row) == subsystem:
+                rows.append(row)
+    return list(rows)
+
+
+def append_metric_row(
+    output_dir: Path,
+    metrics: dict[str, Any],
+    *,
+    step: int,
+    subsystem: MetricSubsystem,
+    write_jsonl: bool = True,
+    write_csv: bool = True,
+) -> dict[str, Any]:
+    """Persist one canonical metric row under a cross-process file lock."""
+    row = {
+        **metrics,
+        "step": step,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "subsystem": subsystem,
+    }
+    if not write_jsonl and not write_csv:
+        return row
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = output_dir / METRICS_LOCK_FILENAME
+    with lock_path.open("a+", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if write_jsonl:
+                append_jsonl(output_dir / METRICS_FILENAME, row, sort_keys=True)
+            if write_csv:
+                _append_csv(output_dir / METRICS_CSV_FILENAME, row)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+    return row
+
+
+def prometheus_exposition(
+    path: Path,
+    *,
+    subsystem: str | None = None,
+) -> str:
+    """Render the latest numeric values in a canonical journal for Prometheus."""
+    latest: dict[tuple[str, str], float] = {}
+    timestamps: dict[str, float] = {}
+    if path.exists():
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                row_subsystem = metric_subsystem(row)
+                if subsystem is not None and row_subsystem != subsystem:
+                    continue
+                timestamp = _iso_timestamp_seconds(row.get("timestamp"))
+                if timestamp is not None:
+                    timestamps[row_subsystem] = timestamp
+                for name, value in row.items():
+                    numeric = _finite_number(value)
+                    if name in {"timestamp", "subsystem"} or numeric is None:
+                        continue
+                    latest[(row_subsystem, name)] = numeric
+
+    lines = [
+        "# HELP wavelet_metric Latest value from Wavelet's canonical metric journal.",
+        "# TYPE wavelet_metric gauge",
+    ]
+    for (row_subsystem, name), value in sorted(latest.items()):
+        labels = (
+            f'subsystem="{_prometheus_escape(row_subsystem)}",'
+            f'name="{_prometheus_escape(name)}"'
+        )
+        lines.append(f"wavelet_metric{{{labels}}} {value:.17g}")
+    lines.extend(
+        [
+            "# HELP wavelet_metric_timestamp_seconds Unix time of the latest metric row.",
+            "# TYPE wavelet_metric_timestamp_seconds gauge",
+        ]
+    )
+    for row_subsystem, timestamp in sorted(timestamps.items()):
+        label = _prometheus_escape(row_subsystem)
+        lines.append(
+            f'wavelet_metric_timestamp_seconds{{subsystem="{label}"}} {timestamp:.17g}'
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
+
+
+def _iso_timestamp_seconds(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def _prometheus_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
 def redact(value: Any) -> Any:
@@ -237,8 +376,8 @@ class RunMonitor:
         self.log_cuda_memory = log_cuda_memory
         self.log_disk_usage = log_disk_usage
         self.wandb = wandb or WandbConfig()
-        self.metrics_file = output_dir / "metrics.jsonl"
-        self.csv_file = output_dir / "metrics.csv"
+        self.metrics_file = output_dir / METRICS_FILENAME
+        self.csv_file = output_dir / METRICS_CSV_FILENAME
         self.samples_file = output_dir / "samples.jsonl"
         self.events_file = output_dir / "events.jsonl"
         self.heartbeat_file = output_dir / "heartbeat.json"
@@ -285,16 +424,15 @@ class RunMonitor:
         if not self._should_write():
             return
 
-        row = dict(metrics)
-        row["step"] = step
-        row["timestamp"] = self._timestamp()
-        row.update(self._resource_metrics())
-
-        if self.write_metrics_jsonl:
-            append_jsonl(self.metrics_file, row)
-
-        if self.write_metrics_csv:
-            _append_csv(self.csv_file, row)
+        values = {**metrics, **self._resource_metrics()}
+        row = append_metric_row(
+            self.output_dir,
+            values,
+            step=step,
+            subsystem="trainer",
+            write_jsonl=self.write_metrics_jsonl,
+            write_csv=self.write_metrics_csv,
+        )
 
         if self._wandb_run is not None:
             wandb_metrics = {k: v for k, v in row.items() if k != "timestamp"}
@@ -530,7 +668,13 @@ def log_rollout_metrics(
             timings=timings,
         )
     )
-    _append_metrics(config.output_dir, metrics, step=step)
+    _append_metrics(
+        config.output_dir,
+        metrics,
+        step=step,
+        write_jsonl=config.monitor.enabled and config.monitor.write_metrics_jsonl,
+        write_csv=config.monitor.enabled and config.monitor.write_metrics_csv,
+    )
     _append_rollout_trace(
         config,
         rows,
@@ -753,18 +897,22 @@ def _add_stop_condition_metrics(
         metrics[f"{prefix}/{condition}"] = rate
 
 
-def _append_metrics(output_dir: Path, metrics: dict[str, float], *, step: int) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    row = {
-        "timestamp": datetime.now(UTC).isoformat(),
-        "step": step,
-        **metrics,
-    }
-    jsonl_path = output_dir / "orchestrator_metrics.jsonl"
-    append_jsonl(jsonl_path, row, sort_keys=True)
-
-    csv_path = output_dir / "orchestrator_metrics.csv"
-    _append_csv(csv_path, row)
+def _append_metrics(
+    output_dir: Path,
+    metrics: dict[str, float],
+    *,
+    step: int,
+    write_jsonl: bool = True,
+    write_csv: bool = True,
+) -> None:
+    append_metric_row(
+        output_dir,
+        metrics,
+        step=step,
+        subsystem="orchestrator",
+        write_jsonl=write_jsonl,
+        write_csv=write_csv,
+    )
 
 
 def _append_csv(path: Path, row: dict[str, Any]) -> None:

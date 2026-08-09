@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from wavelet.configs.rl_config import RLEvalConfig
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.rl_config import RLConfig, RLEvalConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
-from wavelet.orchestrator.verifiers import _eval_metrics
+from wavelet.orchestrator.verifiers import _append_eval_metrics, _eval_metrics
 
 
 def test_compute_eval_policy_step_runs_base_and_intervals() -> None:
@@ -182,3 +183,16 @@ def test_eval_metrics_treat_missing_reward_as_failed_rollout() -> None:
     assert metrics["eval/alphabet/avg@2"] == pytest.approx(1.0)
     assert metrics["eval/alphabet/pass@1"] == pytest.approx(1.0)
     assert metrics["eval/alphabet/failed_rollouts"] == pytest.approx(0.5)
+
+
+def test_eval_metrics_use_canonical_metric_journal(tmp_path) -> None:
+    _append_eval_metrics(
+        tmp_path,
+        {"step": 3.0, "eval/alphabet/pass@1": 0.75},
+    )
+
+    row = json.loads((tmp_path / "metrics.jsonl").read_text(encoding="utf-8"))
+
+    assert row["subsystem"] == "eval"
+    assert row["step"] == 3
+    assert not (tmp_path / "eval_metrics.jsonl").exists()

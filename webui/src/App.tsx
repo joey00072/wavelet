@@ -86,7 +86,10 @@ function App() {
       try {
         const [nextState, nextMetrics, nextEvents] = await Promise.all([
           fetchJson<RunState>(`${apiBase}/state`, controller.signal),
-          fetchJson<MetricRow[]>(`${apiBase}/metrics?limit=${METRIC_LIMIT}`, controller.signal),
+          fetchJson<MetricRow[]>(
+            `${apiBase}/metrics?subsystem=trainer&limit=${METRIC_LIMIT}`,
+            controller.signal,
+          ),
           fetchJson<RolloutEvent[]>(`${apiBase}/events?limit=${EVENT_LIMIT}`, controller.signal),
         ]);
         if (!cancelled) {
@@ -296,8 +299,8 @@ function App() {
         {/* ── Main ── */}
         <main className="min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-8">
           {/* Page title */}
-          <div className="mb-6 flex items-start justify-between gap-4">
-            <div>
+          <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0">
               <h1 className="text-lg font-semibold tracking-tight">
                 {activeView === "rollouts" ? "Rollout Inspector" : "Training Overview"}
               </h1>
@@ -307,7 +310,7 @@ function App() {
                   : "Training progress, queue flow, policy state, and throughput."}
               </p>
             </div>
-            <div className="flex shrink-0 items-center gap-2 lg:hidden">
+            <div className="flex w-full items-center gap-2 sm:w-auto sm:shrink-0 lg:hidden">
               <ViewTabs activeView={activeView} onChange={selectView} layout="horizontal" />
             </div>
           </div>

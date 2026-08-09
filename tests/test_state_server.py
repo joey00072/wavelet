@@ -3,6 +3,7 @@ import json
 import pytest
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from fastapi.testclient import TestClient
 
 from wavelet.configs.rl_config import RLConfig
@@ -105,10 +106,11 @@ def test_orchestrator_state_describes_mixed_algorithms_and_observations(
             ],
         },
     )
-    (tmp_path / "orchestrator_metrics.jsonl").write_text(
+    (tmp_path / "metrics.jsonl").write_text(
         json.dumps(
             {
                 "step": 4,
+                "subsystem": "orchestrator",
                 "batch/source/distill": 1 / 3,
                 "reward/source/distill/mean": 0.75,
                 "fate/source/distill/produced": 2,
@@ -167,6 +169,48 @@ def test_state_api_exposes_algorithm_snapshot(tmp_path) -> None:
     assert payload["default"]["type"] == "opd"
     assert payload["sources"][0]["algorithm"]["teacher"]["name"] == "t"
     assert payload["student"]["adapter_count"] == 1
+
+
+def test_state_api_exposes_filtered_json_and_prometheus_metrics(tmp_path) -> None:
+    (tmp_path / "metrics.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps({"step": 1, "subsystem": "trainer", "loss": 2.0}),
+                json.dumps(
+                    {
+                        "step": 1,
+                        "subsystem": "orchestrator",
+                        "reward/all/mean": 0.5,
+                    }
+                ),
+                json.dumps({"step": 2, "subsystem": "trainer", "loss": 1.0}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state = OrchestratorRunState(RLConfig(output_dir=tmp_path), target_step=2)
+    app = _build_state_app(
+        state,
+        fastapi=FastAPI,
+        query=Query,
+        cors_middleware=CORSMiddleware,
+        plain_text_response=PlainTextResponse,
+    )
+    client = TestClient(app)
+
+    response = client.get("/metrics?subsystem=trainer&limit=1")
+    prometheus = client.get("/metrics?format=prometheus&subsystem=orchestrator")
+
+    assert response.status_code == 200
+    assert response.json() == [{"step": 2, "subsystem": "trainer", "loss": 1.0}]
+    assert prometheus.status_code == 200
+    assert prometheus.headers["content-type"].startswith("text/plain")
+    assert (
+        'wavelet_metric{subsystem="orchestrator",name="reward/all/mean"} 0.5'
+        in prometheus.text
+    )
+    assert 'subsystem="trainer"' not in prometheus.text
 
 
 def test_orchestrator_state_includes_queue_summary(tmp_path) -> None:

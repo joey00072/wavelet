@@ -89,5 +89,6 @@ step, packed training, `max_completion_tokens=768`, and `lr=1e-5` for a stable
 multi-GPU alphabet-sort reward run.
 
 The reward recipe also runs verifier evals every 20 exported policy steps and at
-the end of training. Eval metrics are written to `eval_metrics.jsonl`, and raw
-eval rollouts are written under `evals/step-*`.
+the end of training. Eval metrics are written as `subsystem: eval` rows in the
+unified `metrics.jsonl`, and raw eval rollouts are written under
+`evals/step-*`.

@@ -102,6 +102,7 @@ export type AlgorithmTopology = {
 export type MetricRow = {
   timestamp?: string;
   step?: number;
+  subsystem?: "trainer" | "orchestrator" | "eval";
   "progress/step"?: number;
   reward_mean?: number;
   "reward/all/mean"?: number;

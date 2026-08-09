@@ -58,8 +58,15 @@ algorithm state atomically.
 The response includes the single student model and adapter count, unique
 teacher count, active loss components, source weights, teacher endpoint replica
 counts, and the latest source-local observations from
-`orchestrator_metrics.jsonl`. Observation values are `null` until the first
-rollout batch is published.
+the orchestrator rows in `metrics.jsonl`. Observation values are `null` until
+the first rollout batch is published.
+
+## Metrics API
+
+Trainer, orchestrator, and eval producers append to the same `metrics.jsonl`
+journal. The dashboard requests trainer rows explicitly so rollout and eval
+updates cannot replace the latest training point. See the
+[metrics guide](../docs/metrics.md) for JSON filters and Prometheus scraping.
 
 ## Rollout Inspection API
 

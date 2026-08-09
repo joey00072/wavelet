@@ -17,6 +17,8 @@ training or inference runs.
   scheduling, policy artifacts, and extension boundaries.
 - [Data pipeline](data_pipeline.md): source loading, normalization,
   tokenization, RL packing, and collation contracts.
+- [Metrics](metrics.md): unified trainer, orchestrator, and eval journals plus
+  JSON and Prometheus access.
 - [Inference diagnostics](inference.skill.md): isolate model serving, policy
   loading, generation, logprobs, and throughput.
 - [Orchestrator diagnostics](orchestrator.skill.md): inspect scheduling,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-
 STABLE_CHECKPOINT_MARKER = "STABLE"
 OUTPUT_RUN_STATE_MARKERS = (
     "configs",
@@ -13,6 +12,7 @@ OUTPUT_RUN_STATE_MARKERS = (
     "events.jsonl",
     "heartbeat.json",
     "logs",
+    "metrics.lock",
     "metrics.csv",
     "metrics.jsonl",
     "policies",

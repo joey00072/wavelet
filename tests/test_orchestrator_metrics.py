@@ -145,18 +145,18 @@ def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:
 
     trace_path = tmp_path / "traces" / "step-000004.jsonl"
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
-    metrics_row = json.loads(
-        (tmp_path / "orchestrator_metrics.jsonl").read_text(encoding="utf-8")
-    )
-    with (tmp_path / "orchestrator_metrics.csv").open(
+    metrics_row = json.loads((tmp_path / "metrics.jsonl").read_text(encoding="utf-8"))
+    with (tmp_path / "metrics.csv").open(
         newline="",
         encoding="utf-8",
     ) as handle:
         csv_rows = list(csv.DictReader(handle))
     assert metrics["progress/samples"] == 1
     assert metrics_row["step"] == 4
+    assert metrics_row["subsystem"] == "orchestrator"
     assert metrics_row["progress/queue_step"] == 5.0
-    assert csv_rows[0]["step"] == "4.0"
+    assert csv_rows[0]["step"] == "4"
+    assert csv_rows[0]["subsystem"] == "orchestrator"
     assert csv_rows[0]["progress/queue_step"] == "5.0"
     assert trace["event"] == "rollout_metrics_logged"
     assert trace["subsystem"] == "orchestrator"

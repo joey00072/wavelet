@@ -12,6 +12,7 @@ from typing import Any
 
 from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
 from wavelet.data.rl import RLExample
+from wavelet.monitor import append_metric_row
 from wavelet.orchestrator.advantage import (
     output_completion_token_count,
     output_tool_response_token_count,
@@ -148,7 +149,12 @@ async def _evaluate_env_async(
     )
     metrics["progress/policy_step"] = float(policy_step)
     metrics["step"] = float(step)
-    _append_eval_metrics(config.output_dir / "eval_metrics.jsonl", metrics)
+    _append_eval_metrics(
+        config.output_dir,
+        metrics,
+        write_jsonl=config.monitor.enabled and config.monitor.write_metrics_jsonl,
+        write_csv=config.monitor.enabled and config.monitor.write_metrics_csv,
+    )
     return metrics
 
 
@@ -254,10 +260,21 @@ def _write_eval_rollouts(path: Path, outputs: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(output, default=str) + "\n")
 
 
-def _append_eval_metrics(path: Path, metrics: dict[str, float]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(metrics) + "\n")
+def _append_eval_metrics(
+    output_dir: Path,
+    metrics: dict[str, float],
+    *,
+    write_jsonl: bool = True,
+    write_csv: bool = True,
+) -> None:
+    append_metric_row(
+        output_dir,
+        metrics,
+        step=int(metrics.get("step", 0.0)),
+        subsystem="eval",
+        write_jsonl=write_jsonl,
+        write_csv=write_csv,
+    )
 
 
 def _verifier_client_routes(

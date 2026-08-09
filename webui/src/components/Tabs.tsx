@@ -25,7 +25,7 @@ export function ViewTabs({
           return (
             <button
               key={tab.id}
-              id={`tab-${tab.id}`}
+              id={`tab-${layout}-${tab.id}`}
               type="button"
               onClick={() => onChange(tab.id)}
               className={`flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm transition-colors ${
@@ -51,7 +51,7 @@ export function ViewTabs({
         return (
           <button
             key={tab.id}
-            id={`tab-${tab.id}`}
+            id={`tab-${layout}-${tab.id}`}
             type="button"
             onClick={() => onChange(tab.id)}
             className={`flex items-center gap-2 border-b-2 pb-2 text-sm font-medium transition-colors ${
