@@ -32,8 +32,17 @@ records, tokenization, collation, and datasets.
 
 A pre-tokenized row must provide `input_ids`, `target_ids`, and `loss_mask` with
 matching lengths. Token-level `advantage`, `inference_logprobs`,
-`teacher_logprobs`, and `temperature` values align only with `true` entries in
-`loss_mask`; they do not include values for masked tokens.
+`teacher_logprobs`, `ref_logprobs`, `rl_weights`, `ce_weights`,
+`ref_kl_weights`, and `temperature` values align only with `true` entries in
+`loss_mask`; they do not include values for masked tokens. Scalar component
+weights are broadcast across the row's trainable tokens. Nonzero
+`ref_kl_weights` require aligned `ref_logprobs`.
+
+Packing preserves all three component-weight streams. Missing streams receive
+their semantic defaults: legacy rows are RL-only, while an explicitly mixed
+row defaults unspecified components to zero. The trainer normalizes RL,
+cross-entropy, and reference-KL contributions independently across the full
+optimizer batch.
 
 Normal rows with no trainable tokens are skipped. Internally marked dummy and
 filtered rollout rows are retained so distributed batch counts and rollout

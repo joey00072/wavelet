@@ -1,30 +1,29 @@
 from __future__ import annotations
 
-import json
 import csv
+import json
 import logging
+import math
 import os
 import random
 import shutil
-from collections import defaultdict
+from collections import defaultdict, deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
+from statistics import mean, pstdev
+from typing import Any
 
 import torch
 
 from wavelet.configs.config import RLConfig, WandbConfig
-from wavelet.trainer.distributed import World, get_world
 from wavelet.orchestrator.rollout_metadata import (
     metadata_harness_name,
     metadata_task_name,
 )
 from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
-from collections import deque
-from collections.abc import Iterable, Iterator
-from pathlib import Path
-from statistics import mean, pstdev
-from typing import Any
-
+from wavelet.trainer.distributed import World, get_world
 
 _SECRET_KEY_PARTS = ("api_key", "token", "secret", "password")
 logger = logging.getLogger(__name__)
@@ -430,16 +429,16 @@ class RunMonitor:
             return
         import wandb
 
-        init_kwargs = dict(
-            project=self.wandb.project or "wavelet",
-            entity=self.wandb.entity,
-            name=self.wandb.name,
-            group=self.wandb.group,
-            tags=self.wandb.tags,
-            dir=str(self.output_dir),
-            config=run_config,
-            resume="allow" if resumed_from is not None else None,
-        )
+        init_kwargs = {
+            "project": self.wandb.project or "wavelet",
+            "entity": self.wandb.entity,
+            "name": self.wandb.name,
+            "group": self.wandb.group,
+            "tags": self.wandb.tags,
+            "dir": str(self.output_dir),
+            "config": run_config,
+            "resume": "allow" if resumed_from is not None else None,
+        }
         settings_factory = getattr(wandb, "Settings", None)
         if callable(settings_factory):
             init_kwargs["settings"] = settings_factory(
@@ -450,7 +449,7 @@ class RunMonitor:
         except Exception:
             if self.wandb.mode != "online" or not self.wandb.offline_fallback:
                 raise
-            logging.warning(
+            logger.warning(
                 "W&B online initialization failed; falling back to offline W&B "
                 "logging in %s.",
                 self.output_dir,
@@ -481,7 +480,7 @@ class RunMonitor:
         return aliases
 
     def _timestamp(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
 
 
 def setup_logger(name: str, level: str = "info") -> Any:
@@ -655,6 +654,11 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         rows,
         rollouts_per_example=inputs.rollouts_per_example,
     )
+    _add_source_metrics(
+        metrics,
+        rows,
+        rollouts_per_example=inputs.rollouts_per_example,
+    )
 
     if inputs.timings:
         for key, value in inputs.timings.items():
@@ -677,6 +681,26 @@ def _add_environment_metrics(
             env_rows,
             grouped,
             suffix=env_name,
+            rollouts_per_example=rollouts_per_example,
+        )
+
+
+def _add_source_metrics(
+    metrics: dict[str, float],
+    rows: list[dict[str, Any]],
+    *,
+    rollouts_per_example: int,
+) -> None:
+    """Report source-local outcomes when mixed algorithms share an environment."""
+    for source_name, source_rows in _group_by_source(rows).items():
+        grouped = _group_by_example(source_rows)
+        suffix = f"source/{source_name}"
+        metrics[f"batch/{suffix}"] = len(source_rows) / max(len(rows), 1)
+        _add_group_metrics(
+            metrics,
+            source_rows,
+            grouped,
+            suffix=suffix,
             rollouts_per_example=rollouts_per_example,
         )
 
@@ -732,7 +756,7 @@ def _add_stop_condition_metrics(
 def _append_metrics(output_dir: Path, metrics: dict[str, float], *, step: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     row = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "step": step,
         **metrics,
     }
@@ -793,7 +817,7 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")
         _WANDB_RUN.log({**metrics, "step": step}, step=step)
-    except Exception as exc:  # pragma: no cover - diagnostics must not kill training
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
 
 
@@ -814,6 +838,15 @@ def _group_by_env(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[str(row.get("env_name") or row.get("source") or "all")].append(row)
+    return dict(grouped)
+
+
+def _group_by_source(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        source = row.get("source")
+        if source is not None:
+            grouped[str(source)].append(row)
     return dict(grouped)
 
 
@@ -931,6 +964,10 @@ def _fate_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
         "truncated",
         "with_inference_logprobs",
         "with_teacher_logprobs",
+        "with_ref_logprobs",
+        "with_rl_loss",
+        "with_ce_loss",
+        "with_ref_kl_loss",
     )
     counts = {"produced": len(rows), **dict.fromkeys(names, 0)}
     for row in rows:
@@ -945,10 +982,33 @@ def _fate_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
             metadata.get("is_truncated"),
             isinstance(row.get("inference_logprobs"), list),
             isinstance(row.get("teacher_logprobs"), list),
+            isinstance(row.get("ref_logprobs"), list),
+            _loss_component_is_active(row, "rl_weights", default=True),
+            _loss_component_is_active(row, "ce_weights", default=False),
+            _loss_component_is_active(row, "ref_kl_weights", default=False),
         )
         for name, flag in zip(names, flags, strict=True):
             counts[name] += int(bool(flag))
     return counts
+
+
+def _component_is_active(value: object, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, int | float):
+        return value > 0
+    if isinstance(value, list):
+        return any(isinstance(item, int | float) and item > 0 for item in value)
+    return False
+
+
+def _loss_component_is_active(
+    row: dict[str, Any],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    return _decode_len(row) > 0 and _component_is_active(row.get(key), default=default)
 
 
 def _fate_metrics(prefix: str, counts: dict[str, int]) -> dict[str, float]:
@@ -1019,7 +1079,7 @@ def _numeric(row: dict[str, Any], key: str) -> float | None:
         numeric = float(value)
     except (TypeError, ValueError):
         return None
-    if numeric != numeric:
+    if math.isnan(numeric):
         return None
     return numeric
 
@@ -1070,6 +1130,16 @@ def _compact_rollout_row(
         "prompt": _message_text(row.get("prompt")),
         "completion": _message_text(row.get("completion")),
         "target_completion": _message_text(row.get("target_completion")),
+        "loss_components": [
+            name
+            for name, key, default in (
+                ("rl", "rl_weights", True),
+                ("ce", "ce_weights", False),
+                ("ref_kl", "ref_kl_weights", False),
+            )
+            if _loss_component_is_active(row, key, default=default)
+        ],
+        "has_ref_logprobs": isinstance(row.get("ref_logprobs"), list),
     }
     for key in ("prompt", "completion", "target_completion"):
         value = sample.get(key)

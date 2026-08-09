@@ -228,6 +228,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._train_loss_accum: list[float] = []
         self._train_metric_accum: list[dict[str, float]] = []
         self._optimizer_batch_loss_scale: float | None = None
+        self._optimizer_component_loss_scales: dict[str, float] | None = None
         self._gradient_accumulation_loss_scale: float | None = None
         self._loaded_micro_batch_count = 0
         self._run_closed = False
@@ -258,6 +259,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if isinstance(self.dataset, PackedRLDataset):
             self.accumulation_steps = self._packed_dataloader_batch_count()
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
+        self._optimizer_component_loss_scales = (
+            self._estimate_optimizer_component_loss_scales()
+        )
 
     def _validate_ready(self) -> None:
         super()._validate_ready()
@@ -566,9 +570,42 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         ):
             return None
         return self.dataset.loss_scale_for_next_local_batch(
-            self.accumulation_steps,
+            self.accumulation_steps * self.config.data.micro_batch_size,
             normalization=self.config.loss.normalization,
         )
+
+    def _estimate_optimizer_component_loss_scales(
+        self,
+    ) -> dict[str, float] | None:
+        if self.config.data.num_workers != 0:
+            return None
+        if not isinstance(self.dataset, (RLDataset, PackedRLDataset)):
+            return None
+        local_scales = self.dataset.component_loss_scales_for_next_local_batch(
+            self.accumulation_steps * self.config.data.micro_batch_size,
+            normalization=self.config.loss.normalization,
+        )
+        if (
+            self.world is None
+            or self.parallel_dims is None
+            or not torch.distributed.is_initialized()
+            or self._data_parallel_world_size() <= 1
+        ):
+            return local_scales
+
+        components = ("rl", "ce", "ref_kl")
+        counts = torch.tensor(
+            [local_scales[component] for component in components],
+            dtype=torch.float64,
+            device=self.world.device,
+        )
+        data_group = self.parallel_dims.get_mesh("dp").get_group()
+        torch.distributed.all_reduce(counts, group=data_group)
+        data_world_size = self._data_parallel_world_size()
+        return {
+            component: max(float(count.item()) / data_world_size, 1.0)
+            for component, count in zip(components, counts, strict=True)
+        }
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
@@ -630,6 +667,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             self.config.loss,
             loss_scale=self._optimizer_batch_loss_scale,
             position_ids=batch["position_ids"],
+            ref_logprobs=(
+                batch["ref_logprobs"] if batch["ref_kl_weights"].ne(0).any() else None
+            ),
+            rl_weights=batch["rl_weights"],
+            ce_weights=batch["ce_weights"],
+            ref_kl_weights=batch["ref_kl_weights"],
+            component_loss_scales=self._optimizer_component_loss_scales,
         )
 
     def _backward_rl_loss(self, loss: Tensor) -> None:
@@ -637,6 +681,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             backward_loss = (
                 loss / self.accumulation_steps
                 if self._optimizer_batch_loss_scale is None
+                and self._optimizer_component_loss_scales is None
                 else loss
             )
             backward_loss.backward()
@@ -653,6 +698,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             self._accumulated_micro_batches = 0
             self._optimizer_batch_loss_scale = (
                 self._estimate_optimizer_batch_loss_scale()
+            )
+            self._optimizer_component_loss_scales = (
+                self._estimate_optimizer_component_loss_scales()
             )
         return TrainOutput(
             loss=loss_output,
@@ -699,7 +747,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 self._gradient_accumulation_loss_scale,
                 1.0,
             )
-        elif self._optimizer_batch_loss_scale is None:
+        elif (
+            self._optimizer_batch_loss_scale is None
+            and self._optimizer_component_loss_scales is None
+        ):
             logged_loss = sum(self._train_loss_accum) / len(self._train_loss_accum)
         else:
             logged_loss = sum(self._train_loss_accum)
@@ -719,6 +770,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         metrics = self._sync_metrics(metrics)
         metrics = self._finalize_synced_metrics(metrics)
         self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
+        self._optimizer_component_loss_scales = (
+            self._estimate_optimizer_component_loss_scales()
+        )
         self._gradient_accumulation_loss_scale = None
         return metrics
 

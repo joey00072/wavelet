@@ -1,8 +1,8 @@
 # RL Algorithms
 
-Wavelet algorithms assign advantages to rollout records. The same runtime is
-used for native and Verifiers-backed rollouts, so an algorithm behaves the same
-regardless of where its completions came from.
+Wavelet algorithms turn finalized rollouts into per-token training signals.
+The same runtime is used for native and Verifiers-backed rollouts, and an
+algorithm may be selected globally or per training source.
 
 The top-level `algo` block selects a built-in algorithm or a user-owned Python
 file:
@@ -13,6 +13,7 @@ file:
 | `type: reward` | rollout | Copy each reward into its missing advantage. |
 | `type: grpo` | group | Center rewards within each prompt group. |
 | `type: max_rl` | group | Center rewards and divide by the group mean. |
+| `type: opd` | rollout | Score policy rollouts under a frozen teacher and train with reverse KL. |
 | `file` + `algorithm` | explicit | Load a registered class or factory from a local file. |
 
 Algorithm and length-penalty configs reject unknown keys so misspellings fail
@@ -92,6 +93,109 @@ algo:
   type: max_rl
 ```
 
+### On-policy distillation (OPD)
+
+OPD samples rollouts from the live policy and prefill-scores the exact shifted
+token sequence under a frozen teacher. It writes `ref_logprobs` and selects the
+`ref_kl` trainer component; it does not assign a scalar advantage.
+
+```yaml
+algo:
+  type: opd
+  teacher:
+    name: PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL
+    base_url: http://localhost:8001/v1
+    api_key_var: OPENAI_API_KEY
+    timeout_seconds: 120
+```
+
+The teacher is an external vLLM endpoint. Wavelet manages only the trainable
+policy. For the reverse-text example, start the teacher separately:
+
+```bash
+CUDA_VISIBLE_DEVICES=2 uv run vllm serve \
+  PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL \
+  --port 8001 --gpu-memory-utilization 0.5 --enforce-eager
+```
+
+OPD calls vLLM's `/inference/v1/generate` token endpoint with
+`prompt_logprobs: 1`. The endpoint must return one aligned prompt logprob per
+token. Verifier rollouts must use `openai_chat_completions_token` so Wavelet can
+prove that teacher, inference, and trainer token streams are identical.
+
+The reverse-KL component uses the sampling-policy importance ratio and the same
+one-sided mismatch guard and drift regularizer configured under `loss`. OPD is
+currently published as a complete optimizer batch rather than streaming
+partial chunks, which lets `rl`, `ce`, and `ref_kl` use independent exact
+denominators. Distributed trainers sum each component's token count across the
+data-parallel group before scaling the rank-local loss. OPD therefore requires
+`data.num_workers: 0`; config validation rejects worker-local dataset state
+that cannot prove the upcoming optimizer-batch denominator.
+
+## Mixed per-source algorithms
+
+`orchestrator.train_sources` overrides the global `algo` for named training
+sources. Every source may select its own verifier environment, data config,
+algorithm, weight, and OPD teacher. All records are packed by the same trainer
+and update one student policy and one LoRA adapter.
+
+```yaml
+algo:
+  type: grpo
+
+orchestrator:
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_client_type: openai_chat_completions_token
+  examples_per_step: 8
+  rollouts_per_example: 4
+  train_sources:
+    - name: reverse-text-grpo
+      verifier_env_id: reverse-text
+      algo:
+        type: grpo
+    - name: reverse-text-opd
+      verifier_env_id: reverse-text
+      algo:
+        type: opd
+        teacher:
+          name: PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL
+          base_url: http://localhost:8001/v1
+```
+
+`weight` defaults to `1` and controls each source's share of the configured
+groups. When there are enough groups, every source receives at least one.
+Different OPD sources can point to different teacher endpoints, providing
+multi-teacher distillation without multiple students or multiple LoRA
+adapters. See `examples/reverse_text/rl_mixed_grpo_opd.yaml` for a complete
+debug configuration.
+
+### API and Web UI observability
+
+When the orchestrator state server is enabled, `GET /algorithms` exposes the
+resolved source-to-algorithm graph. `GET /state` embeds the same payload under
+`algorithms`. Both responses omit teacher credential environment variable names
+and values. The payload reports one student, at most one trainable adapter,
+unique teachers, teacher endpoint replica counts, source weights, active loss
+components, and the latest per-source rollout observations.
+
+The orchestrator emits source-local `batch/source/<name>`,
+`reward/source/<name>`, and `fate/source/<name>` metrics. Fate metrics include
+reference-logprob coverage and whether RL, CE, or REF-KL was active for each
+rollout. The Web UI presents these fields in the overview and annotates compact
+rollout samples with their source and active loss streams.
+
+The trainer understands three independently normalized token components:
+
+- `rl_weights`: policy-gradient credit from GRPO, MaxRL, reward, or a custom
+  algorithm.
+- `ce_weights`: cross-entropy tokens reserved for distillation and ECHO-style
+  algorithms.
+- `ref_kl_weights`: reverse-KL tokens with aligned `ref_logprobs`, used by OPD.
+
+Components may coexist in one packed micro-batch. A zero weight removes a token
+from that component's numerator and denominator; adding OPD tokens therefore
+does not reduce the effective GRPO learning rate.
+
 ## Custom Algorithm Files
 
 A custom algorithm can live anywhere on the local filesystem. It does not need
@@ -125,6 +229,13 @@ class CenteredRewardAlgorithm(BaseAlgorithm):
 `BaseAlgorithm` supplies no-op implementations of both hooks, so the class only
 overrides the hook it needs. Using `dataclasses.replace` keeps input records
 unchanged and makes the returned state explicit.
+
+Set `action_loss_type` to `"rl"`, `"ce"`, or `"ref_kl"` to select the default
+trainer component for every trainable action token returned by the algorithm.
+It defaults to `"rl"`. An algorithm may instead set `rl_weights`, `ce_weights`,
+and `ref_kl_weights` directly on a record for token-level mixtures; explicit
+weights take precedence over the class default. A nonzero `ref_kl` stream must
+also attach aligned `ref_logprobs`.
 
 ### 2. Select it in YAML
 
@@ -194,6 +305,10 @@ Relevant `RLExample` fields include:
 - `prompt` and `completion`: rendered message lists when available.
 - `input_ids`, `target_ids`, and `loss_mask`: pre-tokenized training artifacts
   when available.
+- `rl_weights`, `ce_weights`, and `ref_kl_weights`: optional per-token component
+  membership. Supplying no component streams retains the legacy all-RL path.
+- `ref_logprobs`: frozen-reference logprobs required wherever
+  `ref_kl_weights` is non-zero.
 - `metadata`: group identity, rollout identity, token counts, tool-response
   token counts, turn count, and rollout provenance when supplied by the source.
 - `source`: dataset or environment name.
@@ -218,10 +333,10 @@ factory, passes `kwargs`, and validates both hooks. A custom file may therefore
 import normal installed dependencies, including Wavelet itself.
 
 The file must be readable from every process that generates or scores rollouts.
-Factories should be lightweight and stateless because preflight and rollout
-workers may construct them more than once. Hooks are currently synchronous;
-async hooks and long-lived external model clients are not part of this
-interface.
+Factories should be lightweight because preflight and rollout workers may
+construct them more than once. If present, synchronous `setup()` and `close()`
+lifecycle hooks run around each scoring call. Scoring hooks remain synchronous;
+async custom hooks are not yet part of this interface.
 
 Configuration executes only the explicitly named local file. Wavelet does not
 download custom algorithm code.
@@ -242,17 +357,19 @@ non-callable algorithm names before GPU processes start.
 
 For each scoring batch, Wavelet:
 
-1. Builds the selected built-in or custom algorithm.
-2. Runs the hooks declared by the algorithm scope.
+1. Resolves the global or source-local algorithm.
+2. Builds it and runs its lifecycle and declared scoring hooks.
 3. Partitions group-scoped records by prompt group.
-4. Validates hook return types and group cardinality.
-5. Restores original record order.
-6. Applies zero-advantage filtering when configured.
-7. Serializes advantages into the existing trainer rollout format.
+4. Validates hook return types, token alignment, and group cardinality.
+5. Restores original cross-source record order.
+6. Applies group-advantage filtering only to sources that use it.
+7. Serializes advantages, component weights, and reference logprobs.
+8. Packs heterogeneous records and normalizes each trainer component
+   independently.
 
-Algorithms only assign credit. The trainer loss remains configured separately
-under `loss`; this interface does not add custom optimizer losses, asynchronous
-model calls, or remote code loading.
+The `loss` block still configures off-policy correction and optimization math;
+custom optimizer losses are separate from the algorithm layer. Wavelet does
+not download custom algorithm code or manage frozen teacher processes.
 
 ## Legacy Configuration
 

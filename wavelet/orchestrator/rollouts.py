@@ -14,10 +14,9 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import RLExample, load_rl_records, serialize_rl_record
 from wavelet.inference.policy import RLInference
 from wavelet.orchestrator.algorithms import (
+    algorithm_config_for_source,
     algorithm_epsilon,
-    algorithm_scope,
-    build_algorithm,
-    score_algorithm_records,
+    score_records_by_source,
     uses_group_advantages,
 )
 from wavelet.orchestrator.reward import RLRewardScorer
@@ -322,11 +321,9 @@ class RLOrchestrator:
         return trimmed
 
     def _assign_advantages(self, records: list[RLExample]) -> list[RLExample]:
-        algorithm = build_algorithm(self.config.algo)
-        return score_algorithm_records(
-            algorithm,
+        return score_records_by_source(
+            self.config,
             records,
-            scope=algorithm_scope(self.config.algo),
             group_key=self._group_key,
         )
 
@@ -338,14 +335,19 @@ class RLOrchestrator:
     ) -> list[RLExample]:
         if not self.config.orchestrator.filter_zero_advantage:
             return records
-        if not uses_group_advantages(self.config.algo):
-            return records
-        epsilon = algorithm_epsilon(self.config.algo)
-        return [
-            record
-            for record in records
-            if record.advantage is not None and abs(float(record.advantage)) > epsilon
-        ]
+        filtered: list[RLExample] = []
+        for record in records:
+            algorithm_config = algorithm_config_for_source(
+                self.config,
+                record.source,
+            )
+            if not uses_group_advantages(algorithm_config):
+                filtered.append(record)
+                continue
+            epsilon = algorithm_epsilon(algorithm_config)
+            if record.advantage is not None and abs(float(record.advantage)) > epsilon:
+                filtered.append(record)
+        return filtered
 
     def _filter_degenerate_native_rollout_records(
         self,
@@ -381,10 +383,7 @@ class RLOrchestrator:
         self,
         records: list[RLExample],
     ) -> list[RLExample]:
-        if (
-            not uses_group_advantages(self.config.algo)
-            or self.config.orchestrator.rollouts_per_example <= 1
-        ):
+        if self.config.orchestrator.rollouts_per_example <= 1:
             return records
 
         grouped: dict[str, list[RLExample]] = {}
@@ -392,9 +391,14 @@ class RLOrchestrator:
             grouped.setdefault(self._group_key(record), []).append(record)
 
         expected = self.config.orchestrator.rollouts_per_example
-        complete_group_keys = {
-            key for key, group in grouped.items() if len(group) >= expected
-        }
+        complete_group_keys = set()
+        for key, group in grouped.items():
+            algorithm_config = algorithm_config_for_source(
+                self.config,
+                group[0].source,
+            )
+            if not uses_group_advantages(algorithm_config) or len(group) >= expected:
+                complete_group_keys.add(key)
         dropped = sum(
             len(group)
             for key, group in grouped.items()

@@ -1,6 +1,6 @@
 # ruff: noqa: E402, F811
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 from enum import StrEnum
@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import Callable
 
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.rl_config import OPDAlgorithmConfig, RLConfig, RLTrainSourceConfig
 
 
 from wavelet.orchestrator.schedule import rollout_chunk_examples
@@ -110,6 +110,10 @@ class IntegratedRolloutScheduler:
 
 def resolve_rollout_schedule(config: RLConfig) -> RolloutSchedule:
     source = source_kind(config.orchestrator.custom_rollout_function)
+    has_opd = isinstance(config.algo, OPDAlgorithmConfig) or any(
+        isinstance(train_source.algo, OPDAlgorithmConfig)
+        for train_source in config.orchestrator.train_sources
+    )
     streaming = (
         config.launcher.mode == "process"
         and config.orchestrator.max_async_level > 0
@@ -118,6 +122,7 @@ def resolve_rollout_schedule(config: RLConfig) -> RolloutSchedule:
             source is RolloutSourceKind.VERIFIER
             or config.orchestrator.examples_per_step is not None
         )
+        and not has_opd
     )
     return RolloutSchedule(
         source=source,
@@ -157,6 +162,8 @@ from wavelet.data.rl import RLExample, load_rl_records
 
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
+    score_records_by_source,
+    uses_group_advantages,
 )
 
 
@@ -219,6 +226,46 @@ def generate_rollouts(
     vf = _load_verifiers("rollouts")
 
     config = orchestrator.config
+    verifier_sources = config.orchestrator.train_sources
+    if verifier_sources:
+        target_groups = config.orchestrator.examples_per_step or len(records)
+        allocations = _allocate_source_groups(
+            [source.weight for source in verifier_sources],
+            target_groups,
+        )
+        mixed_records: list[RLExample] = []
+        for source, allocation in zip(
+            verifier_sources,
+            allocations,
+            strict=True,
+        ):
+            if allocation == 0:
+                continue
+            source_config = _config_for_train_source(config, source)
+            source_config.orchestrator.examples_per_step = allocation
+            source_records = (
+                load_rl_records(source_config.data)
+                if source.data is not None
+                else records
+            )
+            generated = generate_rollouts(
+                RLOrchestrator(source_config),
+                source_records,
+                _inference_engine,
+            )
+            mixed_records.extend(
+                replace(
+                    record,
+                    source=source.name,
+                    metadata={
+                        **(record.metadata or {}),
+                        "environment_name": record.source,
+                    },
+                )
+                for record in generated
+            )
+        return mixed_records
+
     env_id = config.orchestrator.verifier_env_id
     if env_id is None:
         raise ValueError("orchestrator.verifier_env_id is required.")
@@ -252,7 +299,10 @@ def generate_rollouts(
             rollout_count=rollout_count,
             max_retries=config.orchestrator.verifier_max_retries,
             target_groups=config.orchestrator.examples_per_step,
-            filter_zero_advantage=config.orchestrator.filter_zero_advantage,
+            filter_zero_advantage=(
+                config.orchestrator.filter_zero_advantage
+                and uses_group_advantages(config.algo)
+            ),
             advantage_epsilon=algorithm_epsilon(config.algo),
             algorithm_config=config.algo,
             env_name=_env_name(env, fallback=env_id),
@@ -262,6 +312,11 @@ def generate_rollouts(
     convert_started_at = perf_counter()
     _assign_rollout_advantages(outputs, config)
     records = [record for output in outputs for record in _records_from_output(output)]
+    records = score_records_by_source(
+        config,
+        records,
+        group_key=lambda record: str((record.metadata or {}).get("group_key", "group")),
+    )
     convert_seconds = perf_counter() - convert_started_at
     emit_perf(
         "verifier_rollouts",
@@ -513,6 +568,13 @@ class VerifierRolloutScheduler:
         records = [
             record for output in outputs for record in _records_from_output(output)
         ]
+        records = score_records_by_source(
+            self.config,
+            records,
+            group_key=lambda record: str(
+                (record.metadata or {}).get("group_key", "group")
+            ),
+        )
         records = _mark_zero_advantage_records_metric_only(records, self.config)
         emit_perf(
             "verifier_scheduler",
@@ -776,6 +838,158 @@ class VerifierRolloutScheduler:
         return _sampling_args(self.config, cache_salt=cache_salt)
 
 
+def _config_for_train_source(
+    config: RLConfig,
+    source: RLTrainSourceConfig,
+) -> RLConfig:
+    """Resolve one verifier source into the existing single-source runtime."""
+    orchestrator = config.orchestrator.model_copy(
+        deep=True,
+        update={
+            "train_sources": [],
+            "verifier_env_id": (
+                source.verifier_env_id or config.orchestrator.verifier_env_id
+            ),
+            "verifier_env_args": (
+                source.verifier_env_args
+                if source.verifier_env_args
+                else config.orchestrator.verifier_env_args
+            ),
+        },
+    )
+    return config.model_copy(
+        deep=True,
+        update={
+            "algo": source.algo or config.algo,
+            "data": source.data or config.data,
+            "orchestrator": orchestrator,
+        },
+    )
+
+
+def _allocate_source_groups(weights: list[int], target_groups: int) -> list[int]:
+    """Allocate groups proportionally while including every source when possible."""
+    if target_groups < 0:
+        raise ValueError("target_groups must be non-negative.")
+    if not weights:
+        return []
+    if any(weight < 1 for weight in weights):
+        raise ValueError("Source weights must be positive.")
+    allocations = [0] * len(weights)
+    if target_groups == 0:
+        return allocations
+    if target_groups < len(weights):
+        for index in range(target_groups):
+            allocations[index] = 1
+        return allocations
+
+    allocations = [1] * len(weights)
+    remaining = target_groups - len(weights)
+    total_weight = sum(weights)
+    exact = [remaining * weight / total_weight for weight in weights]
+    floors = [int(value) for value in exact]
+    allocations = [
+        allocation + floor
+        for allocation, floor in zip(allocations, floors, strict=True)
+    ]
+    leftover = remaining - sum(floors)
+    order = sorted(
+        range(len(weights)),
+        key=lambda index: exact[index] - floors[index],
+        reverse=True,
+    )
+    for index in order[:leftover]:
+        allocations[index] += 1
+    return allocations
+
+
+class MultiVerifierRolloutScheduler:
+    """Combine independent per-source verifier schedulers into mixed batches."""
+
+    def __init__(self, orchestrator: RLOrchestrator) -> None:
+        self.sources = list(orchestrator.config.orchestrator.train_sources)
+        if not self.sources:
+            raise ValueError("Multi-source verifier scheduling needs train sources.")
+        self.schedulers = [
+            VerifierRolloutScheduler(
+                RLOrchestrator(_config_for_train_source(orchestrator.config, source))
+            )
+            for source in self.sources
+        ]
+        self._rotation = 0
+
+    def set_policy_step(
+        self,
+        policy_step: int | None,
+        *,
+        model_name: str | None = None,
+    ) -> None:
+        for scheduler in self.schedulers:
+            scheduler.set_policy_step(policy_step, model_name=model_name)
+
+    async def generate_batch(
+        self,
+        *,
+        target_groups: int | None = None,
+    ) -> list[RLExample]:
+        if target_groups is None:
+            target_groups = sum(
+                scheduler.target_groups for scheduler in self.schedulers
+            )
+        order = [
+            (self._rotation + index) % len(self.schedulers)
+            for index in range(len(self.schedulers))
+        ]
+        rotated_weights = [self.sources[index].weight for index in order]
+        rotated_allocations = _allocate_source_groups(
+            rotated_weights,
+            target_groups,
+        )
+        allocations = [0] * len(self.schedulers)
+        for index, allocation in zip(order, rotated_allocations, strict=True):
+            allocations[index] = allocation
+        self._rotation = (self._rotation + 1) % len(self.schedulers)
+        active = [
+            (source, scheduler, allocation)
+            for source, scheduler, allocation in zip(
+                self.sources,
+                self.schedulers,
+                allocations,
+                strict=True,
+            )
+            if allocation > 0
+        ]
+        batches = await asyncio.gather(
+            *[
+                scheduler.generate_batch(target_groups=allocation)
+                for _, scheduler, allocation in active
+            ]
+        )
+        mixed_records: list[RLExample] = []
+        for (source, _, _), batch in zip(active, batches, strict=True):
+            mixed_records.extend(
+                replace(
+                    record,
+                    source=source.name,
+                    metadata={
+                        **(record.metadata or {}),
+                        "environment_name": record.source,
+                    },
+                )
+                for record in batch
+            )
+        return mixed_records
+
+    async def mark_policy_update(self) -> int:
+        counts = await asyncio.gather(
+            *(scheduler.mark_policy_update() for scheduler in self.schedulers)
+        )
+        return sum(counts)
+
+    async def aclose(self) -> None:
+        await asyncio.gather(*(scheduler.aclose() for scheduler in self.schedulers))
+
+
 import asyncio
 
 
@@ -866,15 +1080,20 @@ def _preload_rollout_resources(config: RLConfig) -> None:
         _verifier_extra_env_kwargs,
     )
 
-    env_id = config.orchestrator.verifier_env_id
-    if env_id is None:
-        return
-    _load_cached_env(
-        vf,
-        env_id,
-        config.orchestrator.verifier_env_args,
-        _verifier_extra_env_kwargs(config),
-    )
+    source_configs = [
+        _config_for_train_source(config, source)
+        for source in config.orchestrator.train_sources
+    ] or [config]
+    for source_config in source_configs:
+        env_id = source_config.orchestrator.verifier_env_id
+        if env_id is None:
+            continue
+        _load_cached_env(
+            vf,
+            env_id,
+            source_config.orchestrator.verifier_env_args,
+            _verifier_extra_env_kwargs(source_config),
+        )
 
 
 @dataclass(slots=True)
@@ -1881,7 +2100,11 @@ async def _run_verifier_scheduler(
 ) -> int:
     from wavelet.orchestrator.scheduler import VerifierRolloutScheduler
 
-    scheduler = VerifierRolloutScheduler(orchestrator)
+    scheduler = (
+        MultiVerifierRolloutScheduler(orchestrator)
+        if config.orchestrator.train_sources
+        else VerifierRolloutScheduler(orchestrator)
+    )
     chunks_per_step = _chunks_per_step(config)
     context = _VerifierPublisherStrategy(
         config=config,

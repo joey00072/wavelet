@@ -4,7 +4,9 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.scheduler import (
     IntegratedRolloutScheduler,
     PublishMode,
+    _allocate_source_groups,
     _ChunkPublisherStrategy,
+    _config_for_train_source,
     _SchedulerStateMachine,
     resolve_rollout_schedule,
 )
@@ -41,12 +43,16 @@ def test_legacy_scheduler_configs_resolve_explicitly(
     source,
     publish_mode,
 ):
-    examples_per_step = None if (
-        mode == "process"
-        and function is None
-        and async_level == 2
-        and publish_mode is PublishMode.BATCH
-    ) else 8
+    examples_per_step = (
+        None
+        if (
+            mode == "process"
+            and function is None
+            and async_level == 2
+            and publish_mode is PublishMode.BATCH
+        )
+        else 8
+    )
     config = RLConfig(
         launcher={"mode": mode},
         orchestrator={
@@ -61,8 +67,8 @@ def test_legacy_scheduler_configs_resolve_explicitly(
     assert schedule.source is source
     assert schedule.publish_mode is publish_mode
     assert schedule.is_sync is (async_level == 0)
-    expected_chunk_examples = 1 if examples_per_step is None else (
-        8 if async_level == 0 else 4
+    expected_chunk_examples = (
+        1 if examples_per_step is None else (8 if async_level == 0 else 4)
     )
     assert schedule.chunk_examples == expected_chunk_examples
 
@@ -112,3 +118,92 @@ def test_scheduler_strategies_share_queue_to_optimizer_step_mapping() -> None:
         1,
         2,
     ]
+
+
+def test_source_group_allocation_includes_each_source_and_respects_weights() -> None:
+    assert _allocate_source_groups([1, 1], 1) == [1, 0]
+    assert _allocate_source_groups([1, 1], 2) == [1, 1]
+    assert _allocate_source_groups([1, 3], 6) == [2, 4]
+
+
+def test_train_source_resolves_independent_env_data_and_algorithm() -> None:
+    config = RLConfig(
+        algo={"type": "grpo"},
+        orchestrator={
+            "verifier_env_id": "default-env",
+            "train_sources": [
+                {
+                    "name": "opd",
+                    "verifier_env_id": "opd-env",
+                    "verifier_env_args": {"split": "math"},
+                    "data": {"source": "fake", "max_examples": 2},
+                    "algo": {
+                        "type": "opd",
+                        "teacher": {
+                            "name": "teacher",
+                            "base_url": "http://teacher:8001/v1",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    resolved = _config_for_train_source(
+        config,
+        config.orchestrator.train_sources[0],
+    )
+
+    assert resolved.orchestrator.verifier_env_id == "opd-env"
+    assert resolved.orchestrator.verifier_env_args == {"split": "math"}
+    assert resolved.orchestrator.train_sources == []
+    assert resolved.data.source == "fake"
+    assert resolved.algo.type == "opd"
+
+
+def test_train_source_inherits_default_verifier_environment() -> None:
+    config = RLConfig(
+        orchestrator={
+            "verifier_env_id": "default-env",
+            "verifier_env_args": {"split": "default"},
+            "train_sources": [
+                {
+                    "name": "inherited",
+                    "verifier_env_args": {"split": "source"},
+                    "algo": {"type": "reward"},
+                }
+            ],
+        },
+    )
+
+    resolved = _config_for_train_source(
+        config,
+        config.orchestrator.train_sources[0],
+    )
+
+    assert resolved.orchestrator.verifier_env_id == "default-env"
+    assert resolved.orchestrator.verifier_env_args == {"split": "source"}
+    assert resolved.algo.type == "reward"
+
+
+def test_opd_uses_whole_optimizer_batches_for_component_normalization() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "max_async_level": 2,
+            "examples_per_step": 8,
+            "verifier_client_type": "openai_chat_completions_token",
+        },
+        algo={
+            "type": "opd",
+            "teacher": {
+                "name": "teacher",
+                "base_url": "http://teacher:8001/v1",
+            },
+        },
+    )
+
+    assert resolve_rollout_schedule(config).publish_mode is PublishMode.BATCH

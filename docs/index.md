@@ -103,9 +103,9 @@ uv run python -m wavelet debug trainer inspect \
 ```
 
 The report validates `input_ids`, `target_ids`, `loss_mask`, rollout logprobs,
-and teacher logprobs when present. It proves the saved batch is structurally
-ready for trainer replay; it does not compare model logprobs or run an optimizer
-step.
+teacher/reference logprobs, and mixed component weights when present. It proves
+the saved batch is structurally ready for trainer replay; it does not compare
+model logprobs or run an optimizer step.
 
 Export a compact token sidecar when a batch needs closer inspection:
 
@@ -117,8 +117,9 @@ uv run python -m wavelet debug trainer tokens \
 ```
 
 The token sidecar contains token ids, loss masks, trainable target ids,
-rollout-time logprobs, temperatures, rewards, advantages, and row provenance.
-It is intended for debugging and should stay under the run output directory.
+rollout-time and reference logprobs, component weights, temperatures, rewards,
+advantages, and row provenance. It is intended for debugging and should stay
+under the run output directory.
 
 When trainer-side logprobs have been exported into the rollout JSONL, compare
 them with rollout-time logprobs:

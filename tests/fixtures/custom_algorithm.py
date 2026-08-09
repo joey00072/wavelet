@@ -27,6 +27,11 @@ class RewardPlusOneAlgorithm(BaseAlgorithm):
         ]
 
 
+@register_algorithm("ce_actions")
+class CEActionsAlgorithm(BaseAlgorithm):
+    action_loss_type = "ce"
+
+
 @register_algorithm("missing_group_hook")
 class MissingGroupHook:
     def score_rollout(self, record: RLExample) -> RLExample:

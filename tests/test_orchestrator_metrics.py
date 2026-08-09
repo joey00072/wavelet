@@ -7,13 +7,17 @@ import json
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
-from wavelet.orchestrator.metrics import log_rollout_metrics
+from wavelet.orchestrator.metrics import (
+    RolloutMetricInputs,
+    log_rollout_metrics,
+    rollout_metrics,
+)
 
 
 def test_rollout_metrics_match_reference_style_grouping() -> None:
     rows = [
         {
+            "source": "policy",
             "env_name": "reverse-text",
             "example_id": "a",
             "reward": 1.0,
@@ -23,6 +27,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
             "metadata": {"stop_condition": "max_turns_reached", "turn_count": 1},
         },
         {
+            "source": "policy",
             "env_name": "reverse-text",
             "example_id": "a",
             "reward": 0.0,
@@ -32,6 +37,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
             "metadata": {"stop_condition": "max_turns_reached", "turn_count": 1},
         },
         {
+            "source": "distill",
             "env_name": "reverse-text",
             "example_id": "b",
             "reward": 1.0,
@@ -39,6 +45,9 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
             "input_ids": [1, 2],
             "loss_mask": [False, True],
             "inference_logprobs": [-0.1],
+            "ref_logprobs": [-0.2],
+            "rl_weights": 0.0,
+            "ref_kl_weights": 1.0,
             "metadata": {
                 "stop_condition": "length",
                 "is_truncated": True,
@@ -46,6 +55,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
             },
         },
         {
+            "source": "distill",
             "env_name": "reverse-text",
             "example_id": "c",
             "reward": 0.0,
@@ -53,6 +63,9 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
             "input_ids": [1, 2],
             "loss_mask": [False, False],
             "teacher_logprobs": [],
+            "ref_logprobs": [],
+            "rl_weights": 0.0,
+            "ref_kl_weights": 1.0,
             "metadata": {
                 "_wavelet_filtered_rollout": True,
                 "error": "parser",
@@ -73,7 +86,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
 
     serialized = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
     assert hashlib.sha256(serialized.encode()).hexdigest() == (
-        "d07682cf864d09be205ad8969d96c24958bb5684d5fab47ae8a9374ef0962ffc"
+        "f7f42faf78623927c0d6d194d7ae45de98f504b031ae8eea1bca8ff06f8a4d31"
     )
 
     assert metrics["progress/samples"] == 4
@@ -95,7 +108,14 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
     assert metrics["fate/all/truncated"] == 1
     assert metrics["fate/all/with_inference_logprobs"] == 1
     assert metrics["fate/all/with_teacher_logprobs"] == 1
+    assert metrics["fate/all/with_ref_logprobs"] == 2
+    assert metrics["fate/all/with_rl_loss"] == 2
+    assert metrics["fate/all/with_ref_kl_loss"] == 1
     assert metrics["fate/reverse-text/filtered_rate"] == pytest.approx(0.25)
+    assert metrics["batch/source/policy"] == pytest.approx(0.5)
+    assert metrics["batch/source/distill"] == pytest.approx(0.5)
+    assert metrics["fate/source/distill/with_ref_logprobs_rate"] == 1.0
+    assert metrics["fate/source/distill/with_ref_kl_loss_rate"] == 0.5
 
 
 def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:

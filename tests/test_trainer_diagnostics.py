@@ -67,6 +67,49 @@ def test_inspect_rollout_batch_reports_logprob_mismatch(tmp_path: Path) -> None:
     assert report["errors"][0]["field"] == "inference_logprobs"
 
 
+def test_inspect_rollout_batch_reports_mixed_opd_streams(tmp_path: Path) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2, 3],
+                "target_ids": [2, 3, 4],
+                "loss_mask": [False, True, True],
+                "inference_logprobs": [-0.2, -0.3],
+                "ref_logprobs": [-0.1, -0.2],
+                "rl_weights": 0.0,
+                "ce_weights": [0.0, 0.0],
+                "ref_kl_weights": [1.0, 1.0],
+            }
+        ],
+    )
+
+    report = inspect_rollout_batch(RLConfig(), rollout_path=rollout_path)
+
+    assert report["ok"] is True
+    assert report["summary"]["rows_with_ref_logprobs"] == 1
+    assert report["summary"]["rows_with_component_weights"] == 1
+
+
+def test_inspect_rollout_batch_requires_refs_for_ref_kl(tmp_path: Path) -> None:
+    rollout_path = _write_jsonl(
+        tmp_path / "rollouts.jsonl",
+        [
+            {
+                "input_ids": [1, 2],
+                "target_ids": [2, 3],
+                "loss_mask": [False, True],
+                "ref_kl_weights": [1.0],
+            }
+        ],
+    )
+
+    report = inspect_rollout_batch(RLConfig(), rollout_path=rollout_path)
+
+    assert report["ok"] is False
+    assert report["errors"][0]["field"] == "ref_logprobs"
+
+
 def test_trainer_debug_inspect_outputs_json(tmp_path: Path, capsys) -> None:
     rollout_path = _write_jsonl(
         tmp_path / "rollouts.jsonl",
@@ -81,7 +124,9 @@ def test_trainer_debug_inspect_outputs_json(tmp_path: Path, capsys) -> None:
     )
 
     assert (
-        debug_main(["trainer", "inspect", "--rollout-path", str(rollout_path), "--json"])
+        debug_main(
+            ["trainer", "inspect", "--rollout-path", str(rollout_path), "--json"]
+        )
         == 0
     )
 
@@ -100,6 +145,9 @@ def test_export_rollout_token_debug_writes_compact_jsonl(tmp_path: Path) -> None
                 "loss_mask": [False, True, True],
                 "inference_logprobs": [-0.2, -0.3],
                 "teacher_logprobs": [-0.1, -0.2],
+                "ref_logprobs": [-0.05, -0.15],
+                "rl_weights": [0.0, 0.0],
+                "ref_kl_weights": [1.0, 1.0],
                 "temperatures": [0.7, 0.7],
                 "advantage": 0.5,
                 "reward": 1.0,
@@ -119,7 +167,9 @@ def test_export_rollout_token_debug_writes_compact_jsonl(tmp_path: Path) -> None
         write_path=write_path,
     )
 
-    rows = [json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()]
+    rows = [
+        json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert report["ok"] is True
     assert report["rows_exported"] == 1
     assert rows[0]["example_id"] == "ex-1"
@@ -128,6 +178,8 @@ def test_export_rollout_token_debug_writes_compact_jsonl(tmp_path: Path) -> None
     assert rows[0]["trainable_indexes"] == [1, 2]
     assert rows[0]["trainable_target_ids"] == [3, 4]
     assert rows[0]["inference_logprobs"] == [-0.2, -0.3]
+    assert rows[0]["ref_logprobs"] == [-0.05, -0.15]
+    assert rows[0]["component_weights"]["ref_kl_weights"] == [1.0, 1.0]
 
 
 def test_trainer_debug_tokens_writes_export(tmp_path: Path, capsys) -> None:
@@ -160,7 +212,9 @@ def test_trainer_debug_tokens_writes_export(tmp_path: Path, capsys) -> None:
     )
 
     report = json.loads(capsys.readouterr().out)
-    rows = [json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()]
+    rows = [
+        json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert report["rows_exported"] == 1
     assert rows[0]["trainable_target_ids"] == [3]
 

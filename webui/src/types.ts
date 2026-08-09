@@ -48,7 +48,55 @@ export type RunState = {
     rollouts_published_per_second: number;
     rollouts_consumed_per_second: number;
   } | null;
+  algorithms?: AlgorithmTopology;
   errors: Array<{ type: string; message: string; timestamp: string }>;
+};
+
+export type AlgorithmObservation = {
+  batch_fraction: number | null;
+  reward_mean: number | null;
+  produced: number | null;
+  trainable_rate: number | null;
+  ref_logprobs_rate: number | null;
+  rl_loss_rate: number | null;
+  ce_loss_rate: number | null;
+  ref_kl_loss_rate: number | null;
+};
+
+export type AlgorithmDescriptor = {
+  type: string;
+  name?: string;
+  file?: string;
+  scope: "rollout" | "group" | "both";
+  loss_components: Array<"rl" | "ce" | "ref_kl">;
+  teacher?: {
+    name: string;
+    base_urls: string[];
+    replica_count: number;
+  };
+};
+
+export type AlgorithmSource = {
+  name: string;
+  environment: string | null;
+  weight: number;
+  inherits_default: boolean;
+  algorithm: AlgorithmDescriptor;
+  observed: AlgorithmObservation;
+};
+
+export type AlgorithmTopology = {
+  default: AlgorithmDescriptor;
+  sources: AlgorithmSource[];
+  loss_components: Array<"rl" | "ce" | "ref_kl">;
+  teacher_count: number;
+  multi_teacher: boolean;
+  student: {
+    model: string;
+    lora_enabled: boolean;
+    adapter_count: number;
+  };
+  observed_step: number | null;
 };
 
 export type MetricRow = {
@@ -83,6 +131,8 @@ export type RolloutSample = {
   prompt?: string;
   completion?: string;
   target_completion?: string;
+  loss_components?: Array<"rl" | "ce" | "ref_kl">;
+  has_ref_logprobs?: boolean;
 };
 
 export type NumericStats = {

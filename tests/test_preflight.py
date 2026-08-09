@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.orchestrator.preflight import build_preflight_report
@@ -57,6 +59,34 @@ def test_preflight_reports_missing_local_data(tmp_path) -> None:
     assert report["ok"] is False
     assert any(
         check["name"] == "data_path_0" and check["status"] == "error"
+        for check in report["checks"]
+    )
+
+
+def test_preflight_reports_missing_source_local_data(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        output_dir=tmp_path / "run",
+        orchestrator={
+            "train_sources": [
+                {
+                    "name": "opd-data",
+                    "data": {
+                        "source": "local",
+                        "path": tmp_path / "missing-opd.jsonl",
+                    },
+                }
+            ]
+        },
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert report["summary"]["train_sources"][0]["name"] == "opd-data"
+    assert any(
+        check["name"] == "data_source_opd-data_path_0" and check["status"] == "error"
         for check in report["checks"]
     )
 
@@ -135,6 +165,52 @@ def test_preflight_reports_custom_algorithm_constructor_error(tmp_path) -> None:
         and "multiplier" in check["message"]
         for check in report["checks"]
     )
+
+
+def test_preflight_reports_each_source_algorithm_and_opd_teacher(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+        orchestrator={
+            "train_sources": [
+                {
+                    "name": "math-opd",
+                    "algo": {
+                        "type": "opd",
+                        "teacher": {
+                            "name": "math-teacher",
+                            "base_url": "http://teacher:8001/v1",
+                        },
+                    },
+                }
+            ]
+        },
+    )
+
+    report = build_preflight_report(config)
+
+    source_check = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "algorithm_source_math-opd"
+    )
+    assert source_check["status"] == "ok"
+    assert source_check["details"]["teacher"] == "math-teacher"
+
+
+def test_config_rejects_invalid_opd_teacher_url(tmp_path) -> None:
+    with pytest.raises(ValueError, match="absolute HTTP"):
+        RLConfig(
+            data={"source": "local", "path": _write_local_data(tmp_path)},
+            output_dir=tmp_path / "run",
+            reward={"mode": "math_format"},
+            algo={
+                "type": "opd",
+                "teacher": {"name": "teacher", "base_url": "teacher:8001"},
+            },
+        )
 
 
 def test_preflight_resolves_process_commands(tmp_path, monkeypatch) -> None:

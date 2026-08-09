@@ -106,3 +106,36 @@ def test_max_inflight_rollouts_must_cover_one_group() -> None:
                 "max_inflight_rollouts": 4,
             }
         )
+
+
+def test_opd_verifier_requires_token_rollout_client() -> None:
+    with pytest.raises(ValueError, match="require.*openai_chat_completions_token"):
+        RLConfig(
+            algo={
+                "type": "opd",
+                "teacher": {
+                    "name": "teacher",
+                    "base_url": "http://teacher:8001/v1",
+                },
+            },
+            orchestrator={
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                ),
+                "verifier_client_type": "openai_chat_completions",
+            },
+        )
+
+
+def test_opd_requires_main_process_data_iteration() -> None:
+    with pytest.raises(ValueError, match="data.num_workers=0"):
+        RLConfig(
+            data={"num_workers": 1},
+            algo={
+                "type": "opd",
+                "teacher": {
+                    "name": "teacher",
+                    "base_url": "http://teacher:8001/v1",
+                },
+            },
+        )

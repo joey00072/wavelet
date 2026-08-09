@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import { Metric } from "../components/Metric";
+import { AlgorithmPanel } from "../components/AlgorithmPanel";
 import { InventoryCard, Stat, StatusIcon } from "../components/StatusCards";
 import { ThroughputChart } from "../components/ThroughputChart";
 import type { MetricRow, PipelineInventory, RolloutEvent, RunState } from "../types";
@@ -71,6 +72,10 @@ export function OverviewView({
       </section>
 
       <div className="h-px w-full bg-slate-200 dark:bg-white/[0.04]" />
+
+      <AlgorithmPanel topology={state?.algorithms} />
+
+      {state?.algorithms && <div className="h-px w-full bg-slate-200 dark:bg-white/[0.04]" />}
 
       {/* ── Throughput chart ── */}
       <section>

@@ -1,0 +1,107 @@
+model:
+  name: PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT
+  torch_dtype: float32
+  gradient_checkpointing: true
+
+data:
+  source: local
+  path: outputs/reverse_text_data/rl_train.jsonl
+  batch_size: 32
+  micro_batch_size: 1
+  pack_sequences: true
+  seq_len: 2048
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 1.0e-3
+
+# Sources without an override use this algorithm.
+algo:
+  type: grpo
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_model: PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT
+  verifier_client_type: openai_chat_completions_token
+  examples_per_step: 8
+  rollouts_per_example: 4
+  filter_zero_advantage: true
+  zero_advantage_max_retries: 8
+  max_async_level: 1
+  max_off_policy_steps: 8
+  train_sources:
+    - name: reverse-text-grpo
+      verifier_env_id: reverse-text
+      weight: 1
+      algo:
+        type: grpo
+    - name: reverse-text-opd
+      verifier_env_id: reverse-text
+      weight: 1
+      algo:
+        type: opd
+        teacher:
+          name: PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL
+          base_url: http://localhost:8001/v1
+          timeout_seconds: 120.0
+
+inference:
+  enabled: true
+  mode: vllm_http
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    max_completion_tokens: 128
+    do_sample: true
+    num_generations: 1
+  vllm:
+    server_backend: openai
+    dtype: bfloat16
+    gpu_memory_utilization: 0.5
+    max_model_len: 2048
+    max_lora_rank: 8
+  http:
+    request_timeout_seconds: 300.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 3.0e-6
+
+lora:
+  rank: 8
+  alpha: 16.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+launcher:
+  mode: process
+  backend: local
+  inference_cuda_visible_devices: "0"
+  trainer_cuda_visible_devices: "1"
+  trainer_num_processes: 1
+  inference_num_replicas: 1
+
+max_steps: 5
+seed: 42
+output_dir: outputs/reverse_text_mixed_grpo_opd

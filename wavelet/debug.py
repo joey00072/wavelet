@@ -1,29 +1,40 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Any, Literal
 import importlib.util
+import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Literal
 
-from wavelet.configs.config import CustomAlgorithmConfig, RLConfig
+from wavelet.configs.config import (
+    CustomAlgorithmConfig,
+    OPDAlgorithmConfig,
+    RLAlgorithmConfig,
+    RLConfig,
+)
 from wavelet.data.rl import RLExample, load_rl_records
 from wavelet.orchestrator.algorithms import build_algorithm
 from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
 from wavelet.orchestrator.placement import (
     device_group_size as _device_group_size,
+)
+from wavelet.orchestrator.placement import (
     device_groups as _as_device_groups,
+)
+from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
+)
+from wavelet.orchestrator.placement import (
     trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -38,7 +49,6 @@ from wavelet.transport.queue import (
     resolve_policy_dir,
     resolve_queue_dir,
 )
-
 
 DEBUG_COMMANDS = {
     "preflight": (
@@ -466,6 +476,8 @@ def inspect_rollout_batch(
     trainable_tokens = 0
     rows_with_inference_logprobs = 0
     rows_with_teacher_logprobs = 0
+    rows_with_ref_logprobs = 0
+    rows_with_component_weights = 0
 
     for row_index, payload in _iter_jsonl(path):
         if max_rows is not None and rows_scanned >= max_rows:
@@ -476,6 +488,12 @@ def inspect_rollout_batch(
             row_index=row_index,
             inference_logprobs_column=config.data.inference_logprobs_column,
             teacher_logprobs_column=config.data.teacher_logprobs_column,
+            ref_logprobs_column=config.data.ref_logprobs_column,
+            component_weight_columns=(
+                config.data.rl_weights_column,
+                config.data.ce_weights_column,
+                config.data.ref_kl_weights_column,
+            ),
         )
         errors.extend(row_errors)
         warnings.extend(row_warnings)
@@ -484,6 +502,8 @@ def inspect_rollout_batch(
         rows_with_trainable_tokens += int(stats["trainable_tokens"] > 0)
         rows_with_inference_logprobs += int(stats["has_inference_logprobs"])
         rows_with_teacher_logprobs += int(stats["has_teacher_logprobs"])
+        rows_with_ref_logprobs += int(stats["has_ref_logprobs"])
+        rows_with_component_weights += int(stats["has_component_weights"])
         if len(rows) < sample_limit:
             rows.append(_sample_row(payload, row_index=row_index, stats=stats))
 
@@ -498,6 +518,8 @@ def inspect_rollout_batch(
             "rows_with_trainable_tokens": rows_with_trainable_tokens,
             "rows_with_inference_logprobs": rows_with_inference_logprobs,
             "rows_with_teacher_logprobs": rows_with_teacher_logprobs,
+            "rows_with_ref_logprobs": rows_with_ref_logprobs,
+            "rows_with_component_weights": rows_with_component_weights,
         },
         "errors": errors,
         "warnings": warnings,
@@ -633,6 +655,12 @@ def export_rollout_token_debug(
                 row_index=row_index,
                 inference_logprobs_column=config.data.inference_logprobs_column,
                 teacher_logprobs_column=config.data.teacher_logprobs_column,
+                ref_logprobs_column=config.data.ref_logprobs_column,
+                component_weight_columns=(
+                    config.data.rl_weights_column,
+                    config.data.ce_weights_column,
+                    config.data.ref_kl_weights_column,
+                ),
             )
             errors.extend(row_errors)
             warnings.extend(row_warnings)
@@ -645,6 +673,12 @@ def export_rollout_token_debug(
                 row_index=row_index,
                 inference_logprobs_column=config.data.inference_logprobs_column,
                 teacher_logprobs_column=config.data.teacher_logprobs_column,
+                ref_logprobs_column=config.data.ref_logprobs_column,
+                component_weight_columns=(
+                    config.data.rl_weights_column,
+                    config.data.ce_weights_column,
+                    config.data.ref_kl_weights_column,
+                ),
             )
             handle.write(json.dumps(token_row, sort_keys=True) + "\n")
             rows_exported += 1
@@ -702,6 +736,8 @@ def _inspect_row(
     row_index: int,
     inference_logprobs_column: str,
     teacher_logprobs_column: str,
+    ref_logprobs_column: str,
+    component_weight_columns: tuple[str, str, str],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -753,6 +789,7 @@ def _inspect_row(
 
     inference_logprobs = _sequence(payload.get(inference_logprobs_column))
     teacher_logprobs = _sequence(payload.get(teacher_logprobs_column))
+    ref_logprobs = _sequence(payload.get(ref_logprobs_column))
     _check_logprob_alignment(
         errors,
         row_index=row_index,
@@ -760,6 +797,57 @@ def _inspect_row(
         values=inference_logprobs,
         trainable_tokens=trainable_tokens,
     )
+    _check_logprob_alignment(
+        errors,
+        row_index=row_index,
+        field=ref_logprobs_column,
+        values=ref_logprobs,
+        trainable_tokens=trainable_tokens,
+    )
+    present_component_weights = False
+    for field in component_weight_columns:
+        value = payload.get(field)
+        if value is None:
+            continue
+        present_component_weights = True
+        if isinstance(value, list):
+            _check_weight_alignment(
+                errors,
+                row_index=row_index,
+                field=field,
+                values=value,
+                trainable_tokens=trainable_tokens,
+            )
+        elif not isinstance(value, (int, float)):
+            errors.append(
+                {
+                    "row": row_index,
+                    "field": field,
+                    "message": "component weight must be a number or list",
+                }
+            )
+        elif value < 0:
+            errors.append(
+                {
+                    "row": row_index,
+                    "field": field,
+                    "message": "component weights must be non-negative numbers",
+                }
+            )
+    ref_kl_value = payload.get(component_weight_columns[2])
+    ref_kl_enabled = (
+        any(isinstance(value, (int, float)) and value != 0.0 for value in ref_kl_value)
+        if isinstance(ref_kl_value, list)
+        else isinstance(ref_kl_value, (int, float)) and ref_kl_value != 0.0
+    )
+    if ref_kl_enabled and ref_logprobs is None:
+        errors.append(
+            {
+                "row": row_index,
+                "field": ref_logprobs_column,
+                "message": "reference KL weights require reference logprobs",
+            }
+        )
     _check_logprob_alignment(
         errors,
         row_index=row_index,
@@ -775,6 +863,8 @@ def _inspect_row(
             "trainable_tokens": trainable_tokens,
             "has_inference_logprobs": inference_logprobs is not None,
             "has_teacher_logprobs": teacher_logprobs is not None,
+            "has_ref_logprobs": ref_logprobs is not None,
+            "has_component_weights": present_component_weights,
         },
     )
 
@@ -803,6 +893,36 @@ def _check_logprob_alignment(
         )
 
 
+def _check_weight_alignment(
+    errors: list[dict[str, Any]],
+    *,
+    row_index: int,
+    field: str,
+    values: list[Any],
+    trainable_tokens: int,
+) -> None:
+    if len(values) < trainable_tokens:
+        errors.append(
+            {
+                "row": row_index,
+                "field": field,
+                "message": "component weight count must cover trainable tokens",
+                "lengths": {
+                    field: len(values),
+                    "trainable_tokens": trainable_tokens,
+                },
+            }
+        )
+    elif any(not isinstance(value, (int, float)) or value < 0 for value in values):
+        errors.append(
+            {
+                "row": row_index,
+                "field": field,
+                "message": "component weights must be non-negative numbers",
+            }
+        )
+
+
 def _sample_row(
     payload: dict[str, Any],
     *,
@@ -826,6 +946,8 @@ def _token_debug_row(
     row_index: int,
     inference_logprobs_column: str,
     teacher_logprobs_column: str,
+    ref_logprobs_column: str,
+    component_weight_columns: tuple[str, str, str],
 ) -> dict[str, Any]:
     input_ids = _sequence(payload.get("input_ids")) or []
     target_ids = _sequence(payload.get("target_ids")) or []
@@ -848,6 +970,10 @@ def _token_debug_row(
         "advantage": payload.get("advantage"),
         "inference_logprobs": _float_sequence(payload.get(inference_logprobs_column)),
         "teacher_logprobs": _float_sequence(payload.get(teacher_logprobs_column)),
+        "ref_logprobs": _float_sequence(payload.get(ref_logprobs_column)),
+        "component_weights": {
+            field: payload.get(field) for field in component_weight_columns
+        },
         "temperatures": _float_sequence(payload.get("temperatures"))
         or _float_sequence(payload.get("temperature")),
     }
@@ -894,6 +1020,8 @@ def _empty_stats() -> dict[str, Any]:
         "trainable_tokens": 0,
         "has_inference_logprobs": False,
         "has_teacher_logprobs": False,
+        "has_ref_logprobs": False,
+        "has_component_weights": False,
     }
 
 
@@ -1553,6 +1681,10 @@ def _summary(config: RLConfig) -> dict[str, Any]:
         "inference_backend": config.inference.vllm.server_backend,
         "policy_transfer": config.policy_transfer.type,
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
+        "train_sources": [
+            source.model_dump(mode="json", exclude_none=True)
+            for source in config.orchestrator.train_sources
+        ],
         "target_steps": target_steps(config),
         "low_precision": _low_precision_summary(config),
     }
@@ -1600,20 +1732,34 @@ def _path_checks(config: RLConfig) -> list[PreflightCheck]:
 
 
 def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:
-    if config.data.source != "local":
+    checks = _data_path_checks_for(config.data, name="data")
+    for source in config.orchestrator.train_sources:
+        if source.data is not None:
+            checks.extend(
+                _data_path_checks_for(
+                    source.data,
+                    name=f"data_source_{source.name}",
+                )
+            )
+    return checks
+
+
+def _data_path_checks_for(data: Any, *, name: str) -> list[PreflightCheck]:
+    if data.source != "local":
         return [
             PreflightCheck(
-                name="data_source",
+                name=f"{name}_source",
                 status="ok",
-                message=f"data.source={config.data.source!r} does not require a local path preflight.",
+                message=(
+                    f"data.source={data.source!r} does not require a local path "
+                    "preflight."
+                ),
             )
         ]
-    paths = (
-        config.data.path if isinstance(config.data.path, list) else [config.data.path]
-    )
+    paths = data.path if isinstance(data.path, list) else [data.path]
     return [
         PreflightCheck(
-            f"data_path_{index}",
+            f"{name}_path_{index}",
             "ok" if Path(path).exists() else "error",
             f"Local data path {'exists' if Path(path).exists() else 'does not exist'}: {path}",
             {"path": str(path)},
@@ -1829,36 +1975,81 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
 
 
 def _algorithm_checks(config: RLConfig) -> list[PreflightCheck]:
-    if not isinstance(config.algo, CustomAlgorithmConfig):
-        return [
-            PreflightCheck(
-                "algorithm",
-                "ok",
-                f"Built-in algorithm is available: {config.algo.type}",
-            )
+    configured = [("algorithm", "default", config.algo)]
+    configured.extend(
+        (
+            f"algorithm_source_{source.name}",
+            source.name,
+            source.algo or config.algo,
+        )
+        for source in config.orchestrator.train_sources
+    )
+    return [
+        _algorithm_check(name, source_name, algorithm_config)
+        for name, source_name, algorithm_config in configured
+    ]
+
+
+def _algorithm_check(
+    check_name: str,
+    source_name: str,
+    algorithm_config: RLAlgorithmConfig,
+) -> PreflightCheck:
+    if isinstance(algorithm_config, OPDAlgorithmConfig):
+        urls = (
+            algorithm_config.teacher.base_url
+            if isinstance(algorithm_config.teacher.base_url, list)
+            else [algorithm_config.teacher.base_url]
+        )
+        invalid_urls = [
+            url for url in urls if not url.startswith(("http://", "https://"))
         ]
+        if invalid_urls:
+            return PreflightCheck(
+                check_name,
+                "error",
+                f"OPD source {source_name!r} has invalid teacher URL(s).",
+                {"base_urls": urls, "invalid_urls": invalid_urls},
+            )
+        return PreflightCheck(
+            check_name,
+            "ok",
+            f"OPD source {source_name!r} uses teacher "
+            f"{algorithm_config.teacher.name!r}.",
+            {
+                "type": "opd",
+                "teacher": algorithm_config.teacher.name,
+                "base_urls": urls,
+            },
+        )
+
+    if not isinstance(algorithm_config, CustomAlgorithmConfig):
+        return PreflightCheck(
+            check_name,
+            "ok",
+            f"Built-in algorithm is available for {source_name}: "
+            f"{algorithm_config.type}",
+        )
     try:
-        build_algorithm(config.algo)
+        build_algorithm(algorithm_config)
     except (ImportError, OSError, SyntaxError, TypeError, ValueError) as exc:
         status: CheckStatus = "error"
         message = (
-            f"Could not load custom algorithm {config.algo.algorithm!r} "
-            f"from {str(config.algo.file)!r}: {type(exc).__name__}: {exc}"
+            f"Could not load custom algorithm {algorithm_config.algorithm!r} "
+            f"from {str(algorithm_config.file)!r}: {type(exc).__name__}: {exc}"
         )
     else:
         status = "ok"
         message = (
-            f"Custom algorithm is loadable: {config.algo.algorithm} "
-            f"from {config.algo.file}"
+            f"Custom algorithm is loadable: {algorithm_config.algorithm} "
+            f"from {algorithm_config.file}"
         )
-    return [
-        PreflightCheck(
-            "algorithm",
-            status,
-            message,
-            _custom_algorithm_details(config.algo),
-        )
-    ]
+    return PreflightCheck(
+        check_name,
+        status,
+        message,
+        _custom_algorithm_details(algorithm_config),
+    )
 
 
 def _custom_algorithm_details(config: CustomAlgorithmConfig) -> dict[str, Any]:

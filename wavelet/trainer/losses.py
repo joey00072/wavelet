@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass
 import logging
 import types
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, replace
 from typing import TypedDict
 
 import torch
@@ -20,6 +20,8 @@ class LossInputs:
     teacher_logprobs: Tensor | None
     advantages: Tensor
     loss_mask: Tensor
+    ref_logprobs: Tensor | None = None
+    loss_weights: Tensor | None = None
 
 
 def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
@@ -84,7 +86,10 @@ def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput
 
     pg_loss = keep_mask * scaled_advantages * importance_ratio
     kl_loss = loss_mask * log_importance_ratio.square()
-    loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
+    per_token_loss = -pg_loss + loss_config.kl_tau * kl_loss
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+    loss = per_token_loss.sum()
 
     metrics = {
         "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),
@@ -100,6 +105,60 @@ def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)
     return LossOutput(loss=loss, metrics=metrics)
+
+
+def ref_kl_loss_fn(
+    inputs: LossInputs,
+    loss_config: RLLossConfig,
+) -> LossOutput:
+    """Compute OPD reverse-KL credit with off-policy correction."""
+    ref_logprobs = inputs.ref_logprobs
+    if ref_logprobs is None:
+        raise ValueError("ref_kl loss requires ref_logprobs.")
+
+    trainer_logprobs = inputs.trainer_logprobs
+    inference_logprobs = inputs.inference_logprobs
+    loss_mask = inputs.loss_mask
+    log_importance_ratio = trainer_logprobs - inference_logprobs
+    importance_ratio = torch.exp(log_importance_ratio)
+    mismatch_kl = importance_ratio - log_importance_ratio - 1
+    probs_diff = torch.exp(trainer_logprobs) - torch.exp(inference_logprobs)
+    invalid = probs_diff < -loss_config.dppo_mask_low
+    keep_mask = loss_mask & ~invalid
+    ref_kl = ref_logprobs - trainer_logprobs
+
+    policy_loss = -(keep_mask * ref_kl.detach() * importance_ratio)
+    drift_loss = loss_mask * log_importance_ratio.square()
+    per_token_loss = policy_loss + loss_config.kl_tau * drift_loss
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+    loss = per_token_loss.sum()
+    return LossOutput(
+        loss=loss,
+        metrics={
+            "ref_kl": _safe_mean(ref_kl, loss_mask),
+            "ref_kl/is_masked": _safe_mean(invalid.float(), loss_mask),
+            "ref_kl/masked_mismatch_kl": _safe_mean(
+                mismatch_kl,
+                loss_mask & invalid,
+            ),
+            "ref_kl/unmasked_mismatch_kl": _safe_mean(
+                mismatch_kl,
+                keep_mask,
+            ),
+        },
+    )
+
+
+def ce_loss_fn(inputs: LossInputs) -> LossOutput:
+    """Compute masked cross entropy for distillation and observation tokens."""
+    per_token_loss = -inputs.trainer_logprobs
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+    return LossOutput(
+        loss=per_token_loss[inputs.loss_mask].sum(),
+        metrics={"ce/nll": _safe_mean(-inputs.trainer_logprobs, inputs.loss_mask)},
+    )
 
 
 def _sequence_spans(position_ids: Tensor, seq_len: int) -> list[tuple[int, int]]:
@@ -123,7 +182,19 @@ def _iter_trainable_spans(
     advantages: Tensor,
     loss_mask: Tensor,
     position_ids: Tensor | None,
-) -> Iterator[tuple[LossInputs, Tensor]]:
+    ref_logprobs: Tensor | None = None,
+    rl_weights: Tensor | None = None,
+    ce_weights: Tensor | None = None,
+    ref_kl_weights: Tensor | None = None,
+) -> Iterator[
+    tuple[
+        LossInputs,
+        Tensor,
+        Tensor | None,
+        Tensor | None,
+        Tensor | None,
+    ]
+]:
     seq_len = trainer_logprobs.shape[1]
     spans_by_row = (
         [[(0, seq_len)] for _ in range(trainer_logprobs.shape[0])]
@@ -147,26 +218,21 @@ def _iter_trainable_spans(
                     ),
                     advantages=advantages[row_index, start:end],
                     loss_mask=span_mask,
+                    ref_logprobs=(
+                        None
+                        if ref_logprobs is None
+                        else ref_logprobs[row_index, start:end]
+                    ),
                 ),
                 trainable_tokens,
+                (None if rl_weights is None else rl_weights[row_index, start:end]),
+                (None if ce_weights is None else ce_weights[row_index, start:end]),
+                (
+                    None
+                    if ref_kl_weights is None
+                    else ref_kl_weights[row_index, start:end]
+                ),
             )
-
-
-def _resolve_loss_scale(
-    loss_scale: int | float | Tensor | None,
-    *,
-    normalization: str,
-    sequence_count: int,
-    loss_mask: Tensor,
-    device: torch.device,
-) -> float | Tensor:
-    if loss_scale is None:
-        if normalization == "sequence":
-            return max(float(sequence_count), 1.0)
-        return torch.clamp_min(loss_mask.sum(), 1)
-    if isinstance(loss_scale, Tensor):
-        return torch.clamp_min(loss_scale.to(device), 1)
-    return max(float(loss_scale), 1.0)
 
 
 def _aggregate_loss_metrics(
@@ -195,10 +261,35 @@ def compute_loss(
     *,
     loss_scale: int | float | Tensor | None = None,
     position_ids: Tensor | None = None,
+    ref_logprobs: Tensor | None = None,
+    rl_weights: Tensor | None = None,
+    ce_weights: Tensor | None = None,
+    ref_kl_weights: Tensor | None = None,
+    component_loss_scales: Mapping[str, float | Tensor] | None = None,
 ) -> LossOutput:
-    total_loss: Tensor | None = None
+    component_losses = {
+        "rl": trainer_logprobs.sum() * 0.0,
+        "ce": trainer_logprobs.sum() * 0.0,
+        "ref_kl": trainer_logprobs.sum() * 0.0,
+    }
     metric_values: dict[str, list[Tensor]] = {}
-    sequence_count = 0
+    component_token_counts = {"rl": 0, "ce": 0, "ref_kl": 0}
+    component_sequence_counts = {"rl": 0, "ce": 0, "ref_kl": 0}
+
+    def record_output(
+        component: str,
+        outputs: LossOutput,
+        component_mask: Tensor,
+    ) -> None:
+        component_loss = outputs.loss
+        token_count = int(component_mask.sum().item())
+        component_token_counts[component] += token_count
+        if loss_config.normalization == "sequence":
+            component_loss = component_loss / max(token_count, 1)
+            component_sequence_counts[component] += 1
+        component_losses[component] = component_losses[component] + component_loss
+        for key, value in outputs.metrics.items():
+            metric_values.setdefault(key, []).append(value)
 
     spans = _iter_trainable_spans(
         trainer_logprobs,
@@ -207,27 +298,77 @@ def compute_loss(
         advantages,
         loss_mask,
         position_ids,
+        ref_logprobs,
+        rl_weights,
+        ce_weights,
+        ref_kl_weights,
     )
-    for span_inputs, trainable_tokens in spans:
-        outputs = default_loss_fn(span_inputs, loss_config)
-        span_loss = outputs.loss
-        if loss_config.normalization == "sequence":
-            span_loss = span_loss / torch.clamp_min(trainable_tokens, 1)
-            sequence_count += 1
-        total_loss = span_loss if total_loss is None else total_loss + span_loss
-        for key, value in outputs.metrics.items():
-            metric_values.setdefault(key, []).append(value)
+    for span_inputs, _trainable_tokens, rl_w, ce_w, ref_kl_w in spans:
+        rl_mask = (
+            span_inputs.loss_mask
+            if rl_w is None
+            else (span_inputs.loss_mask & (rl_w != 0))
+        )
+        if bool(rl_mask.any()):
+            record_output(
+                "rl",
+                default_loss_fn(
+                    replace(span_inputs, loss_mask=rl_mask, loss_weights=rl_w),
+                    loss_config,
+                ),
+                rl_mask,
+            )
 
-    if total_loss is None:
-        total_loss = trainer_logprobs.sum() * 0.0
-    scale = _resolve_loss_scale(
-        loss_scale,
-        normalization=loss_config.normalization,
-        sequence_count=sequence_count,
-        loss_mask=loss_mask,
-        device=total_loss.device,
-    )
-    scaled_loss = total_loss / scale
+        if ce_w is not None:
+            ce_mask = span_inputs.loss_mask & (ce_w != 0)
+            if bool(ce_mask.any()):
+                record_output(
+                    "ce",
+                    ce_loss_fn(
+                        replace(
+                            span_inputs,
+                            loss_mask=ce_mask,
+                            loss_weights=ce_w,
+                        )
+                    ),
+                    ce_mask,
+                )
+
+        if ref_kl_w is not None:
+            ref_kl_mask = span_inputs.loss_mask & (ref_kl_w != 0)
+            if bool(ref_kl_mask.any()):
+                record_output(
+                    "ref_kl",
+                    ref_kl_loss_fn(
+                        replace(
+                            span_inputs,
+                            loss_mask=ref_kl_mask,
+                            loss_weights=ref_kl_w,
+                        ),
+                        loss_config,
+                    ),
+                    ref_kl_mask,
+                )
+
+    scales = dict(component_loss_scales or {})
+    if loss_scale is not None and "rl" not in scales:
+        scales["rl"] = loss_scale
+    scaled_loss = trainer_logprobs.sum() * 0.0
+    for component, component_loss in component_losses.items():
+        default_count = (
+            component_sequence_counts[component]
+            if loss_config.normalization == "sequence"
+            else component_token_counts[component]
+        )
+        scale = scales.get(component, max(default_count, 1))
+        if isinstance(scale, Tensor):
+            resolved_scale: float | Tensor = torch.clamp_min(
+                scale.to(component_loss.device),
+                1,
+            )
+        else:
+            resolved_scale = max(float(scale), 1.0)
+        scaled_loss = scaled_loss + component_loss / resolved_scale
     return LossOutput(
         loss=scaled_loss,
         metrics=_aggregate_loss_metrics(metric_values),

@@ -8,8 +8,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from wavelet.configs.config import RLConfig
-from wavelet.monitor import redact as _redact
 from wavelet.monitor import (
+    RolloutStateEventsMixin,
     _file_exceeds_rows,
     _nearest_reward_row,
     _read_json,
@@ -18,18 +18,16 @@ from wavelet.monitor import (
     summary_stats,
     tail_jsonl_rows,
     unavailable_rollout_inspection,
-    RolloutStateEventsMixin,
 )
-from wavelet.transport.queue import (
-    build_queue_report,
-    get_step_dir,
-    resolve_policy_dir,
-    resolve_queue_dir,
-)
+from wavelet.monitor import redact as _redact
 from wavelet.transport.queue import (
     MANIFEST_FILENAME,
     STABLE_BATCH_MARKER,
     STEP_DIR_PREFIX,
+    build_queue_report,
+    get_step_dir,
+    resolve_policy_dir,
+    resolve_queue_dir,
 )
 
 
@@ -105,6 +103,7 @@ class OrchestratorRunState(RolloutStateEventsMixin):
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             snapshot = json.loads(json.dumps(self._state))
+        snapshot["algorithms"] = self.algorithm_snapshot()
         queue_report = self.queue_snapshot(detail=False, limit=0)
         if queue_report is not None:
             snapshot["queue_summary"] = queue_report.get("summary")
@@ -132,7 +131,7 @@ class OrchestratorRunState(RolloutStateEventsMixin):
                 detail=detail,
                 limit=limit,
             )
-        except Exception as exc:  # pragma: no cover - health should degrade only
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
             return {
                 "summary": None,
                 "policy": None,
@@ -143,6 +142,79 @@ class OrchestratorRunState(RolloutStateEventsMixin):
 
     def sanitized_config(self) -> dict[str, Any]:
         return _redact(self._config.model_dump(mode="json", exclude_none=True))
+
+    def algorithm_snapshot(self) -> dict[str, Any]:
+        """Describe the configured algorithm graph and latest source observations."""
+        latest_rows = tail_jsonl_rows(
+            self._config.output_dir / "orchestrator_metrics.jsonl",
+            limit=1,
+        )
+        latest = latest_rows[-1] if latest_rows else {}
+        configured_sources = self._config.orchestrator.train_sources
+        sources: list[dict[str, Any]] = []
+        if configured_sources:
+            for source in configured_sources:
+                algorithm = source.algo or self._config.algo
+                sources.append(
+                    {
+                        "name": source.name,
+                        "environment": (
+                            source.verifier_env_id
+                            or self._config.orchestrator.verifier_env_id
+                        ),
+                        "weight": source.weight,
+                        "inherits_default": source.algo is None,
+                        "algorithm": _algorithm_summary(algorithm),
+                        "observed": _source_observation(latest, source.name),
+                    }
+                )
+        else:
+            sources.append(
+                {
+                    "name": "default",
+                    "environment": self._config.orchestrator.verifier_env_id,
+                    "weight": 1,
+                    "inherits_default": True,
+                    "algorithm": _algorithm_summary(self._config.algo),
+                    "observed": _source_observation(latest, None),
+                }
+            )
+
+        teachers = {
+            (
+                source["algorithm"]["teacher"]["name"],
+                tuple(source["algorithm"]["teacher"]["base_urls"]),
+            )
+            for source in sources
+            if "teacher" in source["algorithm"]
+        }
+        loss_components = {
+            component
+            for source in sources
+            for component in source["algorithm"]["loss_components"]
+        }
+        for source in sources:
+            observation = source["observed"]
+            for component, key in (
+                ("rl", "rl_loss_rate"),
+                ("ce", "ce_loss_rate"),
+                ("ref_kl", "ref_kl_loss_rate"),
+            ):
+                if (observation.get(key) or 0.0) > 0.0:
+                    loss_components.add(component)
+        return {
+            "default": _algorithm_summary(self._config.algo),
+            "sources": sources,
+            "loss_components": sorted(loss_components),
+            "teacher_count": len(teachers),
+            "multi_teacher": len(teachers) > 1,
+            "student": {
+                "model": self._config.model.name,
+                "lora_enabled": self._config.lora is not None,
+                "adapter_count": 1 if self._config.lora is not None else 0,
+            },
+            "observed_step": _metric_number(latest.get("step")),
+        }
 
     def metrics(self, *, limit: int) -> list[dict[str, Any]]:
         return tail_jsonl_rows(
@@ -245,7 +317,7 @@ def _build_state_app(
     cors_middleware: Any,
 ) -> Any:
     config = state._config.orchestrator.state_server
-    app = fastapi(title="Wavelet Orchestrator State", version="1.0")
+    app = fastapi(title="Wavelet Orchestrator State", version="1.1")
     app.add_middleware(
         cors_middleware,
         allow_origins=config.cors_allow_origins,
@@ -286,6 +358,10 @@ def _build_state_app(
     async def run_config() -> dict[str, Any]:
         return state.sanitized_config()
 
+    @app.get("/algorithms")
+    async def algorithms() -> dict[str, Any]:
+        return state.algorithm_snapshot()
+
     @app.get("/metrics")
     async def metrics(
         limit: int = query(default=20, ge=1, le=200),
@@ -321,6 +397,74 @@ def _build_state_app(
         )
 
     return app
+
+
+def _algorithm_summary(config: Any) -> dict[str, Any]:
+    algorithm_type = str(config.type)
+    summary: dict[str, Any] = {
+        "type": algorithm_type,
+        "scope": (
+            config.scope
+            if algorithm_type == "custom"
+            else "group"
+            if algorithm_type in {"grpo", "max_rl"}
+            else "rollout"
+        ),
+        "loss_components": (
+            ["ref_kl"]
+            if algorithm_type == "opd"
+            else []
+            if algorithm_type == "custom"
+            else ["rl"]
+        ),
+    }
+    if algorithm_type == "custom":
+        summary["name"] = config.algorithm
+        summary["file"] = str(config.file)
+    teacher = getattr(config, "teacher", None)
+    if teacher is not None:
+        base_urls = (
+            list(teacher.base_url)
+            if isinstance(teacher.base_url, list)
+            else [teacher.base_url]
+        )
+        summary["teacher"] = {
+            "name": teacher.name,
+            "base_urls": base_urls,
+            "replica_count": len(base_urls),
+        }
+    return summary
+
+
+def _source_observation(
+    metrics: dict[str, Any],
+    source_name: str | None,
+) -> dict[str, float | None]:
+    suffix = f"source/{source_name}" if source_name is not None else "all"
+    return {
+        "batch_fraction": (
+            _metric_number(metrics.get(f"batch/{suffix}"))
+            if source_name is not None
+            else (1.0 if metrics else None)
+        ),
+        "reward_mean": _metric_number(metrics.get(f"reward/{suffix}/mean")),
+        "produced": _metric_number(metrics.get(f"fate/{suffix}/produced")),
+        "trainable_rate": _metric_number(metrics.get(f"fate/{suffix}/trainable_rate")),
+        "ref_logprobs_rate": _metric_number(
+            metrics.get(f"fate/{suffix}/with_ref_logprobs_rate")
+        ),
+        "rl_loss_rate": _metric_number(metrics.get(f"fate/{suffix}/with_rl_loss_rate")),
+        "ce_loss_rate": _metric_number(metrics.get(f"fate/{suffix}/with_ce_loss_rate")),
+        "ref_kl_loss_rate": _metric_number(
+            metrics.get(f"fate/{suffix}/with_ref_kl_loss_rate")
+        ),
+    }
+
+
+def _metric_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 class StateServerHandle:

@@ -24,9 +24,8 @@ agent-readable map of workflows, diagnostics, and repository guidance.
   logprobs, and throughput checks
 - [Orchestrator diagnostics](docs/orchestrator.skill.md): scheduling, rollout,
   reward, filtering, and materialization checks
-- [RL algorithms](docs/algorithms.md): configure GRPO, MaxRL, reward, or
-  passthrough advantage assignment, including algorithms from user-owned
-  Python files
+- [RL algorithms](docs/algorithms.md): configure GRPO, MaxRL, OPD, mixed
+  per-source algorithms, or algorithms from user-owned Python files
 - [Agent instructions](AGENTS.md): repository rules for coding agents and
   contributors
 
@@ -52,7 +51,14 @@ uv run python -m wavelet rl @ examples/unsloth_math/rl.yaml
 
 RL advantage assignment is selected explicitly with `algo.type`. The
 `reverse_text` example uses GRPO; see the [algorithm guide](docs/algorithms.md)
-for the supported choices and their contracts.
+for the supported choices and their contracts. The mixed reverse-text example
+combines GRPO and OPD against an external frozen teacher while training one
+student and one LoRA adapter. Start the teacher described in the algorithm
+guide before launching it:
+
+```bash
+uv run python -m wavelet rl @ examples/reverse_text/rl_mixed_grpo_opd.yaml
+```
 
 Current distributed scope is experimental:
 

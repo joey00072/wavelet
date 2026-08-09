@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -340,6 +341,10 @@ class RLDataConfig(TrainingDataConfig):
     reward_column: str = "reward"
     inference_logprobs_column: str = "inference_logprobs"
     teacher_logprobs_column: str = "teacher_logprobs"
+    ref_logprobs_column: str = "ref_logprobs"
+    rl_weights_column: str = "rl_weights"
+    ce_weights_column: str = "ce_weights"
+    ref_kl_weights_column: str = "ref_kl_weights"
     temperature_column: str = "temperature"
     metadata_column: str = "metadata"
 
@@ -655,6 +660,39 @@ class MaxRLAlgorithmConfig(_StrictConfig):
     type: Literal["max_rl"] = "max_rl"
 
 
+class FrozenModelConfig(_StrictConfig):
+    """External immutable model endpoint used by an algorithm."""
+
+    name: str = Field(min_length=1)
+    base_url: str | list[str]
+    api_key_var: str = "OPENAI_API_KEY"
+    timeout_seconds: float = Field(default=120.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_base_urls(self) -> "FrozenModelConfig":
+        urls = self.base_url if isinstance(self.base_url, list) else [self.base_url]
+        if not urls or any(not url.strip() for url in urls):
+            raise ValueError("Frozen model base_url must contain at least one URL.")
+        invalid = [
+            url
+            for url in urls
+            if urlparse(url).scheme not in {"http", "https"} or not urlparse(url).netloc
+        ]
+        if invalid:
+            raise ValueError(
+                "Frozen model base_url values must be absolute HTTP(S) URLs: "
+                + ", ".join(invalid)
+            )
+        return self
+
+
+class OPDAlgorithmConfig(_StrictConfig):
+    """On-policy distillation against a frozen reference model."""
+
+    type: Literal["opd"] = "opd"
+    teacher: FrozenModelConfig
+
+
 AlgorithmScope = Literal["rollout", "group", "both"]
 
 
@@ -674,9 +712,36 @@ RLAlgorithmConfig = Annotated[
     | RewardAlgorithmConfig
     | GRPOAlgorithmConfig
     | MaxRLAlgorithmConfig
+    | OPDAlgorithmConfig
     | CustomAlgorithmConfig,
     Field(discriminator="type"),
 ]
+
+
+class RLTrainSourceConfig(_StrictConfig):
+    """Source-local algorithm override for mixed training batches."""
+
+    name: str = Field(min_length=1)
+    algo: RLAlgorithmConfig | None = None
+    verifier_env_id: str | None = None
+    verifier_env_args: dict[str, Any] = Field(default_factory=dict)
+    data: RLDataConfig | None = None
+    weight: int = Field(default=1, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def infer_custom_algorithm_type(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        algo = normalized.get("algo")
+        if (
+            isinstance(algo, dict)
+            and "type" not in algo
+            and ("file" in algo or "algorithm" in algo)
+        ):
+            normalized["algo"] = {"type": "custom", **algo}
+        return normalized
 
 
 class RLOrchestratorConfig(BaseModel):
@@ -711,6 +776,7 @@ class RLOrchestratorConfig(BaseModel):
     max_pending_rollout_chunks: int | None = Field(default=None, ge=1)
     length_penalty: LengthPenaltyConfig | None = None
     state_server: RLStateServerConfig = RLStateServerConfig()
+    train_sources: list[RLTrainSourceConfig] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
@@ -732,6 +798,17 @@ class RLOrchestratorConfig(BaseModel):
             raise ValueError(
                 "orchestrator.max_inflight_rollouts must be at least "
                 "orchestrator.rollouts_per_example"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_train_source_names(self) -> "RLOrchestratorConfig":
+        names = [source.name for source in self.train_sources]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(
+                "orchestrator.train_sources names must be unique: "
+                + ", ".join(duplicates)
             )
         return self
 
@@ -812,6 +889,39 @@ class RLConfig(TrainerConfig):
             raise ValueError(
                 "reward.mode must score generated completions when inference.mode "
                 "generates rollouts."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_opd_token_rollouts(self) -> "RLConfig":
+        algorithms = [
+            self.algo,
+            *[
+                source.algo
+                for source in self.orchestrator.train_sources
+                if source.algo is not None
+            ],
+        ]
+        has_opd = any(
+            isinstance(algorithm, OPDAlgorithmConfig) for algorithm in algorithms
+        )
+        if not has_opd:
+            return self
+        if self.data.num_workers != 0:
+            raise ValueError(
+                "OPD requires data.num_workers=0 so mixed loss denominators can "
+                "be computed for the exact optimizer batch."
+            )
+        if (
+            self.orchestrator.custom_rollout_function
+            == "wavelet.orchestrator.verifiers:generate_rollouts"
+            and self.orchestrator.verifier_client_type
+            != "openai_chat_completions_token"
+        ):
+            raise ValueError(
+                "OPD verifier rollouts require "
+                "orchestrator.verifier_client_type='openai_chat_completions_token' "
+                "for exact teacher-logprob alignment."
             )
         return self
 

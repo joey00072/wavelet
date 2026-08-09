@@ -147,10 +147,15 @@ function SampleHeader({ label, sample }: { label: string; sample: RolloutSample 
       </div>
       <div className="flex flex-wrap gap-2">
         {[
+          sample.source ? `source ${sample.source}` : null,
+          ...(sample.loss_components ?? []).map((component) =>
+            component === "ref_kl" ? "loss REF-KL" : `loss ${component.toUpperCase()}`,
+          ),
+          sample.has_ref_logprobs ? "reference aligned" : null,
           `example ${sample.example_id ?? "–"}`,
           `${sample.completion_token_count ?? "–"} tokens`,
           sample.stop_condition ?? "–",
-        ].map((t) => (
+        ].filter((value): value is string => value !== null).map((t) => (
           <span key={t} className="rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[10px] text-slate-500 dark:border-white/[0.06] dark:bg-white/[0.02] dark:text-slate-400">
             {t}
           </span>

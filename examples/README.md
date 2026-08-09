@@ -6,7 +6,7 @@ that are expected to run on this host.
 | Example | Status | Notes |
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL. |
-| `reverse_text` | working | 0.6B LoRA RL with explicit GRPO plus SFT config; includes a 2-GPU INT4 QLoRA 4B experiment. |
+| `reverse_text` | working | 0.6B LoRA RL with GRPO and SFT configs; includes mixed GRPO+OPD and a 2-GPU INT4 QLoRA 4B experiment. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
 | `hendrycks_sanity` | runnable | 1.5B math sanity config. |
@@ -38,6 +38,11 @@ The canonical named-algorithm example is `examples/reverse_text/rl.yaml`. Its
 `algo` block can be changed to `type: max_rl` to use mean-normalized MaxRL
 advantages while keeping the same rollout and trainer path. See
 [RL algorithms](../docs/algorithms.md) for the full configuration contract.
+
+`examples/reverse_text/rl_mixed_grpo_opd.yaml` runs GRPO and OPD sources
+against one student. Start its frozen teacher on port 8001 first, as documented
+in the algorithm guide. The example uses one LoRA adapter; source-local
+teachers do not create additional adapters.
 
 Environment-specific blockers found locally:
 

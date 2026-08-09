@@ -8,29 +8,33 @@ import pytest
 from wavelet.configs.rl_config import (
     AlgorithmScope,
     CustomAlgorithmConfig,
+    FrozenModelConfig,
     GRPOAlgorithmConfig,
     MaxRLAlgorithmConfig,
+    OPDAlgorithmConfig,
     PassthroughAlgorithmConfig,
+    RewardAlgorithmConfig,
     RLAlgorithmConfig,
     RLConfig,
-    RewardAlgorithmConfig,
 )
 from wavelet.data.rl_dataset import RLExample
 from wavelet.orchestrator.algorithms import (
     BaseAlgorithm,
     GRPOAlgorithm,
     MaxRLAlgorithm,
+    OPDAlgorithm,
     PassthroughAlgorithm,
     RewardAlgorithm,
+    algorithm_config_for_source,
     algorithm_epsilon,
     algorithm_scope,
     build_algorithm,
     register_algorithm,
     score_algorithm_records,
+    score_records_by_source,
     uses_group_advantages,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
-
 
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
 
@@ -110,6 +114,55 @@ def test_max_rl_algorithm_zeroes_groups_without_success() -> None:
     assert [record.advantage for record in scored] == pytest.approx([0.0, 0.0])
 
 
+class _FakeReferenceScorer:
+    def __init__(self) -> None:
+        self.token_ids: list[int] | None = None
+
+    def score(self, token_ids: list[int]) -> list[float]:
+        self.token_ids = token_ids
+        return [0.0, -0.1, -0.2, -0.3]
+
+
+def test_opd_scores_shifted_tokens_and_selects_trainable_logprobs() -> None:
+    config = OPDAlgorithmConfig(
+        teacher=FrozenModelConfig(
+            name="teacher",
+            base_url="http://teacher:8000/v1",
+        )
+    )
+    scorer = _FakeReferenceScorer()
+    algorithm = OPDAlgorithm(config, scorer=scorer)
+    record = replace(
+        _example(reward=None),
+        input_ids=[10, 11, 12],
+        target_ids=[11, 12, 13],
+        loss_mask=[False, True, True],
+    )
+
+    scored = algorithm.score_rollout(record)
+
+    assert scorer.token_ids == [10, 11, 12, 13]
+    assert scored.ref_logprobs == pytest.approx([-0.2, -0.3])
+    assert scored.advantage is None
+    assert scored.rl_weights == 0.0
+    assert scored.ref_kl_weights == 1.0
+
+
+def test_opd_rejects_unshifted_token_streams() -> None:
+    config = OPDAlgorithmConfig(
+        teacher=FrozenModelConfig(name="teacher", base_url="http://teacher:8000")
+    )
+    record = replace(
+        _example(reward=None),
+        input_ids=[10, 99],
+        target_ids=[11, 12],
+        loss_mask=[True, True],
+    )
+
+    with pytest.raises(ValueError, match="causal shifted"):
+        OPDAlgorithm(config, scorer=_FakeReferenceScorer()).score_rollout(record)
+
+
 @pytest.mark.parametrize(
     ("config", "expected_type", "expected_scope"),
     [
@@ -177,6 +230,64 @@ def test_file_algorithm_config_infers_custom_type() -> None:
     assert config.algo.type == "custom"
 
 
+def test_source_local_algorithm_overrides_run_default() -> None:
+    config = RLConfig(
+        algo={"type": "grpo"},
+        orchestrator={
+            "train_sources": [
+                {"name": "direct-reward", "algo": {"type": "reward"}},
+            ]
+        },
+    )
+    records = [
+        replace(_example(reward=1.0), source="grpo"),
+        replace(_example(reward=0.0), source="grpo"),
+        replace(_example(reward=3.0), source="direct-reward"),
+    ]
+
+    scored = score_records_by_source(config, records)
+
+    assert [record.advantage for record in scored] == pytest.approx([0.5, -0.5, 3.0])
+    assert algorithm_config_for_source(config, "grpo").type == "grpo"
+    assert algorithm_config_for_source(config, "direct-reward").type == "reward"
+
+
+def test_opd_config_is_available_as_source_override() -> None:
+    config = RLConfig(
+        orchestrator={
+            "train_sources": [
+                {
+                    "name": "math",
+                    "algo": {
+                        "type": "opd",
+                        "teacher": {
+                            "name": "math-teacher",
+                            "base_url": "http://teacher:8001/v1",
+                        },
+                    },
+                }
+            ]
+        }
+    )
+
+    algorithm_config = algorithm_config_for_source(config, "math")
+
+    assert isinstance(algorithm_config, OPDAlgorithmConfig)
+    assert algorithm_config.teacher.name == "math-teacher"
+
+
+def test_train_source_names_must_be_unique() -> None:
+    with pytest.raises(ValueError, match="must be unique"):
+        RLConfig(
+            orchestrator={
+                "train_sources": [
+                    {"name": "math"},
+                    {"name": "math"},
+                ]
+            }
+        )
+
+
 def test_custom_algorithm_rejects_missing_file(tmp_path: Path) -> None:
     config = CustomAlgorithmConfig(
         file=tmp_path / "missing.py",
@@ -230,6 +341,20 @@ def test_custom_algorithm_supports_registered_factory() -> None:
     )
 
     assert scored[0].advantage == pytest.approx(3.0)
+
+
+def test_custom_file_algorithm_selects_trainer_loss_component() -> None:
+    config = _custom_config("ce_actions", scope="rollout")
+
+    scored = score_algorithm_records(
+        build_algorithm(config),
+        [_example(reward=None)],
+        scope=config.scope,
+    )
+
+    assert scored[0].rl_weights == 0.0
+    assert scored[0].ce_weights == 1.0
+    assert scored[0].ref_kl_weights == 0.0
 
 
 def test_custom_algorithm_rejects_duplicate_registration() -> None:
@@ -313,6 +438,55 @@ def test_group_scope_preserves_fully_pre_scored_records() -> None:
     )
 
     assert scored == records
+
+
+def test_external_algorithm_action_loss_type_selects_ce_stream() -> None:
+    class CEAlgorithm(BaseAlgorithm):
+        action_loss_type = "ce"
+
+    scored = score_algorithm_records(
+        CEAlgorithm(),
+        [_example(reward=None)],
+        scope="rollout",
+    )
+
+    assert scored[0].rl_weights == 0.0
+    assert scored[0].ce_weights == 1.0
+    assert scored[0].ref_kl_weights == 0.0
+
+
+def test_external_algorithm_rejects_unknown_action_loss_type() -> None:
+    class InvalidAlgorithm(BaseAlgorithm):
+        action_loss_type = "unknown"  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="action_loss_type"):
+        score_algorithm_records(
+            InvalidAlgorithm(),
+            [_example(reward=1.0)],
+            scope="rollout",
+        )
+
+
+def test_external_algorithm_runs_setup_and_close_lifecycle() -> None:
+    class LifecycleAlgorithm(BaseAlgorithm):
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        def setup(self) -> None:
+            self.events.append("setup")
+
+        def score_rollout(self, record: RLExample) -> RLExample:
+            self.events.append("score")
+            return record
+
+        def close(self) -> None:
+            self.events.append("close")
+
+    algorithm = LifecycleAlgorithm()
+
+    score_algorithm_records(algorithm, [_example(reward=1.0)], scope="rollout")
+
+    assert algorithm.events == ["setup", "score", "close"]
 
 
 @pytest.mark.parametrize("name", ["", "  ", " surrounded "])

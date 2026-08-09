@@ -9,17 +9,20 @@ from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+
 from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
 from wavelet.data.rl import RLExample
-from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.advantage import (
     output_completion_token_count,
     output_tool_response_token_count,
 )
+from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.algorithms import (
+    algorithm_config_for_source,
     algorithm_epsilon,
     algorithm_scope,
     build_algorithm,
+    requires_tokenized_records,
     score_algorithm_records,
     uses_group_advantages,
 )
@@ -27,7 +30,6 @@ from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.patches import apply_verifier_openai_patches
 from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
 from wavelet.orchestrator.rollouts import RLOrchestrator
-
 
 _ENV_CACHE: dict[tuple[str, str], Any] = {}
 
@@ -676,6 +678,8 @@ def _assign_group_advantages(
 ) -> None:
     if not outputs:
         return
+    if requires_tokenized_records(algorithm_config):
+        return
     algorithm = build_algorithm(algorithm_config)
     records = [_algorithm_record_from_output(output) for output in outputs]
     scored = score_algorithm_records(
@@ -762,11 +766,13 @@ def _mark_zero_advantage_records_metric_only(
 ) -> list[RLExample]:
     if not config.orchestrator.filter_zero_advantage:
         return records
-    if not uses_group_advantages(config.algo):
-        return records
-    epsilon = algorithm_epsilon(config.algo)
     marked: list[RLExample] = []
     for record in records:
+        algorithm_config = algorithm_config_for_source(config, record.source)
+        if not uses_group_advantages(algorithm_config):
+            marked.append(record)
+            continue
+        epsilon = algorithm_epsilon(algorithm_config)
         if record.advantage is not None and abs(float(record.advantage)) > epsilon:
             marked.append(record)
             continue

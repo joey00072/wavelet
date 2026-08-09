@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from wavelet.configs.rl_config import RLDataConfig
-from wavelet.data.rl_dataset import PackedRLDataset, RLExample, prepare_rl_sample
+from wavelet.data.rl import (
+    PackedRLDataset,
+    RLExample,
+    pack_samples,
+    prepare_rl_sample,
+)
 
 
 def _record(index: int, *, length: int = 6) -> RLExample:
@@ -152,3 +157,70 @@ def test_pretokenized_rollout_count_metadata_sets_sample_count() -> None:
 
     assert sample is not None
     assert sample["sample_count"] == 0
+
+
+def test_opd_sample_does_not_require_scalar_advantage() -> None:
+    record = _record(0)
+    record.advantage = None
+    record.reward = None
+    record.ref_logprobs = [-0.5] * len(record.loss_mask)
+    record.rl_weights = 0.0
+    record.ref_kl_weights = 1.0
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sample["advantages"] == [0.0] * len(record.loss_mask)
+    assert sample["rl_weights"] == [0.0] * len(record.loss_mask)
+    assert sample["ref_kl_weights"] == [1.0] * len(record.loss_mask)
+
+
+def test_ref_kl_weights_require_reference_logprobs() -> None:
+    record = _record(0)
+    record.advantage = None
+    record.reward = None
+    record.rl_weights = 0.0
+    record.ref_kl_weights = 1.0
+
+    with pytest.raises(ValueError, match="require ref_logprobs"):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )
+
+
+def test_packing_preserves_mixed_grpo_and_opd_components() -> None:
+    grpo = prepare_rl_sample(
+        _record(0, length=2),
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+    opd_record = _record(1, length=2)
+    opd_record.advantage = None
+    opd_record.reward = None
+    opd_record.ref_logprobs = [-0.5, -0.5]
+    opd_record.rl_weights = 0.0
+    opd_record.ref_kl_weights = 1.0
+    opd = prepare_rl_sample(
+        opd_record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert grpo is not None
+    assert opd is not None
+    packed = pack_samples([grpo, opd], seq_len=8, pad_to_multiple_of=1)
+
+    assert len(packed) == 1
+    assert sorted(packed[0]["rl_weights"]) == [0.0, 0.0, 1.0, 1.0]
+    assert sorted(packed[0]["ref_kl_weights"]) == [0.0, 0.0, 1.0, 1.0]
+    assert sorted(packed[0]["ref_logprobs"]) == [-0.5, -0.5, 0.0, 0.0]

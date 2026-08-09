@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import random
+from pathlib import Path
 from types import MethodType
 from typing import Any
 
@@ -13,19 +13,20 @@ from wavelet.configs.rl_config import GRPOAlgorithmConfig, RLConfig
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.verifiers import (
-    _PendingVerifierRequest,
-    _VerifierGroupState,
+    MultiVerifierRolloutScheduler,
     VerifierRolloutScheduler,
     _assign_rollout_advantages,
     _completed_group_outputs,
     _is_usable_training_group,
     _load_cached_env,
+    _PendingVerifierRequest,
     _records_from_output,
     _run_all,
     _run_group,
     _sampling_args,
     _successful_rollout_outputs,
     _verifier_extra_env_kwargs,
+    _VerifierGroupState,
 )
 
 
@@ -416,6 +417,43 @@ def test_verifier_scheduler_samples_records_randomly_with_replacement() -> None:
     selected = [scheduler._next_record().source for _ in range(8)]  # noqa: SLF001
 
     assert selected == ["0", "2", "0", "3", "2", "0", "0", "3"]
+
+
+def test_multi_verifier_scheduler_preserves_configured_source_identity() -> None:
+    class DummyScheduler:
+        target_groups = 1
+
+        async def generate_batch(self, *, target_groups: int) -> list[RLExample]:
+            assert target_groups == 1
+            return [
+                RLExample(
+                    prompt=[],
+                    completion=[],
+                    advantage=1.0,
+                    reward=1.0,
+                    source="actual-env",
+                )
+            ]
+
+    config = RLConfig(
+        orchestrator={
+            "train_sources": [
+                {
+                    "name": "configured-source",
+                    "verifier_env_id": "actual-env",
+                }
+            ]
+        }
+    )
+    scheduler = object.__new__(MultiVerifierRolloutScheduler)
+    scheduler.sources = config.orchestrator.train_sources
+    scheduler.schedulers = [DummyScheduler()]
+    scheduler._rotation = 0
+
+    records = asyncio.run(scheduler.generate_batch(target_groups=1))
+
+    assert records[0].source == "configured-source"
+    assert records[0].metadata == {"environment_name": "actual-env"}
 
 
 def test_verifier_scheduler_uses_explicit_pending_chunk_limit() -> None:
