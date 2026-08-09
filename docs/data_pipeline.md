@@ -6,28 +6,27 @@ boundary that owns it and keeps trainer code independent of file formats.
 
 ## SFT Flow
 
-`wavelet.data.loading` reads local JSON/JSONL, Hugging Face datasets, or fake
-data and normalizes each row into an `Example`. `wavelet.data.tokenization`
-then applies the chat template and constructs token-aligned loss masks.
-`wavelet.data.dataset` owns iteration and SFT packing.
+`wavelet.data.sft` reads local JSON/JSONL, Hugging Face datasets, or fake data,
+normalizes each row into an `Example`, applies the chat template, constructs
+token-aligned loss masks, and owns SFT iteration and collation.
 
 ## RL Flow
 
-RL records use `RLExample` from `wavelet.data.rl_types`. The stages are:
+RL records use `RLExample` from `wavelet.data.rl`. The stages are:
 
 1. `load_data_payloads` reads and mixes raw rows.
 2. `load_rl_records` normalizes RL-specific reward, advantage, logprob, and
    metadata fields.
 3. `prepare_rl_sample` tokenizes message rows or validates pre-tokenized rows.
-4. `wavelet.data.rl_packing` packs prepared samples and equalizes distributed
+4. RL packing helpers pack prepared samples and equalize distributed
    bin counts with explicit zero-loss samples.
 5. `collate_rl_batch` pads a local micro-batch and aligns trainable-token value
    streams with the full token sequence.
 
-Existing imports from `wavelet.data.rl_dataset` remain supported. New code
-should import serialization types from `wavelet.data.rl_types`, collation from
-`wavelet.data.rl_collation`, and packing helpers from
-`wavelet.data.rl_packing` when it needs those focused contracts directly.
+Existing imports from `wavelet.data.rl_dataset`, `rl_types`, `rl_collation`, and
+`rl_packing` remain supported as compatibility wrappers. New code should import
+the canonical RL surface from `wavelet.data.rl`; use `wavelet.data.sft` for SFT
+records, tokenization, collation, and datasets.
 
 ## Pretokenized RL Rows
 

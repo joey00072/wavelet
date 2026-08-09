@@ -14,7 +14,7 @@ from wavelet.configs.rl_config import (
     RLAlgorithmConfig,
     RewardAlgorithmConfig,
 )
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 from wavelet.orchestrator.advantage import (
     group_reward_advantages,
     length_penalty_cost_for_record,

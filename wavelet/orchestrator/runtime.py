@@ -26,8 +26,9 @@ from wavelet.orchestrator.placement import (
     trainer_device_group as _trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.scheduler import IntegratedRolloutScheduler
 from wavelet.trainer.rl_trainer import RLTrainer
-from wavelet.orchestrator.queue import (
+from wavelet.transport.queue import (
     FileSystemPolicyReceiver,
     FileSystemRolloutReceiver,
     RolloutBatch,
@@ -195,7 +196,7 @@ def _publish_rollout_timed(
     return batch, perf_counter() - started_at
 
 
-def _run_sync_rollout_loop(
+def _run_rollout_loop(
     config: RLConfig,
     *,
     trainer: RLTrainer,
@@ -203,35 +204,48 @@ def _run_sync_rollout_loop(
     policy_receiver: FileSystemPolicyReceiver,
     inference_engine,
     orchestrator: RLOrchestrator,
+    pipelined: bool,
 ) -> None:
     target_step = _target_steps(config)
-    while trainer.step < target_step:
-        timings = StepTimes(started_at=perf_counter())
-        timings.update_weights = _load_policy_for_step(
-            config,
-            policy_receiver,
-            inference_engine,
-            step=trainer.step,
-        )
-        timings.generate_completions = _publish_rollout_timed(
-            orchestrator,
-            step=trainer.step,
-            inference_engine=inference_engine,
-        )[1]
-        _consume_and_train_step(trainer, receiver, timings)
-        _log_step_times(trainer, timings)
+    if not pipelined:
+        timings: StepTimes | None = None
 
+        def prepare_policy(step: int) -> None:
+            nonlocal timings
+            timings = StepTimes(started_at=perf_counter())
+            timings.update_weights = _load_policy_for_step(
+                config,
+                policy_receiver,
+                inference_engine,
+                step=step,
+            )
 
-def _run_async_rollout_loop(
-    config: RLConfig,
-    *,
-    trainer: RLTrainer,
-    receiver: FileSystemRolloutReceiver,
-    policy_receiver: FileSystemPolicyReceiver,
-    inference_engine,
-    orchestrator: RLOrchestrator,
-) -> None:
-    target_step = _target_steps(config)
+        def publish(step: int) -> None:
+            assert timings is not None
+            timings.generate_completions = _publish_rollout_timed(
+                orchestrator,
+                step=step,
+                inference_engine=inference_engine,
+            )[1]
+
+        def consume_and_train() -> None:
+            assert timings is not None
+            _consume_and_train_step(trainer, receiver, timings)
+
+        def after_step() -> None:
+            assert timings is not None
+            _log_step_times(trainer, timings)
+
+        IntegratedRolloutScheduler(
+            target_step=target_step,
+            current_step=lambda: trainer.step,
+            prepare_policy=prepare_policy,
+            publish=publish,
+            consume_and_train=consume_and_train,
+            after_step=after_step,
+        ).run()
+        return
+
     with ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="wavelet-rollout"
     ) as pool:
@@ -249,9 +263,7 @@ def _run_async_rollout_loop(
         )
         while trainer.step < target_step:
             if pending is None:
-                raise RuntimeError(
-                    "Async rollout loop lost its pending rollout future."
-                )
+                raise RuntimeError("Rollout scheduler lost its pending future.")
             timings = StepTimes(started_at=perf_counter())
             wait_started_at = perf_counter()
             _published, timings.generate_completions = pending.result()
@@ -549,27 +561,19 @@ def _run_integrated_launcher(config: RLConfig) -> int:
         orchestrator = RLOrchestrator(config)
         try:
             trainer.export_policy(step=trainer.step)
-            if (
+            pipelined = (
                 config.orchestrator.max_async_level > 0
                 and config.orchestrator.max_off_policy_steps > 0
-            ):
-                _run_async_rollout_loop(
-                    config,
-                    trainer=trainer,
-                    receiver=receiver,
-                    policy_receiver=policy_receiver,
-                    inference_engine=inference_engine,
-                    orchestrator=orchestrator,
-                )
-            else:
-                _run_sync_rollout_loop(
-                    config,
-                    trainer=trainer,
-                    receiver=receiver,
-                    policy_receiver=policy_receiver,
-                    inference_engine=inference_engine,
-                    orchestrator=orchestrator,
-                )
+            )
+            _run_rollout_loop(
+                config,
+                trainer=trainer,
+                receiver=receiver,
+                policy_receiver=policy_receiver,
+                inference_engine=inference_engine,
+                orchestrator=orchestrator,
+                pipelined=pipelined,
+            )
         except Exception:
             trainer.finalize(status="failed")
             raise

@@ -95,6 +95,27 @@ def _run_role_subprocess(
         return int(process.wait())
 
 
+def _start_local_role(
+    spec: RoleSpec,
+    *,
+    output_dir: Path,
+) -> tuple[subprocess.Popen, TextIO]:
+    log_file = _log_path(output_dir, spec.log_name).open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        _role_command(
+            spec.command,
+            spec.config_path,
+            torchrun_nproc_per_node=spec.torchrun_nproc_per_node,
+        ),
+        cwd=Path.cwd(),
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=_role_env(spec.cuda_visible_devices),
+        start_new_session=True,
+    )
+    return process, log_file
+
+
 class LocalRoleHandle:
     def __init__(self, spec: RoleSpec, process: subprocess.Popen, log_file: TextIO):
         self.spec = spec
@@ -146,21 +167,7 @@ class LocalRoleLauncher:
         self.output_dir = output_dir
 
     def start(self, spec: RoleSpec) -> LocalRoleHandle:
-        log_path = _log_path(self.output_dir, spec.log_name)
-        log_file = log_path.open("w", encoding="utf-8")
-        command_args = _role_command(
-            spec.command,
-            spec.config_path,
-            torchrun_nproc_per_node=spec.torchrun_nproc_per_node,
-        )
-        process = subprocess.Popen(
-            command_args,
-            cwd=Path.cwd(),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            env=_role_env(spec.cuda_visible_devices),
-            start_new_session=True,
-        )
+        process, log_file = _start_local_role(spec, output_dir=self.output_dir)
         return LocalRoleHandle(spec, process, log_file)
 
 

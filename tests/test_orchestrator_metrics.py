@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 
 import pytest
@@ -69,6 +71,11 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
         )
     )
 
+    serialized = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
+    assert hashlib.sha256(serialized.encode()).hexdigest() == (
+        "d07682cf864d09be205ad8969d96c24958bb5684d5fab47ae8a9374ef0962ffc"
+    )
+
     assert metrics["progress/samples"] == 4
     assert metrics["progress/problems"] == 3
     assert metrics["progress/tokens"] == 11
@@ -118,7 +125,19 @@ def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:
 
     trace_path = tmp_path / "traces" / "step-000004.jsonl"
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    metrics_row = json.loads(
+        (tmp_path / "orchestrator_metrics.jsonl").read_text(encoding="utf-8")
+    )
+    with (tmp_path / "orchestrator_metrics.csv").open(
+        newline="",
+        encoding="utf-8",
+    ) as handle:
+        csv_rows = list(csv.DictReader(handle))
     assert metrics["progress/samples"] == 1
+    assert metrics_row["step"] == 4
+    assert metrics_row["progress/queue_step"] == 5.0
+    assert csv_rows[0]["step"] == "4.0"
+    assert csv_rows[0]["progress/queue_step"] == "5.0"
     assert trace["event"] == "rollout_metrics_logged"
     assert trace["subsystem"] == "orchestrator"
     assert trace["task"] == "reverse-text"

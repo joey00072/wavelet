@@ -287,3 +287,33 @@ def test_preflight_reports_qlora_topology_errors(tmp_path, monkeypatch) -> None:
         check["name"] for check in report["checks"] if check["status"] == "error"
     }
     assert {"qlora_fsdp", "qlora_tensor_parallel"} <= error_names
+
+
+def test_qlora_check_json_contract_is_stable(tmp_path, monkeypatch) -> None:
+    data_path = _write_local_data(tmp_path)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        lambda name: object() if name == "bitsandbytes" else None,
+    )
+    report = build_preflight_report(
+        RLConfig(
+            data={"source": "local", "path": data_path},
+            model={"load_in_4bit": True},
+            output_dir=tmp_path / "run",
+            reward={"mode": "math_format"},
+        )
+    )
+    checks = {
+        item["name"]: item
+        for item in report["checks"]
+        if item["name"].startswith("qlora_") or item["name"] == "bitsandbytes_available"
+    }
+
+    assert {name: item["status"] for name, item in checks.items()} == {
+        "bitsandbytes_available": "ok",
+        "qlora_adapter": "ok",
+        "qlora_colocate_sleep": "ok",
+        "qlora_fsdp": "ok",
+    }
+    expected_keys = {"name", "status", "message", "details"}
+    assert all(set(item) == expected_keys for item in checks.values())

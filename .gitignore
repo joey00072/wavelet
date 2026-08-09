@@ -15,7 +15,7 @@ wheels/
 *.egg-info
 
 # Virtual environments and local secrets
-.venv/
+.venv
 .venvs/
 venv/
 env/

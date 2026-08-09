@@ -7,7 +7,7 @@ from wavelet.configs.rl_config import (
     TokensLengthPenaltyConfig,
     TurnsLengthPenaltyConfig,
 )
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 
 
 def group_reward_advantages(

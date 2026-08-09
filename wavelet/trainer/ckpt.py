@@ -21,7 +21,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from wavelet.configs.sft import CheckpointConfig
-from wavelet.distributed.world import World, barrier
+from wavelet.trainer.distributed import World, barrier
 from wavelet.utils.pathing import (
     STABLE_CHECKPOINT_MARKER,
     get_checkpoint_dir,

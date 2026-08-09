@@ -53,6 +53,24 @@ def test_sft_global_batch_must_divide_distributed_micro_batch() -> None:
         trainer._setup_accumulation_steps()  # noqa: SLF001
 
 
+def test_sft_gradient_clipping_uses_model_wrapper_operation() -> None:
+    trainer = SFTTrainer(SFTConfig(max_grad_norm=0.25))
+
+    class WrappedModel:
+        def __init__(self) -> None:
+            self.max_norm: float | None = None
+
+        def clip_grad_norm_(self, max_norm: float) -> torch.Tensor:
+            self.max_norm = max_norm
+            return torch.tensor(1.5)
+
+    model = WrappedModel()
+    trainer.model = model  # type: ignore[assignment]
+
+    assert trainer._clip_grad_norm() == 1.5  # noqa: SLF001
+    assert model.max_norm == 0.25
+
+
 def test_rl_batch_size_is_global_across_distributed_ranks() -> None:
     trainer = RLTrainer(
         RLConfig(

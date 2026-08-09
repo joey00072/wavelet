@@ -10,9 +10,9 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.orchestrator.rollout_worker import (
     _colocated_trainer_device_ids,
-    _use_streaming_native_scheduler,
     _wait_for_colocated_training_memory,
 )
+from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
 from wavelet.orchestrator.runtime import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
@@ -780,7 +780,7 @@ def test_native_process_rollouts_use_streaming_chunks() -> None:
         },
     )
 
-    assert _use_streaming_native_scheduler(config) is True
+    assert resolve_rollout_schedule(config).publish_mode is PublishMode.STREAMING
     assert _use_streaming_rollout_chunks(config) is True
 
 

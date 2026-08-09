@@ -5,12 +5,12 @@ from dataclasses import replace
 from pathlib import Path
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 
 
 def create_policy_inference_engine(config: RLConfig) -> PolicyInferenceEngine:
     if config.inference.mode == "vllm_http":
-        from wavelet.inference.http import HTTPPolicyInferenceEngine
+        from wavelet.inference.engine import HTTPPolicyInferenceEngine
 
         return HTTPPolicyInferenceEngine(config)
     if config.inference.mode == "passthrough":

@@ -9,22 +9,24 @@ filesystem artifacts carry state between independently restartable processes.
 | Area | Responsibility |
 | --- | --- |
 | `wavelet.configs` | Pydantic schemas, legacy input normalization, and cross-field validation |
-| `wavelet.data` | Source loading, message normalization, tokenization, packing, and collation |
+| `wavelet.data` | Canonical SFT and RL loading, normalization, tokenization, packing, and collation |
 | `wavelet.entrypoints` | Thin command adapters that load a subsystem's `main` function |
-| `wavelet.orchestrator` | Example selection, rollout scheduling, scoring, algorithms, queues, metrics, and run state |
+| `wavelet.orchestrator` | Example selection, rollout scheduling/sources, verifier environments, scoring, algorithms, metrics, and run state |
+| `wavelet.transport` | Filesystem rollout queues and filesystem/NCCL policy transfer |
 | `wavelet.inference` | Native and vLLM policy inference, HTTP clients, policy loading, and diagnostics |
-| `wavelet.trainer` | Model setup, RL/SFT training, loss calculation, checkpointing, and policy export |
-| `wavelet.distributed` | World and device-mesh construction plus distributed collectives |
+| `wavelet.trainer` | Model/LoRA and distributed setup, RL/SFT training, losses, optimization, and checkpointing |
+| `wavelet.distributed` | Compatibility imports for distributed APIs now owned by `wavelet.trainer.distributed` |
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
-| `wavelet.utils` | Configuration loading, monitoring, paths, and activation offloading |
+| `wavelet.utils` | Configuration loading and path helpers |
 
 Entrypoints contain no runtime behavior. A new command belongs in
 `wavelet.entrypoints`, while its configuration, lifecycle, and reusable
-behavior belong to the subsystem it invokes. RL launch supervision lives in
-`wavelet.orchestrator.runtime`, rollout-worker scheduling in
-`wavelet.orchestrator.rollout_worker`, inference serving in
-`wavelet.inference.server`, and trainer worker loops in
-`wavelet.trainer.rl_worker`.
+behavior belong to the subsystem it invokes. Shared rollout scheduling lives in
+`wavelet.orchestrator.scheduler`, verifier clients and evaluation in
+`wavelet.orchestrator.envs`, inference serving in `wavelet.inference.server`,
+and trainer behavior in `wavelet.trainer.trainer` and `wavelet.trainer.rl`.
+Historical module paths are retained as thin compatibility aliases where user
+code may still import them.
 
 ## RL Process Flow
 
@@ -44,8 +46,8 @@ source of truth for a completed batch or policy.
 
 ## Inference Scheduling
 
-`wavelet.orchestrator.rollout_worker` exposes three scheduling strategies with
-the same policy-loading contract:
+`wavelet.orchestrator.scheduler` owns the scheduling strategies behind one
+explicit source/publish-mode boundary:
 
 - Prefetch scheduling publishes complete optimizer-step batches in order.
 - Native chunk scheduling permits chunks to finish out of order while tracking
@@ -59,14 +61,17 @@ state server at the transition that actually occurred.
 
 ## Data Boundaries
 
-SFT and RL share raw-source loading and message normalization. RL-specific
-types, collation, and packing live in focused modules; see the
-[data pipeline guide](data_pipeline.md). Serialized `RLExample` payloads are the
-boundary between rollout generation, HTTP inference, queues, diagnostics, and
-training.
+`wavelet.data.sft` owns source loading, message normalization, tokenization,
+collation, and SFT datasets. `wavelet.data.rl` owns RL records, serialization,
+packing, collation, and datasets. Historical fine-grained imports remain
+supported; see the [data pipeline guide](data_pipeline.md). Serialized
+`RLExample` payloads are the boundary between rollout generation, HTTP
+inference, queues, diagnostics, and training.
 
 ## Policy Artifacts
 
+`wavelet.transport.policy` owns filesystem and NCCL policy transfer, while
+`wavelet.transport.queue` owns queue artifacts and lifecycle events.
 Filesystem policy exports use a temporary directory followed by an atomic
 rename and stable marker. Metadata is written beside the model or adapter. NCCL
 transfer uses the same metadata and readiness concepts, but broadcasts named

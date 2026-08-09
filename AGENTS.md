@@ -24,13 +24,16 @@ Guidance for coding agents working in this repository.
 - `wavelet/entrypoints/`: CLI entrypoints for RL, SFT, trainer, inference, and
   vLLM server processes.
 - `wavelet/configs/`: Pydantic config models and legacy normalization.
-- `wavelet/orchestrator/`: rollout generation, queues, state server, scheduling,
-  reward/verifier integration, and launcher utilities.
-- `wavelet/trainer/`: model loading, LoRA/QLoRA, RL loss, optimizer/scheduler,
-  checkpointing, and distributed trainer logic.
+- `wavelet/orchestrator/`: rollout scheduling and sources, verifier environments,
+  rewards, algorithms, metrics, state inspection, and launcher utilities.
+- `wavelet/transport/`: canonical filesystem queue and filesystem/NCCL policy
+  transport implementations. Legacy queue imports remain compatibility aliases.
+- `wavelet/trainer/`: model and LoRA/QLoRA setup, distributed world/mesh state,
+  SFT/RL trainers, losses, optimization, and checkpointing.
 - `wavelet/inference/`: vLLM integration, policy adapter loading, and inference
   serialization.
-- `wavelet/data/`: datasets, tokenization, collation, dataloaders, and JSONL helpers.
+- `wavelet/data/`: canonical `sft.py` and `rl.py` data pipelines; historical
+  fine-grained module paths remain compatibility wrappers.
 - `examples/`: runnable example configs and data-preparation helpers.
 - `tests/`: pytest suite.
 - `webui/`: lightweight run-state UI.
@@ -43,7 +46,7 @@ Guidance for coding agents working in this repository.
 
 - Python version: `>=3.11` (from `pyproject.toml`).
 - Use `uv` for environment and command execution.
-- Run commands from repository root: `/mnt/vast/joey/wavelet`.
+- Run commands from repository root: `/home/joey/workspace/wavelet`.
 - Prefer deterministic CLI invocations that can run in CI.
 
 ## Git and Credentials
@@ -266,7 +269,7 @@ small smoke config that can prove the pipeline before long runs.
 - If touching RL scheduling, rollout queues, policy sync, trainer stepping, or
   reward calculation, add or update tests in `tests/` that exercise the invariant.
 - If touching docs or agent guidance, ensure there are no stale project names,
-  stale paths, or instructions that point outside `/mnt/vast/joey/wavelet`.
+  stale paths, or instructions that point outside `/home/joey/workspace/wavelet`.
 - Keep commit messages focused on Wavelet behavior. Do not mention external
   reference repositories unless the user explicitly asks.
 
