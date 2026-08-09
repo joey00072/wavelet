@@ -11,7 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample, load_rl_records
+from wavelet.data.rl import RLExample, load_rl_records, serialize_rl_record
 from wavelet.inference.policy import RLInference
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
@@ -21,7 +21,7 @@ from wavelet.orchestrator.algorithms import (
     uses_group_advantages,
 )
 from wavelet.orchestrator.reward import RLRewardScorer
-from wavelet.orchestrator.queue import FileSystemRolloutSender, RolloutBatch
+from wavelet.transport.queue import FileSystemRolloutSender, RolloutBatch
 
 CustomRolloutFunction = Callable[
     ["RLOrchestrator", list[RLExample], object | None],
@@ -292,39 +292,12 @@ class RLOrchestrator:
         return output_path
 
     def _serialize_record(self, record: RLExample) -> dict[str, object]:
-        payload: dict[str, object] = {
-            self.config.data.prompt_column: record.prompt,
-            self.config.data.completion_column: record.completion,
-            "target_completion": record.target_completion,
-            "source": record.source,
-            "env_name": record.source,
-            "task": self.config.reward.mode,
-            "example_id": self._example_id(record),
-            self.config.data.advantage_column: record.advantage,
-            self.config.data.reward_column: record.reward,
-            self.config.data.temperature_column: record.temperatures,
-        }
-        if record.input_ids is not None:
-            payload["input_ids"] = record.input_ids
-        if record.target_ids is not None:
-            payload["target_ids"] = record.target_ids
-        if record.loss_mask is not None:
-            payload["loss_mask"] = record.loss_mask
-        if record.inference_logprobs is not None:
-            payload[self.config.data.inference_logprobs_column] = (
-                record.inference_logprobs
-            )
-        if record.teacher_logprobs is not None:
-            payload[self.config.data.teacher_logprobs_column] = record.teacher_logprobs
-        if record.tools is not None:
-            payload[self.config.data.tools_column] = record.tools
-        if record.chat_template_kwargs is not None:
-            payload[self.config.data.chat_template_kwargs_column] = (
-                record.chat_template_kwargs
-            )
-        if record.metadata is not None:
-            payload[self.config.data.metadata_column] = record.metadata
-        return payload
+        return serialize_rl_record(
+            record,
+            self.config.data,
+            task=self.config.reward.mode,
+            example_id=self._example_id(record),
+        )
 
     def _score_record(
         self,

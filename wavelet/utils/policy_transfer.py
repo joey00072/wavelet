@@ -1,4 +1,5 @@
-from __future__ import annotations
+"""Compatibility imports for the policy transport boundary."""
 
-NCCL_READY_MARKER = "NCCL_READY"
-NCCL_UPDATE_INFO_FILENAME = "update_info.json"
+from wavelet.transport.policy import NCCL_READY_MARKER, NCCL_UPDATE_INFO_FILENAME
+
+__all__ = ["NCCL_READY_MARKER", "NCCL_UPDATE_INFO_FILENAME"]

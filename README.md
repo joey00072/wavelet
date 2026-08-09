@@ -88,6 +88,12 @@ they claim filesystem batches.
 Inference policy receivers emit matching wait-time and payload-byte events when
 they observe exported policies.
 
+Implementation ownership is similarly explicit: `wavelet.transport` owns queue
+and policy transfer, `wavelet.orchestrator.scheduler` owns rollout scheduling,
+`wavelet.orchestrator.envs` owns verifier clients and evaluation, and
+`wavelet.data.sft` / `wavelet.data.rl` own the two data pipelines. Historical
+module paths remain import-compatible.
+
 For distributed trainer jobs, do not run `wavelet rl` under `torchrun`. Start one
 inference process and one trainer job:
 

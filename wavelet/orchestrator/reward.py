@@ -7,7 +7,7 @@ from functools import lru_cache
 from typing import Any
 
 from wavelet.configs.rl_config import RLRewardConfig
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 
 
 _NUMBER_RE = re.compile(
