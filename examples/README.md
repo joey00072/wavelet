@@ -37,7 +37,9 @@ Some verifier packages are Python 3.12-only. Use `uv run --python 3.12
 The canonical named-algorithm example is `examples/reverse_text/rl.yaml`. Its
 `algo` block can be changed to `type: max_rl` to use mean-normalized MaxRL
 advantages while keeping the same rollout and trainer path. See
-[RL algorithms](../docs/algorithms.md) for the full configuration contract.
+[RL algorithms](../docs/algorithms.md) for the full configuration contract. Its
+training and fixed-policy evaluation sampling both cap completions at 128 tokens
+so evaluation cannot consume the remaining model context by default.
 
 `examples/reverse_text/rl_mixed_grpo_opd.yaml` runs GRPO and OPD sources
 against one student. Start its frozen teacher on port 8001 first, as documented

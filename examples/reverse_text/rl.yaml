@@ -54,6 +54,8 @@ eval:
   rollouts_per_example: 3
   eval_base_model: false
   final_eval: false
+  sampling:
+    max_completion_tokens: 128
   env:
     - id: reverse-text
       name: reverse-text

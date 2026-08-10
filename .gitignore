@@ -53,7 +53,7 @@ webui/dist/
 
 # External reference checkouts and local notes
 ref/
-ref*
+/ref*
 .vscode/
 AGENT.md
 goal.md

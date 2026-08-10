@@ -8,7 +8,6 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import SFTConfig
 from wavelet.utils.serialization import load_yaml
 
-
 RL_CONFIGS = [
     path
     for path in sorted(Path("examples").rglob("*.yaml"))
@@ -208,6 +207,8 @@ def test_reverse_text_rl_matches_reference_core_hyperparams() -> None:
     assert config.orchestrator.examples_per_step == 128
     assert config.orchestrator.rollouts_per_example == 16
     assert config.inference.sampling.max_completion_tokens == 128
+    assert config.eval is not None
+    assert config.eval.sampling.max_completion_tokens == 128
     assert config.optim.lr == pytest.approx(3e-6)
 
 

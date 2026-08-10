@@ -18,6 +18,7 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import (
     PackedRLDataset,
     RLDataset,
+    RLExample,
     _normalize_rl_record,
     _pretokenized_sample,
     count_nonempty_jsonl_rows,
@@ -25,6 +26,14 @@ from wavelet.data.rl import (
     setup_rl_dataset,
 )
 from wavelet.data.sft import Example, build_sample
+from wavelet.orchestrator.schedule import chunks_per_step as _chunks_per_step
+from wavelet.orchestrator.schedule import target_steps as _target_steps
+from wavelet.trainer.distributed import barrier
+from wavelet.trainer.losses import compute_loss, selective_log_softmax
+from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.trainer import BaseTrainer
+from wavelet.trainer.types import LossOutput, TrainOutput
+from wavelet.transport.policy import PolicyExportMixin
 from wavelet.transport.queue import (
     FileSystemRolloutReceiver,
     RolloutBatch,
@@ -32,21 +41,8 @@ from wavelet.transport.queue import (
     record_rollout_claim,
     record_rollout_consumed,
 )
-from wavelet.orchestrator.schedule import (
-    chunks_per_step as _chunks_per_step,
-    target_steps as _target_steps,
-)
-from wavelet.trainer.trainer import BaseTrainer
-from wavelet.trainer.distributed import barrier
-from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
-from wavelet.trainer.losses import compute_loss, selective_log_softmax
-from wavelet.trainer.types import LossOutput, TrainOutput
-from wavelet.transport.policy import (
-    PolicyExportMixin,
-)
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
-
 
 logger = logging.getLogger(__name__)
 SUM_SYNCED_METRIC_KEYS = {
@@ -78,6 +74,23 @@ TRAIN_METRIC_ALIASES = {
     "is_masked_high": "dppo/is_masked_high",
     "advantage_mean": "advantage/token/mean",
 }
+
+
+def _missing_required_rl_target(record: RLExample) -> bool:
+    if record.advantage is not None or record.reward is not None:
+        return False
+    explicit_components = any(
+        weight is not None
+        for weight in (record.rl_weights, record.ce_weights, record.ref_kl_weights)
+    )
+    if not explicit_components:
+        return True
+    rl_weights = record.rl_weights
+    if rl_weights is None:
+        return False
+    if isinstance(rl_weights, list):
+        return any(float(weight) != 0.0 for weight in rl_weights)
+    return float(rl_weights) != 0.0
 
 
 def _scalar_or_json(value: object) -> object:
@@ -281,11 +294,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         metrics["progress/step"] = float(self.step)
         metrics["progress/micro_step"] = float(self._micro_step)
         self.monitor.log(metrics, self.step)
-        progress.set_postfix(
-            loss=f"{metrics['loss']:.4f}",
-            kl=f"{metrics['mismatch_kl']:.4f}",
-            lr=f"{metrics['lr']:.2e}",
-        )
+        postfix = {
+            "loss": f"{metrics['loss']:.4f}",
+            "lr": f"{metrics['lr']:.2e}",
+        }
+        if "mismatch_kl" in metrics:
+            postfix["kl"] = f"{metrics['mismatch_kl']:.4f}"
+        elif "ref_kl" in metrics:
+            postfix["ref_kl"] = f"{metrics['ref_kl']:.4f}"
+        progress.set_postfix(**postfix)
 
     def load_rollout_path(self, rollout_path: Path) -> None:
         rollout_path = Path(rollout_path)
@@ -580,6 +597,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if self.config.data.num_workers != 0:
             return None
         if not isinstance(self.dataset, (RLDataset, PackedRLDataset)):
+            return None
+        if any(_missing_required_rl_target(record) for record in self.dataset.records):
             return None
         local_scales = self.dataset.component_loss_scales_for_next_local_batch(
             self.accumulation_steps * self.config.data.micro_batch_size,

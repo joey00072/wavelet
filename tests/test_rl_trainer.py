@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import ModelConfig
+from wavelet.data.rl import RLDataset, RLExample
 from wavelet.distributed.world import World
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.model import _fsdp_mixed_precision
@@ -12,6 +15,7 @@ from wavelet.trainer.rl_trainer import (
     _packed_causal_attention_mask,
     _packed_training_attention_mask,
 )
+from wavelet.trainer.types import LossOutput, TrainOutput
 
 
 class _Config:
@@ -111,6 +115,81 @@ def test_gradient_accumulation_loss_scale_divides_grads_once() -> None:
     trainer._apply_gradient_accumulation_loss_scale()  # noqa: SLF001
 
     assert torch.allclose(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+
+
+def test_component_loss_scale_estimation_skips_unscored_prompt_rows() -> None:
+    config = RLConfig(data={"pack_sequences": False})
+    trainer = RLTrainer(config)
+    trainer.accumulation_steps = 1
+    trainer.dataset = RLDataset(
+        records=[
+            RLExample(
+                prompt=[{"role": "user", "content": "reverse me"}],
+                completion=[],
+                advantage=None,
+                reward=None,
+            )
+        ],
+        tokenizer=object(),  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config.data,
+    )
+
+    assert trainer._estimate_optimizer_component_loss_scales() is None
+
+
+def test_component_loss_scale_estimation_allows_rewardless_opd_rows() -> None:
+    config = RLConfig(data={"pack_sequences": False})
+    trainer = RLTrainer(config)
+    trainer.accumulation_steps = 1
+    trainer.dataset = RLDataset(
+        records=[
+            RLExample(
+                prompt=[],
+                completion=[],
+                advantage=None,
+                reward=None,
+                input_ids=[1, 2, 3],
+                target_ids=[2, 3, 4],
+                loss_mask=[True, True, True],
+                ref_logprobs=[-1.0, -1.0, -1.0],
+                rl_weights=0.0,
+                ref_kl_weights=1.0,
+            )
+        ],
+        tokenizer=object(),  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config.data,
+    )
+
+    assert trainer._estimate_optimizer_component_loss_scales() == {
+        "rl": 0.0,
+        "ce": 0.0,
+        "ref_kl": 3.0,
+    }
+
+
+def test_train_progress_uses_ref_kl_when_batch_has_no_grpo_metrics() -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.monitor = Mock()
+    trainer.step = 2
+    trainer._micro_step = 2
+    progress = Mock()
+    output = TrainOutput(
+        loss=LossOutput(torch.tensor(0.28)),
+        stepped=True,
+        step=2,
+        micro_step=2,
+        metrics={"loss": 0.28, "ref_kl": 0.125},
+    )
+
+    trainer._log_train_output(output, progress)
+
+    progress.set_postfix.assert_called_once_with(
+        loss="0.2800",
+        lr="0.00e+00",
+        ref_kl="0.1250",
+    )
 
 
 def test_packed_flash_attention_uses_varlen_position_ids() -> None:
