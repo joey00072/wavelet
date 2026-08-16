@@ -5,17 +5,27 @@ from __future__ import annotations
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
+
 import torch
 import torch.distributed
-from peft import PeftModel, prepare_model_for_kbit_training
+from peft import LoraConfig as PeftLoraConfig
+from peft import (
+    PeftModel,
+    TaskType,
+    get_peft_model,
+    get_peft_model_state_dict,
+    prepare_model_for_kbit_training,
+)
+from safetensors.torch import save_file as save_safetensors
 from torch import nn
-from torch.distributed.fsdp import CPUOffload, FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import (
+    CPUOffload,
     FullStateDictConfig,
     MixedPrecision,
     ShardingStrategy,
     StateDictType,
 )
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import (
@@ -27,22 +37,15 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 from transformers.utils import logging as transformers_logging
-from wavelet.configs.sft import FSDPConfig, ModelConfig
-from wavelet.trainer.distributed import ParallelDims, World
+
+from wavelet.configs.sft import FSDPConfig, LoRAConfig, ModelConfig
 from wavelet.trainer.debug import (
+    DEBUG_LORA_TARGET_MODULES,
     DEBUG_MODEL_NAME,
     build_debug_model,
     build_debug_tokenizer,
 )
-from peft import LoraConfig as PeftLoraConfig
-from peft import (
-    TaskType,
-    get_peft_model,
-    get_peft_model_state_dict,
-)
-from safetensors.torch import save_file as save_safetensors
-from wavelet.configs.sft import LoRAConfig
-from wavelet.trainer.debug import DEBUG_LORA_TARGET_MODULES
+from wavelet.trainer.distributed import ParallelDims, World
 
 
 def resolve_dtype(name: str) -> torch.dtype | str:
@@ -785,7 +788,7 @@ def save_lora_adapter_snapshot_from_fsdp(
     parallel_dims: ParallelDims | None = None,
 ) -> Path:
     """Save a PEFT LoRA adapter from an FSDP-wrapped model without a full state dict."""
-    unwrapped = _unwrap_model(model)
+    unwrapped = unwrap_model(model)
     if not isinstance(unwrapped, PeftModel):
         raise TypeError(
             "FSDP lightweight policy snapshots require a wrapped PeftModel."
@@ -811,7 +814,7 @@ def _save_lora_adapter_snapshot_from_fsdp_full_params(
     *,
     is_main_process: bool = True,
 ) -> Path:
-    unwrapped = _unwrap_model(model)
+    unwrapped = unwrap_model(model)
     if not isinstance(unwrapped, PeftModel):
         raise TypeError(
             "FSDP lightweight policy snapshots require a wrapped PeftModel."
@@ -1255,10 +1258,3 @@ def _align_lora_dtypes(model: nn.Module) -> None:
                         device=target_device,
                         dtype=target_dtype,
                     )
-
-
-def _unwrap_model(model: nn.Module) -> PreTrainedModel:
-    current = model
-    while hasattr(current, "module"):
-        current = cast(nn.Module, getattr(current, "module"))
-    return cast(PreTrainedModel, current)
