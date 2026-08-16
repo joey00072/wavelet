@@ -19,7 +19,7 @@ def test_fsdp_lora_snapshot_uses_sharded_lora_gather(monkeypatch, tmp_path: Path
     calls: dict[str, object] = {}
 
     monkeypatch.setattr(lora_utils, "PeftModel", _FakePeftModel)
-    monkeypatch.setattr(lora_utils, "_unwrap_model", lambda model: unwrapped)
+    monkeypatch.setattr(lora_utils, "unwrap_model", lambda model: unwrapped)
 
     def fake_gather(
         model: object,

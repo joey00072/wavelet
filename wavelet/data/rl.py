@@ -1,22 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any, NotRequired, TypedDict
-from torch import Tensor
-from wavelet.configs.rl_config import RLDataConfig
-from typing import cast
-import torch
 import random
-from collections import defaultdict
 from collections.abc import Iterator
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
-from torch.utils.data import IterableDataset, get_worker_info
+from typing import Any, NotRequired, TypedDict, cast
+
+import torch
+from torch import Tensor
+from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
+
+from wavelet.configs.rl_config import RLDataConfig
+from wavelet.data._stateful import StatefulDatasetMixin
 from wavelet.data.sft import (
     IGNORE_INDEX,
     Example,
+    Sample,
     build_sample,
     load_data_payloads,
     normalize_record,
@@ -627,7 +629,7 @@ def prepare_rl_sample(
     data_config: RLDataConfig,
     seq_len: int,
 ) -> RLSample | None:
-    base_sample = _pretokenized_sample(record, seq_len)
+    base_sample: Sample | RLSample | None = _pretokenized_sample(record, seq_len)
     if base_sample is None:
         base_sample = build_sample(
             Example(
@@ -710,7 +712,7 @@ def load_rl_records(config: RLDataConfig) -> list[RLExample]:
 
 
 @dataclass
-class RLDataset(IterableDataset[RLSample]):
+class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
     records: list[RLExample]
     tokenizer: PreTrainedTokenizerBase
     seq_len: int
@@ -721,34 +723,7 @@ class RLDataset(IterableDataset[RLSample]):
     data_world_size: int = 1
 
     def __post_init__(self) -> None:
-        self.step = 0
-        self.epoch = 0
-        self.num_samples: dict[str, int] = defaultdict(int)
-        self.num_tokens: dict[str, int] = defaultdict(int)
-        self.skipped = 0
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "step": self.step,
-            "epoch": self.epoch,
-            "num_samples": dict(self.num_samples),
-            "num_tokens": dict(self.num_tokens),
-            "skipped": self.skipped,
-        }
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.step = int(state_dict["step"])
-        self.epoch = int(state_dict["epoch"])
-        self.num_samples = defaultdict(int, state_dict.get("num_samples", {}))
-        self.num_tokens = defaultdict(int, state_dict.get("num_tokens", {}))
-        self.skipped = int(state_dict.get("skipped", 0))
-
-    def stats(self) -> dict[str, Any]:
-        return {
-            "samples": dict(self.num_samples),
-            "tokens": dict(self.num_tokens),
-            "skipped": self.skipped,
-        }
+        self._initialize_iteration_state()
 
     def loss_scale_for_next_local_batch(
         self,
@@ -790,21 +765,7 @@ class RLDataset(IterableDataset[RLSample]):
         return max(total, 1)
 
     def __iter__(self) -> Iterator[RLSample]:
-        num_examples = len(self.records)
-        if num_examples == 0:
-            return
-        data_rank, data_world_size = self._effective_data_partition()
-        while True:
-            next_step = self.step + 1
-            epoch = (next_step - 1) // num_examples
-            if epoch != self.epoch:
-                self.epoch = epoch
-            sample_index = (next_step - 1) % num_examples
-            self.step = next_step
-            if (next_step - 1) % data_world_size != data_rank:
-                continue
-
-            record_index = self._order_for_epoch(epoch)[sample_index]
+        for record_index in self._local_record_indexes():
             record = self.records[record_index]
             sample = prepare_rl_sample(
                 record,
@@ -816,30 +777,12 @@ class RLDataset(IterableDataset[RLSample]):
                 self.skipped += 1
                 continue
 
-            source = record.source or "dataset"
-            self.num_samples[source] += 1
-            self.num_tokens[source] += len(sample["input_ids"])
+            self._record_sample(record.source, len(sample["input_ids"]))
             yield sample
-
-    def _order_for_epoch(self, epoch: int) -> list[int]:
-        order = list(range(len(self.records)))
-        if self.shuffle:
-            rng = random.Random(self.seed + epoch)
-            rng.shuffle(order)
-        return order
-
-    def _effective_data_partition(self) -> tuple[int, int]:
-        worker_info = get_worker_info()
-        if worker_info is None:
-            return self.data_rank, self.data_world_size
-        return (
-            self.data_rank * worker_info.num_workers + worker_info.id,
-            self.data_world_size * worker_info.num_workers,
-        )
 
 
 @dataclass
-class PackedRLDataset(IterableDataset[RLSample]):
+class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
     records: list[RLExample]
     tokenizer: PreTrainedTokenizerBase
     seq_len: int
@@ -850,36 +793,9 @@ class PackedRLDataset(IterableDataset[RLSample]):
     data_world_size: int = 1
 
     def __post_init__(self) -> None:
-        self.step = 0
-        self.epoch = 0
-        self.num_samples: dict[str, int] = defaultdict(int)
-        self.num_tokens: dict[str, int] = defaultdict(int)
-        self.skipped = 0
+        self._initialize_iteration_state()
         self._epoch_bins: dict[int, list[RLSample]] = {}
         self._epoch_global_bins: dict[int, list[RLSample]] = {}
-
-    def state_dict(self) -> dict[str, Any]:
-        return {
-            "step": self.step,
-            "epoch": self.epoch,
-            "num_samples": dict(self.num_samples),
-            "num_tokens": dict(self.num_tokens),
-            "skipped": self.skipped,
-        }
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.step = int(state_dict["step"])
-        self.epoch = int(state_dict["epoch"])
-        self.num_samples = defaultdict(int, state_dict.get("num_samples", {}))
-        self.num_tokens = defaultdict(int, state_dict.get("num_tokens", {}))
-        self.skipped = int(state_dict.get("skipped", 0))
-
-    def stats(self) -> dict[str, Any]:
-        return {
-            "samples": dict(self.num_samples),
-            "tokens": dict(self.num_tokens),
-            "skipped": self.skipped,
-        }
 
     def micro_batch_count(self) -> int:
         return max(len(self._bins_for_epoch(self.epoch)), 1)
@@ -930,12 +846,8 @@ class PackedRLDataset(IterableDataset[RLSample]):
         if cached is not None:
             return cached
 
-        order = list(range(len(self.records)))
-        if self.shuffle:
-            rng = random.Random(self.seed + epoch)
-            rng.shuffle(order)
         samples: list[RLSample] = []
-        for record_index in order:
+        for record_index in self._order_for_epoch(epoch):
             record = self.records[record_index]
             sample = prepare_rl_sample(
                 record,
@@ -946,9 +858,7 @@ class PackedRLDataset(IterableDataset[RLSample]):
             if sample is None:
                 self.skipped += 1
                 continue
-            source = record.source or "dataset"
-            self.num_samples[source] += 1
-            self.num_tokens[source] += len(sample["input_ids"])
+            self._record_sample(record.source, len(sample["input_ids"]))
             samples.append(sample)
 
         packed = pack_samples(
@@ -963,15 +873,6 @@ class PackedRLDataset(IterableDataset[RLSample]):
         )
         self._epoch_global_bins[epoch] = packed
         return packed
-
-    def _effective_data_partition(self) -> tuple[int, int]:
-        worker_info = get_worker_info()
-        if worker_info is None:
-            return self.data_rank, self.data_world_size
-        return (
-            self.data_rank * worker_info.num_workers + worker_info.id,
-            self.data_world_size * worker_info.num_workers,
-        )
 
 
 class FakeRLDataset(IterableDataset[RLSample]):
