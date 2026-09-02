@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from unittest.mock import Mock
+
+import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.rollout_worker import (
@@ -12,6 +16,8 @@ from wavelet.orchestrator.schedule import (
     policy_step_to_load,
     required_policy_step,
 )
+from wavelet.trainer.distributed import World
+from wavelet.transport.policy import PolicyExportMixin
 
 
 class _PolicyReceiver:
@@ -20,6 +26,10 @@ class _PolicyReceiver:
 
     def available_steps(self) -> list[int]:
         return self.steps
+
+
+class _PolicyExporter(PolicyExportMixin):
+    pass
 
 
 def _config() -> RLConfig:
@@ -132,6 +142,33 @@ def test_policy_selection_uses_initial_export_when_allowed() -> None:
         )
         == 0
     )
+
+
+def test_checkpoint_resume_can_force_export_between_intervals() -> None:
+    config = RLConfig(policy_transfer={"export_every_steps": 4})
+    config = config.model_copy(
+        update={
+            "policy_transfer": config.policy_transfer.model_copy(
+                update={"type": "nccl"}
+            )
+        }
+    )
+    exporter = _PolicyExporter()
+    exporter.config = config
+    exporter.model = object()
+    exporter.tokenizer = object()
+    exporter.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    exporter._export_nccl_policy = Mock(return_value=Path("policy"))  # noqa: SLF001
+
+    assert exporter.export_policy(step=7) is None
+    assert exporter.export_policy(step=7, force=True) == Path("policy")
+    exporter._export_nccl_policy.assert_called_once_with(7)  # noqa: SLF001
 
 
 def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:

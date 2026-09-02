@@ -30,6 +30,10 @@ _TAGGED_RESPONSE = re.compile(
     re.DOTALL,
 )
 _DIFFICULTY = re.compile(r"\A([0-8])/8\Z")
+_PROOF_REQUEST = re.compile(
+    r"\b(?:prove|demonstrate|establish)\b|\bshow\s+that\b",
+    re.IGNORECASE,
+)
 
 
 def extract_tagged_answer(text: str) -> str:
@@ -55,6 +59,11 @@ def difficulty_numerator(value: object) -> int | None:
     return None if match is None else int(match.group(1))
 
 
+def is_proof_problem(problem: object) -> bool:
+    """Return whether a prompt asks for a proof instead of a final answer."""
+    return _PROOF_REQUEST.search(str(problem)) is not None
+
+
 def format_aime_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Format the pinned Prime AIME 2024 task source for legacy Verifiers."""
     formatted = []
@@ -76,8 +85,14 @@ def build_polaris_rows(
     held_out_problems: Iterable[object] = (),
     min_difficulty: int = 1,
     max_difficulty: int = 6,
+    exclude_proof_problems: bool = True,
 ) -> list[dict[str, Any]]:
-    """Filter, deduplicate, and decontaminate Polaris training rows."""
+    """Filter, deduplicate, and decontaminate Polaris training rows.
+
+    Proof requests are excluded by default because a final-answer equivalence
+    rubric cannot evaluate whether the proof is valid. Several such Polaris
+    rows also contain answer fragments copied or corrupted from the claim.
+    """
     if not 0 <= min_difficulty <= max_difficulty <= 8:
         raise ValueError("difficulty bounds must satisfy 0 <= min <= max <= 8")
 
@@ -91,7 +106,13 @@ def build_polaris_rows(
         problem = str(row.get("problem", "")).strip()
         answer = str(row.get("answer", "")).strip()
         normalized = normalize_problem(problem)
-        if not normalized or not answer or normalized in held_out or normalized in seen:
+        if (
+            not normalized
+            or not answer
+            or normalized in held_out
+            or normalized in seen
+            or (exclude_proof_problems and is_proof_problem(problem))
+        ):
             continue
         seen.add(normalized)
         formatted.append(
@@ -116,7 +137,7 @@ def build_resilient_math_rubric(
     timeout_seconds: float,
 ) -> Any:
     """Build a math rubric that replaces a poisoned verifier process pool."""
-    from verifiers.legacy.utils.thread_utils import (
+    from verifiers.utils.thread_utils import (
         register_executor,
         unregister_executor,
     )
@@ -174,6 +195,7 @@ def load_environment(
     max_difficulty: int = 6,
     math_verify_max_workers: int = 128,
     math_verify_timeout: float = 5.0,
+    exclude_proof_problems: bool = True,
 ) -> vf.Environment:
     """Load filtered Polaris for training and held-out AIME 2024 for evaluation."""
     import verifiers as vf
@@ -192,6 +214,7 @@ def load_environment(
         held_out_problems=(row["question"] for row in aime_rows),
         min_difficulty=min_difficulty,
         max_difficulty=max_difficulty,
+        exclude_proof_problems=exclude_proof_problems,
     )
     if not polaris_rows:
         raise RuntimeError("Polaris filtering returned no training examples.")

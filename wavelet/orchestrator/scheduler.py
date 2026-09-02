@@ -171,6 +171,30 @@ from wavelet.orchestrator.schedule import (
 from wavelet.utils.monitoring import emit_perf
 
 
+from wavelet.utils.pathing import resolve_resume_checkpoint
+
+
+def _resume_optimizer_step(config: RLConfig) -> int:
+    checkpoint = config.ckpt
+    if checkpoint is None or checkpoint.resume_step is None:
+        return 0
+    checkpoint_dir = resolve_resume_checkpoint(
+        config.output_dir,
+        checkpoint.resume_step,
+    )
+    try:
+        step = int(checkpoint_dir.name.removeprefix("checkpoint-"))
+    except ValueError as exc:
+        raise ValueError(
+            f"Could not resolve optimizer step from checkpoint '{checkpoint_dir}'."
+        ) from exc
+    if config.max_steps is not None and step > config.max_steps:
+        raise ValueError(
+            f"Checkpoint step {step} exceeds configured max_steps={config.max_steps}."
+        )
+    return step
+
+
 from wavelet.orchestrator.envs import (
     _load_verifiers,
     _verifier_clients,
@@ -185,7 +209,6 @@ from wavelet.orchestrator.envs import (
     _run_single_rollout,
     _assign_completed_group_advantages,
     _completed_group_outputs,
-    _is_complete_training_group,
     _has_trainable_rollout_record,
     _mark_zero_advantage_records_metric_only,
     _verifier_example,
@@ -209,6 +232,51 @@ class _VerifierGroupState:
     rollouts_to_schedule: int
     completed_outputs: list[dict[str, Any]] = field(default_factory=list)
     pinned_client_index: int | None = None
+
+
+@dataclass(slots=True)
+class _VerifierBatchStats:
+    """Metrics for every verifier group completed while building one batch."""
+
+    admitted_groups: int = 0
+    rejected_groups: int = 0
+    rollout_rewards: list[float] = field(default_factory=list)
+    group_reward_sums: list[float] = field(default_factory=list)
+
+    def observe(self, outputs: list[dict[str, Any]], *, admitted: bool) -> None:
+        rewards = [float(output["reward"]) for output in outputs]
+        self.rollout_rewards.extend(rewards)
+        self.group_reward_sums.append(sum(rewards))
+        if admitted:
+            self.admitted_groups += 1
+        else:
+            self.rejected_groups += 1
+
+    def metrics(self, *, rollouts_per_group: int) -> dict[str, float]:
+        completed = len(self.group_reward_sums)
+        solve_none = sum(value == 0.0 for value in self.group_reward_sums)
+        solve_all = sum(
+            value >= rollouts_per_group for value in self.group_reward_sums
+        )
+        denominator = max(completed, 1)
+        return {
+            "generation/groups/completed": float(completed),
+            "generation/groups/admitted": float(self.admitted_groups),
+            "generation/groups/rejected": float(self.rejected_groups),
+            "generation/groups/admission_rate": self.admitted_groups / denominator,
+            "generation/rollouts/scored": float(len(self.rollout_rewards)),
+            "generation/reward/mean": (
+                sum(self.rollout_rewards) / len(self.rollout_rewards)
+                if self.rollout_rewards
+                else 0.0
+            ),
+            "generation/solve_none/rate": solve_none / denominator,
+            "generation/solve_all/rate": solve_all / denominator,
+            "generation/effective_groups/rate": (
+                completed - solve_none - solve_all
+            )
+            / denominator,
+        }
 
 
 def generate_rollouts(
@@ -325,6 +393,7 @@ class VerifierRolloutScheduler:
         )
         self.cancelled_rollouts_count = 0
         self.rejected_groups_count = 0
+        self.last_batch_metrics: dict[str, float] = {}
 
     def set_policy_step(
         self,
@@ -374,6 +443,7 @@ class VerifierRolloutScheduler:
         rejected_groups = 0
         completed_groups = 0
         attempt = 0
+        batch_stats = _VerifierBatchStats()
         max_completed_groups = target_groups * (
             self.config.orchestrator.zero_advantage_max_retries + 1
         )
@@ -384,6 +454,7 @@ class VerifierRolloutScheduler:
                 target_groups=target_groups,
                 outputs=outputs,
                 accepted_groups=accepted_groups,
+                batch_stats=batch_stats,
             )
             completed_groups += drained_completed
             rejected_groups += drained_rejected
@@ -403,6 +474,7 @@ class VerifierRolloutScheduler:
                         completed_groups=completed_groups,
                         max_completed_groups=max_completed_groups,
                         accepted_groups=accepted_groups,
+                        target_groups=target_groups,
                         rejected_groups=rejected_groups,
                     )
                     outputs = []
@@ -419,18 +491,18 @@ class VerifierRolloutScheduler:
                         target_groups=target_groups,
                         outputs=outputs,
                         accepted_groups=accepted_groups,
+                        batch_stats=batch_stats,
                     )
                     accepted_groups += accepted
                     completed_groups += completed
                     rejected_groups += rejected
-                    if self._should_stop_at_completed_limit(
+                    self._raise_if_retries_exhausted(
                         completed_groups=completed_groups,
                         max_completed_groups=max_completed_groups,
                         accepted_groups=accepted_groups,
                         target_groups=target_groups,
                         rejected_groups=rejected_groups,
-                    ):
-                        break
+                    )
         except Exception:
             await self.aclose()
             raise
@@ -439,6 +511,7 @@ class VerifierRolloutScheduler:
             target_groups=target_groups,
             outputs=outputs,
             accepted_groups=accepted_groups,
+            batch_stats=batch_stats,
         )
         completed_groups += drained_completed
         rejected_groups += drained_rejected
@@ -449,6 +522,7 @@ class VerifierRolloutScheduler:
             accepted_groups=accepted_groups,
             rejected_groups=rejected_groups,
             completed_groups=completed_groups,
+            batch_stats=batch_stats,
         )
 
     def _has_trainable_batch(self, outputs: list[dict[str, Any]]) -> bool:
@@ -464,9 +538,13 @@ class VerifierRolloutScheduler:
         completed_groups: int,
         max_completed_groups: int,
         accepted_groups: int,
+        target_groups: int,
         rejected_groups: int,
     ) -> None:
-        if completed_groups < max_completed_groups:
+        if (
+            accepted_groups >= target_groups
+            or completed_groups < max_completed_groups
+        ):
             return
         raise RuntimeError(
             "Verifier scheduler could not produce enough trainable rollout groups "
@@ -475,28 +553,6 @@ class VerifierRolloutScheduler:
             "orchestrator.zero_advantage_max_retries, relax filtering, or check "
             "reward/model behavior."
         )
-
-    @classmethod
-    def _should_stop_at_completed_limit(
-        cls,
-        *,
-        completed_groups: int,
-        max_completed_groups: int,
-        accepted_groups: int,
-        target_groups: int,
-        rejected_groups: int,
-    ) -> bool:
-        if completed_groups < max_completed_groups or accepted_groups >= target_groups:
-            return False
-        if accepted_groups > 0:
-            return True
-        cls._raise_if_retries_exhausted(
-            completed_groups=completed_groups,
-            max_completed_groups=max_completed_groups,
-            accepted_groups=accepted_groups,
-            rejected_groups=rejected_groups,
-        )
-        return False
 
     def _finalize_batch(
         self,
@@ -507,6 +563,7 @@ class VerifierRolloutScheduler:
         accepted_groups: int,
         rejected_groups: int,
         completed_groups: int,
+        batch_stats: _VerifierBatchStats,
     ) -> list[RLExample]:
         self._fill_inflight()
         convert_started_at = perf_counter()
@@ -514,6 +571,9 @@ class VerifierRolloutScheduler:
             record for output in outputs for record in _records_from_output(output)
         ]
         records = _mark_zero_advantage_records_metric_only(records, self.config)
+        self.last_batch_metrics = batch_stats.metrics(
+            rollouts_per_group=self.rollout_count
+        )
         emit_perf(
             "verifier_scheduler",
             attempts=attempts,
@@ -533,6 +593,7 @@ class VerifierRolloutScheduler:
         target_groups: int,
         outputs: list[dict[str, Any]],
         accepted_groups: int,
+        batch_stats: _VerifierBatchStats,
     ) -> tuple[int, int]:
         completed_groups = 0
         rejected_groups = 0
@@ -542,6 +603,7 @@ class VerifierRolloutScheduler:
                 target_groups=target_groups,
                 outputs=outputs,
                 accepted_groups=accepted_groups,
+                batch_stats=batch_stats,
             )
             accepted_groups += accepted
             completed_groups += completed
@@ -558,6 +620,7 @@ class VerifierRolloutScheduler:
         target_groups: int,
         outputs: list[dict[str, Any]],
         accepted_groups: int,
+        batch_stats: _VerifierBatchStats | None = None,
     ) -> tuple[int, int, int]:
         """Consume one finished request and classify its completed group."""
         request = self.pending.pop(task, None)
@@ -584,10 +647,15 @@ class VerifierRolloutScheduler:
         self.groups.pop(request.group_id, None)
         _stamp_env_name(completed_outputs, getattr(self, "env_name", "verifier"))
         _assign_completed_group_advantages(completed_outputs, self.config)
-        if not _is_complete_training_group(
+        is_usable = _is_usable_training_group(
             completed_outputs,
             expected_rollouts=self.rollout_count,
-        ):
+            filter_zero_advantage=self.config.orchestrator.filter_zero_advantage,
+            advantage_epsilon=algorithm_epsilon(self.config.algo),
+        )
+        if batch_stats is not None:
+            batch_stats.observe(completed_outputs, admitted=is_usable)
+        if not is_usable:
             return 0, 1, 1
         if accepted_groups < target_groups:
             outputs.extend(completed_outputs)
@@ -887,7 +955,7 @@ class RolloutScheduler:
     policy_receiver: FileSystemPolicyReceiver
     state: OrchestratorRunState | None = None
 
-    def run(self, *, target_step: int) -> int:
+    def run(self, *, target_step: int, start_step: int = 0) -> int:
         schedule = resolve_rollout_schedule(self.config)
         common = {
             "config": self.config,
@@ -895,6 +963,7 @@ class RolloutScheduler:
             "inference_engine": self.inference_engine,
             "policy_receiver": self.policy_receiver,
             "target_step": target_step,
+            "start_step": start_step,
             "state": self.state,
         }
         if (
@@ -914,9 +983,11 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     config = load_config(RLConfig, argv)
+    start_step = _resume_optimizer_step(config)
     policy_receiver = FileSystemPolicyReceiver(
         config.output_dir,
         config.policy_transfer,
+        start_step=start_step,
         events_dir=config.output_dir / "events",
     )
     if _target_steps(config) == 0 and config.model.adapter_path is not None:
@@ -946,7 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
             inference_engine=inference_engine,
             policy_receiver=policy_receiver,
             state=state,
-        ).run(target_step=target_step)
+        ).run(target_step=target_step, start_step=start_step)
         if state is not None:
             state.set_status("completed", phase="completed")
         return result
@@ -1271,6 +1342,7 @@ def _run_batched_scheduler(
     inference_engine,
     policy_receiver: FileSystemPolicyReceiver,
     target_step: int,
+    start_step: int = 0,
     state: OrchestratorRunState | None = None,
 ) -> int:
     prefetch_steps = max(1, min(config.orchestrator.max_async_level, target_step))
@@ -1281,6 +1353,8 @@ def _run_batched_scheduler(
         policy_receiver=policy_receiver,
         state=state,
         rollout_sender=FileSystemRolloutSender(config.output_dir, config.transport),
+        next_step_to_submit=start_step,
+        next_step_to_publish=start_step,
     )
     return context.run(target_step=target_step, prefetch_steps=prefetch_steps)
 
@@ -1297,6 +1371,8 @@ class _ChunkPublisherStrategy(_SchedulerStateMachine):
         rollout_sender: FileSystemRolloutSender,
         chunks_per_step: int,
         chunk_examples: int,
+        next_step_to_submit: int = 0,
+        next_step_to_publish: int = 0,
     ) -> None:
         self.chunks_per_step = chunks_per_step
         self.chunk_examples = chunk_examples
@@ -1308,6 +1384,8 @@ class _ChunkPublisherStrategy(_SchedulerStateMachine):
             policy_receiver=policy_receiver,
             state=state,
             rollout_sender=rollout_sender,
+            next_step_to_submit=next_step_to_submit,
+            next_step_to_publish=next_step_to_publish,
         )
 
     def submit_step(self, pool: ThreadPoolExecutor, queue_step: int) -> None:
@@ -1731,6 +1809,7 @@ class _VerifierPublisherStrategy:
                 "publish": publish_seconds,
                 "step": perf_counter() - step_started_at,
             },
+            extra_metrics=getattr(self.scheduler, "last_batch_metrics", None),
         )
         emit_perf(
             "inference_chunk",
@@ -1855,6 +1934,7 @@ def _run_chunk_scheduler(
     inference_engine,
     policy_receiver: FileSystemPolicyReceiver,
     target_step: int,
+    start_step: int = 0,
     state: OrchestratorRunState | None = None,
 ) -> int:
     chunks_per_step = _chunks_per_step(config)
@@ -1864,6 +1944,7 @@ def _run_chunk_scheduler(
         or config.orchestrator.max_async_level * chunks_per_step
     )
     max_pending_chunks = max(1, min(configured_limit, target_chunks))
+    start_queue_step = start_step * chunks_per_step
     context = _ChunkPublisherStrategy(
         config=config,
         orchestrator=orchestrator,
@@ -1873,6 +1954,8 @@ def _run_chunk_scheduler(
         rollout_sender=FileSystemRolloutSender(config.output_dir, config.transport),
         chunks_per_step=chunks_per_step,
         chunk_examples=_rollout_chunk_examples(config),
+        next_step_to_submit=start_queue_step,
+        next_step_to_publish=start_queue_step,
     )
     return context.run_native(
         target_chunks=target_chunks,
@@ -1887,6 +1970,7 @@ async def _run_verifier_scheduler(
     inference_engine,
     policy_receiver: FileSystemPolicyReceiver,
     target_step: int,
+    start_step: int = 0,
     state: OrchestratorRunState | None = None,
 ) -> int:
     from wavelet.orchestrator.scheduler import VerifierRolloutScheduler
@@ -1904,14 +1988,14 @@ async def _run_verifier_scheduler(
         chunk_groups=_rollout_chunk_examples(config),
         chunks_per_step=chunks_per_step,
         last_eval_steps=(
-            {env.resolved_name: -1 for env in config.eval.env}
+            {env.resolved_name: start_step for env in config.eval.env}
             if config.eval is not None
             else {}
         ),
     )
     target_chunks = target_step * chunks_per_step
     try:
-        for queue_step in range(target_chunks):
+        for queue_step in range(start_step * chunks_per_step, target_chunks):
             optimizer_step = queue_step // chunks_per_step
             wait_seconds, load_seconds = await context.prepare_policy(optimizer_step)
             await context.publish_chunk(

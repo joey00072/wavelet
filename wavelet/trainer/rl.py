@@ -12,6 +12,7 @@ from time import perf_counter
 import torch
 from torch import Tensor
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from wavelet.configs.rl_config import RLConfig
@@ -32,6 +33,7 @@ from wavelet.orchestrator.schedule import (
     target_steps as _target_steps,
 )
 from wavelet.trainer.distributed import barrier
+from wavelet.trainer.ckpt import TrainerState
 from wavelet.trainer.losses import compute_loss, selective_log_softmax
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.trainer import BaseTrainer
@@ -267,6 +269,18 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def _after_resume(self) -> None:
         self._accumulated_micro_batches = 0
+
+    def _validate_resume_state(self, state: TrainerState) -> None:
+        if state.step < 0 or state.micro_step < state.step:
+            raise ValueError(
+                "RL checkpoint step counters are invalid: expected non-negative "
+                "counters and at least one micro-step per optimizer step."
+            )
+
+    def _checkpoint_dataloader(self) -> StatefulDataLoader | None:
+        if self.config.orchestrator.enabled:
+            return None
+        return self.dataloader
 
     def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
         if self.monitor is None:
@@ -523,6 +537,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._close_policy_transport()
         if self.monitor is None or self._run_closed:
             return
+        if status == "completed" and self.ckpt_manager is not None:
+            self.ckpt_manager.wait_for_pending_save()
         self.monitor.finish(status=status, step=self.step)
         self._run_closed = True
         if status == "completed" and not self._uses_sleep_colocation():
@@ -1152,7 +1168,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         trainer.setup()
         if config.orchestrator.enabled:
-            trainer.export_policy(step=trainer.step)
+            trainer.export_policy(
+                step=trainer.step,
+                force=trainer.resume_checkpoint_dir is not None,
+            )
             trainer.offload_after_refit()
             try:
                 target_step = _target_steps(config)
