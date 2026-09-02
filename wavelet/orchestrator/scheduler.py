@@ -931,6 +931,7 @@ from wavelet.transport.queue import (
     append_event_best_effort,
     publish_adapter_policy_snapshot,
     utc_now,
+    validate_rollout_manifest,
 )
 
 
@@ -990,6 +991,40 @@ def _preload_rollout_resources(config: RLConfig) -> None:
         config.orchestrator.verifier_env_args,
         _verifier_extra_env_kwargs(config),
     )
+
+
+def _reusable_rollout_batch(
+    config: RLConfig,
+    sender: FileSystemRolloutSender,
+    *,
+    queue_step: int,
+    optimizer_step: int,
+    chunk_index: int | None,
+):
+    batch = sender.stable_batch(queue_step)
+    if batch is None:
+        return None
+    row_count = _count_nonempty_lines(batch.path)
+    validate_rollout_manifest(
+        batch,
+        queue_step=queue_step,
+        optimizer_step=optimizer_step,
+        chunk_index=chunk_index,
+        rows=row_count,
+        minimum_policy_step=_required_policy_step(config, optimizer_step),
+        maximum_policy_step=optimizer_step,
+    )
+    append_event_best_effort(
+        config.output_dir / "events",
+        QueueEvent(
+            time=utc_now(),
+            kind="rollout_reused",
+            queue_step=queue_step,
+            optimizer_step=optimizer_step,
+            details={"path": str(batch.path)},
+        ),
+    )
+    return batch
 
 
 @dataclass(slots=True)
@@ -1357,8 +1392,20 @@ class _SchedulerStateMachine:
             if not ready:
                 continue
             self.next_step_to_submit += 1
-            self.submit_step(pool, step)
-            self._record_submitted_step(step)
+            existing = _reusable_rollout_batch(
+                self.config,
+                self.rollout_sender,
+                queue_step=step,
+                optimizer_step=step,
+                chunk_index=None,
+            )
+            if existing is not None:
+                self._record_submitted_step(step)
+                self.completed[step] = (existing, 0.0, 0.0)
+                self.publish_ready()
+            else:
+                self.submit_step(pool, step)
+                self._record_submitted_step(step)
             submitted = True
             emit_perf(
                 "inference_submit",
@@ -1620,8 +1667,20 @@ class _ChunkPublisherStrategy(_SchedulerStateMachine):
             if not ready:
                 continue
             self.next_step_to_submit += 1
-            self.submit_step(pool, queue_step)
-            self._record_submitted_chunk(queue_step)
+            existing = _reusable_rollout_batch(
+                self.config,
+                self.rollout_sender,
+                queue_step=queue_step,
+                optimizer_step=optimizer_step,
+                chunk_index=queue_step % self.chunks_per_step,
+            )
+            if existing is not None:
+                self._record_submitted_chunk(queue_step)
+                self.completed[queue_step] = (existing, 0.0, 0.0)
+                self.publish_ready()
+            else:
+                self.submit_step(pool, queue_step)
+                self._record_submitted_chunk(queue_step)
             submitted = True
             emit_perf(
                 "inference_native_submit",
@@ -1822,6 +1881,21 @@ class _VerifierPublisherStrategy:
     ) -> None:
         step_started_at = perf_counter()
         optimizer_step = queue_step // self.chunks_per_step
+        existing = _reusable_rollout_batch(
+            self.config,
+            self.rollout_sender,
+            queue_step=queue_step,
+            optimizer_step=optimizer_step,
+            chunk_index=queue_step % self.chunks_per_step,
+        )
+        if existing is not None:
+            self._record_published_chunk(
+                queue_step,
+                optimizer_step=optimizer_step,
+                path=existing.path,
+            )
+            print(existing.path)
+            return
         generate_started_at = perf_counter()
         records = await self.scheduler.generate_batch(target_groups=self.chunk_groups)
         generate_seconds = perf_counter() - generate_started_at

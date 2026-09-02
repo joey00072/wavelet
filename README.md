@@ -124,6 +124,11 @@ engine in every rollout manifest.
 Persistent verifier requests retain the policy version used at dispatch; mixed
 async chunks are labeled with their oldest contributing policy, and incomplete
 groups are never refilled from a newer policy.
+Checkpoint resume reuses an existing stable rollout only after the same manifest
+checks pass. A stable queue directory is immutable and cannot be overwritten by
+a racing producer.
+Queue receive, claim, and consume events retain the originating optimizer and
+policy steps so policy lag remains traceable through the full lifecycle.
 
 RL loss normalization is optimizer-batch exact for variable-length examples.
 When dataloader workers prevent deterministic look-ahead, the trainer sums raw

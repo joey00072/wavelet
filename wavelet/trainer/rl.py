@@ -51,9 +51,9 @@ from wavelet.transport.queue import (
     RolloutBatch,
     RolloutChunkAccumulator,
     prune_consumed_rollout_batches,
-    read_manifest,
     record_rollout_claim,
     record_rollout_consumed,
+    validate_rollout_manifest,
 )
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
@@ -1450,36 +1450,16 @@ def _validate_rollout_batch(
     expected_queue_step = batch.step if chunk_index is not None else trainer_step
     expected_optimizer_step = trainer_step
 
-    manifest = read_manifest(batch.step_dir)
-    if manifest is None:
-        raise ValueError(
-            f"Rollout queue step {batch.step} is missing manifest.json."
-        )
-    mismatches = {
-        "queue_step": (manifest.queue_step, expected_queue_step),
-        "optimizer_step": (manifest.optimizer_step, expected_optimizer_step),
-        "chunk_index": (manifest.chunk_index, chunk_index),
-        "rows": (manifest.rows, row_count),
-    }
-    invalid = [
-        f"{name}={actual!r} (expected {expected!r})"
-        for name, (actual, expected) in mismatches.items()
-        if actual != expected
-    ]
-    if invalid:
-        raise ValueError(
-            f"Rollout queue step {batch.step} has invalid manifest metadata: "
-            + ", ".join(invalid)
-        )
-
-    policy_step = manifest.policy_step
     minimum_policy_step = required_policy_step(config, trainer_step)
-    if policy_step is None or not minimum_policy_step <= policy_step <= trainer_step:
-        raise ValueError(
-            f"Rollout queue step {batch.step} has policy_step={policy_step!r}; "
-            f"optimizer step {trainer_step} requires a policy step in "
-            f"[{minimum_policy_step}, {trainer_step}]."
-        )
+    validate_rollout_manifest(
+        batch,
+        queue_step=expected_queue_step,
+        optimizer_step=expected_optimizer_step,
+        chunk_index=chunk_index,
+        rows=row_count,
+        minimum_policy_step=minimum_policy_step,
+        maximum_policy_step=trainer_step,
+    )
 
 
 def _configure_streaming_accumulation(

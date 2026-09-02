@@ -8,6 +8,7 @@ from wavelet.orchestrator.scheduler import (
     _ChunkPublisherStrategy,
     _SchedulerStateMachine,
     _resume_optimizer_step,
+    _reusable_rollout_batch,
     resolve_rollout_schedule,
 )
 from wavelet.orchestrator.sources import RolloutSourceKind
@@ -168,3 +169,56 @@ def test_chunk_scheduler_initializes_in_resumed_queue_step_space(tmp_path) -> No
 
     assert context.next_step_to_submit == 28
     assert context.next_step_to_publish == 28
+
+
+def test_resume_reuses_only_valid_stable_rollout_batch(tmp_path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={"max_async_level": 2, "max_off_policy_steps": 1},
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    expected = sender.publish(
+        source,
+        step=2,
+        optimizer_step=2,
+        policy_step=1,
+        rows=1,
+    )
+
+    reused = _reusable_rollout_batch(
+        config,
+        sender,
+        queue_step=2,
+        optimizer_step=2,
+        chunk_index=None,
+    )
+
+    assert reused == expected
+
+
+def test_resume_rejects_stale_stable_rollout_batch(tmp_path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={"max_async_level": 2, "max_off_policy_steps": 1},
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    sender.publish(
+        source,
+        step=3,
+        optimizer_step=3,
+        policy_step=0,
+        rows=1,
+    )
+
+    with pytest.raises(ValueError, match="policy_step=0"):
+        _reusable_rollout_batch(
+            config,
+            sender,
+            queue_step=3,
+            optimizer_step=3,
+            chunk_index=None,
+        )

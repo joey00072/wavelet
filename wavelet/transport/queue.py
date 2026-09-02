@@ -209,6 +209,59 @@ def read_manifest(step_dir: Path) -> RolloutManifest | None:
     return _read_record(step_dir / MANIFEST_FILENAME, RolloutManifest)
 
 
+def validate_rollout_manifest(
+    batch: RolloutBatch,
+    *,
+    queue_step: int,
+    optimizer_step: int,
+    chunk_index: int | None,
+    rows: int,
+    minimum_policy_step: int,
+    maximum_policy_step: int,
+) -> RolloutManifest:
+    """Validate immutable rollout provenance before reuse or training."""
+    manifest = read_manifest(batch.step_dir)
+    if manifest is None:
+        raise ValueError(
+            f"Rollout queue step {batch.step} is missing manifest.json."
+        )
+    expected = {
+        "queue_step": queue_step,
+        "optimizer_step": optimizer_step,
+        "chunk_index": chunk_index,
+        "rows": rows,
+    }
+    actual = {
+        "queue_step": manifest.queue_step,
+        "optimizer_step": manifest.optimizer_step,
+        "chunk_index": manifest.chunk_index,
+        "rows": manifest.rows,
+    }
+    invalid = [
+        f"{name}={actual[name]!r} (expected {value!r})"
+        for name, value in expected.items()
+        if actual[name] != value
+    ]
+    if invalid:
+        raise ValueError(
+            f"Rollout queue step {batch.step} has invalid manifest metadata: "
+            + ", ".join(invalid)
+        )
+
+    policy_step = manifest.policy_step
+    if (
+        policy_step is None
+        or policy_step < minimum_policy_step
+        or policy_step > maximum_policy_step
+    ):
+        raise ValueError(
+            f"Rollout queue step {batch.step} has policy_step={policy_step!r}; "
+            f"optimizer step {optimizer_step} requires a policy step in "
+            f"[{minimum_policy_step}, {maximum_policy_step}]."
+        )
+    return manifest
+
+
 def write_claim(step_dir: Path, claim: ClaimRecord) -> Path:
     return _write_record(step_dir / CLAIM_FILENAME, claim)
 
@@ -278,12 +331,15 @@ def record_rollout_claim(
     except Exception as exc:  # pragma: no cover - defensive observability guard
         logger.warning("Failed to write rollout claim for step %s: %s", batch.step, exc)
         return None
+    manifest = _read_manifest_best_effort(batch)
     append_event_best_effort(
         events_dir,
         QueueEvent(
             time=claim.claimed_at,
             kind="rollout_claimed",
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             consumer_id=claim.consumer_id,
         ),
     )
@@ -294,6 +350,8 @@ def record_rollout_claim(
             event="rollout_claimed",
             step=trainer_step_before,
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             details={
                 "consumer_id": claim.consumer_id,
                 "path": str(batch.path),
@@ -331,12 +389,15 @@ def record_rollout_consumed(
             exc,
         )
         return None
+    manifest = _read_manifest_best_effort(batch)
     append_event_best_effort(
         events_dir,
         QueueEvent(
             time=consumed.consumed_at,
             kind="rollout_consumed",
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             consumer_id=consumed.consumer_id,
         ),
     )
@@ -347,7 +408,12 @@ def record_rollout_consumed(
             event="rollout_consumed",
             step=trainer_step_after,
             queue_step=batch.step,
-            optimizer_step=trainer_step_after,
+            optimizer_step=(
+                trainer_step_after
+                if manifest is None
+                else manifest.optimizer_step
+            ),
+            policy_step=None if manifest is None else manifest.policy_step,
             details={
                 "consumer_id": consumed.consumer_id,
                 "trainer_step_before": trainer_step_before,
@@ -356,6 +422,18 @@ def record_rollout_consumed(
         ),
     )
     return consumed
+
+
+def _read_manifest_best_effort(batch: RolloutBatch) -> RolloutManifest | None:
+    try:
+        return read_manifest(batch.step_dir)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Failed to read rollout manifest for lifecycle event step %s: %s",
+            batch.step,
+            exc,
+        )
+        return None
 
 
 def _trace_output_dir(events_dir: Path | None) -> Path | None:
@@ -475,6 +553,7 @@ def _record_received(
     payload_bytes: int | None,
     wait_seconds: float,
     queue_step: int | None = None,
+    optimizer_step: int | None = None,
     policy_step: int | None = None,
 ) -> None:
     if events_dir is None:
@@ -490,6 +569,7 @@ def _record_received(
             time=utc_now(),
             kind=kind,
             queue_step=queue_step,
+            optimizer_step=optimizer_step,
             policy_step=policy_step,
             consumer_id=consumer_id,
             details=details,
@@ -502,6 +582,7 @@ def _record_received(
             event=kind,
             step=step,
             queue_step=queue_step,
+            optimizer_step=optimizer_step,
             policy_step=policy_step,
             details={"consumer_id": consumer_id, **details},
         ),
@@ -529,6 +610,12 @@ class FileSystemRolloutSender:
         events_dir: Path | None = None,
     ) -> RolloutBatch:
         step_dir = get_step_dir(self.queue_dir, step)
+        existing = self.stable_batch(step)
+        if existing is not None:
+            raise FileExistsError(
+                f"Rollout queue step {step} is already stable at "
+                f"'{existing.step_dir}' and cannot be overwritten."
+            )
         step_dir.mkdir(parents=True, exist_ok=True)
         target_path = step_dir / self.config.rollout_filename
         tmp_path = step_dir / f"{self.config.rollout_filename}.tmp"
@@ -586,6 +673,14 @@ class FileSystemRolloutSender:
                 ),
             )
         (step_dir / STABLE_BATCH_MARKER).touch()
+        return RolloutBatch(step=step, path=target_path, step_dir=step_dir)
+
+    def stable_batch(self, step: int) -> RolloutBatch | None:
+        """Return an immutable stable batch for idempotent scheduler resume."""
+        step_dir = get_step_dir(self.queue_dir, step)
+        target_path = step_dir / self.config.rollout_filename
+        if not _is_stable_dir(step_dir) or not target_path.is_file():
+            return None
         return RolloutBatch(step=step, path=target_path, step_dir=step_dir)
 
 
@@ -696,12 +791,15 @@ class FileSystemRolloutReceiver:
             payload_bytes = batch.path.stat().st_size
         except OSError:
             payload_bytes = None
+        manifest = _read_manifest_best_effort(batch)
         _record_received(
             self.events_dir,
             kind="rollout_received",
             subsystem="trainer",
             step=batch.step,
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             consumer_id=consumer_id,
             mode=mode,
             payload_bytes=payload_bytes,
