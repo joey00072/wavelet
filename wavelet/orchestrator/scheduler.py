@@ -665,6 +665,7 @@ class VerifierRolloutScheduler:
         group_outputs = _completed_group_outputs(task)
         for output in group_outputs:
             output["_wavelet_policy_step"] = request.policy_step
+            output["_wavelet_group_id"] = f"persistent:{request.group_id}"
         missing_rollouts = request.rollout_count - len(group_outputs)
         if missing_rollouts > 0:
             if request.policy_step != getattr(self, "policy_step", None):

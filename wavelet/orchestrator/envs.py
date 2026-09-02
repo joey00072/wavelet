@@ -540,6 +540,7 @@ async def _run_complete_record_set(
             vf,
             env,
             _verifier_example(record),
+            group_id=f"complete:{index}",
             client=clients[index % len(clients)],
             model=model,
             sampling_args=sampling_args,
@@ -586,6 +587,7 @@ async def _run_until_target_groups(
                 vf,
                 env,
                 example,
+                group_id=f"target:{record_index}",
                 client=client,
                 model=model,
                 sampling_args=sampling_args,
@@ -631,6 +633,7 @@ async def _run_group(
     env,
     example: dict[str, Any],
     *,
+    group_id: str | None = None,
     client: Any,
     model: str,
     sampling_args: dict[str, Any],
@@ -655,6 +658,7 @@ async def _run_group(
             state_columns=["trajectory", "sampling_args"],
         )
         outputs = _successful_rollout_outputs(list(result))
+        _stamp_group_id(outputs, group_id)
         _assign_group_advantages(outputs, algorithm_config=algorithm_config)
         return outputs
 
@@ -671,8 +675,16 @@ async def _run_group(
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     outputs = _successful_rollout_outputs(results)
+    _stamp_group_id(outputs, group_id)
     _assign_group_advantages(outputs, algorithm_config=algorithm_config)
     return outputs
+
+
+def _stamp_group_id(outputs: list[dict[str, Any]], group_id: str | None) -> None:
+    if group_id is None:
+        return
+    for output in outputs:
+        output["_wavelet_group_id"] = group_id
 
 
 def _env_name(env: Any, *, fallback: str) -> str:
@@ -1067,8 +1079,12 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
 def _output_group_key(output: dict[str, Any]) -> str:
     env_name = str(output.get("env_name") or output.get("task") or "verifier")
     example_id = str(output.get("example_id", "unknown"))
+    dispatch_group_id = output.get("_wavelet_group_id")
+    payload = {"env_name": env_name, "example_id": example_id}
+    if dispatch_group_id is not None:
+        payload["rollout_group_id"] = str(dispatch_group_id)
     return json.dumps(
-        {"env_name": env_name, "example_id": example_id},
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )
