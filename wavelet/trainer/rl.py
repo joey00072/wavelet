@@ -1381,6 +1381,7 @@ def _run_streaming_rollout_training(
                 trainer_step_before=trainer_step_before,
                 optimizer_step_completed=metrics is not None,
             )
+        _remove_combined_rollout_path(config, trainer=trainer, path=rollout_path)
 
         export_seconds = 0.0
         if metrics is not None:
@@ -1586,6 +1587,19 @@ def _combined_rollout_path(
     if world is not None and world.world_size > 1:
         barrier(world)
     return path
+
+
+def _remove_combined_rollout_path(
+    config: RLConfig,
+    *,
+    trainer: RLTrainer,
+    path: Path,
+) -> None:
+    """Remove the redundant merged rollout after every rank has trained on it."""
+    combined_dir = config.output_dir / "rollouts" / "combined"
+    if path.parent != combined_dir or not trainer.is_main_process():
+        return
+    path.unlink(missing_ok=True)
 
 
 def _padded_row_count(row_count: int, *, multiple: int) -> int:

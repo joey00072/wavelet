@@ -129,6 +129,9 @@ checks pass. A stable queue directory is immutable and cannot be overwritten by
 a racing producer.
 Queue receive, claim, and consume events retain the originating optimizer and
 policy steps so policy lag remains traceable through the full lifecycle.
+Temporary files used to merge small streaming chunks are deleted after all
+trainer ranks finish reading them; retained consumed queue batches remain the
+auditable rollout source.
 
 RL loss normalization is optimizer-batch exact for variable-length examples.
 When dataloader workers prevent deterministic look-ahead, the trainer sums raw

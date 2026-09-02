@@ -1,7 +1,13 @@
 from pathlib import Path
+from types import SimpleNamespace
 
+from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.rl_config import RLTransportConfig
 from wavelet.orchestrator.envs import _prune_eval_rollout_sets
+from wavelet.trainer.rl import (
+    _combined_rollout_path,
+    _remove_combined_rollout_path,
+)
 from wavelet.transport.policy import prune_policy_snapshots
 from wavelet.transport.queue import (
     CONSUMED_FILENAME,
@@ -72,3 +78,40 @@ def test_prune_consumed_rollout_batches_keeps_recent_audit_batches(tmp_path) -> 
     assert not (queue_dir / "materialized-step-000000.jsonl").exists()
     assert paths[1].exists()
     assert paths[2].exists()
+
+
+def test_combined_rollout_is_removed_after_training(tmp_path) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    trainer = SimpleNamespace(step=7, world=None, is_main_process=lambda: True)
+    source_paths = []
+    for index in range(2):
+        path = tmp_path / f"source-{index}.jsonl"
+        path.write_text('{"input_ids": [1]}\n', encoding="utf-8")
+        source_paths.append(path)
+
+    combined = _combined_rollout_path(
+        config,
+        trainer=trainer,
+        paths=source_paths,
+        chunk_index=0,
+        min_rows=1,
+    )
+
+    assert combined.exists()
+    _remove_combined_rollout_path(config, trainer=trainer, path=combined)
+
+    assert not combined.exists()
+    assert all(path.exists() for path in source_paths)
+
+
+def test_combined_rollout_cleanup_is_main_rank_owned(tmp_path) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    combined_dir = tmp_path / "rollouts" / "combined"
+    combined_dir.mkdir(parents=True)
+    combined = combined_dir / "trainer-step-000007-chunk-000000.jsonl"
+    combined.write_text("{}\n", encoding="utf-8")
+    trainer = SimpleNamespace(is_main_process=lambda: False)
+
+    _remove_combined_rollout_path(config, trainer=trainer, path=combined)
+
+    assert combined.exists()
