@@ -8,6 +8,7 @@ import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.rollout_worker import (
+    _VerifierPublisherStrategy,
     _load_policy_and_update_scheduler,
 )
 from wavelet.orchestrator.schedule import (
@@ -214,3 +215,44 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
 
     assert loaded_step == 5
     assert calls == [("load", 4), ("set", 5), ("model", "policy"), ("mark", 0)]
+
+
+def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None:
+    calls: list[tuple[str, int | str | None]] = []
+
+    async def fake_load_policy_async(*_args, **_kwargs) -> int:
+        return 5
+
+    class Scheduler:
+        def set_policy_step(
+            self,
+            policy_step: int,
+            *,
+            model_name: str | None = None,
+        ) -> None:
+            calls.append(("set", policy_step))
+            calls.append(("model", model_name))
+
+        async def mark_policy_update(self) -> int:
+            calls.append(("mark", 0))
+            return 0
+
+    monkeypatch.setattr(
+        "wavelet.orchestrator.rollout_worker._load_policy_async",
+        fake_load_policy_async,
+    )
+    context = object.__new__(_VerifierPublisherStrategy)
+    context.config = _config()
+    context.inference_engine = type(
+        "Engine", (), {"policy_model_name": "policy"}
+    )()
+    context.policy_receiver = object()
+    context.scheduler = Scheduler()
+    context.loaded_policy_step = 3
+    context.state = None
+    context.last_eval_steps = {}
+    context.orchestrator = Mock()
+
+    asyncio.run(context._load_now(5, optimizer_step=5))  # noqa: SLF001
+
+    assert calls == [("set", 5), ("model", "policy"), ("mark", 0)]

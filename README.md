@@ -121,6 +121,9 @@ agree with its queue step, optimizer step, chunk index, row count, and configure
 policy-freshness window before any tokens are trained.
 Integrated generation also records the policy version loaded by its inference
 engine in every rollout manifest.
+Persistent verifier requests retain the policy version used at dispatch; mixed
+async chunks are labeled with their oldest contributing policy, and incomplete
+groups are never refilled from a newer policy.
 
 RL loss normalization is optimizer-batch exact for variable-length examples.
 When dataloader workers prevent deterministic look-ahead, the trainer sums raw

@@ -994,6 +994,24 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
         temperatures = [
             float(sample["temperatures"][index]) for index in trainable_indexes
         ]
+        metadata = {
+            "group_key": group_key,
+            "rollout_key": f"{group_key}:{sample_index}",
+            "stop_condition": output.get("stop_condition"),
+            "is_truncated": output.get("is_truncated"),
+            "completion_token_count": output_completion_token_count(output),
+            "tool_response_token_count": output_tool_response_token_count(output),
+            "turn_count": len(output.get("trajectory") or []),
+            "_wavelet_rollout_count": 1 if sample_index == 0 else 0,
+            **rollout_task_harness_metadata(
+                output,
+                group_key=group_key,
+                sample_index=sample_index,
+            ),
+        }
+        policy_step = output.get("_wavelet_policy_step")
+        if isinstance(policy_step, int) and not isinstance(policy_step, bool):
+            metadata["policy_step"] = policy_step
         records.append(
             RLExample(
                 prompt=_mask_prompt_history(first_step.get("prompt") or []),
@@ -1008,23 +1026,7 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 reward=float(output["reward"]),
                 inference_logprobs=inference_logprobs,
                 temperatures=temperatures,
-                metadata={
-                    "group_key": group_key,
-                    "rollout_key": f"{group_key}:{sample_index}",
-                    "stop_condition": output.get("stop_condition"),
-                    "is_truncated": output.get("is_truncated"),
-                    "completion_token_count": output_completion_token_count(output),
-                    "tool_response_token_count": output_tool_response_token_count(
-                        output
-                    ),
-                    "turn_count": len(output.get("trajectory") or []),
-                    "_wavelet_rollout_count": 1 if sample_index == 0 else 0,
-                    **rollout_task_harness_metadata(
-                        output,
-                        group_key=group_key,
-                        sample_index=sample_index,
-                    ),
-                },
+                metadata=metadata,
                 source=str(output.get("env_name") or output.get("task") or "verifier"),
             )
         )

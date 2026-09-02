@@ -224,12 +224,14 @@ class _PendingVerifierRequest:
     client_index: int
     rollout_count: int
     off_policy_steps: int = 0
+    policy_step: int | None = None
 
 
 @dataclass(slots=True)
 class _VerifierGroupState:
     example: dict[str, Any]
     rollouts_to_schedule: int
+    policy_step: int | None = None
     completed_outputs: list[dict[str, Any]] = field(default_factory=list)
     pinned_client_index: int | None = None
 
@@ -335,6 +337,9 @@ def generate_rollouts(
             env_name=_env_name(env, fallback=env_id),
         )
     )
+    if isinstance(policy_step, int) and not isinstance(policy_step, bool):
+        for output in outputs:
+            output["_wavelet_policy_step"] = policy_step
     rollout_seconds = perf_counter() - rollout_started_at
     convert_started_at = perf_counter()
     _assign_rollout_advantages(outputs, config)
@@ -641,8 +646,13 @@ class VerifierRolloutScheduler:
             return 0, 0, 0
 
         group_outputs = _completed_group_outputs(task)
+        for output in group_outputs:
+            output["_wavelet_policy_step"] = request.policy_step
         missing_rollouts = request.rollout_count - len(group_outputs)
         if missing_rollouts > 0:
+            if request.policy_step != getattr(self, "policy_step", None):
+                self.groups.pop(request.group_id, None)
+                return 0, 1, 1
             if self.requires_group_scoring:
                 group.completed_outputs.clear()
                 group.rollouts_to_schedule = self.rollout_count
@@ -684,7 +694,7 @@ class VerifierRolloutScheduler:
         stale_group_ids = {
             request.group_id
             for request in self.pending.values()
-            if request.off_policy_steps >= max_off_policy_steps
+            if self._request_policy_lag(request) > max_off_policy_steps
         }
         tasks_to_cancel = [
             task
@@ -701,12 +711,20 @@ class VerifierRolloutScheduler:
             self.groups.pop(group_id, None)
 
         for request in self.pending.values():
-            request.off_policy_steps += 1
+            request.off_policy_steps = self._request_policy_lag(request)
 
         if tasks_to_cancel:
             await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         self.cancelled_rollouts_count += cancelled_rollouts
         return cancelled_rollouts
+
+    def _request_policy_lag(self, request: _PendingVerifierRequest) -> int:
+        current_policy_step = getattr(self, "policy_step", None)
+        if isinstance(current_policy_step, int) and isinstance(
+            request.policy_step, int
+        ):
+            return max(current_policy_step - request.policy_step, 0)
+        return request.off_policy_steps + 1
 
     def _age_ready_groups(self, max_off_policy_steps: int) -> int:
         if not hasattr(self, "ready_groups"):
@@ -724,11 +742,22 @@ class VerifierRolloutScheduler:
             self.ready_group_off_policy_steps,
             strict=False,
         ):
-            if off_policy_steps >= max_off_policy_steps:
+            policy_steps = [
+                output.get("_wavelet_policy_step")
+                for output in group_outputs
+                if isinstance(output.get("_wavelet_policy_step"), int)
+                and not isinstance(output.get("_wavelet_policy_step"), bool)
+            ]
+            current_policy_step = getattr(self, "policy_step", None)
+            if isinstance(current_policy_step, int) and policy_steps:
+                next_age = max(current_policy_step - min(policy_steps), 0)
+            else:
+                next_age = off_policy_steps + 1
+            if next_age > max_off_policy_steps:
                 dropped_rollouts += len(group_outputs)
                 continue
             kept_groups.append(group_outputs)
-            kept_ages.append(off_policy_steps + 1)
+            kept_ages.append(next_age)
         self.ready_groups = kept_groups
         self.ready_group_off_policy_steps = kept_ages
         return dropped_rollouts
@@ -771,8 +800,15 @@ class VerifierRolloutScheduler:
         if remaining_capacity <= 0:
             return False
 
-        for group_id, group in self.groups.items():
+        current_policy_step = getattr(self, "policy_step", None)
+        for group_id, group in list(self.groups.items()):
             if group.rollouts_to_schedule <= 0:
+                continue
+            if group.policy_step != current_policy_step:
+                self.groups.pop(group_id, None)
+                self.rejected_groups_count = (
+                    getattr(self, "rejected_groups_count", 0) + 1
+                )
                 continue
             cost = group.rollouts_to_schedule if self.requires_group_scoring else 1
             if cost <= remaining_capacity:
@@ -788,6 +824,7 @@ class VerifierRolloutScheduler:
         group = _VerifierGroupState(
             example=_verifier_example(record),
             rollouts_to_schedule=self.rollout_count,
+            policy_step=current_policy_step,
         )
         self.groups[group_id] = group
         self._schedule_group_rollout(group_id, group)
@@ -836,6 +873,7 @@ class VerifierRolloutScheduler:
             group_id=group_id,
             client_index=client_index,
             rollout_count=rollout_count,
+            policy_step=group.policy_step,
         )
         self.pending_clients[task] = client_index
 
@@ -1715,6 +1753,7 @@ class _VerifierPublisherStrategy:
         optimizer_step: int,
     ) -> tuple[float, float]:
         started_at = perf_counter()
+        previous_policy_step = self.loaded_policy_step
         self.loaded_policy_step = await _load_policy_async(
             self.config,
             self.inference_engine,
@@ -1725,6 +1764,11 @@ class _VerifierPublisherStrategy:
             self.loaded_policy_step,
             model_name=_current_policy_model_name(self.inference_engine),
         )
+        if (
+            previous_policy_step is not None
+            and self.loaded_policy_step != previous_policy_step
+        ):
+            await self.scheduler.mark_policy_update()
         await self._record_loaded_policy(optimizer_step)
         elapsed = perf_counter() - started_at
         return elapsed, elapsed
@@ -1781,6 +1825,10 @@ class _VerifierPublisherStrategy:
         generate_started_at = perf_counter()
         records = await self.scheduler.generate_batch(target_groups=self.chunk_groups)
         generate_seconds = perf_counter() - generate_started_at
+        rollout_policy_step = _rollout_records_policy_step(
+            records,
+            fallback=self.loaded_policy_step,
+        )
 
         materialize_started_at = perf_counter()
         materialized_path = _write_materialized_records(
@@ -1795,7 +1843,7 @@ class _VerifierPublisherStrategy:
             step=queue_step,
             optimizer_step=optimizer_step,
             chunk_index=queue_step % self.chunks_per_step,
-            policy_step=self.loaded_policy_step,
+            policy_step=rollout_policy_step,
             rows=_count_nonempty_lines(materialized_path),
         )
         publish_seconds = perf_counter() - publish_started_at
@@ -1808,7 +1856,7 @@ class _VerifierPublisherStrategy:
             self.config,
             materialized_path,
             step=optimizer_step,
-            policy_step=self.loaded_policy_step,
+            policy_step=rollout_policy_step,
             queue_step=queue_step,
             optimizer_step=optimizer_step,
             chunk_index=queue_step % self.chunks_per_step,
@@ -2090,6 +2138,22 @@ def _load_policy_step(
         ),
     )
     return policy.step, wait_policy_seconds, load_policy_seconds
+
+
+def _rollout_records_policy_step(
+    records: list[RLExample],
+    *,
+    fallback: int | None,
+) -> int | None:
+    """Return the oldest policy that contributed trajectories to a batch."""
+    policy_steps = [
+        value
+        for record in records
+        if isinstance(record.metadata, dict)
+        for value in [record.metadata.get("policy_step")]
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    return min(policy_steps) if policy_steps else fallback
 
 
 def _write_materialized_records(
