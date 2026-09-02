@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-import random
 import sys
 from types import MethodType
 from typing import Any
@@ -433,18 +432,43 @@ def test_verifier_scheduler_uses_oversampling_without_async_multiplier() -> None
     assert scheduler.max_inflight_groups == 64
 
 
-def test_verifier_scheduler_samples_records_randomly_with_replacement() -> None:
+def test_verifier_scheduler_cycles_every_record_before_repeating() -> None:
     records = [
         RLExample(prompt=[], completion=[], advantage=0.0, reward=0.0, source=str(i))
         for i in range(5)
     ]
     scheduler = object.__new__(VerifierRolloutScheduler)
     scheduler.records = records
-    scheduler.rng = random.Random(123)
+    scheduler.config = RLConfig(data={"shuffle": False})
+    scheduler.record_cursor = 0
+    scheduler._record_order_epoch = None  # noqa: SLF001
+    scheduler._record_order = []  # noqa: SLF001
 
-    selected = [scheduler._next_record().source for _ in range(8)]  # noqa: SLF001
+    selected = [scheduler._next_record().source for _ in range(7)]  # noqa: SLF001
 
-    assert selected == ["0", "2", "0", "3", "2", "0", "0", "3"]
+    assert selected == ["0", "1", "2", "3", "4", "0", "1"]
+
+
+def test_verifier_scheduler_shuffles_deterministically_per_epoch() -> None:
+    records = [
+        RLExample(prompt=[], completion=[], advantage=0.0, reward=0.0, source=str(i))
+        for i in range(5)
+    ]
+
+    def sample() -> list[str]:
+        scheduler = object.__new__(VerifierRolloutScheduler)
+        scheduler.records = records
+        scheduler.config = RLConfig(data={"shuffle": True, "seed": 123})
+        scheduler.record_cursor = 0
+        scheduler._record_order_epoch = None  # noqa: SLF001
+        scheduler._record_order = []  # noqa: SLF001
+        return [scheduler._next_record().source for _ in range(10)]  # noqa: SLF001
+
+    selected = sample()
+
+    assert sample() == selected
+    assert set(selected[:5]) == {"0", "1", "2", "3", "4"}
+    assert set(selected[5:]) == {"0", "1", "2", "3", "4"}
 
 
 def test_verifier_scheduler_uses_explicit_pending_chunk_limit() -> None:
