@@ -938,7 +938,7 @@ from wavelet.transport.queue import (
 from wavelet.orchestrator.policy_metadata import policy_metadata
 
 
-from wavelet.orchestrator.metrics import log_rollout_metrics
+from wavelet.orchestrator.metrics import log_eval_metrics, log_rollout_metrics
 
 
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -2464,6 +2464,12 @@ def _run_evals(
             step=rollout_step,
             policy_step=policy_step,
         )
+        log_eval_metrics(
+            config,
+            metrics,
+            step=rollout_step,
+            policy_step=policy_step,
+        )
         print(json_dumps_compact(metrics), flush=True)
 
 
@@ -2485,6 +2491,12 @@ async def _run_evals_async(
         metrics = await evaluate_env_async(
             orchestrator,
             env,
+            step=rollout_step,
+            policy_step=policy_step,
+        )
+        log_eval_metrics(
+            config,
+            metrics,
             step=rollout_step,
             policy_step=policy_step,
         )

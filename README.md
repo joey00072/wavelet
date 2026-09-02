@@ -166,3 +166,5 @@ Evaluation `avg@k` and `pass@k` metrics count every requested generation;
 failed or missing-reward attempts count as incorrect instead of disappearing from
 the denominator. Corresponding `eval/<env>/effective/...` metrics describe only
 successful verifier responses, and `failed_rollouts` reports the failure rate.
+The orchestrator writes these fixed-policy metrics to `eval_metrics.jsonl` and
+its W&B run at the matching optimizer step.
