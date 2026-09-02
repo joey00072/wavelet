@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -94,7 +95,13 @@ def existing_run_state_entries(output_dir: Path) -> list[str]:
     return entries
 
 
-def validate_output_dir(output_dir: Path, *, resuming: bool, clean: bool) -> None:
+def validate_output_dir(
+    output_dir: Path,
+    *,
+    resuming: bool,
+    clean: bool,
+    protected_paths: Iterable[Path | None] = (),
+) -> None:
     if resuming and clean:
         raise ValueError(
             "clean_output_dir=true cannot be used with checkpoint resume. "
@@ -103,6 +110,17 @@ def validate_output_dir(output_dir: Path, *, resuming: bool, clean: bool) -> Non
     if resuming:
         return
     if clean:
+        output_root = output_dir.absolute()
+        endangered = [
+            path
+            for path in protected_paths
+            if path is not None and path.absolute().is_relative_to(output_root)
+        ]
+        if endangered:
+            raise ValueError(
+                "clean_output_dir=true would remove required input path(s): "
+                + ", ".join(str(path) for path in endangered)
+            )
         if output_dir.exists():
             if output_dir.is_dir():
                 shutil.rmtree(output_dir)
