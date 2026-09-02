@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import ModelConfig
+from wavelet.data.rl_dataset import RLDataset, RLExample
 from wavelet.distributed.world import World
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.model import _fsdp_mixed_precision
@@ -111,6 +113,86 @@ def test_gradient_accumulation_loss_scale_divides_grads_once() -> None:
     trainer._apply_gradient_accumulation_loss_scale()  # noqa: SLF001
 
     assert torch.allclose(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+
+
+def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch() -> None:
+    config = RLConfig(data={"batch_size": 32, "micro_batch_size": 16, "seq_len": 8})
+    trainer = RLTrainer(config)
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    trainer.accumulation_steps = 2
+    trainer.dataset = RLDataset(
+        records=[
+            RLExample(
+                prompt=[],
+                completion=[],
+                advantage=1.0,
+                reward=1.0,
+                input_ids=[1, 2],
+                target_ids=[2, 3],
+                loss_mask=[True, True],
+                inference_logprobs=[-1.0, -1.0],
+                temperatures=[1.0, 1.0],
+            )
+            for _ in range(32)
+        ],
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config.data,
+    )
+
+    assert trainer._estimate_optimizer_batch_loss_scale() == 64.0  # noqa: SLF001
+
+
+def test_loss_scale_uses_global_token_mean_for_averaged_dp_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        local_world_size=2,
+        device=torch.device("cpu"),
+    )
+    dp_group = object()
+
+    class _Mesh:
+        def get_group(self) -> object:
+            return dp_group
+
+    class _ParallelDims:
+        dp_replicate = 1
+        dp_shard = 2
+        cp = 1
+        tp = 1
+        ep = 1
+
+        def get_mesh(self, name: str) -> _Mesh:
+            assert name == "dp"
+            return _Mesh()
+
+    trainer.parallel_dims = _ParallelDims()  # type: ignore[assignment]
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def fake_all_reduce(
+        tensor: torch.Tensor,
+        *,
+        op: object,
+        group: object,
+    ) -> None:
+        assert op == torch.distributed.ReduceOp.SUM
+        assert group is dp_group
+        tensor.add_(8.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    assert trainer._average_data_parallel_loss_scale(4.0) == 6.0  # noqa: SLF001
 
 
 def test_packed_flash_attention_uses_varlen_position_ids() -> None:

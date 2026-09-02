@@ -733,7 +733,7 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
     ) -> int:
         """Count trainable units for the next local optimizer batch."""
         if local_batch_size <= 0:
-            return 1
+            return 0
 
         num_examples = len(self.records)
         data_rank, data_world_size = self._effective_data_partition()
@@ -762,7 +762,7 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
             else:
                 total += trainable_token_count(sample)
             collected += 1
-        return max(total, 1)
+        return total
 
     def __iter__(self) -> Iterator[RLSample]:
         for record_index in self._local_record_indexes():
@@ -818,7 +818,7 @@ class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]
             else trainable_token_count
         )
         total = sum(counter(sample) for sample in self._bins_for_epoch(self.epoch))
-        return max(float(total), 1.0)
+        return float(total)
 
     def __iter__(self) -> Iterator[RLSample]:
         while True:
