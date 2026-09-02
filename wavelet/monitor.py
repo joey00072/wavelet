@@ -548,6 +548,32 @@ def log_rollout_metrics(
     return metrics
 
 
+def log_eval_metrics(
+    config: RLConfig,
+    metrics: dict[str, float],
+    *,
+    step: int,
+    policy_step: int,
+) -> None:
+    """Publish fixed-policy evaluation metrics to the orchestrator monitor."""
+    _wandb_log(config, metrics, step=step)
+    append_trace_event_best_effort(
+        config.output_dir,
+        make_trace_event(
+            subsystem="orchestrator",
+            event="eval_metrics_logged",
+            step=step,
+            optimizer_step=step,
+            policy_step=policy_step,
+            details={
+                key: value
+                for key, value in metrics.items()
+                if key.startswith("eval/")
+            },
+        ),
+    )
+
+
 def _append_rollout_trace(
     config: RLConfig,
     rows: list[dict[str, Any]],

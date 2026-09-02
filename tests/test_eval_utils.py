@@ -11,7 +11,11 @@ from wavelet.configs.rl_config import RLConfig, RLEvalConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
-from wavelet.orchestrator.scheduler import _run_final_evals
+from wavelet.orchestrator.scheduler import (
+    _run_evals,
+    _run_evals_async,
+    _run_final_evals,
+)
 from wavelet.orchestrator.verifiers import _eval_metrics, _run_eval_examples
 
 
@@ -166,6 +170,80 @@ def test_rl_config_allows_zero_step_eval_only_runs() -> None:
 
     assert target_steps(config) == 0
     assert _final_eval_policy_step(config, 0) == 0
+
+
+def test_run_evals_publishes_metrics_to_monitor(monkeypatch) -> None:
+    config = RLConfig.model_validate(
+        {
+            "orchestrator": {
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                )
+            }
+        }
+    )
+    env = SimpleNamespace(resolved_name="aime")
+    metrics = {"eval/aime/avg@8": 0.25}
+    evaluate = Mock(return_value=metrics)
+    log_metrics = Mock()
+    monkeypatch.setattr("wavelet.orchestrator.envs.evaluate_env", evaluate)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.scheduler.log_eval_metrics",
+        log_metrics,
+    )
+
+    _run_evals(
+        config,
+        Mock(),
+        policy_step=96,
+        rollout_step=100,
+        envs=[env],
+    )
+
+    log_metrics.assert_called_once_with(
+        config,
+        metrics,
+        step=100,
+        policy_step=96,
+    )
+
+
+def test_run_evals_async_publishes_metrics_to_monitor(monkeypatch) -> None:
+    config = RLConfig.model_validate(
+        {
+            "orchestrator": {
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                )
+            }
+        }
+    )
+    env = SimpleNamespace(resolved_name="aime")
+    metrics = {"eval/aime/pass@8": 0.5}
+    evaluate = AsyncMock(return_value=metrics)
+    log_metrics = Mock()
+    monkeypatch.setattr("wavelet.orchestrator.envs.evaluate_env_async", evaluate)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.scheduler.log_eval_metrics",
+        log_metrics,
+    )
+
+    asyncio.run(
+        _run_evals_async(
+            config,
+            Mock(),
+            policy_step=96,
+            rollout_step=100,
+            envs=[env],
+        )
+    )
+
+    log_metrics.assert_called_once_with(
+        config,
+        metrics,
+        step=100,
+        policy_step=96,
+    )
 
 
 def test_eval_metrics_include_avg_and_pass_at_k() -> None:

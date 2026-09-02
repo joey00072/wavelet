@@ -3,12 +3,17 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from unittest.mock import Mock
 
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
-from wavelet.orchestrator.metrics import log_rollout_metrics
+from wavelet.orchestrator.metrics import (
+    RolloutMetricInputs,
+    log_eval_metrics,
+    log_rollout_metrics,
+    rollout_metrics,
+)
 
 
 def test_rollout_metrics_match_reference_style_grouping() -> None:
@@ -146,6 +151,38 @@ def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:
     assert trace["optimizer_step"] == 6
     assert trace["policy_step"] == 3
     assert trace["details"]["trainable"] == 1.0
+
+
+def test_log_eval_metrics_uses_orchestrator_wandb_run(
+    monkeypatch, tmp_path
+) -> None:
+    metrics = {
+        "eval/aime/avg@8": 0.25,
+        "eval/aime/pass@8": 0.75,
+        "progress/policy_step": 96.0,
+    }
+    wandb_log = Mock()
+    monkeypatch.setattr("wavelet.monitor._wandb_log", wandb_log)
+
+    log_eval_metrics(
+        RLConfig(output_dir=tmp_path),
+        metrics,
+        step=100,
+        policy_step=96,
+    )
+
+    wandb_log.assert_called_once()
+    assert wandb_log.call_args.args[1] == metrics
+    assert wandb_log.call_args.kwargs == {"step": 100}
+    trace = json.loads(
+        (tmp_path / "traces" / "step-000100.jsonl").read_text(encoding="utf-8")
+    )
+    assert trace["event"] == "eval_metrics_logged"
+    assert trace["policy_step"] == 96
+    assert trace["details"] == {
+        "eval/aime/avg@8": 0.25,
+        "eval/aime/pass@8": 0.75,
+    }
 
 
 def test_rollout_metrics_include_non_overlapping_generation_metrics() -> None:
