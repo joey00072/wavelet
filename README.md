@@ -18,6 +18,7 @@ agent-readable map of workflows, diagnostics, and repository guidance.
   collation contracts
 - Run preflight checks before expensive RL launches:
   `uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
+  This also validates local training data and required LoRA adapter artifacts.
   The report includes low-precision checks for QLoRA and vLLM quantized
   inference settings.
 - [Inference diagnostics](docs/inference.skill.md): model serving, policy loading,
