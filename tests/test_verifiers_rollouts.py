@@ -22,6 +22,7 @@ from wavelet.orchestrator.verifiers import (
     _is_usable_training_group,
     _load_cached_env,
     _records_from_output,
+    _rollout_records_policy_step,
     _run_all,
     _run_group,
     _sampling_args,
@@ -114,6 +115,30 @@ def test_verifier_step_converts_to_trainable_record() -> None:
     }
     assert record.prompt[1]["step_loss_mask"] == 0
     assert record.source == "alphabet-sort"
+
+
+def test_verifier_record_preserves_actual_generation_policy_step() -> None:
+    output = {
+        "example_id": 7,
+        "reward": 1.0,
+        "advantage": 1.0,
+        "_wavelet_policy_step": 3,
+        "trajectory": _trainable_trajectory(),
+    }
+
+    record = _records_from_output(output)[0]
+
+    assert record.metadata["policy_step"] == 3
+    assert _rollout_records_policy_step([record], fallback=9) == 3
+
+
+def test_rollout_batch_policy_step_uses_oldest_actual_policy() -> None:
+    records = [
+        RLExample([], [], 1.0, 1.0, metadata={"policy_step": step})
+        for step in (5, 3, 4)
+    ]
+
+    assert _rollout_records_policy_step(records, fallback=9) == 3
 
 
 def test_custom_verifier_rollout_function_loads_without_env_import() -> None:
@@ -511,11 +536,13 @@ def test_verifier_scheduler_drains_done_tasks_and_buffers_extra_groups() -> None
                 group_id=group_id,
                 client_index=0,
                 rollout_count=1,
+                policy_step=3,
             )
             scheduler.pending_clients[task] = 0
             scheduler.groups[group_id] = _VerifierGroupState(
                 example={"example_id": group_id},
                 rollouts_to_schedule=0,
+                policy_step=3,
             )
         scheduler._fill_inflight = lambda: None  # type: ignore[method-assign]
         return await scheduler.generate_batch(target_groups=1)
@@ -529,6 +556,8 @@ def test_verifier_scheduler_drains_done_tasks_and_buffers_extra_groups() -> None
     record_example_id = json.loads(records[0].metadata["group_key"])["example_id"]
     assert {ready_example_id, int(record_example_id)} == {1, 2}
     assert scheduler.ready_groups[0][0]["env_name"] == "verifier"
+    assert scheduler.ready_groups[0][0]["_wavelet_policy_step"] == 3
+    assert records[0].metadata["policy_step"] == 3
 
 
 def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
@@ -1070,6 +1099,49 @@ def test_verifier_scheduler_reschedules_failed_single_rollout() -> None:
     assert scheduler.groups == {}
 
 
+def test_verifier_scheduler_drops_incomplete_group_after_policy_change() -> None:
+    config = RLConfig(
+        orchestrator={
+            "examples_per_step": 1,
+            "rollouts_per_example": 2,
+            "filter_zero_advantage": False,
+        }
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.rollout_count = 2
+    scheduler.requires_group_scoring = False
+    scheduler.policy_step = 3
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler.groups = {
+        0: _VerifierGroupState(
+            example={"example_id": 0, "prompt": "x"},
+            rollouts_to_schedule=0,
+            policy_step=2,
+        )
+    }
+
+    async def run() -> tuple[int, int, int]:
+        task = asyncio.get_running_loop().create_future()
+        task.set_result([])
+        scheduler.pending[task] = _PendingVerifierRequest(
+            group_id=0,
+            client_index=0,
+            rollout_count=1,
+            policy_step=2,
+        )
+        return scheduler._consume_completed_task(  # noqa: SLF001
+            task,
+            target_groups=1,
+            outputs=[],
+            accepted_groups=0,
+        )
+
+    assert asyncio.run(run()) == (0, 1, 1)
+    assert scheduler.groups == {}
+
+
 def test_verifier_scheduler_cancels_stale_off_policy_groups() -> None:
     scheduler = object.__new__(VerifierRolloutScheduler)
     scheduler.config = RLConfig(orchestrator={"max_off_policy_steps": 1})
@@ -1106,6 +1178,41 @@ def test_verifier_scheduler_cancels_stale_off_policy_groups() -> None:
     assert scheduler.pending == {}
     assert scheduler.groups == {}
     assert scheduler.cancelled_rollouts_count == 1
+
+
+def test_verifier_scheduler_uses_actual_policy_version_lag() -> None:
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = RLConfig(orchestrator={"max_off_policy_steps": 1})
+    scheduler.policy_step = 5
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler.groups = {
+        0: _VerifierGroupState(
+            example={"example_id": 0, "prompt": "x"},
+            rollouts_to_schedule=1,
+            policy_step=2,
+        )
+    }
+    scheduler.cancelled_rollouts_count = 0
+
+    async def pending_rollout() -> list[dict[str, float]]:
+        await asyncio.sleep(60)
+        return []
+
+    async def run() -> int:
+        task = asyncio.create_task(pending_rollout())
+        scheduler.pending[task] = _PendingVerifierRequest(
+            group_id=0,
+            client_index=0,
+            rollout_count=1,
+            policy_step=2,
+        )
+        scheduler.pending_clients[task] = 0
+        return await scheduler.mark_policy_update()
+
+    assert asyncio.run(run()) == 1
+    assert scheduler.pending == {}
+    assert scheduler.groups == {}
 
 
 def test_verifier_scheduler_ages_ready_groups_on_policy_update() -> None:
