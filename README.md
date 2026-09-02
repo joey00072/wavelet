@@ -90,7 +90,13 @@ transfer time in the manifest and queue event log for transfer observability.
 Trainer receivers can also emit queue wait time and payload-byte events when
 they claim filesystem batches.
 Inference policy receivers emit matching wait-time and payload-byte events when
-they observe exported policies.
+they observe exported policies. LoRA snapshots include the tensor artifact's
+SHA-256 digest; inference verifies and acknowledges that digest before advancing
+its loaded policy step, and exposes it through `/debug/state`.
+
+Process and colocated training require `policy_transfer.export_initial: true`.
+This publishes policy step 0 before rollout generation and prevents the trainer
+and inference scheduler from waiting on each other at startup.
 
 Implementation ownership is similarly explicit: `wavelet.transport` owns queue
 and policy transfer, `wavelet.orchestrator.scheduler` owns rollout scheduling,
@@ -115,5 +121,11 @@ That command will:
 Training rollouts currently use full-distribution sampling (`top_p: 1`,
 `top_k: -1`, `min_p: 0`, and `repetition_penalty: 1`). Wavelet rejects
 truncated or penalty-adjusted training sampling because the trainer cannot yet
-replay those transforms when computing importance ratios. Evaluation sampling
-is unaffected by this restriction.
+replay those transforms when computing importance ratios. Missing sampled-token
+logprobs are rejected instead of being replaced with synthetic values. Evaluation
+sampling is unaffected by this restriction.
+
+Evaluation `avg@k` and `pass@k` metrics count every requested generation;
+failed or missing-reward attempts count as incorrect instead of disappearing from
+the denominator. Corresponding `eval/<env>/effective/...` metrics describe only
+successful verifier responses, and `failed_rollouts` reports the failure rate.

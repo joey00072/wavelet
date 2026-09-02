@@ -20,7 +20,10 @@ from torch.nn import Module
 from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-from wavelet.orchestrator.policy_metadata import policy_metadata
+from wavelet.orchestrator.policy_metadata import (
+    adapter_artifact_metadata,
+    policy_metadata,
+)
 from wavelet.trainer.distributed import barrier
 from wavelet.transport.queue import (
     POLICY_META_FILENAME,
@@ -394,12 +397,14 @@ class PolicyExportMixin:
         export_step: int,
         kind: str,
     ) -> None:
+        artifact = adapter_artifact_metadata(tmp_dir / "adapter")
         metadata = policy_metadata(
             config=self.config,
             format_version=1,
             step=export_step,
             kind=kind,
             created_at=datetime.now(timezone.utc).isoformat(),
+            extra={"artifact": artifact} if artifact is not None else None,
         )
         (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(metadata))
 

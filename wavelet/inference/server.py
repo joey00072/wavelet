@@ -45,6 +45,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.diagnostics import inference_debug_state
+from wavelet.orchestrator.policy_metadata import adapter_artifact_metadata
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
 
@@ -730,6 +731,9 @@ async def debug_state(request: Request) -> dict[str, Any]:
         "policy_adapter_name": getattr(request.app.state, "policy_adapter_name", None),
         "policy_adapter_path": getattr(request.app.state, "policy_adapter_path", None),
         "policy_weight_path": getattr(request.app.state, "policy_weight_path", None),
+        "policy_artifact_sha256": getattr(
+            request.app.state, "policy_artifact_sha256", None
+        ),
         "asleep": getattr(request.app.state, "asleep", False),
     }
     return state
@@ -799,6 +803,7 @@ async def load_policy(payload: dict[str, Any], raw_request: Request):
         policy_dir=policy_dir,
         step=step,
         load_inplace=bool(payload.get("load_inplace", False)),
+        expected_artifact_sha256=payload.get("artifact_sha256"),
         config=_CONFIG,
     )
 
@@ -848,6 +853,7 @@ async def _load_adapter_policy(
     policy_dir: Path,
     step: int,
     load_inplace: bool,
+    expected_artifact_sha256: str | None,
     config: RLConfig,
 ):
     adapter_name = config.policy_transfer.adapter_name
@@ -855,13 +861,30 @@ async def _load_adapter_policy(
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
 
+    artifact = adapter_artifact_metadata(adapter_dir)
+    artifact_sha256 = None if artifact is None else str(artifact["sha256"])
+    if (
+        expected_artifact_sha256 is not None
+        and artifact_sha256 != expected_artifact_sha256
+    ):
+        raise ValueError(
+            "Policy adapter SHA-256 does not match its export metadata: "
+            f"expected {expected_artifact_sha256}, found {artifact_sha256}."
+        )
+
     adapter_path = str(adapter_dir.resolve())
     if (
         getattr(raw_request.app.state, "policy_step", None) == step
         and getattr(raw_request.app.state, "policy_adapter_name", None) == adapter_name
         and getattr(raw_request.app.state, "policy_adapter_path", None) == adapter_path
     ):
-        return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
+        raw_request.app.state.policy_artifact_sha256 = artifact_sha256
+        return {
+            "status": "ok",
+            "policy_step": step,
+            "adapter_name": adapter_name,
+            "artifact_sha256": artifact_sha256,
+        }
     response = await _models(raw_request).load_lora_adapter(
         LoadLoRAAdapterRequest(
             lora_name=adapter_name,
@@ -877,7 +900,13 @@ async def _load_adapter_policy(
     raw_request.app.state.policy_step = step
     raw_request.app.state.policy_adapter_name = adapter_name
     raw_request.app.state.policy_adapter_path = adapter_path
-    return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
+    raw_request.app.state.policy_artifact_sha256 = artifact_sha256
+    return {
+        "status": "ok",
+        "policy_step": step,
+        "adapter_name": adapter_name,
+        "artifact_sha256": artifact_sha256,
+    }
 
 
 @router.post("/init_broadcaster")
@@ -954,6 +983,7 @@ async def custom_init_app_state(
     state.policy_adapter_name = None
     state.policy_adapter_path = None
     state.policy_weight_path = None
+    state.policy_artifact_sha256 = None
     if "generate" in supported_tasks and state.openai_serving_chat is not None:
         serving_chat = object.__new__(OpenAIServingChatWithTokens)
         serving_chat.__dict__.update(state.openai_serving_chat.__dict__)

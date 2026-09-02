@@ -23,6 +23,7 @@ from wavelet.data.rl import (
     rl_examples_from_payload,
     rl_examples_to_payload,
 )
+from wavelet.transport.queue import POLICY_META_FILENAME
 
 
 def openai_sampling_payload(sampling: RLSamplingConfig) -> dict[str, Any]:
@@ -249,6 +250,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         ) from last_error
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
+        artifact_sha256 = self._policy_artifact_sha256(policy_dir)
         if self._uses_openai_rollouts() and self.config.lora is not None:
             policy_dir = self._cache_lora_policy_dir(policy_dir, step=step)
         if (
@@ -259,13 +261,41 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         ):
             (policy_dir / NCCL_READY_MARKER).touch()
         payload: dict[str, Any] = {"policy_dir": str(policy_dir), "step": step}
+        if artifact_sha256 is not None:
+            payload["artifact_sha256"] = artifact_sha256
         if self._uses_openai_rollouts() and self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name
             payload["load_inplace"] = True
-        self._request_all("POST", "/load_policy", payload)
+        responses = self._request_all("POST", "/load_policy", payload)
+        for response in responses:
+            if int(response.get("policy_step", -1)) != step:
+                raise RuntimeError(
+                    "vLLM server acknowledged the wrong policy step: "
+                    f"expected {step}, received {response.get('policy_step')}."
+                )
+            if (
+                artifact_sha256 is not None
+                and response.get("artifact_sha256") != artifact_sha256
+            ):
+                raise RuntimeError(
+                    "vLLM server did not acknowledge the expected policy artifact "
+                    f"SHA-256 for step {step}."
+                )
         self.policy_step = step
         if self.config.lora is not None:
             self.policy_model_name = self.config.policy_transfer.adapter_name
+
+    @staticmethod
+    def _policy_artifact_sha256(policy_dir: Path) -> str | None:
+        metadata_path = Path(policy_dir) / POLICY_META_FILENAME
+        if not metadata_path.is_file():
+            return None
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        artifact = metadata.get("artifact")
+        if not isinstance(artifact, dict):
+            return None
+        digest = artifact.get("sha256")
+        return digest if isinstance(digest, str) and digest else None
 
     def _default_policy_cache_root(self) -> Path:
         configured = os.environ.get("WAVELET_POLICY_CACHE_DIR")
@@ -414,9 +444,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
             )
             prompt_ids, max_completion_tokens = fit_generation_context(
                 prompt_ids,
-                max_prompt_tokens=(
-                    self.config.inference.sampling.max_prompt_tokens
-                ),
+                max_prompt_tokens=(self.config.inference.sampling.max_prompt_tokens),
                 max_model_len=self.config.inference.vllm.max_model_len,
                 max_completion_tokens=(
                     self.config.inference.sampling.max_completion_tokens
@@ -521,10 +549,20 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         completion_ids: list[int],
     ) -> list[float]:
         raw_logprobs = (choice.get("logprobs") or {}).get("content") or []
-        values = [float(item.get("logprob", 0.0)) for item in raw_logprobs]
-        if len(values) < len(completion_ids):
-            values.extend([0.0] * (len(completion_ids) - len(values)))
-        return values[: len(completion_ids)]
+        if len(raw_logprobs) != len(completion_ids):
+            raise RuntimeError(
+                "OpenAI rollout logprobs do not align with completion token ids "
+                f"({len(raw_logprobs)} != {len(completion_ids)})."
+            )
+        values: list[float] = []
+        for index, item in enumerate(raw_logprobs):
+            if not isinstance(item, dict) or item.get("logprob") is None:
+                raise RuntimeError(
+                    "OpenAI rollout response is missing the sampled-token logprob "
+                    f"at completion index {index}."
+                )
+            values.append(float(item["logprob"]))
+        return values
 
     def close(self) -> None:
         return None
@@ -534,10 +572,9 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         if len(self.base_urls) == 1:
-            self._request(method, path, payload, base_url=self.base_url)
-            return
+            return [self._request(method, path, payload, base_url=self.base_url)]
         with ThreadPoolExecutor(max_workers=len(self.base_urls)) as executor:
             futures = [
                 executor.submit(
@@ -549,8 +586,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 )
                 for base_url in self.base_urls
             ]
-            for future in futures:
-                future.result()
+            return [future.result() for future in futures]
 
     def _request(
         self,
@@ -1076,15 +1112,10 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         if self.tokenizer is None:
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
         if logprobs is None:
-            return [
-                {
-                    "token": "",
-                    "logprob": 0.0,
-                    "bytes": None,
-                    "top_logprobs": [],
-                }
-                for token_id in token_ids
-            ]
+            raise RuntimeError(
+                "vLLM generation did not return sampled-token logprobs. Enable "
+                "generation logprobs for RL rollouts."
+            )
         values = extract_vllm_generation_logprobs(logprobs, token_ids)
         return [
             {
