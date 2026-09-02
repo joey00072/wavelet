@@ -173,8 +173,10 @@ Training rollouts currently use full-distribution sampling (`top_p: 1`,
 `top_k: -1`, `min_p: 0`, and `repetition_penalty: 1`). Wavelet rejects
 truncated or penalty-adjusted training sampling because the trainer cannot yet
 replay those transforms when computing importance ratios. Missing sampled-token
-logprobs are rejected instead of being replaced with synthetic values. Evaluation
-sampling is unaffected by this restriction.
+logprobs and pre-tokenized source streams with misaligned response-side values
+are rejected instead of being trimmed or replaced with synthetic values.
+Legitimate context-tail truncation keeps the aligned prefix. Evaluation sampling
+is unaffected by this restriction.
 
 Evaluation `avg@k` and `pass@k` metrics count every requested generation;
 failed or missing-reward attempts count as incorrect instead of disappearing from

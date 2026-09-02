@@ -597,6 +597,29 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
     ):
         return None
 
+    source_lengths = (
+        len(record.input_ids),
+        len(record.target_ids),
+        len(record.loss_mask),
+    )
+    if len(set(source_lengths)) != 1:
+        raise ValueError(
+            "Pretokenized RL row has mismatched source input_ids, target_ids, "
+            f"and loss_mask lengths {source_lengths}."
+        )
+    source_trainable_tokens = sum(bool(value) for value in record.loss_mask)
+    for field_name, values in (
+        ("advantage", record.advantage),
+        ("inference_logprobs", record.inference_logprobs),
+        ("teacher_logprobs", record.teacher_logprobs),
+        ("temperatures", record.temperatures),
+    ):
+        if isinstance(values, list) and len(values) != source_trainable_tokens:
+            raise ValueError(
+                f"Pretokenized {field_name} must align with all source "
+                f"trainable tokens ({len(values)} != {source_trainable_tokens})."
+            )
+
     input_ids = [int(token_id) for token_id in record.input_ids[:seq_len]]
     target_ids = [int(token_id) for token_id in record.target_ids[:seq_len]]
     loss_mask = [bool(value) for value in record.loss_mask[:seq_len]]
@@ -646,12 +669,6 @@ def prepare_rl_sample(
     if base_sample is None:
         return None
 
-    base_sample["loss_mask"] = _trim_loss_mask_to_sequence(
-        base_sample["loss_mask"],
-        record.inference_logprobs
-        if isinstance(record.inference_logprobs, list)
-        else None,
-    )
     num_trainable_tokens = sum(base_sample["loss_mask"])
     advantages = _coerce_advantages(
         record.advantage,

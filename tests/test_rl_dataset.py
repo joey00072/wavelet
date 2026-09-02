@@ -152,3 +152,45 @@ def test_pretokenized_rollout_count_metadata_sets_sample_count() -> None:
 
     assert sample is not None
     assert sample["sample_count"] == 0
+
+
+def test_pretokenized_source_lengths_are_checked_before_truncation() -> None:
+    record = _record(0, length=10)
+    record.target_ids.append(11)
+
+    with pytest.raises(ValueError, match="mismatched source"):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )
+
+
+def test_pretokenized_logprobs_must_cover_every_source_trainable_token() -> None:
+    record = _record(0, length=10)
+    record.inference_logprobs = [-1.0] * 8
+
+    with pytest.raises(ValueError, match="inference_logprobs.*8 != 10"):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )
+
+
+def test_pretokenized_tail_truncation_keeps_aligned_logprob_prefix() -> None:
+    record = _record(0, length=10)
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sample["input_ids"] == list(range(8))
+    assert sample["inference_logprobs"] == [-1.0] * 8
+    assert len(sample["advantages"]) == 8
