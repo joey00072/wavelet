@@ -836,15 +836,34 @@ class RLConfig(TrainerConfig):
             unsupported.append("top_k")
         if sampling.min_p > 0.0:
             unsupported.append("min_p")
+        if sampling.min_tokens > 0:
+            unsupported.append("min_tokens")
         if sampling.repetition_penalty != 1.0:
             unsupported.append("repetition_penalty")
+        distribution_overrides = {
+            "frequency_penalty",
+            "logit_bias",
+            "min_p",
+            "min_tokens",
+            "presence_penalty",
+            "repetition_penalty",
+            "seed",
+            "temperature",
+            "top_k",
+            "top_p",
+        }
+        unsupported.extend(
+            f"extra_body.{field}"
+            for field in sorted(distribution_overrides & sampling.extra_body.keys())
+        )
         if unsupported:
             fields = ", ".join(unsupported)
             raise ValueError(
                 "RL train sampling changes the token distribution with "
                 f"{fields}, but Wavelet does not yet replay those transforms in "
-                "the trainer. Use top_p=1, top_k=-1, min_p=0, and "
-                "repetition_penalty=1 for correct importance ratios."
+                "the trainer. Use top_p=1, top_k=-1, min_p=0, min_tokens=0, "
+                "repetition_penalty=1, and keep distribution controls out of "
+                "extra_body for correct importance ratios."
             )
         return self
 

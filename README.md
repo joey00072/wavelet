@@ -191,9 +191,11 @@ That command will:
 3. Save the resulting adapter under `outputs/unsloth_math_rl/adapter`
 
 Training rollouts currently use full-distribution sampling (`top_p: 1`,
-`top_k: -1`, `min_p: 0`, and `repetition_penalty: 1`). Wavelet rejects
-truncated or penalty-adjusted training sampling because the trainer cannot yet
-replay those transforms when computing importance ratios. Missing sampled-token
+`top_k: -1`, `min_p: 0`, `min_tokens: 0`, and `repetition_penalty: 1`).
+Wavelet rejects truncated, stop-suppressed, or penalty-adjusted training
+sampling—including distribution controls hidden in `extra_body`—because the
+trainer cannot yet replay those transforms when computing importance ratios.
+Missing sampled-token
 logprobs and pre-tokenized source streams with misaligned response-side values
 are rejected instead of being trimmed or replaced with synthetic values.
 Legitimate context-tail truncation keeps the aligned prefix. Evaluation sampling

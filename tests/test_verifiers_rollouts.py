@@ -161,6 +161,7 @@ def test_custom_verifier_rollout_function_loads_without_env_import() -> None:
 
 def test_verifier_sampling_args_preserve_extra_body() -> None:
     config = RLConfig(
+        orchestrator={"enabled": False},
         inference={
             "sampling": {
                 "top_k": -1,
