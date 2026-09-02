@@ -137,6 +137,9 @@ RL loss normalization is optimizer-batch exact for variable-length examples.
 When dataloader workers prevent deterministic look-ahead, the trainer sums raw
 microbatch losses and applies the measured global token or sequence denominator
 once at the optimizer boundary.
+If any distributed rank observes a non-finite loss, all ranks abort before
+backward and accumulated gradients are cleared; the trainer never silently
+skips a microbatch into a later optimizer update.
 
 Implementation ownership is similarly explicit: `wavelet.transport` owns queue
 and policy transfer, `wavelet.orchestrator.scheduler` owns rollout scheduling,

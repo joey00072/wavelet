@@ -670,8 +670,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
         with self.act_offload_ctx:
             loss_output = self._forward_rl_loss(batch, attention_mask)
-            if torch.isnan(loss_output.loss):
-                return self._skip_nan_loss(loss_output)
+            self._require_finite_loss(loss_output.loss, label="RL loss")
             if self._optimizer_batch_loss_scale is None:
                 self._dynamic_loss_scale_local += normalization_unit_count(
                     batch["loss_mask"],
@@ -729,28 +728,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def _backward_rl_loss(self, loss: Tensor) -> None:
         with self._maybe_no_sync():
             loss.backward()
-
-    def _skip_nan_loss(self, loss_output: LossOutput) -> TrainOutput:
-        logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
-        self._micro_step += 1
-        self._accumulated_micro_batches += 1
-        if self._accumulated_micro_batches >= self.accumulation_steps:
-            self._reward_accum.clear()
-            self._rollout_metric_accum.clear()
-            self._train_loss_accum.clear()
-            self._train_metric_accum.clear()
-            self._accumulated_micro_batches = 0
-            self._dynamic_loss_scale_local = 0.0
-            self._optimizer_batch_loss_scale = (
-                self._estimate_optimizer_batch_loss_scale()
-            )
-        return TrainOutput(
-            loss=loss_output,
-            stepped=False,
-            step=self.step,
-            micro_step=self._micro_step,
-            skipped=True,
-        )
 
     def _record_micro_batch_metrics(
         self,

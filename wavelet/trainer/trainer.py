@@ -607,6 +607,31 @@ class BaseTrainer:
             return float(clipped.detach().item())
         return float(clipped)
 
+    def _require_finite_loss(self, loss: Tensor, *, label: str) -> None:
+        """Abort every rank together when any rank observes a non-finite loss."""
+        local_finite = bool(torch.isfinite(loss.detach()).all().item())
+        all_finite = local_finite
+        if torch.distributed.is_initialized():
+            finite_flag = torch.tensor(
+                int(local_finite),
+                dtype=torch.int32,
+                device=loss.device,
+            )
+            torch.distributed.all_reduce(
+                finite_flag,
+                op=torch.distributed.ReduceOp.MIN,
+            )
+            all_finite = bool(finite_flag.item())
+        if all_finite:
+            return
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+        location = "this rank" if not local_finite else "another rank"
+        raise FloatingPointError(
+            f"Non-finite {label} detected on {location} at optimizer step "
+            f"{self.step}; aborting before backward to keep ranks synchronized."
+        )
+
     def _save_model(self) -> None:
         if self.world is None or self.model is None or self.tokenizer is None:
             return
@@ -695,16 +720,7 @@ class SFTTrainer(BaseTrainer):
                 loss_output = self.compute_loss(outputs.logits, batch["labels"])
             loss = loss_output.loss
 
-            if torch.isnan(loss):
-                logger.warning(f"NaN loss at step {self.step}, skipping backward")
-                self._micro_step += 1
-                return TrainOutput(
-                    loss=loss_output,
-                    stepped=False,
-                    step=self.step,
-                    micro_step=self._micro_step,
-                    skipped=True,
-                )
+            self._require_finite_loss(loss, label="SFT loss")
 
             (loss / self.accumulation_steps).backward()
 
