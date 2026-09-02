@@ -218,6 +218,7 @@ class RunMonitor:
         self,
         output_dir: Path,
         *,
+        checkpoint_dir: Path | None = None,
         enabled: bool = True,
         write_events: bool = True,
         write_metrics_jsonl: bool = True,
@@ -229,6 +230,7 @@ class RunMonitor:
         wandb: WandbConfig | None = None,
     ) -> None:
         self.output_dir = output_dir
+        self.checkpoint_dir = checkpoint_dir
         self.enabled = enabled
         self.write_events = write_events
         self.write_metrics_jsonl = write_metrics_jsonl
@@ -395,12 +397,28 @@ class RunMonitor:
         }
 
     def _disk_metrics(self) -> dict[str, Any]:
-        usage = shutil.disk_usage(self.output_dir)
-        return {
+        usage = shutil.disk_usage(_existing_path(self.output_dir))
+        metrics: dict[str, Any] = {
             "disk_total_bytes": usage.total,
             "disk_used_bytes": usage.used,
             "disk_free_bytes": usage.free,
+            "disk_free_ratio": usage.free / usage.total if usage.total else 0.0,
         }
+        if self.checkpoint_dir is not None:
+            checkpoint_usage = shutil.disk_usage(_existing_path(self.checkpoint_dir))
+            metrics.update(
+                {
+                    "checkpoint_disk_total_bytes": checkpoint_usage.total,
+                    "checkpoint_disk_used_bytes": checkpoint_usage.used,
+                    "checkpoint_disk_free_bytes": checkpoint_usage.free,
+                    "checkpoint_disk_free_ratio": (
+                        checkpoint_usage.free / checkpoint_usage.total
+                        if checkpoint_usage.total
+                        else 0.0
+                    ),
+                }
+            )
+        return metrics
 
     def _write_heartbeat(
         self,
@@ -482,6 +500,14 @@ class RunMonitor:
 
     def _timestamp(self) -> str:
         return datetime.now(timezone.utc).isoformat()
+
+
+def _existing_path(path: Path) -> Path:
+    """Return the nearest existing path whose filesystem contains ``path``."""
+    cursor = path
+    while not cursor.exists() and cursor != cursor.parent:
+        cursor = cursor.parent
+    return cursor
 
 
 def setup_logger(name: str, level: str = "info") -> Any:

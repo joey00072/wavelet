@@ -113,6 +113,7 @@ class BaseTrainer:
         config = self.config.monitor
         self.monitor = RunMonitor(
             output_dir=self.output_dir,
+            checkpoint_dir=self.config.checkpoint_output_dir,
             enabled=config.enabled,
             write_events=config.write_events,
             write_metrics_jsonl=config.write_metrics_jsonl,
