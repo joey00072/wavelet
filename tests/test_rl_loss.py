@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from wavelet.configs.rl_config import RLLossConfig
-from wavelet.trainer.rl_loss import compute_loss
+from wavelet.trainer.rl_loss import compute_loss, normalization_unit_count
 from wavelet.trainer.types import LossOutput
 
 
@@ -53,6 +53,22 @@ def test_sequence_normalization_remains_available() -> None:
     )
 
     assert output.loss.item() == pytest.approx(-0.5)
+
+
+def test_normalization_unit_count_matches_packed_sequence_boundaries() -> None:
+    loss_mask = torch.tensor([[True, True, False, True, False]])
+    position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+
+    assert normalization_unit_count(
+        loss_mask,
+        normalization="token",
+        position_ids=position_ids,
+    ) == 3
+    assert normalization_unit_count(
+        loss_mask,
+        normalization="sequence",
+        position_ids=position_ids,
+    ) == 2
 
 
 def test_policy_gradient_moves_logprobs_in_advantage_direction() -> None:

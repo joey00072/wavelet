@@ -116,9 +116,16 @@ and generated solve-rate metrics before filtering. Use those raw generation
 metrics to judge policy progress; reward on admitted mixed groups is
 selection-biased by design.
 
-Streaming trainers consume queue chunks in exact queue order. Each chunk's
-manifest must agree with its queue step, optimizer step, chunk index, row
-count, and configured policy-freshness window before any tokens are trained.
+Trainers consume queue batches in exact queue order. Every batch manifest must
+agree with its queue step, optimizer step, chunk index, row count, and configured
+policy-freshness window before any tokens are trained.
+Integrated generation also records the policy version loaded by its inference
+engine in every rollout manifest.
+
+RL loss normalization is optimizer-batch exact for variable-length examples.
+When dataloader workers prevent deterministic look-ahead, the trainer sums raw
+microbatch losses and applies the measured global token or sequence denominator
+once at the optimizer boundary.
 
 Implementation ownership is similarly explicit: `wavelet.transport` owns queue
 and policy transfer, `wavelet.orchestrator.scheduler` owns rollout scheduling,
