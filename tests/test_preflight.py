@@ -165,6 +165,35 @@ def test_preflight_resolves_process_commands(tmp_path, monkeypatch) -> None:
     assert report["paths"]["policy_dir"] == str(tmp_path / "run" / "policies")
 
 
+def test_checkpoint_output_dir_does_not_replace_run_output_dir(
+    tmp_path, monkeypatch
+) -> None:
+    data_path = _write_local_data(tmp_path)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.preflight._available_gpu_indices",
+        lambda: {"0"},
+    )
+    run_dir = tmp_path / "run"
+    checkpoint_dir = tmp_path / "large-volume"
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        output_dir=run_dir,
+        ckpt={"mode": "async", "interval": 10, "output_dir": checkpoint_dir},
+    )
+
+    report = build_preflight_report(config)
+
+    assert config.output_dir == run_dir
+    assert config.checkpoint_output_dir == checkpoint_dir
+    assert report["paths"]["output_dir"] == str(run_dir)
+    assert report["paths"]["checkpoint_dir"] == str(checkpoint_dir)
+    assert any(
+        check["name"] == "checkpoint_parent_writable"
+        and check["status"] == "ok"
+        for check in report["checks"]
+    )
+
+
 def test_preflight_cli_returns_nonzero_for_errors(tmp_path, capsys) -> None:
     config_path = tmp_path / "rl.yaml"
     config_path.write_text(

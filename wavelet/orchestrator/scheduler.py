@@ -179,7 +179,7 @@ def _resume_optimizer_step(config: RLConfig) -> int:
     if checkpoint is None or checkpoint.resume_step is None:
         return 0
     checkpoint_dir = resolve_resume_checkpoint(
-        config.output_dir,
+        config.checkpoint_output_dir,
         checkpoint.resume_step,
     )
     try:

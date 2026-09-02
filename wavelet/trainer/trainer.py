@@ -131,12 +131,12 @@ class BaseTrainer:
             self.optimizer,
             self.scheduler,
             self.config.ckpt,
-            self.output_dir,
+            self.config.checkpoint_output_dir,
             self.world,
         )
         if self.config.ckpt is not None and self.config.ckpt.resume_step is not None:
             self.resume_checkpoint_dir = resolve_resume_checkpoint(
-                self.output_dir,
+                self.config.checkpoint_output_dir,
                 self.config.ckpt.resume_step,
             )
             state = self.ckpt_manager.load(
@@ -832,7 +832,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if resuming:
             assert config.ckpt is not None
-            resolve_resume_checkpoint(config.output_dir, config.ckpt.resume_step)
+            resolve_resume_checkpoint(
+                config.checkpoint_output_dir,
+                config.ckpt.resume_step,
+            )
         dump_yaml(
             config_path,
             config.model_dump(mode="json", exclude_none=True),
