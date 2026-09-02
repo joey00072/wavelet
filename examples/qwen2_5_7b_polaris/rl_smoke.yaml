@@ -78,7 +78,6 @@ inference:
     max_prompt_tokens: 512
     max_completion_tokens: 1536
     do_sample: true
-    seed: 42
     extra_body:
       stop:
         - "</answer>"

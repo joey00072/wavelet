@@ -77,7 +77,6 @@ inference:
     max_completion_tokens: 1536
     do_sample: true
     num_generations: 1
-    seed: 42
     extra_body:
       stop:
         - "</answer>"

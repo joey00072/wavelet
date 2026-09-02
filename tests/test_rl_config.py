@@ -134,6 +134,35 @@ def test_static_rl_data_allows_sampling_fields_that_are_not_used() -> None:
     assert config.inference.sampling.min_p == pytest.approx(0.1)
 
 
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        {"do_sample": False},
+        {"temperature": 0.0},
+        {"seed": 123},
+    ],
+)
+def test_group_relative_rl_rejects_deterministic_rollouts(sampling) -> None:
+    with pytest.raises(ValueError, match="needs diverse rollouts"):
+        RLConfig(
+            algo={"type": "grpo"},
+            orchestrator={"rollouts_per_example": 8},
+            inference={"sampling": sampling},
+            max_steps=1,
+        )
+
+
+def test_eval_only_group_config_allows_deterministic_sampling() -> None:
+    config = RLConfig(
+        algo={"type": "grpo"},
+        orchestrator={"rollouts_per_example": 8},
+        inference={"sampling": {"seed": 123}},
+        max_steps=0,
+    )
+
+    assert config.inference.sampling.seed == 123
+
+
 @pytest.mark.parametrize("mode", ["process", "colocate", "colocate_sleep"])
 def test_process_training_requires_initial_policy_export(mode: str) -> None:
     with pytest.raises(ValueError, match="export_initial=true"):
