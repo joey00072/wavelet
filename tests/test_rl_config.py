@@ -114,6 +114,7 @@ def test_max_inflight_rollouts_must_cover_one_group() -> None:
         ("top_p", 0.9),
         ("top_k", 20),
         ("min_p", 0.1),
+        ("min_tokens", 2),
         ("repetition_penalty", 1.1),
     ],
 )
@@ -123,6 +124,15 @@ def test_rl_rejects_sampling_transforms_trainer_cannot_replay(
 ) -> None:
     with pytest.raises(ValueError, match=field):
         RLConfig(inference={"sampling": {field: value}})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["temperature", "seed", "logit_bias", "presence_penalty"],
+)
+def test_rl_rejects_hidden_sampling_transforms_in_extra_body(field: str) -> None:
+    with pytest.raises(ValueError, match=f"extra_body.{field}"):
+        RLConfig(inference={"sampling": {"extra_body": {field: 1}}})
 
 
 def test_static_rl_data_allows_sampling_fields_that_are_not_used() -> None:
