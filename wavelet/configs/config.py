@@ -849,6 +849,35 @@ class RLConfig(TrainerConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_group_sampling_diversity(self) -> "RLConfig":
+        if (
+            not self.orchestrator.enabled
+            or not self.inference.enabled
+            or self.max_steps == 0
+            or not isinstance(self.algo, (GRPOAlgorithmConfig, MaxRLAlgorithmConfig))
+            or (self.orchestrator.rollouts_per_example or 1) <= 1
+        ):
+            return self
+
+        sampling = self.inference.sampling
+        deterministic: list[str] = []
+        if not sampling.do_sample:
+            deterministic.append("do_sample=false")
+        if sampling.temperature <= 0:
+            deterministic.append("temperature=0")
+        if sampling.seed is not None:
+            deterministic.append("a fixed sampling seed")
+        if deterministic:
+            settings = ", ".join(deterministic)
+            raise ValueError(
+                "Group-relative RL needs diverse rollouts, but the configured "
+                f"sampling can repeat each completion ({settings}). Use "
+                "do_sample=true, temperature>0, and sampling.seed=null; data.seed "
+                "still provides deterministic task ordering."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_initial_policy_for_process_training(self) -> "RLConfig":
         if (
             self.orchestrator.enabled

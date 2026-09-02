@@ -47,6 +47,12 @@ GRPO requires a reward on every rollout and centers rewards within each prompt
 group. Set `normalize_advantages` to divide centered advantages by their
 population standard deviation when that deviation exceeds `epsilon`.
 
+Training groups must contain genuinely sampled alternatives. When a group has
+more than one rollout, Wavelet rejects greedy decoding, zero temperature, and a
+fixed generation seed because repeated completions produce zero group-relative
+advantages. Use `data.seed` for reproducible task ordering while leaving the
+generation seed unset.
+
 ```yaml
 algo:
   type: grpo
