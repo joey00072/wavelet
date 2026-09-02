@@ -200,6 +200,9 @@ logprobs and pre-tokenized source streams with misaligned response-side values
 are rejected instead of being trimmed or replaced with synthetic values.
 Legitimate context-tail truncation keeps the aligned prefix. Evaluation sampling
 is unaffected by this restriction.
+Verifier advantages are computed inside each dispatched rollout group, so
+duplicate dataset `example_id` values cannot merge otherwise independent GRPO
+comparisons.
 
 Evaluation `avg@k` and `pass@k` metrics count every requested generation;
 failed or missing-reward attempts count as incorrect instead of disappearing from

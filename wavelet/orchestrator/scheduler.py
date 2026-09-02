@@ -213,7 +213,6 @@ from wavelet.orchestrator.envs import (
     _mark_zero_advantage_records_metric_only,
     _verifier_example,
     _sampling_args,
-    _assign_rollout_advantages,
     _records_from_output,
     _scale_verifier_executors,
     _teardown_cached_verifier_envs,
@@ -344,7 +343,6 @@ def generate_rollouts(
             output["_wavelet_policy_step"] = policy_step
     rollout_seconds = perf_counter() - rollout_started_at
     convert_started_at = perf_counter()
-    _assign_rollout_advantages(outputs, config)
     records = [record for output in outputs for record in _records_from_output(output)]
     convert_seconds = perf_counter() - convert_started_at
     emit_perf(
