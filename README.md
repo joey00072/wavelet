@@ -104,6 +104,9 @@ convert that step to the corresponding queue-chunk offset. Completed runs wait
 for a pending async checkpoint to become stable before process teardown. A
 restored trainer also forces one policy export at the checkpoint step, even when
 that step is between normal export intervals.
+Set `ckpt.output_dir` to place large checkpoint step directories on a separate
+volume without moving logs, rollouts, policies, or other run state out of the
+top-level `output_dir`. Resume and preflight resolve the same checkpoint volume.
 
 With `orchestrator.filter_zero_advantage: true`, the persistent verifier
 scheduler resamples zero-signal groups until `examples_per_step` admitted groups

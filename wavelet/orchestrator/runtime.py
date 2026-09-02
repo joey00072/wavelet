@@ -615,7 +615,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     if resuming:
         assert config.ckpt is not None
-        resolve_resume_checkpoint(config.output_dir, config.ckpt.resume_step)
+        resolve_resume_checkpoint(
+            config.checkpoint_output_dir,
+            config.ckpt.resume_step,
+        )
     dump_yaml(
         get_config_dir(config.output_dir) / "rl.yaml",
         _role_config_payload(config),

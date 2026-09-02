@@ -257,11 +257,12 @@ class TrainerConfig(BaseModel):
     seed: int = 0
     activation_offloading: ActivationOffloadingConfig | None = None
 
-    @model_validator(mode="after")
-    def resolve_checkpoint_output_dir(self):
+    @property
+    def checkpoint_output_dir(self) -> Path:
+        """Directory containing checkpoint step directories for this run."""
         if self.ckpt is not None and self.ckpt.output_dir is not None:
-            self.output_dir = self.ckpt.output_dir
-        return self
+            return self.ckpt.output_dir
+        return self.output_dir
 
     @model_validator(mode="after")
     def validate_checkpoint_config(self):

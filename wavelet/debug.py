@@ -1607,6 +1607,7 @@ def _low_precision_summary(config: RLConfig) -> dict[str, Any]:
 def _paths(config: RLConfig) -> dict[str, str]:
     return {
         "output_dir": str(config.output_dir),
+        "checkpoint_dir": str(config.checkpoint_output_dir),
         "queue_dir": str(resolve_queue_dir(config.output_dir, config.transport)),
         "policy_dir": str(
             resolve_policy_dir(config.output_dir, config.policy_transfer)
@@ -1619,6 +1620,12 @@ def _path_checks(config: RLConfig) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
     checks.extend(_data_path_checks(config))
     checks.append(_output_dir_check(config.output_dir, clean=config.clean_output_dir))
+    checks.append(
+        _parent_writable_check(
+            config.checkpoint_output_dir,
+            name="checkpoint_parent_writable",
+        )
+    )
     checks.append(
         _parent_writable_check(
             resolve_queue_dir(config.output_dir, config.transport),
