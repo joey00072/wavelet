@@ -10,6 +10,7 @@ from pathlib import Path
 from time import perf_counter
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.data.rl import count_nonempty_jsonl_rows
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.launcher import (
     RoleHandle,
@@ -26,6 +27,7 @@ from wavelet.orchestrator.placement import (
     trainer_device_group as _trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import target_steps as _target_steps
 from wavelet.orchestrator.scheduler import IntegratedRolloutScheduler
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.transport.queue import (
@@ -33,7 +35,6 @@ from wavelet.transport.queue import (
     FileSystemRolloutReceiver,
     RolloutBatch,
 )
-from wavelet.orchestrator.schedule import target_steps as _target_steps
 from wavelet.utils.config import load_config
 from wavelet.utils.pathing import (
     get_config_dir,
@@ -195,6 +196,7 @@ def _publish_rollout_timed(
     batch = orchestrator.publish(
         step=step,
         inference_engine=inference_engine,
+        policy_step=getattr(inference_engine, "policy_step", None),
     )
     return batch, perf_counter() - started_at
 
@@ -311,6 +313,11 @@ def _load_and_train_received_batch(
     timings: StepTimes,
 ) -> None:
     trainer_step_before = trainer.step
+    row_count = count_nonempty_jsonl_rows(
+        received.path,
+        description="Rollout batch",
+    )
+    trainer.validate_rollout_batch(received, row_count=row_count)
     trainer.record_rollout_claim(
         received,
         trainer_step_before=trainer_step_before,

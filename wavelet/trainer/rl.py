@@ -35,7 +35,11 @@ from wavelet.orchestrator.schedule import (
 )
 from wavelet.trainer.distributed import barrier
 from wavelet.trainer.ckpt import TrainerState
-from wavelet.trainer.losses import compute_loss, selective_log_softmax
+from wavelet.trainer.losses import (
+    compute_loss,
+    normalization_unit_count,
+    selective_log_softmax,
+)
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.types import LossOutput, TrainOutput
@@ -235,6 +239,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._train_metric_accum: list[dict[str, float]] = []
         self._optimizer_batch_loss_scale: float | None = None
         self._gradient_accumulation_loss_scale: float | None = None
+        self._dynamic_loss_scale_local = 0.0
         self._loaded_micro_batch_count = 0
         self._run_closed = False
         self._init_policy_transport()
@@ -271,6 +276,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def _after_resume(self) -> None:
         self._accumulated_micro_batches = 0
+        self._dynamic_loss_scale_local = 0.0
 
     def _validate_resume_state(self, state: TrainerState) -> None:
         if state.step < 0 or state.micro_step < state.step:
@@ -359,6 +365,22 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             batch,
             trainer_step_before=trainer_step_before,
             events_dir=self.output_dir / "events",
+        )
+
+    def validate_rollout_batch(
+        self,
+        batch: RolloutBatch,
+        *,
+        row_count: int,
+        chunk_index: int | None = None,
+    ) -> None:
+        """Validate queue provenance before loading a rollout batch."""
+        _validate_rollout_batch(
+            self.config,
+            batch,
+            trainer_step=self.step,
+            row_count=row_count,
+            chunk_index=chunk_index,
         )
 
     def record_rollout_consumed(
@@ -650,6 +672,12 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             loss_output = self._forward_rl_loss(batch, attention_mask)
             if torch.isnan(loss_output.loss):
                 return self._skip_nan_loss(loss_output)
+            if self._optimizer_batch_loss_scale is None:
+                self._dynamic_loss_scale_local += normalization_unit_count(
+                    batch["loss_mask"],
+                    normalization=self.config.loss.normalization,
+                    position_ids=batch["position_ids"],
+                )
             self._backward_rl_loss(loss_output.loss)
 
         self._record_micro_batch_metrics(batch, loss_output)
@@ -690,18 +718,17 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             batch["advantages"],
             batch["loss_mask"],
             self.config.loss,
-            loss_scale=self._optimizer_batch_loss_scale,
+            loss_scale=(
+                self._optimizer_batch_loss_scale
+                if self._optimizer_batch_loss_scale is not None
+                else 1.0
+            ),
             position_ids=batch["position_ids"],
         )
 
     def _backward_rl_loss(self, loss: Tensor) -> None:
         with self._maybe_no_sync():
-            backward_loss = (
-                loss / self.accumulation_steps
-                if self._optimizer_batch_loss_scale is None
-                else loss
-            )
-            backward_loss.backward()
+            loss.backward()
 
     def _skip_nan_loss(self, loss_output: LossOutput) -> TrainOutput:
         logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
@@ -713,6 +740,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             self._train_loss_accum.clear()
             self._train_metric_accum.clear()
             self._accumulated_micro_batches = 0
+            self._dynamic_loss_scale_local = 0.0
             self._optimizer_batch_loss_scale = (
                 self._estimate_optimizer_batch_loss_scale()
             )
@@ -745,6 +773,12 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         )
 
     def _apply_optimizer_step(self) -> float | None:
+        if self._optimizer_batch_loss_scale is None:
+            self._gradient_accumulation_loss_scale = (
+                self._average_data_parallel_loss_scale(
+                    self._dynamic_loss_scale_local,
+                )
+            )
         self._apply_gradient_accumulation_loss_scale()
         self._sync_tensor_parallel_lora_grads()
         grad_norm = self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
@@ -753,6 +787,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self.optimizer.zero_grad(set_to_none=True)
         self.step += 1
         self._accumulated_micro_batches = 0
+        self._dynamic_loss_scale_local = 0.0
         return grad_norm
 
     def _finalize_optimizer_metrics(self, grad_norm: float | None) -> dict[str, float]:
@@ -1204,6 +1239,14 @@ def main(argv: list[str] | None = None) -> int:
                     batch = receiver.wait()
                     wait_seconds = perf_counter() - wait_started_at
                     trainer_step_before = trainer.step
+                    row_count = count_nonempty_jsonl_rows(
+                        batch.path,
+                        description="Rollout batch",
+                    )
+                    trainer.validate_rollout_batch(
+                        batch,
+                        row_count=row_count,
+                    )
                     trainer.record_rollout_claim(
                         batch,
                         trainer_step_before=trainer_step_before,
@@ -1275,10 +1318,6 @@ def _run_streaming_rollout_training(
         batch = receiver.wait()
         wait_seconds = perf_counter() - wait_started_at
         trainer_step_before = trainer.step
-        trainer.record_rollout_claim(
-            batch,
-            trainer_step_before=trainer_step_before,
-        )
         row_count = count_nonempty_jsonl_rows(
             batch.path,
             description="Rollout chunk",
@@ -1288,6 +1327,10 @@ def _run_streaming_rollout_training(
             batch,
             trainer_step=trainer.step,
             row_count=row_count,
+        )
+        trainer.record_rollout_claim(
+            batch,
+            trainer_step_before=trainer_step_before,
         )
         accumulator.buffer(batch, row_count)
         if not accumulator.should_load(min_rows=min_loadable_rows):
@@ -1386,15 +1429,36 @@ def _validate_streaming_rollout_batch(
             f"{expected_optimizer_step}, but trainer is at step {trainer_step}."
         )
 
+    _validate_rollout_batch(
+        config,
+        batch,
+        trainer_step=trainer_step,
+        row_count=row_count,
+        chunk_index=expected_chunk_index,
+    )
+
+
+def _validate_rollout_batch(
+    config: RLConfig,
+    batch: RolloutBatch,
+    *,
+    trainer_step: int,
+    row_count: int,
+    chunk_index: int | None,
+) -> None:
+    """Reject rollout data whose manifest disagrees with trainer state."""
+    expected_queue_step = batch.step if chunk_index is not None else trainer_step
+    expected_optimizer_step = trainer_step
+
     manifest = read_manifest(batch.step_dir)
     if manifest is None:
         raise ValueError(
-            f"Streaming rollout queue step {batch.step} is missing manifest.json."
+            f"Rollout queue step {batch.step} is missing manifest.json."
         )
     mismatches = {
-        "queue_step": (manifest.queue_step, batch.step),
+        "queue_step": (manifest.queue_step, expected_queue_step),
         "optimizer_step": (manifest.optimizer_step, expected_optimizer_step),
-        "chunk_index": (manifest.chunk_index, expected_chunk_index),
+        "chunk_index": (manifest.chunk_index, chunk_index),
         "rows": (manifest.rows, row_count),
     }
     invalid = [
@@ -1409,7 +1473,7 @@ def _validate_streaming_rollout_batch(
         )
 
     policy_step = manifest.policy_step
-    minimum_policy_step = required_policy_step(config, expected_optimizer_step)
+    minimum_policy_step = required_policy_step(config, trainer_step)
     if policy_step is None or not minimum_policy_step <= policy_step <= trainer_step:
         raise ValueError(
             f"Rollout queue step {batch.step} has policy_step={policy_step!r}; "

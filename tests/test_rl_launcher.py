@@ -17,6 +17,7 @@ from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
 from wavelet.orchestrator.runtime import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
+    _publish_rollout_timed,
     _role_specs,
     _rollout_client_config,
     _sleep_vllm_http_servers,
@@ -27,6 +28,7 @@ from wavelet.trainer.rl_worker import (
     _StreamingChunkAccumulator,
     _dummy_rollout_row,
     _use_streaming_rollout_chunks,
+    _validate_rollout_batch,
     _validate_streaming_rollout_batch,
 )
 from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
@@ -50,6 +52,31 @@ class _FakeWorld:
 class _FakeTrainer:
     def __init__(self, *, is_main: bool | None) -> None:
         self.world = None if is_main is None else _FakeWorld(is_main=is_main)
+
+
+def test_integrated_rollout_publish_records_loaded_policy_step() -> None:
+    published: dict[str, object] = {}
+
+    def publish(**kwargs):
+        published.update(kwargs)
+        return object()
+
+    orchestrator = type("Orchestrator", (), {"publish": staticmethod(publish)})()
+    inference_engine = type("InferenceEngine", (), {"policy_step": 7})()
+
+    batch, elapsed = _publish_rollout_timed(
+        orchestrator,  # type: ignore[arg-type]
+        step=9,
+        inference_engine=inference_engine,
+    )
+
+    assert batch is not None
+    assert elapsed >= 0.0
+    assert published == {
+        "step": 9,
+        "inference_engine": inference_engine,
+        "policy_step": 7,
+    }
 
 
 def _argv_value(argv: list[str], option: str) -> str:
@@ -301,6 +328,45 @@ def test_streaming_rollout_rejects_stale_policy_and_wrong_manifest(
             wrong_rows,
             trainer_step=2,
             row_count=2,
+        )
+
+
+def test_synchronous_rollout_manifest_must_match_trainer_state(
+    tmp_path: Path,
+) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n{}\n", encoding="utf-8")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    valid = sender.publish(
+        source,
+        step=3,
+        optimizer_step=3,
+        policy_step=3,
+        rows=2,
+    )
+    stale = sender.publish(
+        source,
+        step=4,
+        optimizer_step=4,
+        policy_step=2,
+        rows=2,
+    )
+
+    _validate_rollout_batch(
+        config,
+        valid,
+        trainer_step=3,
+        row_count=2,
+        chunk_index=None,
+    )
+    with pytest.raises(ValueError, match="policy_step=2"):
+        _validate_rollout_batch(
+            config,
+            stale,
+            trainer_step=4,
+            row_count=2,
+            chunk_index=None,
         )
 
 

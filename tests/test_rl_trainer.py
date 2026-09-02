@@ -118,6 +118,41 @@ def test_gradient_accumulation_loss_scale_divides_grads_once() -> None:
     assert torch.allclose(model.weight.grad, torch.tensor([[1.0, 2.0]]))
 
 
+def test_dynamic_loss_scale_normalizes_accumulated_raw_gradients() -> None:
+    trainer = RLTrainer(RLConfig(data={"num_workers": 1}, max_grad_norm=0.0))
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    trainer._optimizer_batch_loss_scale = None  # noqa: SLF001
+    trainer._dynamic_loss_scale_local = 6.0  # noqa: SLF001
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[6.0, 12.0]])
+    trainer.model = model
+    trainer.optimizer = Mock()
+    trainer.scheduler = Mock()
+
+    trainer._apply_optimizer_step()  # noqa: SLF001
+
+    assert torch.allclose(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+    assert trainer._dynamic_loss_scale_local == 0.0  # noqa: SLF001
+
+
+def test_dynamic_loss_backward_accumulates_sums_before_final_scaling() -> None:
+    trainer = RLTrainer(RLConfig(data={"num_workers": 1}))
+    trainer.accumulation_steps = 2
+    trainer._optimizer_batch_loss_scale = None  # noqa: SLF001
+    loss = torch.tensor(6.0, requires_grad=True)
+
+    trainer._backward_rl_loss(loss)  # noqa: SLF001
+
+    assert loss.grad is not None
+    assert loss.grad.item() == pytest.approx(1.0)
+
+
 def test_finalize_waits_for_pending_async_checkpoint(monkeypatch) -> None:
     trainer = RLTrainer(RLConfig())
     trainer.monitor = Mock()
