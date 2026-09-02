@@ -813,6 +813,17 @@ class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]
         self._initialize_iteration_state()
         self._epoch_bins: dict[int, list[RLSample]] = {}
         self._epoch_global_bins: dict[int, list[RLSample]] = {}
+        self._next_bin_index = 0
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            **super().state_dict(),
+            "next_bin_index": self._next_bin_index,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        super().load_state_dict(state_dict)
+        self._next_bin_index = int(state_dict.get("next_bin_index", -1))
 
     def micro_batch_count(self) -> int:
         return max(len(self._bins_for_epoch(self.epoch)), 1)
@@ -842,10 +853,19 @@ class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]
             bins = self._bins_for_epoch(self.epoch)
             if not bins:
                 return
-            for sample in bins:
+            if self._next_bin_index < 0:
+                self._next_bin_index = self.step - self.epoch * len(bins)
+            if not 0 <= self._next_bin_index <= len(bins):
+                raise ValueError(
+                    "Packed RL checkpoint bin cursor is inconsistent with its "
+                    "step and epoch."
+                )
+            for index in range(self._next_bin_index, len(bins)):
                 self.step += 1
-                yield sample
+                self._next_bin_index = index + 1
+                yield bins[index]
             self.epoch += 1
+            self._next_bin_index = 0
 
     def _bins_for_epoch(self, epoch: int) -> list[RLSample]:
         cached = self._epoch_bins.get(epoch)

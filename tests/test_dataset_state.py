@@ -2,7 +2,7 @@ from itertools import islice
 
 from wavelet.configs.rl_config import RLDataConfig
 from wavelet.configs.sft import LossMaskConfig
-from wavelet.data.rl import PackedRLDataset, RLDataset
+from wavelet.data.rl import PackedRLDataset, RLDataset, RLExample
 from wavelet.data.sft import CatDataset, Example, SFTDataset
 from wavelet.trainer.debug import build_debug_tokenizer
 
@@ -48,13 +48,17 @@ def test_stateful_datasets_share_checkpoint_and_stats_behavior() -> None:
             }
         )
 
-        assert dataset.state_dict() == {
+        expected_state = {
             "step": 12,
             "epoch": 3,
             "num_samples": {"train": 5},
             "num_tokens": {"train": 40},
             "skipped": 2,
         }
+        actual_state = dataset.state_dict()
+        assert {key: actual_state[key] for key in expected_state} == expected_state
+        if isinstance(dataset, PackedRLDataset):
+            assert actual_state["next_bin_index"] == -1
         assert dataset.stats() == {
             "samples": {"train": 5},
             "tokens": {"train": 40},
@@ -117,3 +121,43 @@ def test_cat_dataset_resume_preserves_pending_token_remainder() -> None:
 
     assert state["pending"]["input_ids"]
     assert next(iter(resumed)) == expected_next
+
+
+def test_packed_rl_resume_continues_at_next_bin() -> None:
+    records = [
+        RLExample(
+            prompt=[],
+            completion=[],
+            advantage=float(index),
+            reward=float(index),
+            input_ids=list(range(index * 10, index * 10 + 6)),
+            target_ids=list(range(index * 10 + 1, index * 10 + 7)),
+            loss_mask=[True] * 6,
+            inference_logprobs=[-1.0] * 6,
+            temperatures=[1.0] * 6,
+        )
+        for index in range(4)
+    ]
+    config = RLDataConfig(pack_sequences=True, seq_len=8)
+    uninterrupted = PackedRLDataset(
+        records=records,
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config,
+    )
+    iterator = iter(uninterrupted)
+    first = next(iterator)
+    state = uninterrupted.state_dict()
+    expected_next = next(iterator)
+
+    resumed = PackedRLDataset(
+        records=records,
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config,
+    )
+    resumed.load_state_dict(state)
+
+    assert state["next_bin_index"] == 1
+    assert next(iter(resumed)) == expected_next
+    assert first != expected_next

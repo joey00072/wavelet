@@ -123,6 +123,8 @@ not fit inside the truncated context window.
 Concatenative SFT packing checkpoints both the source-row position and its
 unconsumed token remainder, so resuming does not skip tokens already read into a
 partially filled packed sequence.
+Static packed-RL checkpoints likewise persist the next packed-bin cursor rather
+than replaying the current epoch from its first bin.
 
 With `orchestrator.filter_zero_advantage: true`, the persistent verifier
 scheduler resamples zero-signal groups until `examples_per_step` admitted groups
