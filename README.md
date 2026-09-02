@@ -114,6 +114,9 @@ that step is between normal export intervals.
 Set `ckpt.output_dir` to place large checkpoint step directories on a separate
 volume without moving logs, rollouts, policies, or other run state out of the
 top-level `output_dir`. Resume and preflight resolve the same checkpoint volume.
+Trainer metrics report byte counts and free-space ratios for both the run and
+checkpoint filesystems, including when either configured directory has not yet
+been created.
 
 With `orchestrator.filter_zero_advantage: true`, the persistent verifier
 scheduler resamples zero-signal groups until `examples_per_step` admitted groups
