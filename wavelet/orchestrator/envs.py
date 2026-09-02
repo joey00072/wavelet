@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
 _ENV_CACHE: dict[tuple[str, str], Any] = {}
+_VERIFIER_EXECUTOR_CONCURRENCY = 0
 logger = logging.getLogger(__name__)
 
 
@@ -168,6 +170,7 @@ async def _run_eval_examples(
     rollouts_per_example: int,
     max_retries: int,
 ) -> list[dict[str, Any]]:
+    _scale_verifier_executors(len(examples) * rollouts_per_example)
     tasks = []
     example_ids: list[str] = []
     for example_index, example in enumerate(examples):
@@ -428,6 +431,48 @@ def _load_cached_env(
     return env, False
 
 
+def _scale_verifier_executors(concurrency: int) -> int:
+    """Grow Verifiers executors to Wavelet's actual request concurrency."""
+    global _VERIFIER_EXECUTOR_CONCURRENCY
+    concurrency = max(int(concurrency), 1)
+    if concurrency <= _VERIFIER_EXECUTOR_CONCURRENCY:
+        return _VERIFIER_EXECUTOR_CONCURRENCY
+    try:
+        from verifiers.utils.thread_utils import scale_executors
+    except ImportError:
+        return _VERIFIER_EXECUTOR_CONCURRENCY
+    scale_executors(concurrency)
+    _VERIFIER_EXECUTOR_CONCURRENCY = concurrency
+    return concurrency
+
+
+async def _teardown_cached_verifier_envs() -> None:
+    """Close cached environments and registered executors exactly once."""
+    global _VERIFIER_EXECUTOR_CONCURRENCY
+    environments = list({id(env): env for env in _ENV_CACHE.values()}.values())
+    _ENV_CACHE.clear()
+    errors: list[Exception] = []
+    for env in environments:
+        teardown = getattr(env, "teardown", None)
+        if not callable(teardown):
+            continue
+        try:
+            result = teardown()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            errors.append(exc)
+    try:
+        from verifiers.utils.thread_utils import shutdown_executors
+    except ImportError:
+        pass
+    else:
+        shutdown_executors()
+    _VERIFIER_EXECUTOR_CONCURRENCY = 0
+    if errors:
+        raise RuntimeError("Verifier environment teardown failed.") from errors[0]
+
+
 async def _run_all(
     vf,
     env,
@@ -446,6 +491,7 @@ async def _run_all(
 ) -> list[dict[str, Any]]:
     if not clients:
         raise ValueError("At least one verifier client is required.")
+    _scale_verifier_executors(len(records) * rollout_count)
     if target_groups is None or len(records) <= target_groups:
         return await _run_complete_record_set(
             vf,

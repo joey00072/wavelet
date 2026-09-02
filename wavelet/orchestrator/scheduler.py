@@ -215,6 +215,8 @@ from wavelet.orchestrator.envs import (
     _sampling_args,
     _assign_rollout_advantages,
     _records_from_output,
+    _scale_verifier_executors,
+    _teardown_cached_verifier_envs,
 )
 
 
@@ -451,6 +453,9 @@ class VerifierRolloutScheduler:
         self, *, target_groups: int | None = None
     ) -> list[RLExample]:
         started_at = perf_counter()
+        self.executor_concurrency = _scale_verifier_executors(
+            self.max_inflight_rollouts
+        )
         target_groups = self.target_groups if target_groups is None else target_groups
         outputs: list[dict[str, Any]] = []
         accepted_groups = 0
@@ -587,6 +592,9 @@ class VerifierRolloutScheduler:
         records = _mark_zero_advantage_records_metric_only(records, self.config)
         self.last_batch_metrics = batch_stats.metrics(
             rollouts_per_group=self.rollout_count
+        )
+        self.last_batch_metrics["generation/executor_concurrency"] = float(
+            self.executor_concurrency
         )
         emit_perf(
             "verifier_scheduler",
@@ -2056,6 +2064,7 @@ class _VerifierPublisherStrategy:
                 return_exceptions=True,
             )
         await self.scheduler.aclose()
+        await _teardown_cached_verifier_envs()
 
 
 def _run_chunk_scheduler(

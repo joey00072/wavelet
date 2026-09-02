@@ -4,11 +4,14 @@ import asyncio
 import json
 from pathlib import Path
 import random
+import sys
 from types import MethodType
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
+import wavelet.orchestrator.envs as verifier_envs
 from wavelet.configs.rl_config import GRPOAlgorithmConfig, RLConfig
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -498,6 +501,57 @@ def test_verifier_scheduler_uses_explicit_max_inflight_rollouts() -> None:
 
     assert scheduler.max_inflight_groups == 16
     assert scheduler.max_inflight_rollouts == 128
+
+
+def test_verifier_executors_scale_to_high_water_concurrency(
+    monkeypatch,
+) -> None:
+    scale_executors = Mock()
+    thread_utils = type(
+        "ThreadUtils",
+        (),
+        {"scale_executors": scale_executors},
+    )()
+    monkeypatch.setitem(
+        sys.modules,
+        "verifiers.utils.thread_utils",
+        thread_utils,
+    )
+    monkeypatch.setattr(verifier_envs, "_VERIFIER_EXECUTOR_CONCURRENCY", 0)
+
+    assert verifier_envs._scale_verifier_executors(256) == 256
+    assert verifier_envs._scale_verifier_executors(128) == 256
+
+    scale_executors.assert_called_once_with(256)
+
+
+def test_cached_verifier_environments_are_torn_down_once(monkeypatch) -> None:
+    teardown = Mock(return_value=None)
+    env = type("Env", (), {"teardown": teardown})()
+    shutdown_executors = Mock()
+    thread_utils = type(
+        "ThreadUtils",
+        (),
+        {"shutdown_executors": shutdown_executors},
+    )()
+    monkeypatch.setitem(
+        sys.modules,
+        "verifiers.utils.thread_utils",
+        thread_utils,
+    )
+    monkeypatch.setattr(
+        verifier_envs,
+        "_ENV_CACHE",
+        {("train", "", ""): env, ("eval", "", ""): env},
+    )
+    monkeypatch.setattr(verifier_envs, "_VERIFIER_EXECUTOR_CONCURRENCY", 256)
+
+    asyncio.run(verifier_envs._teardown_cached_verifier_envs())
+
+    teardown.assert_called_once_with()
+    shutdown_executors.assert_called_once_with()
+    assert verifier_envs._ENV_CACHE == {}
+    assert verifier_envs._VERIFIER_EXECUTOR_CONCURRENCY == 0
 
 
 def test_verifier_scheduler_drains_done_tasks_and_buffers_extra_groups() -> None:
@@ -1054,6 +1108,8 @@ def test_verifier_scheduler_reschedules_failed_single_rollout() -> None:
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 2
+    scheduler.target_groups = 1
+    scheduler.clients = [object()]
     scheduler.requires_group_scoring = False
     scheduler.pending = {}
     scheduler.pending_clients = {}
@@ -1429,6 +1485,8 @@ def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 1
+    scheduler.target_groups = 1
+    scheduler.clients = [object()]
     scheduler.pending = {}
     scheduler.pending_clients = {}
     scheduler.groups = {
