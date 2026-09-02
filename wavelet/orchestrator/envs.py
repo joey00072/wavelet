@@ -535,43 +535,28 @@ async def _run_complete_record_set(
     algorithm_config: RLAlgorithmConfig,
     env_name: str,
 ) -> list[dict[str, Any]]:
-    if getattr(env, "requires_group_scoring", False):
-        tasks = [
-            _run_group(
-                vf,
-                env,
-                _verifier_example(record),
-                client=clients[index % len(clients)],
-                model=model,
-                sampling_args=sampling_args,
-                rollout_count=rollout_count,
-                max_retries=max_retries,
-                algorithm_config=algorithm_config,
-            )
-            for index, record in enumerate(records)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        outputs = [
-            output
-            for result in results
-            if not isinstance(result, Exception)
-            for output in result
-        ]
-    else:
-        tasks = [
-            env.run_rollout(
-                vf.RolloutInput(**_verifier_example(record)),
-                client=clients[index % len(clients)],
-                model=model,
-                sampling_args=sampling_args,
-                max_retries=max_retries,
-                state_columns=["trajectory", "sampling_args"],
-            )
-            for index, record in enumerate(records)
-            for _ in range(rollout_count)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        outputs = _successful_rollout_outputs(results, require_trainable=False)
+    tasks = [
+        _run_group(
+            vf,
+            env,
+            _verifier_example(record),
+            client=clients[index % len(clients)],
+            model=model,
+            sampling_args=sampling_args,
+            rollout_count=rollout_count,
+            max_retries=max_retries,
+            algorithm_config=algorithm_config,
+        )
+        for index, record in enumerate(records)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    outputs: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            _raise_if_external_rate_limit(result)
+            logger.warning("Verifier rollout group failed: %r", result)
+            continue
+        outputs.extend(result)
     _stamp_env_name(outputs, env_name)
     return outputs
 

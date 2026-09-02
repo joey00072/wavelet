@@ -416,6 +416,72 @@ def test_run_all_uses_group_scoring_without_target_scheduler() -> None:
     assert [output["advantage"] for output in outputs] == [-0.5, 0.5]
 
 
+def test_run_all_keeps_duplicate_example_ids_in_separate_groups() -> None:
+    class DummyRolloutInput:
+        def __init__(self, **kwargs: Any) -> None:
+            self.payload = kwargs
+
+    class DummyVerifierModule:
+        RolloutInput = DummyRolloutInput
+
+    class DummyEnv:
+        requires_group_scoring = False
+
+        def __init__(self) -> None:
+            self.calls: dict[int, int] = {}
+
+        async def run_rollout(
+            self,
+            rollout_input: DummyRolloutInput,
+            **_kwargs: Any,
+        ) -> dict[str, Any]:
+            base = int(rollout_input.payload["base"])
+            rollout_index = self.calls.get(base, 0)
+            self.calls[base] = rollout_index + 1
+            return {
+                "example_id": "duplicate",
+                "reward": float(base + rollout_index),
+                "error": None,
+                "trajectory": _trainable_trajectory(),
+            }
+
+    async def run() -> list[dict[str, Any]]:
+        records = [
+            RLExample(
+                prompt=[],
+                completion=[],
+                advantage=None,
+                reward=None,
+                metadata={
+                    "verifier_example": {
+                        "example_id": "duplicate",
+                        "base": base,
+                    }
+                },
+            )
+            for base in (0, 10)
+        ]
+        return await _run_all(
+            DummyVerifierModule(),
+            DummyEnv(),
+            records,
+            clients=[object()],
+            model="debug",
+            sampling_args={},
+            rollout_count=2,
+            max_retries=0,
+            target_groups=2,
+            filter_zero_advantage=False,
+            advantage_epsilon=1e-6,
+            algorithm_config=GRPOAlgorithmConfig(),
+        )
+
+    outputs = asyncio.run(run())
+
+    assert [output["reward"] for output in outputs] == [0.0, 1.0, 10.0, 11.0]
+    assert [output["advantage"] for output in outputs] == [-0.5, 0.5] * 2
+
+
 def test_verifier_scheduler_uses_oversampling_without_async_multiplier() -> None:
     config = RLConfig(
         orchestrator={
