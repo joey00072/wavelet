@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
-from wavelet.orchestrator.launcher import LocalRoleHandle, LocalRoleLauncher, RoleSpec
+from wavelet.configs.rl_config import RLConfig
+from wavelet.orchestrator.launcher import (
+    LocalRoleHandle,
+    LocalRoleLauncher,
+    RayRoleLauncher,
+    RoleSpec,
+)
 
 
 class _FakeProcess:
@@ -97,3 +104,53 @@ def test_local_role_launcher_starts_roles_in_new_session(tmp_path, monkeypatch) 
 
     assert captured["kwargs"]["start_new_session"] is True
     assert captured["kwargs"]["stdout"].name.endswith("rl_inference.log")
+    assert captured["kwargs"]["stdout"].mode == "a"
+
+
+def test_local_role_launcher_preserves_existing_log(tmp_path, monkeypatch) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log_path = log_dir / "rl_inference.log"
+    log_path.write_text("previous run\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "wavelet.orchestrator.launcher.subprocess.Popen",
+        lambda *args, **kwargs: _FakeProcess(),
+    )
+
+    launcher = LocalRoleLauncher(tmp_path)
+    handle = launcher.start(
+        RoleSpec(
+            name="inference",
+            command="rl-inference",
+            config_path=Path("config.yaml"),
+            log_name="rl_inference",
+        )
+    )
+    handle.close()
+
+    assert log_path.read_text(encoding="utf-8") == "previous run\n"
+
+
+def test_ray_role_launcher_disconnects_on_close(monkeypatch) -> None:
+    calls: list[str] = []
+
+    class FakeRay:
+        @staticmethod
+        def remote(function):
+            return function
+
+        @staticmethod
+        def init(**kwargs) -> None:
+            del kwargs
+            calls.append("init")
+
+        @staticmethod
+        def shutdown() -> None:
+            calls.append("shutdown")
+
+    monkeypatch.setitem(sys.modules, "ray", FakeRay)
+
+    launcher = RayRoleLauncher(RLConfig(launcher={"backend": "ray"}))
+    launcher.close()
+
+    assert calls == ["init", "shutdown"]

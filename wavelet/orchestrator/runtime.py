@@ -476,8 +476,11 @@ def _run_process_launcher(config: RLConfig) -> int:
             poll_interval_seconds=config.launcher.poll_interval_seconds,
         )
     finally:
-        terminate_remaining(handles)
-        close_handles(handles)
+        try:
+            terminate_remaining(handles)
+            close_handles(handles)
+        finally:
+            launcher.close()
     print(f"Published rollout batches under {config.output_dir / 'rollouts'}")
     return 0
 
