@@ -106,3 +106,29 @@ def test_max_inflight_rollouts_must_cover_one_group() -> None:
                 "max_inflight_rollouts": 4,
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("top_p", 0.9),
+        ("top_k", 20),
+        ("min_p", 0.1),
+        ("repetition_penalty", 1.1),
+    ],
+)
+def test_rl_rejects_sampling_transforms_trainer_cannot_replay(
+    field: str,
+    value: float | int,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        RLConfig(inference={"sampling": {field: value}})
+
+
+def test_static_rl_data_allows_sampling_fields_that_are_not_used() -> None:
+    config = RLConfig(
+        orchestrator={"enabled": False},
+        inference={"sampling": {"min_p": 0.1}},
+    )
+
+    assert config.inference.sampling.min_p == pytest.approx(0.1)

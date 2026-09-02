@@ -90,7 +90,7 @@ def test_packed_rl_dataset_allows_dummy_only_distributed_ranks() -> None:
     assert bins[0]["advantages"] == []
     assert bins[0]["sample_count"] == 0
     assert dataset.local_real_sample_count() == 0
-    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(1.0)
+    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(0.0)
 
 
 def test_pretokenized_dummy_rollout_keeps_zero_loss_sample() -> None:

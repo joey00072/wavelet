@@ -111,3 +111,9 @@ That command will:
 1. Generate math rollouts from `outputs/unsloth_math_data/rl_train.jsonl`
 2. Train a LoRA-adapted policy from the generated rollout batches
 3. Save the resulting adapter under `outputs/unsloth_math_rl/adapter`
+
+Training rollouts currently use full-distribution sampling (`top_p: 1`,
+`top_k: -1`, `min_p: 0`, and `repetition_penalty: 1`). Wavelet rejects
+truncated or penalty-adjusted training sampling because the trainer cannot yet
+replay those transforms when computing importance ratios. Evaluation sampling
+is unaffected by this restriction.

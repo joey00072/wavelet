@@ -265,6 +265,11 @@ class NCCLWeightUpdateWorker(Worker):
         update_info_path = Path(weight_path) / NCCL_UPDATE_INFO_FILENAME
         update_info = json.loads(update_info_path.read_text())
         model = _worker_model(self)
+        stream = (
+            torch.cuda.current_stream(communicator.device)
+            if communicator.device.type == "cuda"
+            else None
+        )
         for name, dtype_name, shape in zip(
             update_info["names"],
             update_info["dtype_names"],
@@ -273,7 +278,7 @@ class NCCLWeightUpdateWorker(Worker):
         ):
             dtype = getattr(torch, dtype_name)
             weight = torch.empty(shape, dtype=dtype, device=communicator.device)
-            communicator.broadcast(weight, src=0, stream=torch.cuda.current_stream())
+            communicator.broadcast(weight, src=0, stream=stream)
             model.load_weights([(name, weight)])  # type: ignore[arg-type]
             del weight
 

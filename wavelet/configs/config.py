@@ -819,6 +819,35 @@ class RLConfig(TrainerConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_train_sampling_replay(self) -> "RLConfig":
+        if (
+            not self.orchestrator.enabled
+            or not self.inference.enabled
+            or self.inference.mode != "vllm_http"
+        ):
+            return self
+
+        sampling = self.inference.sampling
+        unsupported: list[str] = []
+        if sampling.top_p < 1.0:
+            unsupported.append("top_p")
+        if sampling.top_k > 0:
+            unsupported.append("top_k")
+        if sampling.min_p > 0.0:
+            unsupported.append("min_p")
+        if sampling.repetition_penalty != 1.0:
+            unsupported.append("repetition_penalty")
+        if unsupported:
+            fields = ", ".join(unsupported)
+            raise ValueError(
+                "RL train sampling changes the token distribution with "
+                f"{fields}, but Wavelet does not yet replay those transforms in "
+                "the trainer. Use top_p=1, top_k=-1, min_p=0, and "
+                "repetition_penalty=1 for correct importance ratios."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_policy_transfer(self) -> "RLConfig":
         if self.policy_transfer.type != "nccl":
             return self

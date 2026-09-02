@@ -1067,11 +1067,23 @@ def _append_lora_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--fully-sharded-loras")
 
 
-def _serve_args(config: RLConfig) -> Namespace:
+def _serve_argv(config: RLConfig) -> list[str]:
+    """Build vLLM server arguments without initializing the GPU platform."""
     argv = _base_serve_argv(config)
     _append_optional_serve_args(argv, config)
     _append_parser_serve_args(argv, config)
     _append_lora_serve_args(argv, config)
+    worker_extension_cls = (
+        "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
+        if config.policy_transfer.type == "nccl"
+        else "wavelet.inference.vllm_weight_update.FileSystemWeightUpdateWorker"
+    )
+    argv.extend(["--worker-extension-cls", worker_extension_cls])
+    return argv
+
+
+def _serve_args(config: RLConfig) -> Namespace:
+    argv = _serve_argv(config)
 
     parser = FlexibleArgumentParser(
         description="Wavelet vLLM OpenAI-compatible RL server."
@@ -1079,14 +1091,6 @@ def _serve_args(config: RLConfig) -> Namespace:
     parser = make_arg_parser(parser)
     args = parser.parse_args(argv)
     assert args is not None
-    if config.policy_transfer.type == "nccl":
-        args.worker_extension_cls = (
-            "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
-        )
-    else:
-        args.worker_extension_cls = (
-            "wavelet.inference.vllm_weight_update.FileSystemWeightUpdateWorker"
-        )
     validate_parsed_serve_args(args)
     return args
 

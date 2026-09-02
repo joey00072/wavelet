@@ -27,7 +27,7 @@ from wavelet.trainer.rl_worker import (
     _dummy_rollout_row,
     _use_streaming_rollout_chunks,
 )
-from wavelet.inference.server import _fit_chat_request_to_context, _serve_args
+from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
@@ -45,6 +45,10 @@ class _FakeWorld:
 class _FakeTrainer:
     def __init__(self, *, is_main: bool | None) -> None:
         self.world = None if is_main is None else _FakeWorld(is_main=is_main)
+
+
+def _argv_value(argv: list[str], option: str) -> str:
+    return argv[argv.index(option) + 1]
 
 
 def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
@@ -241,9 +245,9 @@ def test_sleep_colocate_allows_multi_replica_inference() -> None:
 def test_sleep_colocate_enables_vllm_sleep_allocator() -> None:
     config = RLConfig(launcher={"mode": "colocate_sleep"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.enable_sleep_mode is True
+    assert "--enable-sleep-mode" in argv
 
 
 def test_inference_server_enables_fully_sharded_loras() -> None:
@@ -252,13 +256,13 @@ def test_inference_server_enables_fully_sharded_loras() -> None:
         lora={"rank": 32, "target_modules": ["q_proj"]},
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.enable_lora is True
-    assert args.max_loras == 1
-    assert args.max_cpu_loras == 1
-    assert args.fully_sharded_loras is True
-    assert args.max_lora_rank == 32
+    assert "--enable-lora" in argv
+    assert _argv_value(argv, "--max-loras") == "1"
+    assert _argv_value(argv, "--max-cpu-loras") == "1"
+    assert "--fully-sharded-loras" in argv
+    assert _argv_value(argv, "--max-lora-rank") == "32"
 
 
 def test_inference_server_passes_quantized_load_args() -> None:
@@ -271,10 +275,10 @@ def test_inference_server_passes_quantized_load_args() -> None:
         }
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.quantization == "bitsandbytes"
-    assert args.load_format == "bitsandbytes"
+    assert _argv_value(argv, "--quantization") == "bitsandbytes"
+    assert _argv_value(argv, "--load-format") == "bitsandbytes"
 
 
 def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
@@ -285,10 +289,10 @@ def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
         policy_transfer={"type": "nccl"},
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
     assert (
-        args.worker_extension_cls
+        _argv_value(argv, "--worker-extension-cls")
         == "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
     )
 
@@ -403,28 +407,28 @@ def test_publish_adapter_policy_snapshot_copies_adapter(tmp_path: Path) -> None:
 def test_inference_server_auto_enables_qwen_tool_parser() -> None:
     config = RLConfig(model={"name": "Qwen/Qwen3-4B-Instruct-2507"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser == "hermes"
-    assert args.enable_auto_tool_choice is True
+    assert _argv_value(argv, "--tool-call-parser") == "hermes"
+    assert "--enable-auto-tool-choice" in argv
 
 
 def test_inference_server_auto_detects_qwen35_tool_parser() -> None:
     config = RLConfig(model={"name": "Qwen/Qwen3.5-397B-A17B"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser == "qwen3_coder"
-    assert args.enable_auto_tool_choice is True
+    assert _argv_value(argv, "--tool-call-parser") == "qwen3_coder"
+    assert "--enable-auto-tool-choice" in argv
 
 
 def test_inference_server_unknown_auto_tool_parser_disabled() -> None:
     config = RLConfig(model={"name": "some/unknown-model"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser is None
-    assert args.enable_auto_tool_choice is False
+    assert "--tool-call-parser" not in argv
+    assert "--enable-auto-tool-choice" not in argv
 
 
 def test_inference_server_allows_disabling_tool_parser() -> None:
@@ -433,10 +437,10 @@ def test_inference_server_allows_disabling_tool_parser() -> None:
         inference={"vllm": {"tool_call_parser": None}},
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser is None
-    assert args.enable_auto_tool_choice is False
+    assert "--tool-call-parser" not in argv
+    assert "--enable-auto-tool-choice" not in argv
 
 
 def test_sleep_colocate_resolves_memory_wait_devices() -> None:
@@ -684,6 +688,7 @@ def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
 
 def test_http_openai_payload_sets_vllm_request_fields() -> None:
     config = RLConfig(
+        orchestrator={"enabled": False},
         inference={
             "sampling": {
                 "top_k": 20,

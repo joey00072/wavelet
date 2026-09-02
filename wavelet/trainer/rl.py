@@ -573,10 +573,46 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             record.advantage is None and record.reward is None for record in records
         ):
             return None
-        return self.dataset.loss_scale_for_next_local_batch(
-            self.accumulation_steps,
+        local_optimizer_batch_size = (
+            self.accumulation_steps * self.config.data.micro_batch_size
+        )
+        local_loss_scale = self.dataset.loss_scale_for_next_local_batch(
+            local_optimizer_batch_size,
             normalization=self.config.loss.normalization,
         )
+        return self._average_data_parallel_loss_scale(local_loss_scale)
+
+    def _average_data_parallel_loss_scale(self, local_loss_scale: float) -> float:
+        """Return the denominator compatible with averaged DP gradients."""
+        _, data_world_size = self._data_partition()
+        if data_world_size == 1:
+            return max(float(local_loss_scale), 1.0)
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "Distributed RL loss normalization requires an initialized "
+                "process group."
+            )
+        if self.world is None or self.parallel_dims is None:
+            raise RuntimeError(
+                "Distributed world and parallel dimensions must be initialized "
+                "before RL loss normalization."
+            )
+
+        loss_scale = torch.tensor(
+            float(local_loss_scale),
+            dtype=torch.float64,
+            device=self.world.device,
+        )
+        dp_group = self.parallel_dims.get_mesh("dp").get_group()
+        torch.distributed.all_reduce(
+            loss_scale,
+            op=torch.distributed.ReduceOp.SUM,
+            group=dp_group,
+        )
+        # DDP and FSDP average gradients across the same data-parallel ranks.
+        # Dividing each local loss by the average token count therefore yields
+        # a global sum divided by the global token count after gradient sync.
+        return max(float(loss_scale.item()) / data_world_size, 1.0)
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
