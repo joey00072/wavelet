@@ -17,6 +17,7 @@ from wavelet.orchestrator.runtime import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
     _role_specs,
+    _rollout_client_config,
     _sleep_vllm_http_servers,
     _trainer_device_group,
     _wait_for_vllm_http_server,
@@ -315,7 +316,45 @@ def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
     assert roles[0].command == "inference-server"
 
 
-def test_launcher_uses_native_inference_server_only_when_requested(tmp_path: Path) -> None:
+def test_eval_only_base_model_keeps_served_model_name() -> None:
+    config = RLConfig(
+        max_steps=0,
+        model={"name": "Qwen/Qwen2.5-7B-Instruct"},
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        orchestrator={
+            "verifier_model": "Qwen/Qwen2.5-7B-Instruct",
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+        },
+    )
+
+    rollout_config = _rollout_client_config(config, ports=[8000])
+
+    assert rollout_config.orchestrator.verifier_model == ("Qwen/Qwen2.5-7B-Instruct")
+
+
+def test_training_lora_uses_policy_adapter_model_name() -> None:
+    config = RLConfig(
+        max_steps=1,
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            )
+        },
+    )
+
+    rollout_config = _rollout_client_config(config, ports=[8000])
+
+    assert rollout_config.orchestrator.verifier_model == (
+        config.policy_transfer.adapter_name
+    )
+
+
+def test_launcher_uses_native_inference_server_only_when_requested(
+    tmp_path: Path,
+) -> None:
     config = RLConfig(
         output_dir=tmp_path,
         launcher={"mode": "process", "inference_num_replicas": 1},

@@ -1794,6 +1794,16 @@ class _VerifierPublisherStrategy:
         if final_policy_step is None:
             return
         if (
+            target_step == 0
+            and self.loaded_policy_step is None
+            and self.config.model.adapter_path is None
+        ):
+            self.loaded_policy_step = 0
+            self.scheduler.set_policy_step(
+                0,
+                model_name=_current_policy_model_name(self.inference_engine),
+            )
+        elif (
             self.loaded_policy_step is None
             or self.loaded_policy_step < final_policy_step
         ):
@@ -2123,7 +2133,13 @@ def _run_final_evals(
     if final_policy_step is None:
         return loaded_policy_step
 
-    if loaded_policy_step is None or loaded_policy_step < final_policy_step:
+    if (
+        target_step == 0
+        and loaded_policy_step is None
+        and config.model.adapter_path is None
+    ):
+        loaded_policy_step = 0
+    elif loaded_policy_step is None or loaded_policy_step < final_policy_step:
         policy = policy_receiver.wait_for_step(final_policy_step)
         _wake_for_colocated_sleep(config, inference_engine, tags=["weights"])
         inference_engine.load_policy(policy.step_dir, step=policy.step)

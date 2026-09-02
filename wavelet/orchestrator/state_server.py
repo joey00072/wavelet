@@ -8,8 +8,8 @@ from datetime import UTC, datetime
 from typing import Any
 
 from wavelet.configs.config import RLConfig
-from wavelet.monitor import redact as _redact
 from wavelet.monitor import (
+    RolloutStateEventsMixin,
     _file_exceeds_rows,
     _nearest_reward_row,
     _read_json,
@@ -18,18 +18,16 @@ from wavelet.monitor import (
     summary_stats,
     tail_jsonl_rows,
     unavailable_rollout_inspection,
-    RolloutStateEventsMixin,
 )
-from wavelet.transport.queue import (
-    build_queue_report,
-    get_step_dir,
-    resolve_policy_dir,
-    resolve_queue_dir,
-)
+from wavelet.monitor import redact as _redact
 from wavelet.transport.queue import (
     MANIFEST_FILENAME,
     STABLE_BATCH_MARKER,
     STEP_DIR_PREFIX,
+    build_queue_report,
+    get_step_dir,
+    resolve_policy_dir,
+    resolve_queue_dir,
 )
 
 
@@ -147,6 +145,12 @@ class OrchestratorRunState(RolloutStateEventsMixin):
     def metrics(self, *, limit: int) -> list[dict[str, Any]]:
         return tail_jsonl_rows(
             self._config.output_dir / "metrics.jsonl",
+            limit=limit,
+        )
+
+    def eval_metrics(self, *, limit: int) -> list[dict[str, Any]]:
+        return tail_jsonl_rows(
+            self._config.output_dir / "eval_metrics.jsonl",
             limit=limit,
         )
 
@@ -291,6 +295,12 @@ def _build_state_app(
         limit: int = query(default=20, ge=1, le=200),
     ) -> list[dict[str, Any]]:
         return state.metrics(limit=limit)
+
+    @app.get("/eval-metrics")
+    async def eval_metrics(
+        limit: int = query(default=1000, ge=1, le=2000),
+    ) -> list[dict[str, Any]]:
+        return state.eval_metrics(limit=limit)
 
     @app.get("/events")
     async def events(

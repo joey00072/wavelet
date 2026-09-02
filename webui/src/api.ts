@@ -3,6 +3,7 @@ import type { Theme } from "./types";
 const DEFAULT_API_BASE = "http://127.0.0.1:8765";
 
 export const EVENT_LIMIT = 2000;
+export const EVAL_METRIC_LIMIT = 2000;
 export const METRIC_LIMIT = 200;
 export const POLL_MS = 2000;
 export const ROLLOUT_INSPECT_POLL_MS = 5000;

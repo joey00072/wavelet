@@ -4,34 +4,34 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from time import monotonic, sleep
+from typing import TYPE_CHECKING, Any
 
+import torch
 from peft import PeftModel
+from torch import Tensor, nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn import Module
+from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-from wavelet.trainer.distributed import barrier
 from wavelet.orchestrator.policy_metadata import policy_metadata
+from wavelet.trainer.distributed import barrier
 from wavelet.transport.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
+    STEP_DIR_PREFIX,
     QueueEvent,
     append_event_best_effort,
     get_policy_step_dir,
     resolve_policy_dir,
     utc_now,
 )
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from collections.abc import Iterable
-
-import torch
-from torch import Tensor, nn
-from torch.nn import Module
-from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -41,6 +41,29 @@ else:
 NCCL_READY_MARKER = "NCCL_READY"
 NCCL_UPDATE_INFO_FILENAME = "update_info.json"
 NamedTensor = tuple[str, Tensor]
+
+
+def prune_policy_snapshots(policy_dir: Path, *, keep_last: int | None) -> list[Path]:
+    """Remove old stable filesystem policy snapshots and return removed paths."""
+    if keep_last is None or not policy_dir.exists():
+        return []
+
+    snapshots: list[tuple[int, Path]] = []
+    for candidate in policy_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
+            continue
+        try:
+            step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
+        except ValueError:
+            continue
+        if (candidate / STABLE_BATCH_MARKER).exists():
+            snapshots.append((step, candidate))
+
+    removed: list[Path] = []
+    for _, path in sorted(snapshots)[:-keep_last]:
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
 
 
 def _require_vllm_nccl() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
@@ -311,11 +334,9 @@ class PolicyExportMixin:
 
     def _save_filesystem_policy(self, tmp_dir: Path) -> Path:
         from wavelet.trainer.model import (
+            export_model_for_save,
             save_lora_adapter_snapshot,
             save_lora_adapter_snapshot_from_fsdp,
-        )
-        from wavelet.trainer.model import (
-            export_model_for_save,
             save_model,
         )
 
@@ -392,6 +413,11 @@ class PolicyExportMixin:
             self._record_policy_export(export_step)
         if self.world.world_size > 1:
             barrier(self.world)
+        if self.world.is_main:
+            prune_policy_snapshots(
+                step_dir.parent,
+                keep_last=self.config.policy_transfer.keep_last,
+            )
 
     def _export_nccl_policy(self, export_step: int) -> Path:
         if self.model is None:

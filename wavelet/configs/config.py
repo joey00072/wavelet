@@ -386,6 +386,7 @@ class RLTransportConfig(BaseModel):
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
     cleanup_consumed: bool = False
+    keep_last_consumed: int | None = Field(default=None, ge=1)
 
 
 class RLPolicyTransferConfig(BaseModel):
@@ -397,6 +398,7 @@ class RLPolicyTransferConfig(BaseModel):
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
     export_initial: bool = False
     export_every_steps: int = Field(default=1, ge=1)
+    keep_last: int | None = Field(default=None, ge=1)
     lightweight_lora: bool = True
     nccl_host: str = "127.0.0.1"
     nccl_port: int = Field(default=29501, ge=1, le=65535)
@@ -490,6 +492,7 @@ class RLEvalConfig(BaseModel):
     max_retries: int = Field(default=0, ge=0)
     eval_base_model: bool = True
     final_eval: bool = True
+    keep_last_rollout_sets: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def resolve_env_defaults(self) -> "RLEvalConfig":

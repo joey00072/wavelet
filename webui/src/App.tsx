@@ -4,6 +4,7 @@ import { Moon, Server, Sun, Wifi, WifiOff } from "lucide-react";
 
 import {
   EVENT_LIMIT,
+  EVAL_METRIC_LIMIT,
   METRIC_LIMIT,
   POLL_MS,
   ROLLOUT_INSPECT_POLL_MS,
@@ -13,7 +14,15 @@ import {
   normalizeApiBase,
 } from "./api";
 import { type ActiveView, ViewTabs } from "./components/Tabs";
-import type { MetricRow, RolloutEvent, RolloutInspection, RolloutSnapshot, RunState, Theme } from "./types";
+import type {
+  EvalMetricRow,
+  MetricRow,
+  RolloutEvent,
+  RolloutInspection,
+  RolloutSnapshot,
+  RunState,
+  Theme,
+} from "./types";
 import { OverviewView } from "./views/OverviewView";
 import { RolloutsView } from "./views/RolloutsView";
 import { formatTime } from "./utils/format";
@@ -45,6 +54,7 @@ function App() {
   const [activeView, setActiveView] = useState<ActiveView>(viewFromHash);
   const [state, setState] = useState<RunState | null>(null);
   const [metrics, setMetrics] = useState<MetricRow[]>([]);
+  const [evalMetrics, setEvalMetrics] = useState<EvalMetricRow[]>([]);
   const [events, setEvents] = useState<RolloutEvent[]>([]);
   const [rolloutInspection, setRolloutInspection] = useState<RolloutInspection | null>(null);
   const [rolloutInspectionError, setRolloutInspectionError] = useState<string | null>(null);
@@ -84,14 +94,19 @@ function App() {
     const poll = async () => {
       const controller = new AbortController();
       try {
-        const [nextState, nextMetrics, nextEvents] = await Promise.all([
+        const [nextState, nextMetrics, nextEvalMetrics, nextEvents] = await Promise.all([
           fetchJson<RunState>(`${apiBase}/state`, controller.signal),
           fetchJson<MetricRow[]>(`${apiBase}/metrics?limit=${METRIC_LIMIT}`, controller.signal),
+          fetchJson<EvalMetricRow[]>(
+            `${apiBase}/eval-metrics?limit=${EVAL_METRIC_LIMIT}`,
+            controller.signal,
+          ),
           fetchJson<RolloutEvent[]>(`${apiBase}/events?limit=${EVENT_LIMIT}`, controller.signal),
         ]);
         if (!cancelled) {
           setState(nextState);
           setMetrics(nextMetrics);
+          setEvalMetrics(nextEvalMetrics);
           setEvents(nextEvents);
           setError(null);
           setLastFetchAt(new Date().toISOString());
@@ -318,6 +333,7 @@ function App() {
               latest={latest}
               events={events}
               metrics={metrics}
+              evalMetrics={evalMetrics}
               counts={counts}
               inventory={inventory}
               step={step}

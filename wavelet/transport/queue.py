@@ -2,25 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
 import json
 import logging
-from dataclasses import asdict
-from wavelet.monitor import tail_jsonl
 import os
-import socket
-from datetime import UTC, datetime
-from typing import TypeVar
-from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 import shutil
+import socket
 import time
-from collections.abc import Callable
-from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, TypeVar
 
+from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
+from wavelet.monitor import tail_jsonl
+from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 
 STEP_DIR_PREFIX = "step-"
 
@@ -226,6 +223,39 @@ def write_consumed(step_dir: Path, consumed: ConsumedRecord) -> Path:
 
 def read_consumed(step_dir: Path) -> ConsumedRecord | None:
     return _read_record(step_dir / CONSUMED_FILENAME, ConsumedRecord)
+
+
+def prune_consumed_rollout_batches(
+    output_dir: Path,
+    config: RLTransportConfig,
+    *,
+    keep_last: int | None,
+) -> list[Path]:
+    """Remove old consumed queue batches while preserving recent audit samples."""
+    if keep_last is None:
+        return []
+    queue_dir = resolve_queue_dir(output_dir, config)
+    if not queue_dir.exists():
+        return []
+
+    consumed: list[tuple[int, Path]] = []
+    for candidate in queue_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
+            continue
+        try:
+            step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
+        except ValueError:
+            continue
+        if (candidate / CONSUMED_FILENAME).exists():
+            consumed.append((step, candidate))
+
+    removed: list[Path] = []
+    for step, path in sorted(consumed)[:-keep_last]:
+        shutil.rmtree(path)
+        materialized = queue_dir / f"materialized-step-{step:06d}.jsonl"
+        materialized.unlink(missing_ok=True)
+        removed.append(path)
+    return removed
 
 
 def record_rollout_claim(

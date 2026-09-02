@@ -1,0 +1,153 @@
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  load_in_4bit: false
+  gradient_checkpointing: true
+  allow_tf32: true
+  fused_lm_head_token_chunk_size: auto
+
+data:
+  source: local
+  path: outputs/polaris_math_tagged_data/rl_train.jsonl
+  batch_size: 2
+  micro_batch_size: 1
+  pack_sequences: true
+  seq_len: 2048
+  max_examples: 16
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 0.001
+
+algo:
+  type: grpo
+  normalize_advantages: false
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: polaris-math-tagged
+  verifier_env_args:
+    min_difficulty: 1
+    max_difficulty: 6
+  verifier_model: Qwen/Qwen2.5-7B-Instruct
+  verifier_client_type: openai_chat_completions_token
+  examples_per_step: 2
+  rollouts_per_example: 2
+  filter_zero_advantage: false
+  zero_advantage_max_retries: 0
+  max_async_level: 0
+  max_off_policy_steps: 0
+
+transport:
+  cleanup_consumed: true
+  keep_last_consumed: 2
+
+eval:
+  interval: 1
+  num_examples: 2
+  rollouts_per_example: 2
+  eval_base_model: false
+  final_eval: true
+  keep_last_rollout_sets: 1
+  sampling:
+    temperature: 1.0
+    max_completion_tokens: 1536
+    extra_body:
+      stop:
+        - "</answer>"
+      include_stop_str_in_output: true
+  env:
+    - id: polaris-math-tagged
+      name: aime2024
+
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 1.0
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    max_prompt_tokens: 512
+    max_completion_tokens: 1536
+    do_sample: true
+    seed: 42
+    extra_body:
+      stop:
+        - "</answer>"
+      include_stop_str_in_output: true
+  vllm:
+    server_backend: openai
+    dtype: bfloat16
+    gpu_memory_utilization: 0.35
+    max_model_len: 2048
+    enforce_eager: false
+    max_lora_rank: 16
+  http:
+    request_timeout_seconds: 900.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  keep_last: 2
+
+ckpt:
+  mode: async
+  interval: 1
+  keep_last: 1
+
+fsdp:
+  enabled: false
+
+optim:
+  type: adamw
+  implementation: for-loop
+  lr: 1.0e-5
+  weight_decay: 0.0
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+max_steps: 1
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: false
+
+launcher:
+  mode: colocate_sleep
+  backend: local
+  inference_cuda_visible_devices: "0"
+  trainer_cuda_visible_devices: "0"
+  trainer_num_processes: 1
+  inference_num_replicas: 1
+  colocate_memory_wait_margin: 0.15
+
+output_dir: outputs/qwen2_5_7b_polaris_smoke
+clean_output_dir: true

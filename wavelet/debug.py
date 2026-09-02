@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Any, Literal
 import importlib.util
+import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 from wavelet.configs.config import CustomAlgorithmConfig, RLConfig
 from wavelet.data.rl import RLExample, load_rl_records
@@ -22,8 +22,14 @@ from wavelet.orchestrator.algorithms import build_algorithm
 from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
 from wavelet.orchestrator.placement import (
     device_group_size as _device_group_size,
+)
+from wavelet.orchestrator.placement import (
     device_groups as _as_device_groups,
+)
+from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
+)
+from wavelet.orchestrator.placement import (
     trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -38,7 +44,6 @@ from wavelet.transport.queue import (
     resolve_policy_dir,
     resolve_queue_dir,
 )
-
 
 DEBUG_COMMANDS = {
     "preflight": (
@@ -1521,6 +1526,7 @@ def build_preflight_report(config: RLConfig) -> dict[str, Any]:
         *_port_checks(config),
         *_schedule_checks(config),
         *_algorithm_checks(config),
+        *_attention_backend_checks(config),
         *_low_precision_checks(config),
     ]
     commands: list[dict[str, Any]] = []
@@ -1551,11 +1557,40 @@ def _summary(config: RLConfig) -> dict[str, Any]:
         "orchestrator_enabled": config.orchestrator.enabled,
         "inference_mode": config.inference.mode,
         "inference_backend": config.inference.vllm.server_backend,
+        "trainer_attention": config.model.attn_implementation,
         "policy_transfer": config.policy_transfer.type,
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "target_steps": target_steps(config),
         "low_precision": _low_precision_summary(config),
     }
+
+
+def _attention_backend_checks(config: RLConfig) -> list[PreflightCheck]:
+    attention = config.model.attn_implementation
+    if attention != "flash_attention_2":
+        return [
+            PreflightCheck(
+                name="trainer_attention",
+                status="ok",
+                message=f"Trainer attention implementation is {attention!r}.",
+                details={"attn_implementation": attention},
+            )
+        ]
+
+    available = importlib.util.find_spec("flash_attn") is not None
+    return [
+        PreflightCheck(
+            name="flash_attention_available",
+            status="ok" if available else "error",
+            message=(
+                "FlashAttention 2 is available for the trainer."
+                if available
+                else "model.attn_implementation='flash_attention_2' requires "
+                "flash-attn. Install it with `uv sync --extra flash-attn`."
+            ),
+            details={"attn_implementation": attention},
+        )
+    ]
 
 
 def _low_precision_summary(config: RLConfig) -> dict[str, Any]:

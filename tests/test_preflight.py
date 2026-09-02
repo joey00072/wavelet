@@ -7,7 +7,6 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.orchestrator.preflight import build_preflight_report
 
-
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
 
 
@@ -234,6 +233,34 @@ def test_preflight_reports_missing_bitsandbytes_for_qlora(
     assert report["ok"] is False
     assert any(
         check["name"] == "bitsandbytes_available" and check["status"] == "error"
+        for check in report["checks"]
+    )
+
+
+def test_preflight_requires_flash_attention_when_explicit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    data_path = _write_local_data(tmp_path)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        lambda name: None if name == "flash_attn" else object(),
+    )
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"attn_implementation": "flash_attention_2"},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert report["summary"]["trainer_attention"] == "flash_attention_2"
+    assert any(
+        check["name"] == "flash_attention_available"
+        and check["status"] == "error"
+        and "uv sync --extra flash-attn" in check["message"]
         for check in report["checks"]
     )
 

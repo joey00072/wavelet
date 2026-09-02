@@ -10,9 +10,10 @@ import {
 } from "lucide-react";
 
 import { Metric } from "../components/Metric";
+import { EvalProgressChart } from "../components/EvalProgressChart";
 import { InventoryCard, Stat, StatusIcon } from "../components/StatusCards";
 import { ThroughputChart } from "../components/ThroughputChart";
-import type { MetricRow, PipelineInventory, RolloutEvent, RunState } from "../types";
+import type { EvalMetricRow, MetricRow, PipelineInventory, RolloutEvent, RunState } from "../types";
 import { formatNumber, formatRate } from "../utils/format";
 
 export function OverviewView({
@@ -20,6 +21,7 @@ export function OverviewView({
   latest,
   events,
   metrics,
+  evalMetrics,
   counts,
   inventory,
   step,
@@ -32,6 +34,7 @@ export function OverviewView({
   latest: MetricRow | null;
   events: RolloutEvent[];
   metrics: MetricRow[];
+  evalMetrics: EvalMetricRow[];
   counts: { submitted: number; completed: number; published: number };
   inventory: PipelineInventory;
   step: number | null;
@@ -68,6 +71,12 @@ export function OverviewView({
           value={formatRate(consumedRate)}
           sub={`reward ${formatNumber(latest?.reward_mean ?? latest?.["reward/all/mean"])}`}
         />
+      </section>
+
+      <div className="h-px w-full bg-slate-200 dark:bg-white/[0.04]" />
+
+      <section>
+        <EvalProgressChart metrics={evalMetrics} />
       </section>
 
       <div className="h-px w-full bg-slate-200 dark:bg-white/[0.04]" />

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 from pathlib import Path
 from typing import Any, cast
@@ -46,6 +47,8 @@ from wavelet.trainer.debug import (
     build_debug_tokenizer,
 )
 from wavelet.trainer.distributed import ParallelDims, World
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_dtype(name: str) -> torch.dtype | str:
@@ -98,10 +101,15 @@ def setup_tokenizer(config: ModelConfig) -> PreTrainedTokenizerBase:
             tokenizer_source,
             trust_remote_code=config.trust_remote_code,
         )
-    except AttributeError as exc:
-        invalid_adapter_tokenizer = "'list' object has no attribute 'keys'" in str(exc)
-        if config.adapter_path is None or not invalid_adapter_tokenizer:
+    except (AttributeError, OSError, ValueError):
+        if config.adapter_path is None:
             raise
+        logger.warning(
+            "Could not load tokenizer artifacts from adapter path %s; "
+            "falling back to base model %s.",
+            config.adapter_path,
+            config.name,
+        )
         tokenizer = AutoTokenizer.from_pretrained(
             config.name,
             trust_remote_code=config.trust_remote_code,
@@ -182,26 +190,27 @@ def apply_liger_kernel(loss_impl: str, model_name: str) -> None:
 
 
 def _best_attn_implementation() -> str:
-    """Pick the fastest available attention implementation.
+    """Use FlashAttention 2 when installed, otherwise use PyTorch SDPA."""
+    return "flash_attention_2" if _flash_attention_available() else "sdpa"
 
-    Priority: flash_attention_2 → eager (xformers memory-efficient SDPA) → sdpa.
-    xformers is registered as a SDPA backend; passing 'eager' lets the model use
-    whatever SDPA backend PyTorch selects (which picks xformers when available).
-    flash_attention_2 requires the flash-attn package and SM >= 8.0.
-    """
+
+def _flash_attention_available() -> bool:
+    """Return whether the FlashAttention 2 extension imports successfully."""
     try:
         import flash_attn  # noqa: F401
 
-        return "flash_attention_2"
-    except ImportError:
-        pass
-    try:
-        import xformers  # noqa: F401
+        return True
+    except (ImportError, OSError):
+        return False
 
-        return "eager"
-    except ImportError:
-        pass
-    return "sdpa"
+
+def _require_flash_attention() -> None:
+    if _flash_attention_available():
+        return
+    raise ImportError(
+        "model.attn_implementation='flash_attention_2' requires a working "
+        "flash-attn installation. Install it with `uv sync --extra flash-attn`."
+    )
 
 
 def setup_runtime(config: ModelConfig) -> None:
@@ -249,6 +258,8 @@ def _model_load_kwargs(
         if config.attn_implementation == "auto"
         else config.attn_implementation
     )
+    if attention == "flash_attention_2":
+        _require_flash_attention()
     kwargs: dict[str, Any] = {
         "trust_remote_code": config.trust_remote_code,
         "dtype": resolve_dtype(config.torch_dtype),

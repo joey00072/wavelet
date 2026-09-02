@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+
 from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
 from wavelet.data.rl import RLExample
-from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.advantage import (
     output_completion_token_count,
     output_tool_response_token_count,
 )
+from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
     algorithm_scope,
@@ -28,8 +31,8 @@ from wavelet.orchestrator.patches import apply_verifier_openai_patches
 from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
-
 _ENV_CACHE: dict[tuple[str, str], Any] = {}
+logger = logging.getLogger(__name__)
 
 
 _OPENAI_PATCHES_APPLIED = False
@@ -137,6 +140,10 @@ async def _evaluate_env_async(
     env_name = env_config.resolved_name
     output_path = config.output_dir / "evals" / f"step-{step:06d}" / f"{env_name}.jsonl"
     _write_eval_rollouts(output_path, outputs)
+    _prune_eval_rollout_sets(
+        config.output_dir / "evals",
+        keep_last=config.eval.keep_last_rollout_sets,
+    )
     metrics = _eval_metrics(
         env_name,
         outputs,
@@ -256,6 +263,28 @@ def _append_eval_metrics(path: Path, metrics: dict[str, float]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(metrics) + "\n")
+
+
+def _prune_eval_rollout_sets(eval_dir: Path, *, keep_last: int | None) -> list[Path]:
+    """Retain only the newest evaluation rollout directories."""
+    if keep_last is None or not eval_dir.exists():
+        return []
+
+    step_dirs: list[tuple[int, Path]] = []
+    for candidate in eval_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith("step-"):
+            continue
+        try:
+            step = int(candidate.name.removeprefix("step-"))
+        except ValueError:
+            continue
+        step_dirs.append((step, candidate))
+
+    removed: list[Path] = []
+    for _, path in sorted(step_dirs)[:-keep_last]:
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
 
 
 def _verifier_client_routes(
@@ -617,6 +646,7 @@ def _successful_rollout_outputs(
     for result in results:
         if isinstance(result, Exception):
             _raise_if_external_rate_limit(result)
+            logger.warning("Verifier rollout failed: %r", result)
             continue
         try:
             output = dict(result)
@@ -645,6 +675,7 @@ def _completed_group_outputs(
         return task.result()
     except Exception as exc:
         _raise_if_external_rate_limit(exc)
+        logger.warning("Verifier group rollout failed: %s", exc, exc_info=True)
         return []
 
 
