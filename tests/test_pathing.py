@@ -57,3 +57,21 @@ def test_validate_output_dir_clean_removes_previous_run_state(tmp_path: Path) ->
     validate_output_dir(output_dir, resuming=False, clean=True)
 
     assert not output_dir.exists()
+
+
+def test_validate_output_dir_does_not_delete_protected_input(tmp_path: Path) -> None:
+    output_dir = tmp_path / "run"
+    adapter_path = output_dir / "policies" / "step-1" / "adapter"
+    adapter_path.mkdir(parents=True)
+    marker = adapter_path / "adapter_model.safetensors"
+    marker.write_text("weights")
+
+    with pytest.raises(ValueError, match="would remove required input"):
+        validate_output_dir(
+            output_dir,
+            resuming=False,
+            clean=True,
+            protected_paths=(adapter_path,),
+        )
+
+    assert marker.read_text() == "weights"

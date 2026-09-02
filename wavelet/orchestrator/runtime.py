@@ -624,6 +624,7 @@ def main(argv: list[str] | None = None) -> int:
         config.output_dir,
         resuming=resuming,
         clean=config.clean_output_dir,
+        protected_paths=(config.model.adapter_path,),
     )
     if resuming:
         assert config.ckpt is not None

@@ -117,6 +117,8 @@ top-level `output_dir`. Resume and preflight resolve the same checkpoint volume.
 Trainer metrics report byte counts and free-space ratios for both the run and
 checkpoint filesystems, including when either configured directory has not yet
 been created.
+Run-directory cleanup refuses to start when it would delete the configured
+input adapter, even if the launch skips the optional preflight command.
 SFT examples longer than `data.seq_len` train on the available assistant-token
 prefix; an end-of-sequence token is required in the rendered sample, but it need
 not fit inside the truncated context window.
