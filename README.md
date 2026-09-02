@@ -202,7 +202,8 @@ Legitimate context-tail truncation keeps the aligned prefix. Evaluation sampling
 is unaffected by this restriction.
 Verifier advantages are computed inside each dispatched rollout group, so
 duplicate dataset `example_id` values cannot merge otherwise independent GRPO
-comparisons.
+comparisons. The internal dispatch-group identity is retained through rollout
+metadata and complete-group admission.
 
 Evaluation `avg@k` and `pass@k` metrics count every requested generation;
 failed or missing-reward attempts count as incorrect instead of disappearing from

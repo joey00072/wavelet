@@ -480,6 +480,16 @@ def test_run_all_keeps_duplicate_example_ids_in_separate_groups() -> None:
 
     assert [output["reward"] for output in outputs] == [0.0, 1.0, 10.0, 11.0]
     assert [output["advantage"] for output in outputs] == [-0.5, 0.5] * 2
+    assert [output["_wavelet_group_id"] for output in outputs] == [
+        "complete:0",
+        "complete:0",
+        "complete:1",
+        "complete:1",
+    ]
+    record_group_keys = {
+        _records_from_output(output)[0].metadata["group_key"] for output in outputs
+    }
+    assert len(record_group_keys) == 2
 
 
 def test_verifier_scheduler_uses_oversampling_without_async_multiplier() -> None:
