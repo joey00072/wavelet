@@ -841,6 +841,11 @@ def publish_adapter_policy_snapshot(
     }
     if metadata:
         meta.update(metadata)
+    from wavelet.orchestrator.policy_metadata import adapter_artifact_metadata
+
+    artifact = adapter_artifact_metadata(tmp_adapter_dir)
+    if artifact is not None:
+        meta["artifact"] = artifact
     (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
     (tmp_dir / STABLE_BATCH_MARKER).touch()
     tmp_dir.replace(step_dir)

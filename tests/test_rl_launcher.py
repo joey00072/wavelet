@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -522,7 +523,8 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        return {}
+        assert payload is not None
+        return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
 
@@ -562,7 +564,8 @@ def test_http_openai_nccl_load_policy_signals_ready(tmp_path: Path) -> None:
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        return {}
+        assert payload is not None
+        return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
 
@@ -613,6 +616,11 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
     adapter_dir.mkdir(parents=True)
     (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
     (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    artifact_sha256 = hashlib.sha256(b"weights").hexdigest()
+    (policy_dir / "policy.json").write_text(
+        json.dumps({"artifact": {"sha256": artifact_sha256}}),
+        encoding="utf-8",
+    )
     config = RLConfig(
         inference={"vllm": {"server_backend": "openai"}},
         lora={"rank": 4, "target_modules": ["q_proj"]},
@@ -629,7 +637,11 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        return {}
+        assert payload is not None
+        return {
+            "policy_step": payload["step"],
+            "artifact_sha256": payload.get("artifact_sha256"),
+        }
 
     engine._request = fake_request  # type: ignore[method-assign]
 
@@ -648,6 +660,7 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
     ).read_bytes() == b"weights"
     assert payload["adapter_name"] == "policy"
     assert payload["load_inplace"] is True
+    assert payload["artifact_sha256"] == artifact_sha256
 
 
 def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
@@ -696,7 +709,7 @@ def test_http_openai_payload_sets_vllm_request_fields() -> None:
                 "extra_body": {"return_token_ids": False, "allowed_token_ids": [1, 2]},
             },
             "vllm": {"server_backend": "openai"},
-        }
+        },
     )
     engine = HTTPPolicyInferenceEngine(config)
     engine.policy_step = 123

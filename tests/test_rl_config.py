@@ -132,3 +132,23 @@ def test_static_rl_data_allows_sampling_fields_that_are_not_used() -> None:
     )
 
     assert config.inference.sampling.min_p == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("mode", ["process", "colocate", "colocate_sleep"])
+def test_process_training_requires_initial_policy_export(mode: str) -> None:
+    with pytest.raises(ValueError, match="export_initial=true"):
+        RLConfig(
+            launcher={"mode": mode},
+            policy_transfer={"export_initial": False},
+            max_steps=1,
+        )
+
+
+def test_process_eval_only_does_not_require_initial_policy_export() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        policy_transfer={"export_initial": False},
+        max_steps=0,
+    )
+
+    assert config.policy_transfer.export_initial is False

@@ -1,6 +1,8 @@
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.http import HTTPPolicyInferenceEngine
@@ -14,6 +16,22 @@ def _record(index: int) -> RLExample:
         reward=None,
         source=str(index),
     )
+
+
+def test_openai_rollout_rejects_missing_sampled_token_logprobs() -> None:
+    engine = HTTPPolicyInferenceEngine(RLConfig())
+
+    with pytest.raises(RuntimeError, match="do not align"):
+        engine._openai_completion_logprobs(  # noqa: SLF001
+            {"logprobs": {"content": [{"logprob": -0.1}]}},
+            [10, 11],
+        )
+
+    with pytest.raises(RuntimeError, match="missing the sampled-token logprob"):
+        engine._openai_completion_logprobs(  # noqa: SLF001
+            {"logprobs": {"content": [{}]}},
+            [10],
+        )
 
 
 def test_round_robin_annotation_restores_input_order() -> None:
@@ -49,11 +67,16 @@ def test_round_robin_annotation_restores_input_order() -> None:
 def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -> None:
     engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
     calls: list[tuple[str, str, dict[str, object]]] = []
-    monkeypatch.setattr(
-        engine,
-        "_request_all",
-        lambda method, path, payload: calls.append((method, path, payload)),
-    )
+
+    def request_all(
+        method: str,
+        path: str,
+        payload: dict[str, object],
+    ) -> list[dict[str, object]]:
+        calls.append((method, path, payload))
+        return [{"policy_step": payload["step"]}]
+
+    monkeypatch.setattr(engine, "_request_all", request_all)
 
     engine.load_policy(tmp_path / "policy", step=3)
 

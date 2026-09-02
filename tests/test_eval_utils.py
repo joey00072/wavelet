@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from unittest.mock import Mock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -10,7 +12,7 @@ from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.scheduler import _run_final_evals
-from wavelet.orchestrator.verifiers import _eval_metrics
+from wavelet.orchestrator.verifiers import _eval_metrics, _run_eval_examples
 
 
 def test_compute_eval_policy_step_runs_base_and_intervals() -> None:
@@ -216,6 +218,41 @@ def test_eval_metrics_treat_missing_reward_as_failed_rollout() -> None:
         rollouts_per_example=2,
     )
 
-    assert metrics["eval/alphabet/avg@2"] == pytest.approx(1.0)
-    assert metrics["eval/alphabet/pass@1"] == pytest.approx(1.0)
+    assert metrics["eval/alphabet/avg@2"] == pytest.approx(0.5)
+    assert metrics["eval/alphabet/pass@1"] == pytest.approx(0.5)
+    assert metrics["eval/alphabet/pass@2"] == pytest.approx(1.0)
+    assert metrics["eval/alphabet/effective/avg@2"] == pytest.approx(1.0)
+    assert metrics["eval/alphabet/effective/pass@1"] == pytest.approx(1.0)
     assert metrics["eval/alphabet/failed_rollouts"] == pytest.approx(0.5)
+
+
+def test_eval_rollouts_preserve_failed_attempts_and_example_identity() -> None:
+    vf = SimpleNamespace(RolloutInput=lambda **kwargs: kwargs)
+    env = SimpleNamespace(
+        run_rollout=AsyncMock(
+            side_effect=[
+                {"reward": 1.0, "completion": ["ok"]},
+                RuntimeError("generation failed"),
+            ]
+        )
+    )
+
+    outputs = asyncio.run(
+        _run_eval_examples(
+            vf,
+            env,
+            [{"question": "q"}],
+            clients=[object()],
+            model="model",
+            sampling_args={},
+            rollouts_per_example=2,
+            max_retries=0,
+        )
+    )
+
+    assert outputs[0]["example_id"] == "0"
+    assert outputs[1] == {
+        "example_id": "0",
+        "error": "generation failed",
+        "completion": [],
+    }

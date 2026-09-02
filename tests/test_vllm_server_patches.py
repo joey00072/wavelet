@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from logging import CRITICAL
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from vllm.lora.worker_manager import (
 )
 
 from wavelet.inference import server
+from wavelet.configs.rl_config import RLConfig
 
 
 def test_load_lora_patch_still_addresses_upstream_request_replacement() -> None:
@@ -120,3 +122,52 @@ def test_build_app_patch_is_required_for_wavelet_router_and_state() -> None:
     assert "wavelet" not in source
     assert "openai_serving_chat_with_tokens" not in init_source
     assert "policy_step" not in init_source
+
+
+@pytest.mark.anyio
+async def test_adapter_load_rejects_artifact_digest_mismatch(tmp_path: Path) -> None:
+    adapter_dir = tmp_path / "policy" / "adapter"
+    adapter_dir.mkdir(parents=True)
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"wrong-weights")
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        await server._load_adapter_policy(
+            SimpleNamespace(),
+            policy_dir=tmp_path / "policy",
+            step=3,
+            load_inplace=True,
+            expected_artifact_sha256="0" * 64,
+            config=RLConfig(),
+        )
+
+
+@pytest.mark.anyio
+async def test_load_policy_routes_lora_artifact_digest(monkeypatch) -> None:
+    config = RLConfig()
+    monkeypatch.setattr(server, "_CONFIG", config)
+    captured = {}
+
+    async def fake_load_adapter_policy(raw_request, **kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(server, "_load_adapter_policy", fake_load_adapter_policy)
+
+    result = await server.load_policy(
+        {
+            "policy_dir": "/tmp/policy",
+            "step": 4,
+            "load_inplace": True,
+            "artifact_sha256": "a" * 64,
+        },
+        SimpleNamespace(),
+    )
+
+    assert result == {"status": "ok"}
+    assert captured == {
+        "policy_dir": Path("/tmp/policy"),
+        "step": 4,
+        "load_inplace": True,
+        "expected_artifact_sha256": "a" * 64,
+        "config": config,
+    }

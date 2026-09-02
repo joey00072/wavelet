@@ -169,9 +169,13 @@ async def _run_eval_examples(
     max_retries: int,
 ) -> list[dict[str, Any]]:
     tasks = []
+    example_ids: list[str] = []
     for example_index, example in enumerate(examples):
         client = clients[example_index % len(clients)]
         for _ in range(rollouts_per_example):
+            example_ids.append(
+                str(example.get("example_id", example.get("id", example_index)))
+            )
             tasks.append(
                 env.run_rollout(
                     vf.RolloutInput(**example),
@@ -184,10 +188,30 @@ async def _run_eval_examples(
             )
     results = await asyncio.gather(*tasks, return_exceptions=True)
     outputs: list[dict[str, Any]] = []
-    for result in results:
+    for example_id, result in zip(example_ids, results, strict=True):
         if isinstance(result, Exception):
+            _raise_if_external_rate_limit(result)
+            outputs.append(
+                {
+                    "example_id": example_id,
+                    "error": _truncate_error(str(result)),
+                    "completion": [],
+                }
+            )
             continue
-        outputs.append(dict(result))
+        try:
+            output = dict(result)
+        except (TypeError, ValueError) as exc:
+            outputs.append(
+                {
+                    "example_id": example_id,
+                    "error": f"Invalid verifier result: {exc}",
+                    "completion": [],
+                }
+            )
+            continue
+        output.setdefault("example_id", example_id)
+        outputs.append(output)
     return outputs
 
 
@@ -206,14 +230,19 @@ def _eval_metrics(
         f"{prefix}/failed_rollouts": failed / max(total_rollouts, 1),
         f"{prefix}/time": elapsed_seconds,
     }
+
+    if total_rollouts > 0:
+        metrics[f"{prefix}/avg@{rollouts_per_example}"] = sum(rewards) / total_rollouts
+    if rewards:
+        metrics[f"{prefix}/effective/avg@{rollouts_per_example}"] = sum(rewards) / len(
+            rewards
+        )
     if not outputs:
         return metrics
 
     completion_lengths = [_completion_len(output) for output in outputs]
     truncations = [bool(output.get("is_truncated")) for output in outputs]
     no_responses = [not bool(output.get("completion")) for output in outputs]
-    if rewards:
-        metrics[f"{prefix}/avg@{rollouts_per_example}"] = sum(rewards) / len(rewards)
     if completion_lengths:
         metrics[f"{prefix}/completion_len/mean"] = sum(completion_lengths) / len(
             completion_lengths
@@ -222,13 +251,11 @@ def _eval_metrics(
         metrics[f"{prefix}/completion_len/max"] = float(max(completion_lengths))
     metrics[f"{prefix}/is_truncated/mean"] = sum(truncations) / len(truncations)
     metrics[f"{prefix}/no_response/mean"] = sum(no_responses) / len(no_responses)
-    if rewards and set(rewards).issubset({0.0, 1.0}):
+    if set(rewards).issubset({0.0, 1.0}):
         by_example: dict[str, list[float]] = {}
         for output in outputs:
-            if "reward" not in output:
-                continue
             by_example.setdefault(str(output.get("example_id")), []).append(
-                float(output["reward"])
+                float(output.get("reward", 0.0))
             )
         pass_metrics: dict[str, list[float]] = {}
         for group_rewards in by_example.values():
@@ -236,6 +263,19 @@ def _eval_metrics(
                 pass_metrics.setdefault(key, []).append(value)
         for key, values in pass_metrics.items():
             metrics[f"{prefix}/{key}"] = sum(values) / len(values)
+        effective_by_example: dict[str, list[float]] = {}
+        for output in outputs:
+            if "reward" not in output:
+                continue
+            effective_by_example.setdefault(str(output.get("example_id")), []).append(
+                float(output["reward"])
+            )
+        effective_pass_metrics: dict[str, list[float]] = {}
+        for group_rewards in effective_by_example.values():
+            for key, value in pass_at_k(group_rewards).items():
+                effective_pass_metrics.setdefault(key, []).append(value)
+        for key, values in effective_pass_metrics.items():
+            metrics[f"{prefix}/effective/{key}"] = sum(values) / len(values)
     return metrics
 
 

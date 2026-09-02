@@ -48,7 +48,9 @@ The server exposes read-only endpoints and allows browser CORS by default.
 The overview plots AIME 2024 `avg@8` and `pass@8` at the base policy and every
 100 training steps. The step-zero `avg@8` and `pass@8` results are also drawn as
 horizontal base-model references on a fixed 0–100% y-axis. Hover over an
-evaluation point to see its metric value and policy step.
+evaluation point to see its metric value and policy step. These primary metrics
+count failed generations as incorrect; `eval/<env>/effective/...` metrics retain
+the successful-response-only view for diagnosis.
 
 ## Rollout Inspection API
 

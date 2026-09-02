@@ -396,7 +396,7 @@ class RLPolicyTransferConfig(BaseModel):
     adapter_id: int = Field(default=1, ge=1)
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
-    export_initial: bool = False
+    export_initial: bool = True
     export_every_steps: int = Field(default=1, ge=1)
     keep_last: int | None = Field(default=None, ge=1)
     lightweight_lora: bool = True
@@ -844,6 +844,21 @@ class RLConfig(TrainerConfig):
                 f"{fields}, but Wavelet does not yet replay those transforms in "
                 "the trainer. Use top_p=1, top_k=-1, min_p=0, and "
                 "repetition_penalty=1 for correct importance ratios."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_initial_policy_for_process_training(self) -> "RLConfig":
+        if (
+            self.orchestrator.enabled
+            and self.launcher.mode != "integrated"
+            and (self.max_steps is None or self.max_steps > 0)
+            and not self.policy_transfer.export_initial
+        ):
+            raise ValueError(
+                "Process and colocated RL training require "
+                "policy_transfer.export_initial=true so rollout step 0 can load "
+                "the trainer's initial policy."
             )
         return self
 

@@ -55,6 +55,26 @@ def test_sequence_normalization_remains_available() -> None:
     assert output.loss.item() == pytest.approx(-0.5)
 
 
+def test_policy_gradient_moves_logprobs_in_advantage_direction() -> None:
+    trainer_logprobs = torch.zeros((1, 2), requires_grad=True)
+    optimizer = torch.optim.SGD([trainer_logprobs], lr=0.1)
+
+    output = compute_loss(
+        trainer_logprobs,
+        torch.zeros_like(trainer_logprobs),
+        None,
+        torch.tensor([[1.0, -1.0]]),
+        torch.ones((1, 2), dtype=torch.bool),
+        RLLossConfig(kl_tau=0.0),
+        loss_scale=2,
+    )
+    output.loss.backward()
+    optimizer.step()
+
+    assert trainer_logprobs[0, 0].item() > 0.0
+    assert trainer_logprobs[0, 1].item() < 0.0
+
+
 def test_packed_loss_metrics_are_averaged_per_sequence() -> None:
     loss_config = RLLossConfig(kl_tau=0.0)
     trainer_logprobs = torch.tensor([[0.0, 0.0, 0.0, math.log(0.5)]])

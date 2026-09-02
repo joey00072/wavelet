@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+from pathlib import Path
 from typing import Any
 
 from wavelet.configs.rl_config import RLConfig
@@ -56,6 +58,22 @@ def policy_metadata(
     if extra:
         metadata.update(extra)
     return metadata
+
+
+def adapter_artifact_metadata(adapter_dir: Path) -> dict[str, Any] | None:
+    """Describe the exact LoRA tensor artifact used for policy transfer."""
+    tensor_path = Path(adapter_dir) / "adapter_model.safetensors"
+    if not tensor_path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with tensor_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "path": "adapter/adapter_model.safetensors",
+        "bytes": tensor_path.stat().st_size,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def _low_precision_match(config: RLConfig) -> bool:
