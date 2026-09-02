@@ -153,6 +153,39 @@ def test_dynamic_loss_backward_accumulates_sums_before_final_scaling() -> None:
     assert loss.grad.item() == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_loss_aborts_and_clears_accumulated_gradients(value) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.optimizer = Mock()
+
+    with pytest.raises(FloatingPointError, match="Non-finite RL loss"):
+        trainer._require_finite_loss(  # noqa: SLF001
+            torch.tensor(value),
+            label="RL loss",
+        )
+
+    trainer.optimizer.zero_grad.assert_called_once_with(set_to_none=True)
+
+
+def test_remote_nonfinite_loss_aborts_before_backward(monkeypatch) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.optimizer = Mock()
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def mark_remote_failure(flag, *, op) -> None:
+        assert op == torch.distributed.ReduceOp.MIN
+        flag.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", mark_remote_failure)
+
+    with pytest.raises(FloatingPointError, match="another rank"):
+        trainer._require_finite_loss(  # noqa: SLF001
+            torch.tensor(1.0),
+            label="RL loss",
+        )
+
+
 def test_finalize_waits_for_pending_async_checkpoint(monkeypatch) -> None:
     trainer = RLTrainer(RLConfig())
     trainer.monitor = Mock()
