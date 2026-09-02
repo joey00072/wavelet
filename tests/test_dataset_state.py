@@ -3,7 +3,8 @@ from itertools import islice
 from wavelet.configs.rl_config import RLDataConfig
 from wavelet.configs.sft import LossMaskConfig
 from wavelet.data.rl import PackedRLDataset, RLDataset
-from wavelet.data.sft import Example, SFTDataset
+from wavelet.data.sft import CatDataset, Example, SFTDataset
+from wavelet.trainer.debug import build_debug_tokenizer
 
 
 def _datasets():
@@ -77,3 +78,42 @@ def test_shared_local_iterator_preserves_rank_and_epoch_progress() -> None:
     assert indexes == [1, 3, 1]
     assert dataset.step == 6
     assert dataset.epoch == 1
+
+
+def test_cat_dataset_resume_preserves_pending_token_remainder() -> None:
+    tokenizer = build_debug_tokenizer(model_max_length=256)
+    records = [
+        Example(
+            prompt=[{"role": "user", "content": "question"}],
+            completion=[{"role": "assistant", "content": "answer" * 4}],
+            source="test",
+        )
+    ]
+
+    uninterrupted = CatDataset(
+        SFTDataset(
+            records=records,
+            tokenizer=tokenizer,
+            seq_len=64,
+            loss_mask_config=LossMaskConfig(),
+        ),
+        seq_len=32,
+    )
+    iterator = iter(uninterrupted)
+    next(iterator)
+    state = uninterrupted.state_dict()
+    expected_next = next(iterator)
+
+    resumed = CatDataset(
+        SFTDataset(
+            records=records,
+            tokenizer=tokenizer,
+            seq_len=64,
+            loss_mask_config=LossMaskConfig(),
+        ),
+        seq_len=32,
+    )
+    resumed.load_state_dict(state)
+
+    assert state["pending"]["input_ids"]
+    assert next(iter(resumed)) == expected_next

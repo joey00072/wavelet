@@ -757,36 +757,67 @@ class CatDataset(IterableDataset[Sample]):
     def __init__(self, base: SFTDataset, seq_len: int) -> None:
         self.base = base
         self.seq_len = seq_len
+        self._pending_input_ids: list[int] = []
+        self._pending_target_ids: list[int] = []
+        self._pending_loss_mask: list[bool] = []
 
     def state_dict(self) -> dict[str, Any]:
-        return self.base.state_dict()
+        return {
+            "dataset": self.base.state_dict(),
+            "pending": {
+                "input_ids": list(self._pending_input_ids),
+                "target_ids": list(self._pending_target_ids),
+                "loss_mask": list(self._pending_loss_mask),
+            },
+        }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.base.load_state_dict(state_dict)
+        if "dataset" not in state_dict:
+            self.base.load_state_dict(state_dict)
+            self._clear_pending()
+            return
+
+        self.base.load_state_dict(state_dict["dataset"])
+        pending = state_dict.get("pending", {})
+        self._pending_input_ids = [int(value) for value in pending.get("input_ids", [])]
+        self._pending_target_ids = [
+            int(value) for value in pending.get("target_ids", [])
+        ]
+        self._pending_loss_mask = [
+            bool(value) for value in pending.get("loss_mask", [])
+        ]
+        if not (
+            len(self._pending_input_ids)
+            == len(self._pending_target_ids)
+            == len(self._pending_loss_mask)
+        ):
+            raise ValueError("Packed SFT checkpoint has misaligned pending streams.")
 
     def stats(self) -> dict[str, Any]:
         return self.base.stats()
 
     def __iter__(self) -> Iterator[Sample]:
-        buf_input: list[int] = []
-        buf_target: list[int] = []
-        buf_mask: list[bool] = []
-
         for sample in self.base:
-            buf_input.extend(sample["input_ids"])
-            buf_target.extend(sample["target_ids"])
-            buf_mask.extend(sample["loss_mask"])
+            self._pending_input_ids.extend(sample["input_ids"])
+            self._pending_target_ids.extend(sample["target_ids"])
+            self._pending_loss_mask.extend(sample["loss_mask"])
 
-            while len(buf_input) >= self.seq_len:
-                yield {
-                    "input_ids": buf_input[: self.seq_len],
-                    "target_ids": buf_target[: self.seq_len],
-                    "loss_mask": buf_mask[: self.seq_len],
+            while len(self._pending_input_ids) >= self.seq_len:
+                packed = {
+                    "input_ids": self._pending_input_ids[: self.seq_len],
+                    "target_ids": self._pending_target_ids[: self.seq_len],
+                    "loss_mask": self._pending_loss_mask[: self.seq_len],
                     "position_ids": list(range(self.seq_len)),
                 }
-                buf_input = buf_input[self.seq_len :]
-                buf_target = buf_target[self.seq_len :]
-                buf_mask = buf_mask[self.seq_len :]
+                del self._pending_input_ids[: self.seq_len]
+                del self._pending_target_ids[: self.seq_len]
+                del self._pending_loss_mask[: self.seq_len]
+                yield packed
+
+    def _clear_pending(self) -> None:
+        self._pending_input_ids = []
+        self._pending_target_ids = []
+        self._pending_loss_mask = []
 
 
 def setup_dataset(
