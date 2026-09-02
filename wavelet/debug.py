@@ -1619,6 +1619,7 @@ def _paths(config: RLConfig) -> dict[str, str]:
 def _path_checks(config: RLConfig) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
     checks.extend(_data_path_checks(config))
+    checks.extend(_adapter_path_checks(config))
     checks.append(_output_dir_check(config.output_dir, clean=config.clean_output_dir))
     checks.append(
         _parent_writable_check(
@@ -1639,6 +1640,34 @@ def _path_checks(config: RLConfig) -> list[PreflightCheck]:
         )
     )
     return checks
+
+
+def _adapter_path_checks(config: RLConfig) -> list[PreflightCheck]:
+    adapter_path = config.model.adapter_path
+    if adapter_path is None:
+        return []
+
+    required_files = ("adapter_config.json", "adapter_model.safetensors")
+    missing_files = [
+        filename for filename in required_files if not (adapter_path / filename).is_file()
+    ]
+    valid = adapter_path.is_dir() and not missing_files
+    return [
+        PreflightCheck(
+            name="model_adapter_path",
+            status="ok" if valid else "error",
+            message=(
+                f"Model adapter is ready: {adapter_path}"
+                if valid
+                else "Model adapter is not a loadable Wavelet LoRA snapshot: "
+                f"{adapter_path}"
+            ),
+            details={
+                "path": str(adapter_path),
+                "missing_files": missing_files,
+            },
+        )
+    ]
 
 
 def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:

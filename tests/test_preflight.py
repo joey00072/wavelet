@@ -60,6 +60,49 @@ def test_preflight_reports_missing_local_data(tmp_path) -> None:
     )
 
 
+def test_preflight_reports_missing_model_adapter(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    adapter_path = tmp_path / "missing-adapter"
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"adapter_path": adapter_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert any(
+        check["name"] == "model_adapter_path"
+        and check["status"] == "error"
+        and check["details"]["missing_files"]
+        == ["adapter_config.json", "adapter_model.safetensors"]
+        for check in report["checks"]
+    )
+
+
+def test_preflight_accepts_loadable_model_adapter(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    adapter_path = tmp_path / "adapter"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"weights")
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"adapter_path": adapter_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert any(
+        check["name"] == "model_adapter_path" and check["status"] == "ok"
+        for check in report["checks"]
+    )
+
+
 def test_preflight_reports_unimportable_custom_algorithm(tmp_path) -> None:
     data_path = _write_local_data(tmp_path)
     config = RLConfig(
