@@ -84,6 +84,10 @@ The RL stack is now split into minimal but scalable pieces:
 - `wavelet rl`: convenience launcher; set `launcher.mode: process` to supervise
   `rl-trainer` and `rl-inference` as separate subprocesses
 
+Role logs append under `<output_dir>/logs/`, so a resume attempt preserves the
+trace from the process that produced its checkpoint. Ray-backed launchers
+disconnect from Ray during teardown after their role handles are closed.
+
 The transport is intentionally simple and durable: each batch is written under
 `<output_dir>/rollouts/step-000000/rollouts.jsonl` with an atomic stable marker.
 When rollout metadata is enabled, each batch also records payload size and
