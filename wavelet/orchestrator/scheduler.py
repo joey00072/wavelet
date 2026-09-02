@@ -362,7 +362,12 @@ def generate_rollouts(
 class VerifierRolloutScheduler:
     """Persistent verifier rollout scheduler for process-mode async RL."""
 
-    def __init__(self, orchestrator: RLOrchestrator) -> None:
+    def __init__(
+        self,
+        orchestrator: RLOrchestrator,
+        *,
+        start_record_cursor: int = 0,
+    ) -> None:
         vf = _load_verifiers("rollouts")
 
         config = orchestrator.config
@@ -393,8 +398,9 @@ class VerifierRolloutScheduler:
         self.records = load_rl_records(config.data)
         if not self.records:
             raise ValueError("Verifier scheduler requires at least one train record.")
-        self.rng = random.Random(config.data.seed)
-        self.record_offset = self.rng.randrange(len(self.records))
+        self.record_cursor = start_record_cursor
+        self._record_order_epoch: int | None = None
+        self._record_order: list[int] = []
         self.next_group_id = 0
         self.groups: dict[int, _VerifierGroupState] = {}
         self.pending: dict[
@@ -595,6 +601,11 @@ class VerifierRolloutScheduler:
         )
         self.last_batch_metrics["generation/executor_concurrency"] = float(
             self.executor_concurrency
+        )
+        record_cursor = getattr(self, "record_cursor", 0)
+        self.last_batch_metrics["generation/data/cursor"] = float(record_cursor)
+        self.last_batch_metrics["generation/data/epoch"] = float(
+            record_cursor // len(getattr(self, "records", [None]))
         )
         emit_perf(
             "verifier_scheduler",
@@ -886,7 +897,16 @@ class VerifierRolloutScheduler:
         self.pending_clients[task] = client_index
 
     def _next_record(self) -> RLExample:
-        return self.rng.choice(self.records)
+        epoch, offset = divmod(self.record_cursor, len(self.records))
+        if self._record_order_epoch != epoch:
+            self._record_order = list(range(len(self.records)))
+            if self.config.data.shuffle:
+                rng = random.Random(self.config.data.seed + epoch * 1_000_003)
+                rng.shuffle(self._record_order)
+            self._record_order_epoch = epoch
+        record = self.records[self._record_order[offset]]
+        self.record_cursor += 1
+        return record
 
     def _least_loaded_client_index(self) -> int:
         counts = [0] * len(self.clients)
@@ -2115,7 +2135,13 @@ async def _run_verifier_scheduler(
 ) -> int:
     from wavelet.orchestrator.scheduler import VerifierRolloutScheduler
 
-    scheduler = VerifierRolloutScheduler(orchestrator)
+    examples_per_step = config.orchestrator.examples_per_step
+    if examples_per_step is None:
+        raise ValueError("orchestrator.examples_per_step is required.")
+    scheduler = VerifierRolloutScheduler(
+        orchestrator,
+        start_record_cursor=start_step * examples_per_step,
+    )
     chunks_per_step = _chunks_per_step(config)
     context = _VerifierPublisherStrategy(
         config=config,
