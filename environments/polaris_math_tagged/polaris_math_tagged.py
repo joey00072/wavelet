@@ -34,6 +34,10 @@ _PROOF_REQUEST = re.compile(
     r"\b(?:prove|demonstrate|establish)\b|\bshow\s+that\b",
     re.IGNORECASE,
 )
+_MALFORMED_ANSWER = re.compile(
+    r"(?:\A\s*\^|\\frac\s*\{\s*\}|"
+    r"\\frac\s*\{[^{}]*\}\s*\{\s*\}|\A\s*[+*/=^_-]+\s*\Z)"
+)
 
 
 def extract_tagged_answer(text: str) -> str:
@@ -64,6 +68,11 @@ def is_proof_problem(problem: object) -> bool:
     return _PROOF_REQUEST.search(str(problem)) is not None
 
 
+def is_malformed_answer(answer: object) -> bool:
+    """Detect narrow, structurally incomplete Polaris target fragments."""
+    return _MALFORMED_ANSWER.search(str(answer)) is not None
+
+
 def format_aime_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Format the pinned Prime AIME 2024 task source for legacy Verifiers."""
     formatted = []
@@ -86,6 +95,7 @@ def build_polaris_rows(
     min_difficulty: int = 1,
     max_difficulty: int = 6,
     exclude_proof_problems: bool = True,
+    exclude_malformed_answers: bool = True,
 ) -> list[dict[str, Any]]:
     """Filter, deduplicate, and decontaminate Polaris training rows.
 
@@ -112,6 +122,7 @@ def build_polaris_rows(
             or normalized in held_out
             or normalized in seen
             or (exclude_proof_problems and is_proof_problem(problem))
+            or (exclude_malformed_answers and is_malformed_answer(answer))
         ):
             continue
         seen.add(normalized)
@@ -196,6 +207,7 @@ def load_environment(
     math_verify_max_workers: int = 128,
     math_verify_timeout: float = 5.0,
     exclude_proof_problems: bool = True,
+    exclude_malformed_answers: bool = True,
 ) -> vf.Environment:
     """Load filtered Polaris for training and held-out AIME 2024 for evaluation."""
     import verifiers as vf
@@ -215,6 +227,7 @@ def load_environment(
         min_difficulty=min_difficulty,
         max_difficulty=max_difficulty,
         exclude_proof_problems=exclude_proof_problems,
+        exclude_malformed_answers=exclude_malformed_answers,
     )
     if not polaris_rows:
         raise RuntimeError("Polaris filtering returned no training examples.")

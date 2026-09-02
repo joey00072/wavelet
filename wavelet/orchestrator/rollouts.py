@@ -61,11 +61,11 @@ class RLOrchestrator:
             )
             trainable_records = self._filter_zero_advantage_records(scored_records)
             last_scored_records = trainable_records
-            if trainable_records:
+            if self._has_target_groups(trainable_records):
                 break
         else:
             raise RuntimeError(
-                "All rollout groups were filtered after "
+                "Could not materialize the requested rollout group count after "
                 f"{attempts} generation attempt(s). Increase "
                 "orchestrator.zero_advantage_max_retries, relax filtering, or "
                 "check the reward/model output format."
@@ -85,6 +85,7 @@ class RLOrchestrator:
             raise ValueError("Native rollout chunks require native rollouts.")
         attempts = self.config.orchestrator.zero_advantage_max_retries + 1
         last_scored_records: list[RLExample] = []
+        expected_groups: int | None = None
         for retry in range(attempts):
             records = self._load_native_chunk_records(
                 optimizer_step=optimizer_step,
@@ -92,22 +93,43 @@ class RLOrchestrator:
                 chunk_examples=chunk_examples,
                 retry=retry,
             )
+            if expected_groups is None:
+                expected_groups = len(records)
             scored_records = self._generate_and_score(
                 records,
                 inference_engine=inference_engine,
             )
             trainable_records = self._filter_zero_advantage_records(scored_records)
             last_scored_records = trainable_records
-            if trainable_records:
+            if self._has_target_groups(
+                trainable_records,
+                target_groups=expected_groups,
+            ):
                 break
         else:
             raise RuntimeError(
-                "All rollout groups in the native chunk were filtered after "
+                "Could not materialize the requested native chunk group count after "
                 f"{attempts} generation attempt(s). Increase "
                 "orchestrator.zero_advantage_max_retries, relax filtering, or "
                 "check the reward/model output format."
             )
         return self._write_records(last_scored_records, step=queue_step)
+
+    def _has_target_groups(
+        self,
+        records: list[RLExample],
+        *,
+        target_groups: int | None = None,
+    ) -> bool:
+        target = (
+            self.config.orchestrator.examples_per_step
+            if target_groups is None
+            else target_groups
+        )
+        if target is None:
+            return bool(records)
+        group_count = len({self._group_key(record) for record in records})
+        return group_count >= target
 
     def _load_step_records(
         self,

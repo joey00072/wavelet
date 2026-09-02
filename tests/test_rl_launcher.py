@@ -27,11 +27,15 @@ from wavelet.trainer.rl_worker import (
     _StreamingChunkAccumulator,
     _dummy_rollout_row,
     _use_streaming_rollout_chunks,
+    _validate_streaming_rollout_batch,
 )
 from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
-from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
+from wavelet.orchestrator.queue import (
+    FileSystemRolloutSender,
+    publish_adapter_policy_snapshot,
+)
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import chunks_per_step, rollout_chunk_examples
 from wavelet.trainer.rl_trainer import RLTrainer
@@ -214,6 +218,90 @@ def test_streaming_chunk_accumulator_preserves_chunk_step_boundary(tmp_path) -> 
     assert accumulator.accumulated_rows == 0
     assert accumulator.accumulated_chunks == 0
     assert accumulator.accumulated_loss_scale == 0.0
+
+
+def test_streaming_rollout_manifest_must_match_current_step(tmp_path: Path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={
+            "examples_per_step": 4,
+            "rollout_chunk_examples": 2,
+            "max_async_level": 2,
+            "max_off_policy_steps": 2,
+        },
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n{}\n", encoding="utf-8")
+    batch = FileSystemRolloutSender(tmp_path, config.transport).publish(
+        source,
+        step=2,
+        optimizer_step=1,
+        chunk_index=0,
+        policy_step=0,
+        rows=2,
+    )
+
+    _validate_streaming_rollout_batch(
+        config,
+        batch,
+        trainer_step=1,
+        row_count=2,
+    )
+    with pytest.raises(ValueError, match="trainer is at step 0"):
+        _validate_streaming_rollout_batch(
+            config,
+            batch,
+            trainer_step=0,
+            row_count=2,
+        )
+
+
+def test_streaming_rollout_rejects_stale_policy_and_wrong_manifest(
+    tmp_path: Path,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={
+            "examples_per_step": 4,
+            "rollout_chunk_examples": 2,
+            "max_async_level": 2,
+            "max_off_policy_steps": 1,
+        },
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n{}\n", encoding="utf-8")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    stale = sender.publish(
+        source,
+        step=4,
+        optimizer_step=2,
+        chunk_index=0,
+        policy_step=0,
+        rows=2,
+    )
+    wrong_rows = sender.publish(
+        source,
+        step=5,
+        optimizer_step=2,
+        chunk_index=1,
+        policy_step=1,
+        rows=99,
+    )
+
+    with pytest.raises(ValueError, match=r"requires a policy step in \[1, 2\]"):
+        _validate_streaming_rollout_batch(
+            config,
+            stale,
+            trainer_step=2,
+            row_count=2,
+        )
+    with pytest.raises(ValueError, match="rows=99"):
+        _validate_streaming_rollout_batch(
+            config,
+            wrong_rows,
+            trainer_step=2,
+            row_count=2,
+        )
 
 
 def test_sleep_colocate_allows_multi_process_trainer() -> None:

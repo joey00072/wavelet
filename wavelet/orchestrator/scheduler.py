@@ -254,29 +254,38 @@ class _VerifierBatchStats:
 
     def metrics(self, *, rollouts_per_group: int) -> dict[str, float]:
         completed = len(self.group_reward_sums)
+        metrics = {
+            "generation/groups/completed": float(completed),
+            "generation/groups/admitted": float(self.admitted_groups),
+            "generation/groups/rejected": float(self.rejected_groups),
+            "generation/rollouts/scored": float(len(self.rollout_rewards)),
+        }
+        if completed == 0:
+            return metrics
+
         solve_none = sum(value == 0.0 for value in self.group_reward_sums)
         solve_all = sum(
             value >= rollouts_per_group for value in self.group_reward_sums
         )
-        denominator = max(completed, 1)
-        return {
-            "generation/groups/completed": float(completed),
-            "generation/groups/admitted": float(self.admitted_groups),
-            "generation/groups/rejected": float(self.rejected_groups),
-            "generation/groups/admission_rate": self.admitted_groups / denominator,
-            "generation/rollouts/scored": float(len(self.rollout_rewards)),
-            "generation/reward/mean": (
-                sum(self.rollout_rewards) / len(self.rollout_rewards)
-                if self.rollout_rewards
-                else 0.0
-            ),
-            "generation/solve_none/rate": solve_none / denominator,
-            "generation/solve_all/rate": solve_all / denominator,
-            "generation/effective_groups/rate": (
-                completed - solve_none - solve_all
-            )
-            / denominator,
-        }
+        metrics.update(
+            {
+                "generation/groups/admission_rate": (
+                    self.admitted_groups / completed
+                ),
+                "generation/reward/mean": (
+                    sum(self.rollout_rewards) / len(self.rollout_rewards)
+                    if self.rollout_rewards
+                    else 0.0
+                ),
+                "generation/solve_none/rate": solve_none / completed,
+                "generation/solve_all/rate": solve_all / completed,
+                "generation/effective_groups/rate": (
+                    completed - solve_none - solve_all
+                )
+                / completed,
+            }
+        )
+        return metrics
 
 
 def generate_rollouts(

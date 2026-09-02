@@ -24,6 +24,11 @@ def parse_args() -> argparse.Namespace:
             "validate proofs."
         ),
     )
+    parser.add_argument(
+        "--include-malformed-answers",
+        action="store_true",
+        help="Include structurally incomplete Polaris answer fragments.",
+    )
     return parser.parse_args()
 
 
@@ -41,6 +46,7 @@ def main() -> int:
         min_difficulty=args.min_difficulty,
         max_difficulty=args.max_difficulty,
         exclude_proof_problems=not args.include_proof_problems,
+        exclude_malformed_answers=not args.include_malformed_answers,
     )
     dataset = env.get_dataset(n=args.examples or -1, seed=args.seed)
     rows = []
