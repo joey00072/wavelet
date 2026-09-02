@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
@@ -567,9 +568,10 @@ def _run_integrated_launcher(config: RLConfig) -> int:
             events_dir=config.output_dir / "events",
         )
         inference_engine = create_policy_inference_engine(config)
-        inference_engine.setup()
         orchestrator = RLOrchestrator(config)
+        status = "failed"
         try:
+            inference_engine.setup()
             trainer.export_policy(
                 step=trainer.step,
                 force=trainer.resume_checkpoint_dir is not None,
@@ -587,10 +589,17 @@ def _run_integrated_launcher(config: RLConfig) -> int:
                 orchestrator=orchestrator,
                 pipelined=pipelined,
             )
-        except Exception:
-            trainer.finalize(status="failed")
-            raise
-        trainer.finalize(status="completed")
+            status = "completed"
+        finally:
+            from wavelet.orchestrator.envs import _teardown_cached_verifier_envs
+
+            try:
+                asyncio.run(_teardown_cached_verifier_envs())
+            finally:
+                try:
+                    inference_engine.close()
+                finally:
+                    trainer.finalize(status=status)
         print(f"Published rollout batches under {queue_dir}")
     else:
         rollout_path = config.data.path

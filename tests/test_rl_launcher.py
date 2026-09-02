@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import wavelet.orchestrator.envs as verifier_envs
+import wavelet.orchestrator.runtime as runtime
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.orchestrator.rollout_worker import (
@@ -19,6 +22,7 @@ from wavelet.orchestrator.runtime import (
     _config_with_nccl_inference_world_size,
     _publish_rollout_timed,
     _role_specs,
+    _run_integrated_launcher,
     _rollout_client_config,
     _sleep_vllm_http_servers,
     _trainer_device_group,
@@ -77,6 +81,45 @@ def test_integrated_rollout_publish_records_loaded_policy_step() -> None:
         "inference_engine": inference_engine,
         "policy_step": 7,
     }
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_integrated_launcher_closes_resources(
+    tmp_path, monkeypatch, fails
+) -> None:
+    config = RLConfig(output_dir=tmp_path / "run")
+    trainer = Mock(step=0, resume_checkpoint_dir=None)
+    inference_engine = Mock()
+    teardown = AsyncMock()
+    rollout_loop = Mock(
+        side_effect=RuntimeError("rollout failed") if fails else None
+    )
+    monkeypatch.setattr(runtime, "RLTrainer", Mock(return_value=trainer))
+    monkeypatch.setattr(runtime, "FileSystemRolloutReceiver", Mock())
+    monkeypatch.setattr(runtime, "FileSystemPolicyReceiver", Mock())
+    monkeypatch.setattr(
+        runtime,
+        "create_policy_inference_engine",
+        Mock(return_value=inference_engine),
+    )
+    monkeypatch.setattr(runtime, "_run_rollout_loop", rollout_loop)
+    monkeypatch.setattr(
+        verifier_envs,
+        "_teardown_cached_verifier_envs",
+        teardown,
+    )
+
+    if fails:
+        with pytest.raises(RuntimeError, match="rollout failed"):
+            _run_integrated_launcher(config)
+    else:
+        assert _run_integrated_launcher(config) == 0
+
+    teardown.assert_awaited_once_with()
+    inference_engine.close.assert_called_once_with()
+    trainer.finalize.assert_called_once_with(
+        status="failed" if fails else "completed"
+    )
 
 
 def _argv_value(argv: list[str], option: str) -> str:

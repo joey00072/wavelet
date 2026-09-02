@@ -121,7 +121,8 @@ selection-biased by design.
 Verifier thread and math-process pools scale to the scheduler's real in-flight
 request high-water mark, which is logged as `generation/executor_concurrency`.
 Cached verifier environments and registered executors are torn down when the
-inference scheduler closes.
+inference scheduler closes. Integrated runs also close the inference engine and
+verifier resources on both success and failure before finalizing trainer state.
 
 Trainers consume queue batches in exact queue order. Every batch manifest must
 agree with its queue step, optimizer step, chunk index, row count, and configured
