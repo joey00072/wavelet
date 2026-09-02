@@ -8,7 +8,10 @@ By default it keeps Polaris difficulty buckets `1/8` through `6/8`, removes
 duplicate normalized problems, and removes exact normalized overlaps with AIME
 2024. It also removes proof requests because final-answer equivalence cannot
 grade proof validity and some Polaris proof rows contain corrupted target
-fragments. Pass `exclude_proof_problems=false` only for a rubric that can grade
-proofs. Both training and evaluation require exactly one
+fragments. Narrow structural checks also remove incomplete targets such as a
+leading exponent marker, an empty `\\frac` operand, or an operator-only answer.
+Pass `exclude_proof_problems=false` only for a rubric that can grade proofs, or
+`exclude_malformed_answers=false` to inspect the original malformed labels.
+Both training and evaluation require exactly one
 `<think>...</think><answer>...</answer>` response and use `MathRubric` for
 binary correctness.

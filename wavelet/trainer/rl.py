@@ -29,6 +29,7 @@ from wavelet.data.sft import Example, build_sample
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
 )
+from wavelet.orchestrator.schedule import required_policy_step
 from wavelet.orchestrator.schedule import (
     target_steps as _target_steps,
 )
@@ -46,6 +47,7 @@ from wavelet.transport.queue import (
     RolloutBatch,
     RolloutChunkAccumulator,
     prune_consumed_rollout_batches,
+    read_manifest,
     record_rollout_claim,
     record_rollout_consumed,
 )
@@ -1270,7 +1272,7 @@ def _run_streaming_rollout_training(
     while trainer.step < target_step:
         loop_started_at = perf_counter()
         wait_started_at = perf_counter()
-        batch = receiver.wait_available()
+        batch = receiver.wait()
         wait_seconds = perf_counter() - wait_started_at
         trainer_step_before = trainer.step
         trainer.record_rollout_claim(
@@ -1280,6 +1282,12 @@ def _run_streaming_rollout_training(
         row_count = count_nonempty_jsonl_rows(
             batch.path,
             description="Rollout chunk",
+        )
+        _validate_streaming_rollout_batch(
+            config,
+            batch,
+            trainer_step=trainer.step,
+            row_count=row_count,
         )
         accumulator.buffer(batch, row_count)
         if not accumulator.should_load(min_rows=min_loadable_rows):
@@ -1358,6 +1366,55 @@ def _run_streaming_rollout_training(
             export_policy=export_seconds,
             optimizer_step=int(metrics is not None),
             total=total_seconds,
+        )
+
+
+def _validate_streaming_rollout_batch(
+    config: RLConfig,
+    batch: RolloutBatch,
+    *,
+    trainer_step: int,
+    row_count: int,
+) -> None:
+    """Reject a chunk that cannot belong to the current optimizer step."""
+    chunks_per_step = _chunks_per_step(config)
+    expected_optimizer_step = batch.step // chunks_per_step
+    expected_chunk_index = batch.step % chunks_per_step
+    if expected_optimizer_step != trainer_step:
+        raise ValueError(
+            f"Rollout queue step {batch.step} belongs to optimizer step "
+            f"{expected_optimizer_step}, but trainer is at step {trainer_step}."
+        )
+
+    manifest = read_manifest(batch.step_dir)
+    if manifest is None:
+        raise ValueError(
+            f"Streaming rollout queue step {batch.step} is missing manifest.json."
+        )
+    mismatches = {
+        "queue_step": (manifest.queue_step, batch.step),
+        "optimizer_step": (manifest.optimizer_step, expected_optimizer_step),
+        "chunk_index": (manifest.chunk_index, expected_chunk_index),
+        "rows": (manifest.rows, row_count),
+    }
+    invalid = [
+        f"{name}={actual!r} (expected {expected!r})"
+        for name, (actual, expected) in mismatches.items()
+        if actual != expected
+    ]
+    if invalid:
+        raise ValueError(
+            f"Rollout queue step {batch.step} has invalid manifest metadata: "
+            + ", ".join(invalid)
+        )
+
+    policy_step = manifest.policy_step
+    minimum_policy_step = required_policy_step(config, expected_optimizer_step)
+    if policy_step is None or not minimum_policy_step <= policy_step <= trainer_step:
+        raise ValueError(
+            f"Rollout queue step {batch.step} has policy_step={policy_step!r}; "
+            f"optimizer step {trainer_step} requires a policy step in "
+            f"[{minimum_policy_step}, {trainer_step}]."
         )
 
 

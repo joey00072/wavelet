@@ -626,6 +626,9 @@ def test_verifier_batch_stats_report_unfiltered_generation_reward() -> None:
     assert metrics["generation/solve_all/rate"] == 0.5
     assert metrics["generation/effective_groups/rate"] == 0.5
 
+    empty_metrics = _VerifierBatchStats().metrics(rollouts_per_group=2)
+    assert "generation/reward/mean" not in empty_metrics
+
 
 def test_successful_rollout_outputs_raises_on_rate_limit_exception() -> None:
     with pytest.raises(RuntimeError, match="rate limit exceeded"):

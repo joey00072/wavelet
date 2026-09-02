@@ -42,6 +42,11 @@ def test_build_polaris_rows_filters_deduplicates_and_decontaminates() -> None:
             "answer": "x+y=y+x",
             "difficulty": "3/8",
         },
+        {
+            "problem": "Find the area in terms of a.",
+            "answer": "^2(2\\sqrt{3}-3)",
+            "difficulty": "3/8",
+        },
         {"problem": "bad label", "answer": "6", "difficulty": "unknown"},
         {"problem": "empty answer", "answer": "", "difficulty": "3/8"},
     ]
@@ -86,6 +91,17 @@ def test_build_polaris_rows_can_explicitly_include_proof_requests() -> None:
 
     assert ENV.build_polaris_rows(rows) == []
     assert len(ENV.build_polaris_rows(rows, exclude_proof_problems=False)) == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["^3\\sqrt{2}", "\\frac{}{2}", "\\frac{x}{}", "="],
+)
+def test_build_polaris_rows_excludes_malformed_answer_fragments(answer: str) -> None:
+    rows = [{"problem": "Compute the value.", "answer": answer, "difficulty": "3/8"}]
+
+    assert ENV.build_polaris_rows(rows) == []
+    assert len(ENV.build_polaris_rows(rows, exclude_malformed_answers=False)) == 1
 
 
 def test_format_aime_rows_uses_integer_answers_without_solutions() -> None:

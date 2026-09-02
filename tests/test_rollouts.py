@@ -145,6 +145,46 @@ def test_native_rollout_materialization_retries_incomplete_groups(
     assert {row["reward"] for row in rows} == {1.0}
 
 
+def test_native_rollout_retries_when_only_part_of_batch_is_complete(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        inference={"enabled": True},
+        reward={"mode": "reference_match"},
+        orchestrator={
+            "examples_per_step": 2,
+            "rollouts_per_example": 2,
+            "advantage_mode": "group_reward",
+            "filter_zero_advantage": False,
+            "zero_advantage_max_retries": 1,
+        },
+    )
+    orchestrator = RLOrchestrator(config)
+    second = replace(
+        _example(),
+        prompt=[{"role": "user", "content": "What is 20 + 22?"}],
+    )
+    monkeypatch.setattr(
+        "wavelet.orchestrator.rollouts.load_rl_records",
+        lambda _config: [_example(), second],
+    )
+
+    engine = _FlakyIncompleteGroupEngine()
+    path = orchestrator.materialize_native_chunk(
+        optimizer_step=0,
+        chunk_index=0,
+        queue_step=0,
+        chunk_examples=2,
+        inference_engine=engine,
+    )
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert engine.calls == 2
+    assert len(rows) == 4
+
+
 def test_native_rollout_materialization_fails_on_repeated_empty_completions(
     tmp_path,
     monkeypatch,
@@ -177,7 +217,7 @@ def test_native_rollout_materialization_fails_on_repeated_empty_completions(
                 for record in records
             ]
 
-    with pytest.raises(RuntimeError, match="All rollout groups"):
+    with pytest.raises(RuntimeError, match="requested native chunk group count"):
         orchestrator.materialize_native_chunk(
             optimizer_step=0,
             chunk_index=0,

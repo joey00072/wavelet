@@ -109,10 +109,16 @@ With `orchestrator.filter_zero_advantage: true`, the persistent verifier
 scheduler resamples zero-signal groups until `examples_per_step` admitted groups
 are available. Rejected groups remain visible in scheduler diagnostics but do
 not silently occupy most of an optimizer batch as zero-loss rows.
+Synchronous and native rollout paths apply the same full-group-count invariant;
+a single surviving group cannot silently stand in for a requested batch.
 The orchestrator separately logs `generation/reward/mean`, group admission,
 and generated solve-rate metrics before filtering. Use those raw generation
 metrics to judge policy progress; reward on admitted mixed groups is
 selection-biased by design.
+
+Streaming trainers consume queue chunks in exact queue order. Each chunk's
+manifest must agree with its queue step, optimizer step, chunk index, row
+count, and configured policy-freshness window before any tokens are trained.
 
 Implementation ownership is similarly explicit: `wavelet.transport` owns queue
 and policy transfer, `wavelet.orchestrator.scheduler` owns rollout scheduling,
