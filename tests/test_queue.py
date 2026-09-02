@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
 from wavelet.orchestrator.queue import (
     FileSystemPolicyReceiver,
@@ -101,11 +103,31 @@ def test_publish_with_metadata_writes_manifest(tmp_path: Path) -> None:
     assert events[0].details["transfer_seconds"] >= 0
 
 
+def test_stable_rollout_batch_cannot_be_overwritten(tmp_path: Path) -> None:
+    config = RLTransportConfig(poll_interval_seconds=0.001)
+    sender = FileSystemRolloutSender(tmp_path, config)
+    first = _write_source(tmp_path / "first.jsonl", '{"value": 1}\n')
+    second = _write_source(tmp_path / "second.jsonl", '{"value": 2}\n')
+    batch = sender.publish(first, step=0)
+
+    with pytest.raises(FileExistsError, match="already stable"):
+        sender.publish(second, step=0)
+
+    assert sender.stable_batch(0) == batch
+    assert batch.path.read_text(encoding="utf-8") == '{"value": 1}\n'
+
+
 def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
     config = RLTransportConfig(poll_interval_seconds=0.001)
     sender = FileSystemRolloutSender(tmp_path, config)
     source = _write_source(tmp_path / "rollouts.jsonl", "{}\n")
-    sender.publish(source, step=0)
+    sender.publish(
+        source,
+        step=0,
+        optimizer_step=0,
+        policy_step=0,
+        rows=1,
+    )
     receiver = FileSystemRolloutReceiver(
         tmp_path,
         config,
@@ -120,6 +142,8 @@ def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert len(events) == 1
     assert events[0].kind == "rollout_received"
     assert events[0].queue_step == 0
+    assert events[0].optimizer_step == 0
+    assert events[0].policy_step == 0
     assert events[0].consumer_id == "trainer"
     assert events[0].details is not None
     assert events[0].details["mode"] == "wait"
@@ -131,6 +155,8 @@ def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert trace["subsystem"] == "trainer"
     assert trace["event"] == "rollout_received"
     assert trace["queue_step"] == 0
+    assert trace["optimizer_step"] == 0
+    assert trace["policy_step"] == 0
     assert trace["details"]["consumer_id"] == "trainer"
 
 

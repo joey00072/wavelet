@@ -119,6 +119,21 @@ def test_rollout_claim_and_consume_write_traces(tmp_path: Path) -> None:
     batch_path = step_dir / "rollouts.jsonl"
     batch_path.write_text("{}\n", encoding="utf-8")
     batch = RolloutBatch(step=3, path=batch_path, step_dir=step_dir)
+    write_manifest(
+        step_dir,
+        RolloutManifest(
+            format_version=1,
+            queue_step=3,
+            optimizer_step=1,
+            chunk_index=0,
+            policy_step=0,
+            rows=1,
+            tokens=None,
+            reward_mean=None,
+            producer_id="inference",
+            created_at="2026-05-10T00:00:00+00:00",
+        ),
+    )
 
     record_rollout_claim(
         batch,
@@ -143,5 +158,8 @@ def test_rollout_claim_and_consume_write_traces(tmp_path: Path) -> None:
     )
     assert step_one_trace["event"] == "rollout_claimed"
     assert step_one_trace["queue_step"] == 3
+    assert step_one_trace["optimizer_step"] == 1
+    assert step_one_trace["policy_step"] == 0
     assert step_two_trace["event"] == "rollout_consumed"
-    assert step_two_trace["optimizer_step"] == 2
+    assert step_two_trace["optimizer_step"] == 1
+    assert step_two_trace["policy_step"] == 0
