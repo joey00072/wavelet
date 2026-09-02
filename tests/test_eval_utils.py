@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import Mock
+
 import pytest
 
-from wavelet.configs.rl_config import RLEvalConfig
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.rl_config import RLConfig, RLEvalConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
+from wavelet.orchestrator.scheduler import _run_final_evals
 from wavelet.orchestrator.verifiers import _eval_metrics
 
 
@@ -118,6 +121,40 @@ def test_final_eval_policy_step_uses_last_exported_step() -> None:
 
     assert _final_eval_policy_step(config, 100) == 100
     assert _final_eval_policy_step(config, 99) == 96
+
+
+def test_eval_only_base_model_does_not_wait_for_policy_snapshot(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = RLConfig.model_validate(
+        {
+            "max_steps": 0,
+            "output_dir": tmp_path,
+            "orchestrator": {
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                )
+            },
+            "eval": {"env": [{"id": "test-eval"}]},
+            "policy_transfer": {"export_initial": True},
+        }
+    )
+    receiver = Mock()
+    inference_engine = Mock()
+    monkeypatch.setattr("wavelet.orchestrator.scheduler._run_evals", Mock())
+
+    loaded_step = _run_final_evals(
+        config,
+        Mock(),
+        inference_engine,
+        receiver,
+        target_step=0,
+        loaded_policy_step=None,
+    )
+
+    assert loaded_step == 0
+    receiver.wait_for_step.assert_not_called()
+    inference_engine.load_policy.assert_not_called()
 
 
 def test_rl_config_allows_zero_step_eval_only_runs() -> None:

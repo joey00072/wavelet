@@ -20,8 +20,9 @@ The API base is also editable in the page header and is stored in local storage.
 
 ## Views
 
-- `Overview`: run health, trainer progress, queue throughput, policy state, and
-  latest trainer metrics.
+- `Overview`: run health, trainer progress, evaluation history, queue
+  throughput, policy state, and latest trainer metrics. The evaluation chart
+  reads `GET /eval-metrics` and plots available `avg@8` and `pass@8` values.
 - `Rollouts`: rollout inspection, recent rollout buffers, saved snapshots, and
   per-lane queue detail.
 
@@ -43,6 +44,11 @@ orchestrator:
 ```
 
 The server exposes read-only endpoints and allows browser CORS by default.
+
+The overview plots AIME 2024 `avg@8` and `pass@8` at the base policy and every
+100 training steps. The step-zero `avg@8` and `pass@8` results are also drawn as
+horizontal base-model references on a fixed 0–100% y-axis. Hover over an
+evaluation point to see its metric value and policy step.
 
 ## Rollout Inspection API
 

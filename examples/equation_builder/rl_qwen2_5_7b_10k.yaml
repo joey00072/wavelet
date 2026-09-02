@@ -1,0 +1,177 @@
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  load_in_4bit: false
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: local
+  path: outputs/equation_builder_data/rl_train.jsonl
+  batch_size: 8
+  micro_batch_size: 1
+  pack_sequences: true
+  pad_to_multiple_of: 1
+  seq_len: 1024
+  max_examples: 4096
+  shuffle: true
+  seed: 42
+
+loss:
+  type: dppo
+  dppo_mask_high: 0.2
+  dppo_mask_low: 0.2
+  kl_tau: 1e-3
+
+algo:
+  type: grpo
+  normalize_advantages: false
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: equation-builder
+  verifier_env_args:
+    num_examples: 4096
+    eval_examples: 256
+    seed: 42
+    num_numbers: 4
+    target_min: 0
+    target_max: 99
+  verifier_model: Qwen/Qwen2.5-7B-Instruct
+  verifier_client_type: openai_chat_completions_token
+  examples_per_step: 8
+  rollouts_per_example: 8
+  filter_zero_advantage: false
+  zero_advantage_max_retries: 0
+  max_async_level: 1
+  max_off_policy_steps: 2
+  overwrite: true
+  state_server:
+    enabled: true
+    host: 0.0.0.0
+    port: 8765
+
+transport:
+  poll_interval_seconds: 0.05
+  cleanup_consumed: false
+
+eval:
+  interval: 100
+  num_examples: 16
+  rollouts_per_example: 2
+  eval_base_model: true
+  final_eval: true
+  sampling:
+    temperature: 0.7
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 256
+  env:
+    - id: equation-builder
+      name: equation-builder
+      args:
+        num_examples: 4096
+        eval_examples: 256
+        seed: 42
+        num_numbers: 4
+        target_min: 0
+        target_max: 99
+
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 0.8
+  sampling:
+    temperature: 0.8
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 256
+    do_sample: true
+    num_generations: 1
+    seed: null
+  vllm:
+    server_backend: openai
+    dtype: bfloat16
+    gpu_memory_utilization: 0.35
+    max_model_len: 1024
+    enforce_eager: false
+    max_lora_rank: 16
+  http:
+    request_timeout_seconds: 300.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+  poll_interval_seconds: 0.05
+
+fsdp:
+  enabled: false
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: 1
+  cp: 1
+  tp: 1
+  ep: 1
+  cpu_offload: false
+  reshard_after_forward: false
+
+optim:
+  type: adamw
+  implementation: for-loop
+  lr: 3e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+max_grad_norm: 1.0
+max_steps: 10000
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 1
+    sample_ratio: 1.0
+    max_samples: 16
+  wandb:
+    enabled: true
+    project: wavelet-equation-builder
+    name: wavelet-equation-builder-qwen2.5-7b-lora-10k
+    mode: online
+
+launcher:
+  mode: colocate
+  backend: local
+  inference_cuda_visible_devices: "0"
+  trainer_num_processes: 1
+  inference_num_replicas: 1
+
+output_dir: outputs/equation_builder_qwen2_5_7b_lora_10k
+clean_output_dir: true

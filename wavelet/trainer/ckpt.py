@@ -14,8 +14,11 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
 from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict_saver import (
+    AsyncCheckpointerType,
+    AsyncSaveResponse,
+)
 from torch.distributed.checkpoint.stateful import Stateful
-from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -136,6 +139,7 @@ class CheckpointManager:
             response = dcp.async_save(
                 state_dict=state_dict,
                 storage_writer=writer,
+                async_checkpointer_type=AsyncCheckpointerType.THREAD,
                 async_stager=stager,
                 no_dist=no_dist,
             )
@@ -153,6 +157,7 @@ class CheckpointManager:
             response = dcp.async_save(
                 state_dict=state_dict,
                 storage_writer=writer,
+                async_checkpointer_type=AsyncCheckpointerType.THREAD,
                 async_stager=stager,
                 no_dist=no_dist,
             )
@@ -342,7 +347,9 @@ class CheckpointManager:
         return DefaultStager(
             StagingOptions(
                 use_pinned_memory=use_pinned_memory and accelerator_available,
-                use_shared_memory=True,
+                # async_save uses a thread checkpointer, so IPC-backed tensor
+                # storage only burns one POSIX shared-memory FD per storage.
+                use_shared_memory=False,
                 use_async_staging=True,
                 use_non_blocking_copy=accelerator_available,
             )

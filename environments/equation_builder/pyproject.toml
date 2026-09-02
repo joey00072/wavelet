@@ -1,0 +1,16 @@
+[project]
+name = "equation-builder"
+version = "0.1.0"
+description = "Four-number addition and subtraction verifier environment"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets",
+    "verifiers",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["equation_builder.py"]

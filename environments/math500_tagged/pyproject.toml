@@ -1,0 +1,17 @@
+[project]
+name = "math500-tagged"
+version = "0.1.0"
+description = "MATH-500 verifier with strict think and answer tags"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets",
+    "math-verify",
+    "verifiers",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["math500_tagged.py"]

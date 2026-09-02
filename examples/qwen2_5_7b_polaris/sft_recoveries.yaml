@@ -1,0 +1,66 @@
+model:
+  name: "Qwen/Qwen2.5-7B-Instruct"
+  adapter_path: outputs/qwen2_5_7b_polaris_grpo_100k_v2/final_adapter_step-000208/adapter
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  load_in_4bit: false
+  gradient_checkpointing: true
+  allow_tf32: true
+
+data:
+  source: local
+  path: outputs/polaris_recovery_combined_step208/correct_recoveries.jsonl
+  batch_size: 8
+  micro_batch_size: 1
+  seq_len: 2048
+  pack_function: pad
+  shuffle: true
+  seed: 45
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 1.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: constant
+  warmup_steps: 0
+
+lora:
+  rank: 16
+  alpha: 32.0
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+loss_impl: torch
+max_grad_norm: 1.0
+epochs: 3
+# 312 samples / global batch 8 = 39 steps per epoch; 3 epochs = 117.
+max_steps: 117
+seed: 45
+
+ckpt:
+  mode: disabled
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: true
+    project: wavelet-polaris
+    name: qwen2.5-7b-polaris-recovery-sft-step208
+    mode: online
+
+fsdp:
+  enabled: false
+
+output_dir: outputs/qwen2_5_7b_polaris_recovery_sft_step208
+clean_output_dir: true

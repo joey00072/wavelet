@@ -44,6 +44,10 @@ Run the SFT warmup:
 uv run python -m wavelet sft @ examples/unsloth_math/sft.yaml
 ```
 
+To continue training an existing LoRA, set `model.adapter_path` to its adapter
+directory. Wavelet uses tokenizer artifacts from that directory when present
+and otherwise falls back to the tokenizer named by `model.name`.
+
 Run the RL example:
 
 ```bash

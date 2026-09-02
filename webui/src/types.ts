@@ -66,6 +66,13 @@ export type MetricRow = {
   "perf/step_tokens_per_second"?: number;
 };
 
+export type EvalMetricRow = {
+  timestamp?: string;
+  step?: number;
+  "progress/policy_step"?: number;
+  [key: string]: string | number | undefined;
+};
+
 export type RolloutSample = {
   row_index: number;
   reward?: number;

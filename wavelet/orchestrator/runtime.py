@@ -149,7 +149,10 @@ def _rollout_client_config(config: RLConfig, *, ports: list[int]) -> RLConfig:
         }
     )
     orchestrator = config.orchestrator
-    if config.inference.vllm.server_backend == "openai" and config.lora is not None:
+    serves_adapter = config.lora is not None and (
+        _target_steps(config) > 0 or config.model.adapter_path is not None
+    )
+    if config.inference.vllm.server_backend == "openai" and serves_adapter:
         orchestrator = orchestrator.model_copy(
             update={"verifier_model": config.policy_transfer.adapter_name}
         )

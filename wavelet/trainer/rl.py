@@ -25,28 +25,30 @@ from wavelet.data.rl import (
     setup_rl_dataset,
 )
 from wavelet.data.sft import Example, build_sample
-from wavelet.transport.queue import (
-    FileSystemRolloutReceiver,
-    RolloutBatch,
-    RolloutChunkAccumulator,
-    record_rollout_claim,
-    record_rollout_consumed,
-)
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
+)
+from wavelet.orchestrator.schedule import (
     target_steps as _target_steps,
 )
-from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.distributed import barrier
-from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.losses import compute_loss, selective_log_softmax
+from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.transport.policy import (
     PolicyExportMixin,
 )
+from wavelet.transport.queue import (
+    FileSystemRolloutReceiver,
+    RolloutBatch,
+    RolloutChunkAccumulator,
+    prune_consumed_rollout_batches,
+    record_rollout_claim,
+    record_rollout_consumed,
+)
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
-
 
 logger = logging.getLogger(__name__)
 SUM_SYNCED_METRIC_KEYS = {
@@ -352,13 +354,19 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     ) -> None:
         if not self.is_main_process():
             return
-        record_rollout_consumed(
+        consumed = record_rollout_consumed(
             batch,
             trainer_step_before=trainer_step_before,
             trainer_step_after=self.step,
             optimizer_step_completed=optimizer_step_completed,
             events_dir=self.output_dir / "events",
         )
+        if consumed is not None and self.config.transport.cleanup_consumed:
+            prune_consumed_rollout_batches(
+                self.output_dir,
+                self.config.transport,
+                keep_last=self.config.transport.keep_last_consumed,
+            )
 
     def rollout_events_dir(self) -> Path | None:
         if not self.is_main_process():
