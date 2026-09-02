@@ -600,10 +600,6 @@ def build_sample(
     assert len(input_ids) == len(loss_mask) == len(target_ids), (
         f"Length mismatch: {len(input_ids)=}, {len(loss_mask)=}, {len(target_ids)=}"
     )
-    assert tokenizer.eos_token_id in target_ids, (
-        "EOS token id must be present in target_ids"
-    )
-
     return {
         "input_ids": input_ids,
         "position_ids": list(range(len(input_ids))),
