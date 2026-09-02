@@ -120,6 +120,9 @@ been created.
 SFT examples longer than `data.seq_len` train on the available assistant-token
 prefix; an end-of-sequence token is required in the rendered sample, but it need
 not fit inside the truncated context window.
+Concatenative SFT packing checkpoints both the source-row position and its
+unconsumed token remainder, so resuming does not skip tokens already read into a
+partially filled packed sequence.
 
 With `orchestrator.filter_zero_advantage: true`, the persistent verifier
 scheduler resamples zero-signal groups until `examples_per_step` admitted groups
