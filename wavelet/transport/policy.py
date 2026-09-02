@@ -309,14 +309,19 @@ class PolicyExportMixin:
             return self.config.policy_transfer.export_initial
         return step % self.config.policy_transfer.export_every_steps == 0
 
-    def export_policy(self, *, step: int | None = None) -> Path | None:
+    def export_policy(
+        self,
+        *,
+        step: int | None = None,
+        force: bool = False,
+    ) -> Path | None:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Trainer not set up. Call setup() first.")
         if self.world is None:
             raise RuntimeError("World not set up")
 
         export_step = self.step if step is None else step
-        if not self.should_export_policy(export_step):
+        if not force and not self.should_export_policy(export_step):
             return None
         if self.config.policy_transfer.type == "nccl":
             return self._export_nccl_policy(export_step)

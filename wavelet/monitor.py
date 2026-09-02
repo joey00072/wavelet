@@ -505,6 +505,7 @@ class RolloutMetricInputs:
     optimizer_step: int | None = None
     chunk_index: int | None = None
     timings: dict[str, float] | None = None
+    extra_metrics: dict[str, float] | None = None
 
 
 def log_rollout_metrics(
@@ -517,6 +518,7 @@ def log_rollout_metrics(
     optimizer_step: int | None = None,
     chunk_index: int | None = None,
     timings: dict[str, float] | None = None,
+    extra_metrics: dict[str, float] | None = None,
 ) -> dict[str, float]:
     rows = read_jsonl(path)
     metrics = rollout_metrics(
@@ -529,6 +531,7 @@ def log_rollout_metrics(
             optimizer_step=optimizer_step,
             chunk_index=chunk_index,
             timings=timings,
+            extra_metrics=extra_metrics,
         )
     )
     _append_metrics(config.output_dir, metrics, step=step)
@@ -659,6 +662,15 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     if inputs.timings:
         for key, value in inputs.timings.items():
             metrics[f"time/{key}"] = float(value)
+
+    if inputs.extra_metrics:
+        duplicate_keys = metrics.keys() & inputs.extra_metrics.keys()
+        if duplicate_keys:
+            duplicates = ", ".join(sorted(duplicate_keys))
+            raise ValueError(f"Extra rollout metrics replace core metrics: {duplicates}")
+        metrics.update(
+            {key: float(value) for key, value in inputs.extra_metrics.items()}
+        )
 
     return metrics
 

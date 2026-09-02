@@ -16,6 +16,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--min-difficulty", type=int, default=1)
     parser.add_argument("--max-difficulty", type=int, default=6)
+    parser.add_argument(
+        "--include-proof-problems",
+        action="store_true",
+        help=(
+            "Include proof requests even though the final-answer rubric cannot "
+            "validate proofs."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -32,6 +40,7 @@ def main() -> int:
         "polaris-math-tagged",
         min_difficulty=args.min_difficulty,
         max_difficulty=args.max_difficulty,
+        exclude_proof_problems=not args.include_proof_problems,
     )
     dataset = env.get_dataset(n=args.examples or -1, seed=args.seed)
     rows = []

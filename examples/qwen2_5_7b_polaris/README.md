@@ -3,7 +3,9 @@
 This example trains `Qwen/Qwen2.5-7B-Instruct` with BF16 LoRA and GRPO on
 `POLARIS-Project/Polaris-Dataset-53K`. It keeps difficulty buckets `1/8`
 through `6/8`, removes normalized duplicates, and removes exact normalized
-overlaps with the held-out AIME 2024 evaluation set.
+overlaps with the held-out AIME 2024 evaluation set. Proof requests are removed
+because the binary final-answer rubric cannot validate proofs and some of those
+rows contain corrupted target fragments.
 
 Every response must be exactly
 `<think>...</think><answer>...</answer>`. Training uses eight problems per

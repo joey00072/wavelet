@@ -563,7 +563,10 @@ def _run_integrated_launcher(config: RLConfig) -> int:
         inference_engine.setup()
         orchestrator = RLOrchestrator(config)
         try:
-            trainer.export_policy(step=trainer.step)
+            trainer.export_policy(
+                step=trainer.step,
+                force=trainer.resume_checkpoint_dir is not None,
+            )
             pipelined = (
                 config.orchestrator.max_async_level > 0
                 and config.orchestrator.max_off_policy_steps > 0

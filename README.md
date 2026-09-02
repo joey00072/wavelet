@@ -98,6 +98,22 @@ Process and colocated training require `policy_transfer.export_initial: true`.
 This publishes policy step 0 before rollout generation and prevents the trainer
 and inference scheduler from waiting on each other at startup.
 
+Checkpoint resume is absolute-step based. Both trainer and process-mode rollout
+scheduler restart from the resolved checkpoint optimizer step; streaming modes
+convert that step to the corresponding queue-chunk offset. Completed runs wait
+for a pending async checkpoint to become stable before process teardown. A
+restored trainer also forces one policy export at the checkpoint step, even when
+that step is between normal export intervals.
+
+With `orchestrator.filter_zero_advantage: true`, the persistent verifier
+scheduler resamples zero-signal groups until `examples_per_step` admitted groups
+are available. Rejected groups remain visible in scheduler diagnostics but do
+not silently occupy most of an optimizer batch as zero-loss rows.
+The orchestrator separately logs `generation/reward/mean`, group admission,
+and generated solve-rate metrics before filtering. Use those raw generation
+metrics to judge policy progress; reward on admitted mixed groups is
+selection-biased by design.
+
 Implementation ownership is similarly explicit: `wavelet.transport` owns queue
 and policy transfer, `wavelet.orchestrator.scheduler` owns rollout scheduling,
 `wavelet.orchestrator.envs` owns verifier clients and evaluation, and

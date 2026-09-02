@@ -146,3 +146,28 @@ def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:
     assert trace["optimizer_step"] == 6
     assert trace["policy_step"] == 3
     assert trace["details"]["trainable"] == 1.0
+
+
+def test_rollout_metrics_include_non_overlapping_generation_metrics() -> None:
+    metrics = rollout_metrics(
+        RolloutMetricInputs(
+            rows=[],
+            rollouts_per_example=8,
+            step=1,
+            extra_metrics={"generation/reward/mean": 0.25},
+        )
+    )
+
+    assert metrics["generation/reward/mean"] == 0.25
+
+
+def test_rollout_metrics_reject_extra_metric_overrides() -> None:
+    with pytest.raises(ValueError, match="replace core metrics: step"):
+        rollout_metrics(
+            RolloutMetricInputs(
+                rows=[],
+                rollouts_per_example=8,
+                step=1,
+                extra_metrics={"step": 99.0},
+            )
+        )

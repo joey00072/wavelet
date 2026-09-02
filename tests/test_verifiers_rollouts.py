@@ -14,6 +14,7 @@ from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.verifiers import (
     _PendingVerifierRequest,
+    _VerifierBatchStats,
     _VerifierGroupState,
     VerifierRolloutScheduler,
     _assign_rollout_advantages,
@@ -530,7 +531,7 @@ def test_verifier_scheduler_drains_done_tasks_and_buffers_extra_groups() -> None
     assert scheduler.ready_groups[0][0]["env_name"] == "verifier"
 
 
-def test_verifier_scheduler_keeps_filtered_rollouts_for_metrics() -> None:
+def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
     config = RLConfig(
         orchestrator={
             "advantage_mode": "group_reward",
@@ -561,7 +562,9 @@ def test_verifier_scheduler_keeps_filtered_rollouts_for_metrics() -> None:
             "trajectory": _trainable_trajectory(),
         }
 
-    async def run() -> list[RLExample]:
+    async def run() -> tuple[
+        list[RLExample], tuple[int, int, int], tuple[int, int, int]
+    ]:
         loop = asyncio.get_running_loop()
         for group_id, rewards in enumerate(([0.0, 1.0], [1.0, 1.0])):
             task = loop.create_future()
@@ -576,21 +579,52 @@ def test_verifier_scheduler_keeps_filtered_rollouts_for_metrics() -> None:
                 example={"example_id": group_id},
                 rollouts_to_schedule=0,
             )
-        return await scheduler.generate_batch(target_groups=2)
+        tasks = list(scheduler.pending)
+        outputs: list[dict[str, Any]] = []
+        accepted = scheduler._consume_completed_task(  # noqa: SLF001
+            tasks[0],
+            target_groups=1,
+            outputs=outputs,
+            accepted_groups=0,
+        )
+        rejected = scheduler._consume_completed_task(  # noqa: SLF001
+            tasks[1],
+            target_groups=1,
+            outputs=outputs,
+            accepted_groups=accepted[0],
+        )
+        records = [
+            record
+            for output_row in outputs
+            for record in _records_from_output(output_row)
+        ]
+        return records, accepted, rejected
 
-    records = asyncio.run(run())
+    records, accepted, rejected = asyncio.run(run())
 
-    assert len(records) == 4
-    filtered = [
-        record
-        for record in records
-        if (record.metadata or {}).get("_wavelet_filtered_rollout")
-    ]
-    trainable = [record for record in records if record not in filtered]
-    assert len(filtered) == 2
-    assert len(trainable) == 2
-    assert all(record.loss_mask == [False] for record in filtered)
-    assert [record.reward for record in filtered] == [1.0, 1.0]
+    assert accepted == (1, 1, 0)
+    assert rejected == (0, 1, 1)
+    assert len(records) == 2
+    assert [record.reward for record in records] == [0.0, 1.0]
+    assert all(record.loss_mask == [True] for record in records)
+
+
+def test_verifier_batch_stats_report_unfiltered_generation_reward() -> None:
+    stats = _VerifierBatchStats()
+    stats.observe([{"reward": 0.0}, {"reward": 1.0}], admitted=True)
+    stats.observe([{"reward": 1.0}, {"reward": 1.0}], admitted=False)
+
+    metrics = stats.metrics(rollouts_per_group=2)
+
+    assert metrics["generation/groups/completed"] == 2.0
+    assert metrics["generation/groups/admitted"] == 1.0
+    assert metrics["generation/groups/rejected"] == 1.0
+    assert metrics["generation/groups/admission_rate"] == 0.5
+    assert metrics["generation/rollouts/scored"] == 4.0
+    assert metrics["generation/reward/mean"] == 0.75
+    assert metrics["generation/solve_none/rate"] == 0.0
+    assert metrics["generation/solve_all/rate"] == 0.5
+    assert metrics["generation/effective_groups/rate"] == 0.5
 
 
 def test_successful_rollout_outputs_raises_on_rate_limit_exception() -> None:
@@ -1330,3 +1364,14 @@ def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
 
     with pytest.raises(RuntimeError, match="could not produce enough trainable"):
         asyncio.run(scheduler.generate_batch(target_groups=1))
+
+
+def test_verifier_scheduler_rejects_partial_batch_at_retry_limit() -> None:
+    with pytest.raises(RuntimeError, match="accepted 1, rejected 1"):
+        VerifierRolloutScheduler._raise_if_retries_exhausted(  # noqa: SLF001
+            completed_groups=2,
+            max_completed_groups=2,
+            accepted_groups=1,
+            target_groups=2,
+            rejected_groups=1,
+        )

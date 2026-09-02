@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from wavelet.configs.sft import ModelConfig
 from wavelet.data.rl_dataset import RLDataset, RLExample
 from wavelet.distributed.world import World
 from wavelet.trainer import model as model_utils
+from wavelet.trainer.ckpt import TrainerState
 from wavelet.trainer.model import _fsdp_mixed_precision
 from wavelet.trainer.rl_trainer import (
     RLTrainer,
@@ -113,6 +116,33 @@ def test_gradient_accumulation_loss_scale_divides_grads_once() -> None:
     trainer._apply_gradient_accumulation_loss_scale()  # noqa: SLF001
 
     assert torch.allclose(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+
+
+def test_finalize_waits_for_pending_async_checkpoint(monkeypatch) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.monitor = Mock()
+    trainer.ckpt_manager = Mock()
+    monkeypatch.setattr(trainer, "_save_model", Mock())
+
+    trainer.finalize(status="completed")
+
+    trainer.ckpt_manager.wait_for_pending_save.assert_called_once_with()
+
+
+def test_orchestrated_rl_resume_accepts_dynamic_micro_step_count() -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.accumulation_steps = 2
+
+    trainer._validate_resume_state(  # noqa: SLF001
+        TrainerState(step=100, micro_step=1600)
+    )
+
+
+def test_orchestrated_rl_checkpoint_excludes_transient_dataloader() -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.dataloader = object()
+
+    assert trainer._checkpoint_dataloader() is None  # noqa: SLF001
 
 
 def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch() -> None:

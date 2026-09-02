@@ -31,12 +31,17 @@ def test_extract_tagged_answer_requires_exact_complete_structure() -> None:
 
 def test_build_polaris_rows_filters_deduplicates_and_decontaminates() -> None:
     rows = [
-        {"problem": "too hard", "answer": "0", "difficulty": "0/8"},
+        {"problem": "below range", "answer": "0", "difficulty": "0/8"},
         {"problem": "Keep me", "answer": "1", "difficulty": "1/8"},
         {"problem": " keep   ME ", "answer": "2", "difficulty": "6/8"},
         {"problem": "Held out", "answer": "3", "difficulty": "4/8"},
         {"problem": "Upper bound", "answer": "4", "difficulty": "6/8"},
-        {"problem": "too easy", "answer": "5", "difficulty": "7/8"},
+        {"problem": "above range", "answer": "5", "difficulty": "7/8"},
+        {
+            "problem": "Prove that x + y = y + x.",
+            "answer": "x+y=y+x",
+            "difficulty": "3/8",
+        },
         {"problem": "bad label", "answer": "6", "difficulty": "unknown"},
         {"problem": "empty answer", "answer": "", "difficulty": "3/8"},
     ]
@@ -68,6 +73,19 @@ def test_build_polaris_rows_filters_deduplicates_and_decontaminates() -> None:
 def test_build_polaris_rows_rejects_invalid_difficulty_bounds() -> None:
     with pytest.raises(ValueError, match="difficulty bounds"):
         ENV.build_polaris_rows([], min_difficulty=7, max_difficulty=2)
+
+
+def test_build_polaris_rows_can_explicitly_include_proof_requests() -> None:
+    rows = [
+        {
+            "problem": "Show that x + 0 = x.",
+            "answer": "x+0=x",
+            "difficulty": "3/8",
+        }
+    ]
+
+    assert ENV.build_polaris_rows(rows) == []
+    assert len(ENV.build_polaris_rows(rows, exclude_proof_problems=False)) == 1
 
 
 def test_format_aime_rows_uses_integer_answers_without_solutions() -> None:
@@ -108,4 +126,25 @@ def test_resilient_math_rubric_replaces_executor_after_hard_timeout(
     asyncio.run(rubric.correct_answer(None, [], answer="1"))
 
     assert rubric.executor is not original_executor
+    asyncio.run(rubric.teardown())
+
+
+def test_resilient_math_rubric_scores_the_strict_tagged_answer() -> None:
+    vf = pytest.importorskip("verifiers")
+    rubric = ENV.build_resilient_math_rubric(
+        vf,
+        parser=vf.Parser(extract_fn=ENV.extract_tagged_answer),
+        max_workers=1,
+        timeout_seconds=5.0,
+    )
+
+    reward = asyncio.run(
+        rubric.correct_answer(
+            rubric.parser,
+            [{"role": "assistant", "content": "<think>6 * 7</think><answer>42</answer>"}],
+            answer="42",
+        )
+    )
+
+    assert reward == 1.0
     asyncio.run(rubric.teardown())

@@ -18,6 +18,7 @@ from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import IterableDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
@@ -97,6 +98,16 @@ class BaseTrainer:
     def _after_resume(self) -> None:
         pass
 
+    def _validate_resume_state(self, state: TrainerState) -> None:
+        if state.micro_step != state.step * self.accumulation_steps:
+            raise ValueError(
+                "Checkpoint micro_step does not match the expected optimizer-step "
+                "boundary for this trainer configuration."
+            )
+
+    def _checkpoint_dataloader(self) -> StatefulDataLoader | None:
+        return self.dataloader
+
     def _setup_run(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         config = self.config.monitor
@@ -130,13 +141,9 @@ class BaseTrainer:
             )
             state = self.ckpt_manager.load(
                 self.resume_checkpoint_dir,
-                dataloader=self.dataloader,
+                dataloader=self._checkpoint_dataloader(),
             )
-            if state.micro_step != state.step * self.accumulation_steps:
-                raise ValueError(
-                    "Checkpoint micro_step does not match the expected optimizer-step "
-                    "boundary for this trainer configuration."
-                )
+            self._validate_resume_state(state)
             self.step = state.step
             self._micro_step = state.micro_step
             self._after_resume()
@@ -568,7 +575,7 @@ class BaseTrainer:
         self.ckpt_manager.poll_pending_save()
         did_save = self.ckpt_manager.save(
             TrainerState(step=self.step, micro_step=self._micro_step),
-            dataloader=self.dataloader,
+            dataloader=self._checkpoint_dataloader(),
         )
         if did_save:
             self.monitor.log_event(
