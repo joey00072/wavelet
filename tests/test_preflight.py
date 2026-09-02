@@ -103,6 +103,32 @@ def test_preflight_accepts_loadable_model_adapter(tmp_path) -> None:
     )
 
 
+def test_preflight_rejects_adapter_removed_by_clean_output_dir(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    output_dir = tmp_path / "run"
+    adapter_path = output_dir / "policies" / "step-000001" / "adapter"
+    adapter_path.mkdir(parents=True)
+    (adapter_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"weights")
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"adapter_path": adapter_path},
+        output_dir=output_dir,
+        clean_output_dir=True,
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert any(
+        check["name"] == "model_adapter_path"
+        and check["status"] == "error"
+        and check["details"]["removed_by_clean_output_dir"] is True
+        for check in report["checks"]
+    )
+
+
 def test_preflight_reports_unimportable_custom_algorithm(tmp_path) -> None:
     data_path = _write_local_data(tmp_path)
     config = RLConfig(

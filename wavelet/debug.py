@@ -1651,7 +1651,10 @@ def _adapter_path_checks(config: RLConfig) -> list[PreflightCheck]:
     missing_files = [
         filename for filename in required_files if not (adapter_path / filename).is_file()
     ]
-    valid = adapter_path.is_dir() and not missing_files
+    removed_by_clean = config.clean_output_dir and adapter_path.absolute().is_relative_to(
+        config.output_dir.absolute()
+    )
+    valid = adapter_path.is_dir() and not missing_files and not removed_by_clean
     return [
         PreflightCheck(
             name="model_adapter_path",
@@ -1659,12 +1662,18 @@ def _adapter_path_checks(config: RLConfig) -> list[PreflightCheck]:
             message=(
                 f"Model adapter is ready: {adapter_path}"
                 if valid
-                else "Model adapter is not a loadable Wavelet LoRA snapshot: "
-                f"{adapter_path}"
+                else (
+                    "clean_output_dir=true would remove model.adapter_path before "
+                    f"launch: {adapter_path}"
+                    if removed_by_clean
+                    else "Model adapter is not a loadable Wavelet LoRA snapshot: "
+                    f"{adapter_path}"
+                )
             ),
             details={
                 "path": str(adapter_path),
                 "missing_files": missing_files,
+                "removed_by_clean_output_dir": removed_by_clean,
             },
         )
     ]

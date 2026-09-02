@@ -48,6 +48,8 @@ uv run python -m wavelet sft @ examples/unsloth_math/sft.yaml
 To continue training an existing LoRA, set `model.adapter_path` to its adapter
 directory. Wavelet uses tokenizer artifacts from that directory when present
 and otherwise falls back to the tokenizer named by `model.name`.
+Keep that adapter outside a new run's `output_dir` when `clean_output_dir: true`;
+preflight rejects layouts where cleanup would delete the input adapter.
 
 Run the RL example:
 
