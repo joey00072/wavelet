@@ -1,3 +1,7 @@
-"""Compatibility exports for consolidated trainer losses."""
+"""Compatibility alias for consolidated trainer losses."""
 
-from wavelet.trainer.losses import *
+import sys
+
+from wavelet.trainer import losses as _losses
+
+sys.modules[__name__] = _losses
