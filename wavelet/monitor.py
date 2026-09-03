@@ -60,6 +60,14 @@ def append_jsonl(
         handle.write(json.dumps(row, sort_keys=sort_keys) + "\n")
 
 
+def _replace_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    temporary.replace(path)
+
+
 def tail_jsonl(
     path: Path,
     *,
@@ -226,8 +234,11 @@ class RunMonitor:
         write_heartbeat: bool = True,
         log_cuda_memory: bool = True,
         log_disk_usage: bool = True,
+        sample_history_size: int = 256,
         wandb: WandbConfig | None = None,
     ) -> None:
+        if sample_history_size < 1:
+            raise ValueError("sample_history_size must be at least 1.")
         self.output_dir = output_dir
         self.checkpoint_dir = checkpoint_dir
         self.enabled = enabled
@@ -238,6 +249,7 @@ class RunMonitor:
         self.write_heartbeat = write_heartbeat
         self.log_cuda_memory = log_cuda_memory
         self.log_disk_usage = log_disk_usage
+        self.sample_history_size = sample_history_size
         self.wandb = wandb or WandbConfig()
         self.metrics_file = output_dir / "metrics.jsonl"
         self.csv_file = output_dir / "metrics.csv"
@@ -248,6 +260,7 @@ class RunMonitor:
         self._wandb_run: Any | None = None
         self._wandb_samples_table: Any | None = None
         self._wandb_samples_columns: list[str] = []
+        self._sample_rows_since_compaction: int | None = None
 
     def start_run(
         self,
@@ -327,11 +340,10 @@ class RunMonitor:
             return
 
         timestamp = self._timestamp()
-        for sample in samples:
-            append_jsonl(
-                self.samples_file,
-                {"timestamp": timestamp, "step": step, **sample},
-            )
+        rows = [
+            {"timestamp": timestamp, "step": step, **sample} for sample in samples
+        ]
+        self._append_sample_history(rows)
 
         if self._wandb_run is None:
             return
@@ -353,6 +365,30 @@ class RunMonitor:
                 *[step if column == "step" else sample[column] for column in columns]
             )
         self._wandb_run.log({"samples": self._wandb_samples_table}, step=step)
+
+    def _append_sample_history(self, rows: list[dict[str, Any]]) -> None:
+        if self._sample_rows_since_compaction is None:
+            retained = tail_jsonl_rows(
+                self.samples_file,
+                limit=self.sample_history_size,
+            )
+            _replace_jsonl(
+                self.samples_file,
+                [*retained, *rows][-self.sample_history_size :],
+            )
+            self._sample_rows_since_compaction = 0
+            return
+
+        for row in rows:
+            append_jsonl(self.samples_file, row)
+        self._sample_rows_since_compaction += len(rows)
+        if self._sample_rows_since_compaction < self.sample_history_size:
+            return
+        _replace_jsonl(
+            self.samples_file,
+            tail_jsonl_rows(self.samples_file, limit=self.sample_history_size),
+        )
+        self._sample_rows_since_compaction = 0
 
     def finish(
         self,

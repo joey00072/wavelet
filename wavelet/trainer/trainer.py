@@ -121,6 +121,7 @@ class BaseTrainer:
             write_heartbeat=config.write_heartbeat,
             log_cuda_memory=config.log_cuda_memory,
             log_disk_usage=config.log_disk_usage,
+            sample_history_size=config.samples.keep_last,
             wandb=config.wandb,
         )
         assert self.model is not None

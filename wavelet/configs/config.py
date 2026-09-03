@@ -221,6 +221,7 @@ class SampleLogConfig(BaseModel):
     interval: int = Field(default=10, ge=1)
     sample_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
     max_samples: int | None = Field(default=None, ge=1)
+    keep_last: int = Field(default=256, ge=1)
 
 
 class MonitorConfig(BaseModel):

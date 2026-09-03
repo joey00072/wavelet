@@ -61,7 +61,8 @@ and a sequence length of 1,024 tokens.
 
 Consumed rollout cleanup uses the library default: the latest two batches stay
 under the run's `rollouts/` directory for inspection while older consumed
-batches are removed. Sampled responses are appended to `samples.jsonl`.
+batches are removed. Recent sampled responses are kept in a bounded
+`samples.jsonl` rolling history.
 Zero-advantage groups are retained so the saved population is not biased toward
 mixed-reward groups.
 

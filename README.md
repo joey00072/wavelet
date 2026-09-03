@@ -111,6 +111,9 @@ window; do not disable cleanup for long runs.
 Checkpoint and evaluation-rollout retention also default to the latest two
 sets when those features are enabled. Metrics and traces remain the compact
 long-term record.
+Sample logging retains a rolling window of 256 rows by default
+(`monitor.samples.keep_last`) and compacts it in batches, so enabling rollout
+examples cannot grow `samples.jsonl` without bound during a long run.
 This publishes policy step 0 before rollout generation and prevents the trainer
 and inference scheduler from waiting on each other at startup.
 
