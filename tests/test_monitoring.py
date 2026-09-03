@@ -5,6 +5,7 @@ import types
 from collections import namedtuple
 
 from wavelet.configs.sft import WandbConfig
+from wavelet.monitor import read_jsonl
 from wavelet.utils.monitoring import RunMonitor
 
 
@@ -86,3 +87,41 @@ def test_disk_metrics_cover_run_and_checkpoint_volumes(monkeypatch, tmp_path) ->
     assert metrics["disk_free_ratio"] == 0.4
     assert metrics["checkpoint_disk_free_bytes"] == 50
     assert metrics["checkpoint_disk_free_ratio"] == 0.25
+
+
+def test_sample_history_compacts_to_recent_rows(tmp_path) -> None:
+    monitor = RunMonitor(
+        tmp_path,
+        log_cuda_memory=False,
+        log_disk_usage=False,
+        sample_history_size=3,
+    )
+    monitor.start_run()
+
+    monitor.log_samples([{"completion": "zero"}, {"completion": "one"}], step=0)
+    monitor.log_samples([{"completion": "two"}, {"completion": "three"}], step=1)
+    monitor.log_samples([{"completion": "four"}], step=2)
+
+    rows = read_jsonl(tmp_path / "samples.jsonl")
+    assert [row["completion"] for row in rows] == ["two", "three", "four"]
+    assert [row["step"] for row in rows] == [1, 1, 2]
+
+
+def test_sample_history_compacts_existing_file_on_first_write(tmp_path) -> None:
+    samples_path = tmp_path / "samples.jsonl"
+    samples_path.write_text(
+        "".join(f'{{"completion": "{index}"}}\n' for index in range(5)),
+        encoding="utf-8",
+    )
+    monitor = RunMonitor(
+        tmp_path,
+        log_cuda_memory=False,
+        log_disk_usage=False,
+        sample_history_size=3,
+    )
+    monitor.start_run(resumed_from="checkpoint-1")
+
+    monitor.log_samples([{"completion": "new"}], step=2)
+
+    rows = read_jsonl(samples_path)
+    assert [row["completion"] for row in rows] == ["3", "4", "new"]

@@ -111,7 +111,7 @@ trainer uses unpacked microbatches of 16, FlashAttention 2, learning rate
 `5e-5`, and no KL loss. Policy lag is bounded by both the four-stage async
 pipeline and `max_off_policy_steps`. AIME 2024 runs every 100 policy steps, and
 retention keeps only the recent policies, checkpoints, consumed rollouts, eval
-sets, and sampled generations needed for debugging.
+sets, and the configured rolling sample history needed for debugging.
 
 To resume, set `model.adapter_path` to the chosen immutable policy adapter and
 set a new `output_dir`; checkpoint resume should use the checkpoint controls
