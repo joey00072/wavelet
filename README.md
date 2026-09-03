@@ -174,6 +174,9 @@ configured memory budget.
 Cached verifier environments and registered executors are torn down when the
 inference scheduler closes. Integrated runs also close the inference engine and
 verifier resources on both success and failure before finalizing trainer state.
+Secret-valued config fields are redacted before resolved configuration reaches
+run metadata, the state API, or W&B; token-count and tokenizer fields remain
+visible for debugging.
 
 Trainers consume queue batches in exact queue order. Every batch manifest must
 agree with its queue step, optimizer step, chunk index, row count, and configured

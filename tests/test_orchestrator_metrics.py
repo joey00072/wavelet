@@ -3,10 +3,13 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import sys
+import types
 from unittest.mock import Mock
 
 import pytest
 
+import wavelet.monitor as monitor_module
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.metrics import (
     RolloutMetricInputs,
@@ -180,6 +183,35 @@ def test_log_eval_metrics_uses_orchestrator_wandb_run(monkeypatch, tmp_path) -> 
     assert trace["details"] == {
         "eval/aime/avg@8": 0.25,
         "eval/aime/pass@8": 0.75,
+    }
+
+
+def test_orchestrator_wandb_config_redacts_secrets(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    run = Mock()
+
+    def fake_init(**kwargs):
+        captured.update(kwargs)
+        return run
+
+    fake_wandb = types.SimpleNamespace(
+        init=fake_init,
+        define_metric=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    monkeypatch.setattr(monitor_module, "_WANDB_RUN", None)
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={"verifier_env_args": {"api_token": "secret"}},
+        monitor={"wandb": {"enabled": True, "mode": "offline"}},
+    )
+
+    monitor_module._wandb_log(config, {"reward": 1.0}, step=1)
+
+    wandb_config = captured["config"]
+    assert isinstance(wandb_config, dict)
+    assert wandb_config["orchestrator"]["verifier_env_args"] == {
+        "api_token": "<redacted>"
     }
 
 

@@ -25,7 +25,23 @@ from wavelet.orchestrator.rollout_metadata import (
 from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 from wavelet.trainer.distributed import World, get_world
 
-_SECRET_KEY_PARTS = ("api_key", "token", "secret", "password")
+_SECRET_KEYS = {
+    "api_key",
+    "access_token",
+    "auth_token",
+    "credentials",
+    "password",
+    "secret",
+    "token",
+}
+_SECRET_KEY_SUFFIXES = (
+    "_api_key",
+    "_access_token",
+    "_auth_token",
+    "_password",
+    "_secret",
+    "_token",
+)
 logger = logging.getLogger(__name__)
 _TAIL_READ_BLOCK_BYTES = 64 * 1024
 
@@ -132,16 +148,17 @@ def redact(value: Any) -> Any:
     """Recursively redact values whose keys look credential-bearing."""
     if isinstance(value, dict):
         return {
-            key: (
-                "<redacted>"
-                if any(part in str(key).lower() for part in _SECRET_KEY_PARTS)
-                else redact(item)
-            )
+            key: ("<redacted>" if _is_secret_key(key) else redact(item))
             for key, item in value.items()
         }
     if isinstance(value, list):
         return [redact(item) for item in value]
     return value
+
+
+def _is_secret_key(key: object) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    return normalized in _SECRET_KEYS or normalized.endswith(_SECRET_KEY_SUFFIXES)
 
 
 def series_stats(
@@ -298,6 +315,7 @@ class RunMonitor:
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
         world = world or get_world()
+        safe_run_config = redact(run_config)
 
         if self.write_run_metadata:
             metadata = {
@@ -312,11 +330,11 @@ class RunMonitor:
                     "device": str(world.device),
                 },
                 "resumed_from": resumed_from,
-                "config": run_config,
+                "config": safe_run_config,
             }
             self.run_metadata_file.write_text(json.dumps(metadata, indent=2))
 
-        self._init_wandb(run_config, resumed_from)
+        self._init_wandb(safe_run_config, resumed_from)
         event = "run_resumed" if resumed_from is not None else "run_started"
         self.log_event(event, payload={"resumed_from": resumed_from})
         self._write_heartbeat(status="running", step=None)
@@ -365,9 +383,7 @@ class RunMonitor:
             return
 
         timestamp = self._timestamp()
-        rows = [
-            {"timestamp": timestamp, "step": step, **sample} for sample in samples
-        ]
+        rows = [{"timestamp": timestamp, "step": step, **sample} for sample in samples]
         self._append_sample_history(rows)
 
         if self._wandb_run is None:
@@ -925,7 +941,7 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
                 tags=wandb_config.tags,
                 mode=wandb_config.mode,
                 dir=str(config.output_dir),
-                config=config.model_dump(mode="json"),
+                config=redact(config.model_dump(mode="json")),
             )
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")

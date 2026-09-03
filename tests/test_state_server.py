@@ -58,7 +58,7 @@ def test_orchestrator_state_config_redacts_secrets(tmp_path) -> None:
 
     sanitized = state.sanitized_config()
 
-    assert sanitized["orchestrator"]["verifier_api_key_var"] == "<redacted>"
+    assert sanitized["orchestrator"]["verifier_api_key_var"] == "MY_API_KEY"
     assert sanitized["orchestrator"]["verifier_env_args"]["api_key"] == "<redacted>"
     assert sanitized["orchestrator"]["verifier_env_args"]["safe"] == "value"
 
