@@ -87,6 +87,9 @@ Inference loads LoRA adapters directly from the immutable published directory;
 it does not make a second tmpfs copy of every policy.
 Policy receive events reuse the tensor byte count recorded in `policy.json`;
 they do not walk or reread the artifact to reconstruct diagnostic metadata.
+Checkpoint resume removes policy versions beyond the restored step and reuses
+an exact complete snapshot when present. Ordinary exports never overwrite a
+stable policy directory.
 The one-shot `load_inplace` flag is cleared immediately after refresh so vLLM
 does not reread the adapter during later generation scheduler work.
 
