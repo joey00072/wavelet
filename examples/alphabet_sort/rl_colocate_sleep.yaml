@@ -40,7 +40,7 @@ orchestrator:
   examples_per_step: 32
   rollouts_per_example: 4
   filter_zero_advantage: false
-  zero_advantage_max_retries: 8
+  zero_advantage_max_retries: 0
   max_async_level: 0
   max_off_policy_steps: 0
 
