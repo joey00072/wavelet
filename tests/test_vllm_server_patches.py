@@ -15,8 +15,8 @@ from vllm.lora.worker_manager import (
     WorkerLoRAManager,
 )
 
-from wavelet.inference import server
 from wavelet.configs.rl_config import RLConfig
+from wavelet.inference import server
 
 
 def test_load_lora_patch_still_addresses_upstream_request_replacement() -> None:
@@ -171,3 +171,41 @@ async def test_load_policy_routes_lora_artifact_digest(monkeypatch) -> None:
         "expected_artifact_sha256": "a" * 64,
         "config": config,
     }
+
+
+@pytest.mark.anyio
+async def test_policy_update_pause_drains_without_clearing_cache() -> None:
+    calls = []
+
+    async def pause_generation(*, mode: str, clear_cache: bool) -> None:
+        calls.append(("pause", mode, clear_cache))
+
+    state = SimpleNamespace(
+        engine_client=SimpleNamespace(pause_generation=pause_generation),
+        generation_paused=False,
+    )
+
+    result = await server.pause(SimpleNamespace(app=SimpleNamespace(state=state)))
+
+    assert result == {"status": "paused"}
+    assert calls == [("pause", "keep", False)]
+    assert state.generation_paused is True
+
+
+@pytest.mark.anyio
+async def test_policy_update_resume_releases_generation() -> None:
+    calls = []
+
+    async def resume_generation() -> None:
+        calls.append("resume")
+
+    state = SimpleNamespace(
+        engine_client=SimpleNamespace(resume_generation=resume_generation),
+        generation_paused=True,
+    )
+
+    result = await server.resume(SimpleNamespace(app=SimpleNamespace(state=state)))
+
+    assert result == {"status": "resumed"}
+    assert calls == ["resume"]
+    assert state.generation_paused is False

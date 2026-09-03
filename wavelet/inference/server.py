@@ -734,9 +734,40 @@ async def debug_state(request: Request) -> dict[str, Any]:
         "policy_artifact_sha256": getattr(
             request.app.state, "policy_artifact_sha256", None
         ),
+        "generation_paused": getattr(
+            request.app.state, "generation_paused", False
+        ),
         "asleep": getattr(request.app.state, "asleep", False),
     }
     return state
+
+
+@router.post("/pause")
+async def pause(raw_request: Request) -> dict[str, str]:
+    """Drain active requests and hold new generation during a policy update."""
+    client = _engine_client(raw_request)
+    if not hasattr(client, "pause_generation"):
+        raise RuntimeError(
+            "This vLLM engine does not support safe policy updates because "
+            "pause_generation is unavailable."
+        )
+    await client.pause_generation(mode="keep", clear_cache=False)
+    raw_request.app.state.generation_paused = True
+    return {"status": "paused"}
+
+
+@router.post("/resume")
+async def resume(raw_request: Request) -> dict[str, str]:
+    """Allow generation after a policy update transaction."""
+    client = _engine_client(raw_request)
+    if not hasattr(client, "resume_generation"):
+        raise RuntimeError(
+            "This vLLM engine does not support safe policy updates because "
+            "resume_generation is unavailable."
+        )
+    await client.resume_generation()
+    raw_request.app.state.generation_paused = False
+    return {"status": "resumed"}
 
 
 @router.post("/sleep")
@@ -984,6 +1015,7 @@ async def custom_init_app_state(
     state.policy_adapter_path = None
     state.policy_weight_path = None
     state.policy_artifact_sha256 = None
+    state.generation_paused = False
     if "generate" in supported_tasks and state.openai_serving_chat is not None:
         serving_chat = object.__new__(OpenAIServingChatWithTokens)
         serving_chat.__dict__.update(state.openai_serving_chat.__dict__)
