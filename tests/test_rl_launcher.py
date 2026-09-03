@@ -11,43 +11,43 @@ import wavelet.orchestrator.envs as verifier_envs
 import wavelet.orchestrator.runtime as runtime
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
-from wavelet.orchestrator.rollout_worker import (
-    _colocated_trainer_device_ids,
-    _wait_for_colocated_training_memory,
-)
-from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
-from wavelet.orchestrator.runtime import (
-    _config_path_for_role,
-    _config_with_nccl_inference_world_size,
-    _publish_rollout_timed,
-    _role_specs,
-    _run_integrated_launcher,
-    _rollout_client_config,
-    _sleep_vllm_http_servers,
-    _trainer_device_group,
-    _wait_for_vllm_http_server,
-)
-from wavelet.trainer.rl_worker import (
-    _StreamingChunkAccumulator,
-    _dummy_rollout_row,
-    _use_streaming_rollout_chunks,
-    _validate_rollout_batch,
-    _validate_streaming_rollout_batch,
-)
-from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
+from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator.queue import (
     FileSystemRolloutSender,
     publish_adapter_policy_snapshot,
 )
+from wavelet.orchestrator.rollout_worker import (
+    _colocated_trainer_device_ids,
+    _wait_for_colocated_training_memory,
+)
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.runtime import (
+    _config_path_for_role,
+    _config_with_nccl_inference_world_size,
+    _publish_rollout_timed,
+    _role_specs,
+    _rollout_client_config,
+    _run_integrated_launcher,
+    _sleep_vllm_http_servers,
+    _trainer_device_group,
+    _wait_for_vllm_http_server,
+)
 from wavelet.orchestrator.schedule import (
     chunks_per_step,
     rollout_chunk_examples,
     rollout_groups_for_chunk,
 )
+from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
 from wavelet.trainer.rl_trainer import RLTrainer
+from wavelet.trainer.rl_worker import (
+    _dummy_rollout_row,
+    _StreamingChunkAccumulator,
+    _use_streaming_rollout_chunks,
+    _validate_rollout_batch,
+    _validate_streaming_rollout_batch,
+)
 from wavelet.utils.policy_transfer import NCCL_READY_MARKER
 
 
@@ -519,7 +519,9 @@ def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
         launcher={"mode": "process", "inference_num_replicas": 1},
         inference={"mode": "vllm_http"},
         orchestrator={
-            "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
         },
         policy_transfer={"export_initial": True},
     )
@@ -579,7 +581,9 @@ def test_launcher_uses_native_inference_server_only_when_requested(
         launcher={"mode": "process", "inference_num_replicas": 1},
         inference={"mode": "vllm_http", "vllm": {"server_backend": "offline"}},
         orchestrator={
-            "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
         },
     )
 
