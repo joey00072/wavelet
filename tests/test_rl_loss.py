@@ -59,16 +59,22 @@ def test_normalization_unit_count_matches_packed_sequence_boundaries() -> None:
     loss_mask = torch.tensor([[True, True, False, True, False]])
     position_ids = torch.tensor([[0, 1, 2, 0, 1]])
 
-    assert normalization_unit_count(
-        loss_mask,
-        normalization="token",
-        position_ids=position_ids,
-    ) == 3
-    assert normalization_unit_count(
-        loss_mask,
-        normalization="sequence",
-        position_ids=position_ids,
-    ) == 2
+    assert (
+        normalization_unit_count(
+            loss_mask,
+            normalization="token",
+            position_ids=position_ids,
+        )
+        == 3
+    )
+    assert (
+        normalization_unit_count(
+            loss_mask,
+            normalization="sequence",
+            position_ids=position_ids,
+        )
+        == 2
+    )
 
 
 def test_policy_gradient_moves_logprobs_in_advantage_direction() -> None:

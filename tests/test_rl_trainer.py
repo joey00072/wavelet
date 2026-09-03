@@ -210,9 +210,7 @@ def test_orchestrated_rl_resume_accepts_dynamic_micro_step_count() -> None:
     trainer = RLTrainer(RLConfig())
     trainer.accumulation_steps = 2
 
-    trainer._validate_resume_state(
-        TrainerState(step=100, micro_step=1600)
-    )
+    trainer._validate_resume_state(TrainerState(step=100, micro_step=1600))
 
 
 def test_orchestrated_rl_checkpoint_excludes_transient_dataloader() -> None:

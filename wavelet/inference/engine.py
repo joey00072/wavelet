@@ -848,7 +848,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 results = self._openai_chat_completion_batch(
                     [request.payload for request in batch],
                 )
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 - unblock every waiter
                 for request in batch:
                     request.error = exc
                     request.done.set()

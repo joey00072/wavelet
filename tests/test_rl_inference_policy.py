@@ -271,9 +271,7 @@ def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None
     )
     context = object.__new__(_VerifierPublisherStrategy)
     context.config = _config()
-    context.inference_engine = type(
-        "Engine", (), {"policy_model_name": "policy"}
-    )()
+    context.inference_engine = type("Engine", (), {"policy_model_name": "policy"})()
     context.policy_receiver = object()
     context.scheduler = Scheduler()
     context.loaded_policy_step = 3

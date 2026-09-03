@@ -64,10 +64,16 @@ def monkey_patch_oai_iterable_types() -> None:
         tool_call_id: Required[str]
 
     chat_types.chat_completion_developer_message_param.ChatCompletionDeveloperMessageParam = DeveloperMessageParam
-    chat_types.chat_completion_system_message_param.ChatCompletionSystemMessageParam = SystemMessageParam
-    chat_types.chat_completion_user_message_param.ChatCompletionUserMessageParam = UserMessageParam
+    chat_types.chat_completion_system_message_param.ChatCompletionSystemMessageParam = (
+        SystemMessageParam
+    )
+    chat_types.chat_completion_user_message_param.ChatCompletionUserMessageParam = (
+        UserMessageParam
+    )
     chat_types.chat_completion_assistant_message_param.ChatCompletionAssistantMessageParam = AssistantMessageParam
-    chat_types.chat_completion_tool_message_param.ChatCompletionToolMessageParam = ToolMessageParam
+    chat_types.chat_completion_tool_message_param.ChatCompletionToolMessageParam = (
+        ToolMessageParam
+    )
     chat_types.chat_completion_message_param.ChatCompletionMessageParam = (
         DeveloperMessageParam
         | SystemMessageParam

@@ -86,9 +86,7 @@ def existing_run_state_entries(output_dir: Path) -> list[str]:
     if not output_dir.exists():
         return []
     entries = [
-        marker
-        for marker in OUTPUT_RUN_STATE_MARKERS
-        if (output_dir / marker).exists()
+        marker for marker in OUTPUT_RUN_STATE_MARKERS if (output_dir / marker).exists()
     ]
     entries.extend(path.name for path in sorted(output_dir.glob("checkpoint-*")))
     return entries

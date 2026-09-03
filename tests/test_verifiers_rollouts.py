@@ -174,7 +174,7 @@ def test_verifier_sampling_args_preserve_extra_body() -> None:
                 },
                 "min_tokens": 2,
             }
-        }
+        },
     )
 
     args = _sampling_args(config)

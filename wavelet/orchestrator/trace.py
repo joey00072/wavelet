@@ -79,5 +79,5 @@ def append_trace_event_best_effort(output_dir: Path | None, event: TraceEvent) -
         return
     try:
         append_trace_event(output_dir, event)
-    except Exception as exc:  # pragma: no cover - diagnostics must not stop runs
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to append trace event: %s", exc)
