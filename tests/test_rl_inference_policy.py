@@ -212,13 +212,15 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
         fake_load_policy_async,
     )
 
+    scheduler = Scheduler()
+    scheduler.begin_policy_update()
     loaded_step = asyncio.run(
         _load_policy_and_update_scheduler(
             _config(),
             inference_engine=type("Engine", (), {"policy_model_name": "policy"})(),
             policy_receiver=object(),  # type: ignore[arg-type]
             policy_step=4,
-            scheduler=Scheduler(),
+            scheduler=scheduler,
         )
     )
 
