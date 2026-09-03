@@ -1,4 +1,4 @@
-# ruff: noqa: F811
+# ruff: noqa: F811, PLC0414
 
 from collections.abc import Callable
 from dataclasses import dataclass
