@@ -219,9 +219,9 @@ def test_polaris_recovery_fresh_sft_initializes_new_lora_at_requested_lr() -> No
     assert config.max_steps == 117
 
 
-def test_polaris_rl_starts_from_fresh_recovery_sft_adapter() -> None:
+def test_polaris_async_rl_uses_canonical_two_gpu_batch_shape() -> None:
     config = RLConfig.model_validate(
-        load_yaml(Path("examples/qwen2_5_7b_polaris/rl_100k_fresh_sft_lr2e4.yaml"))
+        load_yaml(Path("examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32.yaml"))
     )
 
     assert config.model.adapter_path == Path(
@@ -230,143 +230,28 @@ def test_polaris_rl_starts_from_fresh_recovery_sft_adapter() -> None:
     assert config.model.load_in_4bit is False
     assert config.model.attn_implementation == "flash_attention_2"
     assert config.model.fused_lm_head_token_chunk_size == "auto"
-    assert config.orchestrator.examples_per_step == 128
-    assert config.orchestrator.rollouts_per_example == 8
-    assert config.data.batch_size == 128
-    assert config.data.seq_len == 8192
-    assert config.loss.kl_tau == 0.0
-    assert config.optim.lr == pytest.approx(5e-5)
-    assert config.eval is not None
-    assert config.eval.interval == 100
-    assert config.policy_transfer.keep_last == 5
-    assert config.ckpt is not None
-    assert config.ckpt.keep_last == 2
-    assert config.max_steps == 100000
-
-
-def test_polaris_async_restart_uses_two_gpu_batch_32_shape() -> None:
-    config = RLConfig.model_validate(
-        load_yaml(
-            Path("examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step361.yaml")
-        )
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_sft_rl5e5_nokl_b128x8_fa2_100k/"
-        "policies/step-000361/adapter"
-    )
-    assert config.data.batch_size == 32
-    assert config.data.micro_batch_size == 1
     assert config.orchestrator.examples_per_step == 32
     assert config.orchestrator.rollouts_per_example == 8
     assert config.orchestrator.rollout_chunk_examples == 8
     assert config.orchestrator.max_async_level == 4
     assert config.orchestrator.max_off_policy_steps == 4
     assert config.orchestrator.max_pending_rollout_chunks == 8
+    assert config.orchestrator.zero_advantage_max_retries == 8
+    assert config.data.batch_size == 32
+    assert config.data.micro_batch_size == 16
+    assert config.data.pack_sequences is False
+    assert config.data.seq_len == 8192
+    assert config.loss.kl_tau == 0.0
+    assert config.optim.lr == pytest.approx(5e-5)
     assert config.launcher.mode == "process"
     assert config.launcher.trainer_cuda_visible_devices == "0"
     assert config.launcher.inference_cuda_visible_devices == "1"
-    assert config.inference.vllm.gpu_memory_utilization == pytest.approx(0.9)
-
-
-def test_polaris_unpacked_restart_uses_microbatch_eight() -> None:
-    config = RLConfig.model_validate(
-        load_yaml(
-            Path(
-                "examples/qwen2_5_7b_polaris/"
-                "rl_100k_async_2gpu_b32_from_step385_unpacked_mb8.yaml"
-            )
-        )
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_step361_async_2gpu_b32x8_fa2_100k/"
-        "policies/step-000024/adapter"
-    )
-    assert config.data.batch_size == 32
-    assert config.data.micro_batch_size == 8
-    assert config.data.pack_sequences is False
-    assert config.data.seq_len == 8192
-    assert config.model.attn_implementation == "flash_attention_2"
-
-
-def test_polaris_tuned_unpacked_restart_uses_microbatch_sixteen() -> None:
-    config = RLConfig.model_validate(
-        load_yaml(
-            Path(
-                "examples/qwen2_5_7b_polaris/"
-                "rl_100k_async_2gpu_b32_from_step393_unpacked_mb16.yaml"
-            )
-        )
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_step385_async_2gpu_b32x8_unpacked_mb8_fa2_100k/"
-        "policies/step-000008/adapter"
-    )
-    assert config.data.batch_size == 32
-    assert config.data.micro_batch_size == 16
-    assert config.data.pack_sequences is False
-    assert config.data.seq_len == 8192
-
-
-def test_polaris_expandable_restart_uses_microbatch_sixteen() -> None:
-    config = RLConfig.model_validate(
-        load_yaml(
-            Path(
-                "examples/qwen2_5_7b_polaris/"
-                "rl_100k_async_2gpu_b32_from_step402_unpacked_mb16_expandable.yaml"
-            )
-        )
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_step393_async_2gpu_b32x8_unpacked_mb16_fa2_100k/"
-        "policies/step-000009/adapter"
-    )
-    assert config.data.batch_size == 32
-    assert config.data.micro_batch_size == 16
-    assert config.data.pack_sequences is False
-    assert config.orchestrator.examples_per_step == 32
-    assert config.orchestrator.rollouts_per_example == 8
-
-
-def test_polaris_step547_restart_uses_resilient_verifier_timeout() -> None:
-    config = RLConfig.model_validate(
-        load_yaml(
-            Path(
-                "examples/qwen2_5_7b_polaris/"
-                "rl_100k_async_2gpu_b32_from_step547_unpacked_mb16.yaml"
-            )
-        )
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_step402_async_2gpu_b32x8_unpacked_mb12_fa2_100k/"
-        "policies/step-000145/adapter"
-    )
-    assert config.data.micro_batch_size == 16
-    assert config.data.pack_sequences is False
-    assert config.orchestrator.verifier_env_args["math_verify_timeout"] == 5
-
-
-def test_polaris_step553_restart_has_wider_filter_retry_window() -> None:
-    config = RLConfig.model_validate(
-        load_yaml(
-            Path(
-                "examples/qwen2_5_7b_polaris/"
-                "rl_100k_async_2gpu_b32_from_step553_unpacked_mb16.yaml"
-            )
-        )
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_step547_async_2gpu_b32x8_unpacked_mb16_fa2_100k/"
-        "policies/step-000006/adapter"
-    )
-    assert config.orchestrator.zero_advantage_max_retries == 64
-    assert config.data.micro_batch_size == 16
-    assert config.data.pack_sequences is False
+    assert config.eval is not None
+    assert config.eval.interval == 100
+    assert config.policy_transfer.keep_last == 8
+    assert config.ckpt is not None
+    assert config.ckpt.keep_last == 2
+    assert config.max_steps == 100000
 
 
 def test_moe_reverse_text_rl_starts_from_sft_adapter_on_two_gpus() -> None:
