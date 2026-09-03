@@ -12,7 +12,9 @@ filters, the current training split contains 29,105 examples.
 Every response must be exactly
 `<think>...</think><answer>...</answer>`. The canonical run uses 32 problems per
 optimizer step and eight rollouts per problem. Zero-advantage filtering retries
-all-correct and all-wrong groups so the trainer receives mixed groups.
+all-correct and all-wrong groups so the trainer receives mixed groups. Useful
+groups remain buffered across bounded retry attempts while rejected groups are
+replaced.
 
 AIME 2024 evaluation uses the pinned 30-problem source from Prime's environment,
 eight rollouts per problem, and the same strict response parser and math
