@@ -69,6 +69,56 @@ def prune_policy_snapshots(policy_dir: Path, *, keep_last: int | None) -> list[P
     return removed
 
 
+def prune_policy_snapshots_beyond(policy_dir: Path, *, step: int) -> list[Path]:
+    """Remove policy directories from an abandoned run beyond a resume step."""
+    if not policy_dir.exists():
+        return []
+    removed: list[Path] = []
+    for candidate in policy_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
+            continue
+        try:
+            candidate_step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
+        except ValueError:
+            continue
+        if candidate_step > step:
+            shutil.rmtree(candidate)
+            removed.append(candidate)
+    return sorted(removed)
+
+
+def _is_reusable_policy_snapshot(
+    step_dir: Path,
+    *,
+    step: int,
+    expected_kind: str,
+) -> bool:
+    metadata_path = step_dir / POLICY_META_FILENAME
+    if not (step_dir / STABLE_BATCH_MARKER).is_file() or not metadata_path.is_file():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(metadata, dict) or metadata.get("format_version") != 1:
+        return False
+    metadata_step = metadata.get("step")
+    if (
+        not isinstance(metadata_step, int)
+        or isinstance(metadata_step, bool)
+        or metadata_step != step
+    ):
+        return False
+    kind = metadata.get("kind")
+    if kind != expected_kind:
+        return False
+    if kind == "adapter":
+        return (step_dir / "adapter" / "adapter_model.safetensors").is_file()
+    if kind == "model":
+        return (step_dir / "model").is_dir()
+    return False
+
+
 def _require_vllm_nccl() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
     try:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
@@ -328,6 +378,28 @@ class PolicyExportMixin:
 
         policy_dir = resolve_policy_dir(self.output_dir, self.config.policy_transfer)
         step_dir = get_policy_step_dir(policy_dir, export_step)
+        if force:
+            if self.world.is_main:
+                prune_policy_snapshots_beyond(policy_dir, step=export_step)
+            if self.world.world_size > 1:
+                barrier(self.world)
+            expected_kind = (
+                "adapter"
+                if self.config.lora is not None
+                and self.config.policy_transfer.lightweight_lora
+                else "model"
+            )
+            if _is_reusable_policy_snapshot(
+                step_dir,
+                step=export_step,
+                expected_kind=expected_kind,
+            ):
+                self.offload_after_refit()
+                return step_dir
+        elif (step_dir / STABLE_BATCH_MARKER).is_file():
+            raise FileExistsError(
+                f"Stable policy step {export_step} already exists at '{step_dir}'."
+            )
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
         self._prepare_export_directory(tmp_dir, step_dir)
         saved_path = self._save_filesystem_policy(tmp_dir)

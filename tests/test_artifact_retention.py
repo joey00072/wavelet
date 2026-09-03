@@ -1,5 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 from wavelet.configs.rl_config import RLConfig, RLTransportConfig
 from wavelet.orchestrator.envs import _prune_eval_rollout_sets
@@ -7,7 +10,11 @@ from wavelet.trainer.rl import (
     _combined_rollout_path,
     _remove_combined_rollout_path,
 )
-from wavelet.transport.policy import prune_policy_snapshots
+from wavelet.transport.policy import (
+    PolicyExportMixin,
+    prune_policy_snapshots,
+    prune_policy_snapshots_beyond,
+)
 from wavelet.transport.queue import (
     CONSUMED_FILENAME,
     STABLE_BATCH_MARKER,
@@ -35,6 +42,62 @@ def test_prune_policy_snapshots_keeps_latest_stable_steps(tmp_path) -> None:
     assert stable[1].exists()
     assert stable[2].exists()
     assert incomplete.exists()
+
+
+def test_resume_prunes_only_future_policy_snapshots(tmp_path) -> None:
+    past = _stable_policy_dir(tmp_path, 4)
+    current = _stable_policy_dir(tmp_path, 5)
+    future = _stable_policy_dir(tmp_path, 6)
+
+    removed = prune_policy_snapshots_beyond(tmp_path, step=5)
+
+    assert removed == [future]
+    assert past.exists()
+    assert current.exists()
+    assert not future.exists()
+
+
+def test_forced_resume_reuses_complete_policy_snapshot(tmp_path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        lora={"rank": 4, "target_modules": ["q_proj"]},
+    )
+    policy_root = tmp_path / "policies"
+    step_dir = _stable_policy_dir(policy_root, 5)
+    adapter_dir = step_dir / "adapter"
+    adapter_dir.mkdir()
+    (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    (step_dir / "policy.json").write_text(
+        '{"format_version": 1, "step": 5, "kind": "adapter"}',
+        encoding="utf-8",
+    )
+    future = _stable_policy_dir(policy_root, 6)
+
+    exporter = PolicyExportMixin()
+    exporter.config = config
+    exporter.output_dir = tmp_path
+    exporter.model = object()
+    exporter.tokenizer = object()
+    exporter.world = SimpleNamespace(is_main=True, world_size=1)
+    exporter.offload_after_refit = Mock()
+
+    assert exporter.export_policy(step=5, force=True) == step_dir
+    assert (adapter_dir / "adapter_model.safetensors").read_bytes() == b"weights"
+    assert not future.exists()
+
+
+def test_ordinary_export_does_not_overwrite_stable_policy(tmp_path) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    _stable_policy_dir(tmp_path / "policies", 1)
+    exporter = PolicyExportMixin()
+    exporter.config = config
+    exporter.output_dir = tmp_path
+    exporter.model = object()
+    exporter.tokenizer = object()
+    exporter.world = SimpleNamespace(is_main=True, world_size=1)
+
+    with pytest.raises(FileExistsError, match="Stable policy step 1"):
+        exporter.export_policy(step=1)
 
 
 def test_prune_eval_rollout_sets_keeps_latest_steps(tmp_path) -> None:
