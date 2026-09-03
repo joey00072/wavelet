@@ -142,9 +142,10 @@ The orchestrator separately logs `generation/reward/mean`, group admission,
 and generated solve-rate metrics before filtering. Use those raw generation
 metrics to judge policy progress; reward on admitted mixed groups is
 selection-biased by design.
-Every scheduler initializes evaluation from an unevaluated state, so
+Fresh schedulers initialize evaluation from an unevaluated state, so
 `eval_base_model: true` records policy step 0 before interval evaluations and
-provides the fixed baseline used by the progress chart.
+provides the fixed baseline used by the progress chart. Resumed schedulers use
+the checkpoint step as their evaluation cursor instead of repeating old evals.
 Verifier thread and math-process pools scale to the scheduler's real in-flight
 request high-water mark, which is logged as `generation/executor_concurrency`.
 When `max_pending_rollout_chunks` is set, that queue-derived capacity is a hard
