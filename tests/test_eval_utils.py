@@ -16,6 +16,7 @@ from wavelet.orchestrator.scheduler import (
     _run_evals,
     _run_evals_async,
     _run_final_evals,
+    _select_final_eval_envs,
 )
 from wavelet.orchestrator.verifiers import _eval_metrics, _run_eval_examples
 
@@ -171,6 +172,44 @@ def test_final_eval_policy_step_uses_last_exported_step() -> None:
 
     assert _final_eval_policy_step(config, 100) == 100
     assert _final_eval_policy_step(config, 99) == 96
+
+
+def test_final_eval_skips_policy_already_evaluated_at_interval() -> None:
+    config = RLConfig(
+        eval={
+            "interval": 100,
+            "env": [{"id": "aime", "name": "aime2024"}],
+        }
+    )
+    last_eval_steps = {"aime2024": 100}
+
+    envs = _select_final_eval_envs(
+        config,
+        policy_step=100,
+        last_eval_steps=last_eval_steps,
+    )
+
+    assert envs == []
+    assert last_eval_steps == {"aime2024": 100}
+
+
+def test_final_eval_runs_policy_not_seen_at_an_interval() -> None:
+    config = RLConfig(
+        eval={
+            "interval": 100,
+            "env": [{"id": "aime", "name": "aime2024"}],
+        }
+    )
+    last_eval_steps = {"aime2024": 100}
+
+    envs = _select_final_eval_envs(
+        config,
+        policy_step=137,
+        last_eval_steps=last_eval_steps,
+    )
+
+    assert [env.resolved_name for env in envs] == ["aime2024"]
+    assert last_eval_steps == {"aime2024": 137}
 
 
 def test_eval_only_base_model_does_not_wait_for_policy_snapshot(
