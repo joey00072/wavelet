@@ -129,6 +129,7 @@ def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
     assert captured_kwargs["max_cpu_loras"] == 1
     assert captured_kwargs["fully_sharded_loras"] is True
     assert captured_kwargs["max_lora_rank"] == 32
+    assert captured_kwargs["logprobs_mode"] == "processed_logprobs"
 
 
 def test_vllm_setup_passes_quantized_load_args(monkeypatch) -> None:

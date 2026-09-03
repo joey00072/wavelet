@@ -448,6 +448,12 @@ def test_sleep_colocate_enables_vllm_sleep_allocator() -> None:
     assert "--enable-sleep-mode" in argv
 
 
+def test_inference_server_returns_sampling_distribution_logprobs() -> None:
+    argv = _serve_argv(RLConfig())
+
+    assert _argv_value(argv, "--logprobs-mode") == "processed_logprobs"
+
+
 def test_inference_server_enables_fully_sharded_loras() -> None:
     config = RLConfig(
         inference={"vllm": {"fully_sharded_loras": True}},
