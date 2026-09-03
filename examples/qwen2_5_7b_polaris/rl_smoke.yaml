@@ -12,7 +12,7 @@ data:
   path: outputs/polaris_math_tagged_data/rl_train.jsonl
   batch_size: 2
   micro_batch_size: 1
-  pack_sequences: true
+  pack_sequences: false
   seq_len: 2048
   max_examples: 16
   shuffle: true
@@ -22,7 +22,7 @@ loss:
   type: dppo
   dppo_mask_high: 0.2
   dppo_mask_low: 0.2
-  kl_tau: 0.001
+  kl_tau: 0.0
 
 algo:
   type: grpo
@@ -112,7 +112,7 @@ fsdp:
 optim:
   type: adamw
   implementation: for-loop
-  lr: 1.0e-5
+  lr: 5.0e-5
   weight_decay: 0.0
 
 scheduler:
