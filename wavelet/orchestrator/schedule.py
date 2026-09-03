@@ -126,6 +126,10 @@ def select_due_eval_envs(
         )
         if eval_step is None:
             continue
-        last_eval_steps[env.resolved_name] = eval_step
+        # The currently loaded policy is what evaluation actually measures.
+        # A scheduler can jump over an interval boundary after resume or an
+        # asynchronous export, so retaining the nominal boundary would make a
+        # later final eval repeat the same loaded policy.
+        last_eval_steps[env.resolved_name] = policy_step
         envs.append(env)
     return envs

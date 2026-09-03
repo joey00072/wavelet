@@ -2244,8 +2244,37 @@ def _initial_eval_steps(
 ) -> dict[str, int]:
     if config.eval is None:
         return {}
-    last_eval_step = -1 if start_step == 0 else start_step
-    return {env.resolved_name: last_eval_step for env in config.eval.env}
+    last_eval_steps = {env.resolved_name: -1 for env in config.eval.env}
+    if start_step <= 0:
+        return last_eval_steps
+
+    metrics_path = config.output_dir / "eval_metrics.jsonl"
+    if not metrics_path.exists():
+        return last_eval_steps
+    with metrics_path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                metrics = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(metrics, dict):
+                continue
+            policy_step = metrics.get("progress/policy_step")
+            if not isinstance(policy_step, int | float) or isinstance(
+                policy_step, bool
+            ):
+                continue
+            if not math.isfinite(policy_step) or not float(policy_step).is_integer():
+                continue
+            evaluated_step = int(policy_step)
+            for env_name in last_eval_steps:
+                metric_prefix = f"eval/{env_name}/"
+                if any(str(key).startswith(metric_prefix) for key in metrics):
+                    last_eval_steps[env_name] = max(
+                        last_eval_steps[env_name],
+                        evaluated_step,
+                    )
+    return last_eval_steps
 
 
 async def _load_policy_async(
