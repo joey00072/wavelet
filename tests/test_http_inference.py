@@ -83,7 +83,6 @@ def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -
     engine.load_policy(tmp_path / "policy", step=3)
 
     assert calls == [
-        ("POST", "/pause", None),
         (
             "POST",
             "/load_policy",
@@ -94,12 +93,13 @@ def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -
                 "load_inplace": True,
             },
         ),
-        ("POST", "/resume", None),
     ]
     assert engine.policy_step == 3
 
 
-def test_policy_load_resumes_servers_after_failure(tmp_path: Path, monkeypatch) -> None:
+def test_paused_policy_load_resumes_servers_after_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
     engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
     paths: list[str] = []
 
@@ -116,6 +116,8 @@ def test_policy_load_resumes_servers_after_failure(tmp_path: Path, monkeypatch) 
     monkeypatch.setattr(engine, "_request_all", request_all)
 
     with pytest.raises(RuntimeError, match="load failed"):
-        engine.load_policy(tmp_path / "policy", step=3)
+        engine._load_policy_while_generation_paused(  # noqa: SLF001
+            {"policy_dir": str(tmp_path / "policy"), "step": 3}
+        )
 
     assert paths == ["/pause", "/load_policy", "/resume"]

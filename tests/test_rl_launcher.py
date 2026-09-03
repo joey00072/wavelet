@@ -746,7 +746,6 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
     engine.load_policy(Path("policy"), step=7)
 
     assert calls == [
-        ("POST", "/pause", None, "http://127.0.0.1:8000"),
         (
             "POST",
             "/load_policy",
@@ -758,7 +757,6 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
             },
             "http://127.0.0.1:8000",
         ),
-        ("POST", "/resume", None, "http://127.0.0.1:8000"),
     ]
     assert engine.policy_model_name == "policy"
 
@@ -864,7 +862,7 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
 
     engine.load_policy(policy_dir, step=7)
 
-    payload = calls[1][2]
+    payload = calls[0][2]
     assert payload is not None
     cached_policy_dir = Path(payload["policy_dir"])
     assert cached_policy_dir != policy_dir
