@@ -198,6 +198,58 @@ def test_rollout_metrics_include_non_overlapping_generation_metrics() -> None:
     assert metrics["generation/reward/mean"] == 0.25
 
 
+def test_rollout_metrics_keep_interleaved_group_values_aligned() -> None:
+    rows = [
+        {
+            "example_id": "a",
+            "input_ids": [1, 2],
+            "loss_mask": [False, True],
+        },
+        {
+            "example_id": "b",
+            "input_ids": list(range(10)),
+            "loss_mask": [False] * 9 + [True],
+        },
+        {
+            "example_id": "a",
+            "input_ids": [1, 2, 3, 4],
+            "loss_mask": [False, False, True, True],
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=2, step=1)
+    )
+
+    assert metrics["seq_len/all/mean"] == pytest.approx(6.5)
+    assert metrics["decode_len/all/mean"] == pytest.approx(1.25)
+
+
+def test_rollout_metrics_prefer_exact_dispatch_group_identity() -> None:
+    rows = [
+        {
+            "env_name": "math",
+            "example_id": "duplicate-public-id",
+            "reward": 1.0,
+            "metadata": {"group_key": "dispatch-a"},
+        },
+        {
+            "env_name": "math",
+            "example_id": "duplicate-public-id",
+            "reward": 0.0,
+            "metadata": {"group_key": "dispatch-b"},
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=1, step=1)
+    )
+
+    assert metrics["progress/problems"] == 2
+    assert metrics["solve_none/all"] == pytest.approx(0.5)
+    assert metrics["solve_all/all"] == pytest.approx(0.5)
+
+
 def test_rollout_metrics_reject_extra_metric_overrides() -> None:
     with pytest.raises(ValueError, match="replace core metrics: step"):
         rollout_metrics(

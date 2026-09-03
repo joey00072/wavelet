@@ -1,30 +1,28 @@
 from __future__ import annotations
 
-import json
 import csv
+import json
 import logging
 import os
 import random
 import shutil
-from collections import defaultdict
+from collections import defaultdict, deque
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
+from pathlib import Path
+from statistics import mean, pstdev
+from typing import Any
 
 import torch
 
 from wavelet.configs.config import RLConfig, WandbConfig
-from wavelet.trainer.distributed import World, get_world
 from wavelet.orchestrator.rollout_metadata import (
     metadata_harness_name,
     metadata_task_name,
 )
 from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
-from collections import deque
-from collections.abc import Iterable, Iterator
-from pathlib import Path
-from statistics import mean, pstdev
-from typing import Any
-
+from wavelet.trainer.distributed import World, get_world
 
 _SECRET_KEY_PARTS = ("api_key", "token", "secret", "password")
 logger = logging.getLogger(__name__)
@@ -656,9 +654,6 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         for seq_len, decode_len in zip(seq_lens, decode_lens, strict=True)
     ]
     advantages = [_float_or_none(row.get("advantage")) for row in rows]
-    is_truncated = [_bool_metric(_metadata(row).get("is_truncated")) for row in rows]
-    sample_counts = [_sample_count(row) for row in rows]
-    turn_counts = [_turn_count(row) for row in rows]
     metrics: dict[str, float] = {
         "progress/tokens": float(sum(seq_lens)),
         "progress/prefill_tokens": float(sum(prefill_lens)),
@@ -683,16 +678,24 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     if inputs.chunk_index is not None:
         metrics["progress/chunk_index"] = float(inputs.chunk_index)
 
-    for name, values, include_min in (
-        ("prefill_len", prefill_lens, True),
-        ("is_truncated", is_truncated, False),
-        ("samples_per_rollout", sample_counts, True),
-        ("num_turns", turn_counts, True),
+    for name, value_fn, include_min in (
+        (
+            "prefill_len",
+            lambda row: max(_seq_len(row) - _decode_len(row), 0),
+            True,
+        ),
+        (
+            "is_truncated",
+            lambda row: _bool_metric(_metadata(row).get("is_truncated")),
+            False,
+        ),
+        ("samples_per_rollout", _sample_count, True),
+        ("num_turns", _turn_count, True),
     ):
         metrics.update(
             series_stats(
                 f"{name}/all",
-                _grouped_means_from_values(grouped, values),
+                _grouped_means(grouped, value_fn),
                 include_min=include_min,
             )
         )
@@ -719,7 +722,9 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         duplicate_keys = metrics.keys() & inputs.extra_metrics.keys()
         if duplicate_keys:
             duplicates = ", ".join(sorted(duplicate_keys))
-            raise ValueError(f"Extra rollout metrics replace core metrics: {duplicates}")
+            raise ValueError(
+                f"Extra rollout metrics replace core metrics: {duplicates}"
+            )
         metrics.update(
             {key: float(value) for key, value in inputs.extra_metrics.items()}
         )
@@ -868,7 +873,7 @@ def _group_by_example(
     for row in rows:
         env_name = str(row.get("env_name") or row.get("source") or "all")
         example_id = str(
-            row.get("example_id") or _metadata(row).get("group_key") or len(grouped)
+            _metadata(row).get("group_key") or row.get("example_id") or len(grouped)
         )
         grouped[(env_name, example_id)].append(row)
     return dict(grouped)
@@ -892,21 +897,6 @@ def _grouped_means(
         if numeric:
             values.append(float(mean(numeric)))
     return values
-
-
-def _grouped_means_from_values(
-    grouped: dict[tuple[str, str], list[dict[str, Any]]],
-    values: list[float | int | bool | None],
-) -> list[float]:
-    by_key: dict[tuple[str, str], list[float]] = defaultdict(list)
-    row_index = 0
-    for key, rows in grouped.items():
-        for _ in rows:
-            value = _float_or_none(values[row_index])
-            if value is not None:
-                by_key[key].append(value)
-            row_index += 1
-    return [float(mean(items)) for items in by_key.values() if items]
 
 
 def _solve_rates(
