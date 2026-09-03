@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 from types import MethodType
 from typing import Any
 from unittest.mock import Mock
@@ -15,14 +15,12 @@ from wavelet.configs.rl_config import GRPOAlgorithmConfig, RLConfig
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.verifiers import (
-    _PendingVerifierRequest,
-    _VerifierBatchStats,
-    _VerifierGroupState,
     VerifierRolloutScheduler,
     _assign_rollout_advantages,
     _completed_group_outputs,
     _is_usable_training_group,
     _load_cached_env,
+    _PendingVerifierRequest,
     _records_from_output,
     _rollout_records_policy_step,
     _run_all,
@@ -30,6 +28,8 @@ from wavelet.orchestrator.verifiers import (
     _sampling_args,
     _successful_rollout_outputs,
     _verifier_extra_env_kwargs,
+    _VerifierBatchStats,
+    _VerifierGroupState,
 )
 
 
@@ -520,10 +520,10 @@ def test_verifier_scheduler_cycles_every_record_before_repeating() -> None:
     scheduler.records = records
     scheduler.config = RLConfig(data={"shuffle": False})
     scheduler.record_cursor = 0
-    scheduler._record_order_epoch = None  # noqa: SLF001
-    scheduler._record_order = []  # noqa: SLF001
+    scheduler._record_order_epoch = None
+    scheduler._record_order = []
 
-    selected = [scheduler._next_record().source for _ in range(7)]  # noqa: SLF001
+    selected = [scheduler._next_record().source for _ in range(7)]
 
     assert selected == ["0", "1", "2", "3", "4", "0", "1"]
 
@@ -539,9 +539,9 @@ def test_verifier_scheduler_shuffles_deterministically_per_epoch() -> None:
         scheduler.records = records
         scheduler.config = RLConfig(data={"shuffle": True, "seed": 123})
         scheduler.record_cursor = 0
-        scheduler._record_order_epoch = None  # noqa: SLF001
-        scheduler._record_order = []  # noqa: SLF001
-        return [scheduler._next_record().source for _ in range(10)]  # noqa: SLF001
+        scheduler._record_order_epoch = None
+        scheduler._record_order = []
+        return [scheduler._next_record().source for _ in range(10)]
 
     selected = sample()
 
@@ -824,13 +824,13 @@ def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
             )
         tasks = list(scheduler.pending)
         outputs: list[dict[str, Any]] = []
-        accepted = scheduler._consume_completed_task(  # noqa: SLF001
+        accepted = scheduler._consume_completed_task(
             tasks[0],
             target_groups=1,
             outputs=outputs,
             accepted_groups=0,
         )
-        rejected = scheduler._consume_completed_task(  # noqa: SLF001
+        rejected = scheduler._consume_completed_task(
             tasks[1],
             target_groups=1,
             outputs=outputs,
@@ -1347,7 +1347,7 @@ def test_verifier_scheduler_drops_incomplete_group_after_policy_change() -> None
             rollout_count=1,
             policy_step=2,
         )
-        return scheduler._consume_completed_task(  # noqa: SLF001
+        return scheduler._consume_completed_task(
             task,
             target_groups=1,
             outputs=[],
@@ -1696,7 +1696,7 @@ def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
 
 def test_verifier_scheduler_rejects_partial_batch_at_retry_limit() -> None:
     with pytest.raises(RuntimeError, match="accepted 1, rejected 1"):
-        VerifierRolloutScheduler._raise_if_retries_exhausted(  # noqa: SLF001
+        VerifierRolloutScheduler._raise_if_retries_exhausted(
             completed_groups=2,
             max_completed_groups=2,
             accepted_groups=1,

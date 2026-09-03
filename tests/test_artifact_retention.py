@@ -1,8 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.rl_config import RLTransportConfig
+from wavelet.configs.rl_config import RLConfig, RLTransportConfig
 from wavelet.orchestrator.envs import _prune_eval_rollout_sets
 from wavelet.trainer.rl import (
     _combined_rollout_path,

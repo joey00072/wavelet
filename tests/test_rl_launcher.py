@@ -7,12 +7,12 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import wavelet.orchestrator.envs as verifier_envs
-import wavelet.orchestrator.runtime as runtime
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
+from wavelet.orchestrator import runtime
 from wavelet.orchestrator.queue import (
     FileSystemRolloutSender,
     publish_adapter_policy_snapshot,
@@ -984,7 +984,7 @@ def test_openai_sampling_kwargs_passes_stop_strings() -> None:
     )
     engine = VLLMPolicyInferenceEngine(config)
 
-    kwargs = engine._openai_sampling_kwargs(  # noqa: SLF001
+    kwargs = engine._openai_sampling_kwargs(
         {
             "temperature": 1.0,
             "top_p": 1.0,

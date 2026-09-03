@@ -9,7 +9,7 @@ import shutil
 from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean, pstdev
 from typing import Any
@@ -497,7 +497,7 @@ class RunMonitor:
         return aliases
 
     def _timestamp(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
 
 
 def _existing_path(path: Path) -> Path:
@@ -809,7 +809,7 @@ def _add_stop_condition_metrics(
 def _append_metrics(output_dir: Path, metrics: dict[str, float], *, step: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     row = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "step": step,
         **metrics,
     }

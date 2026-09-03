@@ -11,7 +11,6 @@ from typing import Any, TextIO
 
 from wavelet.configs.rl_config import RLConfig
 
-
 _TERMINATE_TIMEOUT_SECONDS = 10.0
 
 

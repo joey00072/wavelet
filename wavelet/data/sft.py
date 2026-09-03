@@ -348,7 +348,7 @@ def _token_ids(value: object) -> list[int]:
     if isinstance(value, list):
         return [int(item) for item in value]
     if hasattr(value, "input_ids"):
-        input_ids = getattr(value, "input_ids")
+        input_ids = value.input_ids
         if isinstance(input_ids, list):
             if input_ids and isinstance(input_ids[0], list):
                 return [int(item) for item in input_ids[0]]

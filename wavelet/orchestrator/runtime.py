@@ -23,8 +23,14 @@ from wavelet.orchestrator.launcher import (
 )
 from wavelet.orchestrator.placement import (
     device_group_size as _device_group_size,
+)
+from wavelet.orchestrator.placement import (
     device_groups as _as_device_groups,
+)
+from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
+)
+from wavelet.orchestrator.placement import (
     trainer_device_group as _trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -528,7 +534,7 @@ def _sleep_vllm_http_server(config: RLConfig, *, port: int | None = None) -> Non
         request,
         timeout=config.inference.http.request_timeout_seconds,
     ):
-        return None
+        return
 
 
 def _sleep_vllm_http_servers(config: RLConfig, *, ports: list[int]) -> None:

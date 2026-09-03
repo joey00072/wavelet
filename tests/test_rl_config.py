@@ -120,7 +120,7 @@ def test_max_inflight_rollouts_must_cover_one_group() -> None:
 )
 def test_rl_rejects_sampling_transforms_trainer_cannot_replay(
     field: str,
-    value: float | int,
+    value: float,
 ) -> None:
     with pytest.raises(ValueError, match=field):
         RLConfig(inference={"sampling": {field: value}})

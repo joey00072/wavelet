@@ -88,4 +88,4 @@ def test_fixed_accumulation_trainer_still_rejects_misaligned_resume_state() -> N
     trainer.accumulation_steps = 2
 
     with pytest.raises(ValueError, match="micro_step does not match"):
-        trainer._validate_resume_state(TrainerState(step=3, micro_step=7))  # noqa: SLF001
+        trainer._validate_resume_state(TrainerState(step=3, micro_step=7))

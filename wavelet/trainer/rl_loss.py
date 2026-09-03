@@ -1,3 +1,3 @@
 """Compatibility exports for consolidated trainer losses."""
 
-from wavelet.trainer.losses import *  # noqa: F403
+from wavelet.trainer.losses import *

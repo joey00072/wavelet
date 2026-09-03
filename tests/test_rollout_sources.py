@@ -7,7 +7,6 @@ import pytest
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.sources import CustomSource, NativeSource, VerifierSource
 
-
 SOURCE_TYPES = (NativeSource, VerifierSource, CustomSource)
 
 

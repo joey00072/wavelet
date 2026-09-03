@@ -12,12 +12,12 @@ from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.scheduler import (
-    _VerifierPublisherStrategy,
     _initial_eval_steps,
     _run_evals,
     _run_evals_async,
     _run_final_evals,
     _select_final_eval_envs,
+    _VerifierPublisherStrategy,
 )
 from wavelet.orchestrator.verifiers import _eval_metrics, _run_eval_examples
 

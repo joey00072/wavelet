@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass
 import logging
 import types
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import TypedDict
 
 import torch
@@ -178,7 +178,7 @@ def _iter_trainable_spans(
 
 
 def _resolve_loss_scale(
-    loss_scale: int | float | Tensor | None,
+    loss_scale: float | Tensor | None,
     *,
     normalization: str,
     sequence_count: int,
@@ -218,7 +218,7 @@ def compute_loss(
     loss_mask: Tensor,
     loss_config: RLLossConfig,
     *,
-    loss_scale: int | float | Tensor | None = None,
+    loss_scale: float | Tensor | None = None,
     position_ids: Tensor | None = None,
 ) -> LossOutput:
     total_loss: Tensor | None = None

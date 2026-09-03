@@ -5,7 +5,7 @@ import logging
 import shutil
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +32,6 @@ from wavelet.utils.pathing import (
     list_checkpoint_steps,
     resolve_resume_checkpoint,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +255,7 @@ class CheckpointManager:
             "micro_step": trainer_state.micro_step,
             "world_size": self.world.world_size,
             "mode": self.config.mode if self.config is not None else "disabled",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
         }
 
     def _save_dataloader_state(

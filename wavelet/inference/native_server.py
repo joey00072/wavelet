@@ -158,7 +158,7 @@ def _register_policy_routes(
             )
         adapter_path = Path(raw_adapter_path)
         step = int(payload.get("step", engine.policy_step or 0))
-        engine._load_adapter_policy(adapter_path, step=step)  # noqa: SLF001
+        engine._load_adapter_policy(adapter_path, step=step)
         engine.policy_step = step
         return {"status": "ok", "policy_step": engine.policy_step}
 

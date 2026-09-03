@@ -22,13 +22,13 @@ def test_openai_rollout_rejects_missing_sampled_token_logprobs() -> None:
     engine = HTTPPolicyInferenceEngine(RLConfig())
 
     with pytest.raises(RuntimeError, match="do not align"):
-        engine._openai_completion_logprobs(  # noqa: SLF001
+        engine._openai_completion_logprobs(
             {"logprobs": {"content": [{"logprob": -0.1}]}},
             [10, 11],
         )
 
     with pytest.raises(RuntimeError, match="missing the sampled-token logprob"):
-        engine._openai_completion_logprobs(  # noqa: SLF001
+        engine._openai_completion_logprobs(
             {"logprobs": {"content": [{}]}},
             [10],
         )
@@ -46,7 +46,7 @@ def test_round_robin_annotation_restores_input_order() -> None:
             replace(record, source=f"{record.source}@{base_url}") for record in chunk
         ]
 
-    annotated = engine._annotate_round_robin(records, annotate_chunk)  # noqa: SLF001
+    annotated = engine._annotate_round_robin(records, annotate_chunk)
 
     assert chunks == {
         "server-0": ["0", "3", "6"],
@@ -116,7 +116,7 @@ def test_paused_policy_load_resumes_servers_after_failure(
     monkeypatch.setattr(engine, "_request_all", request_all)
 
     with pytest.raises(RuntimeError, match="load failed"):
-        engine._load_policy_while_generation_paused(  # noqa: SLF001
+        engine._load_policy_while_generation_paused(
             {"policy_dir": str(tmp_path / "policy"), "step": 3}
         )
 

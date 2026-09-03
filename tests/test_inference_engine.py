@@ -17,7 +17,7 @@ def test_embedded_vllm_server_rejects_missing_generation_logprobs() -> None:
     engine.tokenizer = object()
 
     with pytest.raises(RuntimeError, match="did not return sampled-token logprobs"):
-        engine._openai_logprob_content([1], None)  # noqa: SLF001
+        engine._openai_logprob_content([1], None)
 
 
 @pytest.mark.parametrize("token_key", [7, "7"])
