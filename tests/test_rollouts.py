@@ -145,6 +145,25 @@ def test_native_rollout_materialization_retries_incomplete_groups(
     assert {row["reward"] for row in rows} == {1.0}
 
 
+def test_native_rollouts_reject_oversized_groups() -> None:
+    config = RLConfig(
+        orchestrator={
+            "rollouts_per_example": 2,
+            "advantage_mode": "group_reward",
+        }
+    )
+    orchestrator = RLOrchestrator(config)
+    records = [
+        replace(
+            _example(),
+            metadata={"group_key": "duplicate-group", "rollout_index": index},
+        )
+        for index in range(3)
+    ]
+
+    assert orchestrator._drop_incomplete_native_rollout_groups(records) == []
+
+
 def test_native_rollout_retries_when_only_part_of_batch_is_complete(
     tmp_path,
     monkeypatch,

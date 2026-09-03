@@ -304,7 +304,8 @@ class RLOrchestrator:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if output_path.exists() and not self.config.orchestrator.overwrite:
             raise FileExistsError(
-                f"Rollout file '{output_path}' already exists and overwrite is disabled."
+                f"Rollout file '{output_path}' already exists and overwrite is "
+                "disabled."
             )
         with output_path.open("w", encoding="utf-8") as handle:
             for record in records:
@@ -415,7 +416,7 @@ class RLOrchestrator:
 
         expected = self.config.orchestrator.rollouts_per_example
         complete_group_keys = {
-            key for key, group in grouped.items() if len(group) >= expected
+            key for key, group in grouped.items() if len(group) == expected
         }
         dropped = sum(
             len(group)
@@ -424,8 +425,8 @@ class RLOrchestrator:
         )
         if dropped:
             logger.warning(
-                "Dropped %s rollout(s) from incomplete native group(s) before "
-                "group-reward scoring.",
+                "Dropped %s rollout(s) from native group(s) with unexpected "
+                "cardinality before group-reward scoring.",
                 dropped,
             )
         return [

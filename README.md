@@ -136,7 +136,8 @@ Finite verifier training datasets are traversed once per epoch instead of
 sampled with replacement. `data.shuffle: true` uses a deterministic permutation
 for each epoch; sampler cursor and epoch are included in generation metrics.
 Synchronous and native rollout paths apply the same full-group-count invariant;
-a single surviving group cannot silently stand in for a requested batch.
+a single surviving group cannot silently stand in for a requested batch, and
+native groups must contain exactly the configured rollout count.
 The orchestrator separately logs `generation/reward/mean`, group admission,
 and generated solve-rate metrics before filtering. Use those raw generation
 metrics to judge policy progress; reward on admitted mixed groups is
