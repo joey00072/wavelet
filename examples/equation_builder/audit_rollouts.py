@@ -11,7 +11,7 @@ from typing import Any
 ENVIRONMENT_DIR = Path(__file__).parents[2] / "environments" / "equation_builder"
 
 
-def _load_equation_checker():
+def _load_equation_environment_helpers():
     path = ENVIRONMENT_DIR / "equation_builder.py"
     spec = importlib.util.spec_from_file_location("equation_builder_audit_env", path)
     if spec is None or spec.loader is None:
@@ -19,18 +19,17 @@ def _load_equation_checker():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.check_equation
+    return module.check_equation, module.extract_tagged_equation
 
 
-check_equation = _load_equation_checker()
+check_equation, extract_tagged_equation = _load_equation_environment_helpers()
 
 
 QUESTION_PATTERN = re.compile(
     r"The (?P<count>[345]) unique two-digit numbers are "
-    r"(?P<numbers>\d+(?:,\s*\d+){2,4})\..*?result is (?P<target>\d+)\.",
+    r"(?P<numbers>\d+(?:,\s*\d+){2,4})\..*?result is (?P<target>[+-]?\d+)\.",
     re.DOTALL,
 )
-ANSWER_PATTERN = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,10 +68,8 @@ def _puzzle_from_prompt(prompt: object) -> tuple[list[int], int] | None:
 
 
 def _answer_from_completion(completion: object) -> str | None:
-    matches = ANSWER_PATTERN.findall(_message_text(completion))
-    if len(matches) != 1:
-        return None
-    return matches[0].strip()
+    answer = extract_tagged_equation(_message_text(completion))
+    return answer or None
 
 
 def audit_row(row: dict[str, Any]) -> dict[str, Any]:
