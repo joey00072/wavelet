@@ -238,3 +238,15 @@ def test_rollout_transport_keeps_a_bounded_audit_window_by_default() -> None:
 
     assert config.transport.cleanup_consumed is True
     assert config.transport.keep_last_consumed == 2
+
+
+def test_checkpoint_and_eval_artifacts_are_bounded_by_default() -> None:
+    config = RLConfig(
+        ckpt={"mode": "async", "interval": 1},
+        eval={"env": [{"id": "aime"}]},
+    )
+
+    assert config.ckpt is not None
+    assert config.ckpt.keep_last == 2
+    assert config.eval is not None
+    assert config.eval.keep_last_rollout_sets == 2
