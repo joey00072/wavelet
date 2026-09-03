@@ -125,24 +125,7 @@ def test_build_app_patch_is_required_for_wavelet_router_and_state() -> None:
 
 
 @pytest.mark.anyio
-async def test_adapter_load_rejects_artifact_digest_mismatch(tmp_path: Path) -> None:
-    adapter_dir = tmp_path / "policy" / "adapter"
-    adapter_dir.mkdir(parents=True)
-    (adapter_dir / "adapter_model.safetensors").write_bytes(b"wrong-weights")
-
-    with pytest.raises(ValueError, match="SHA-256"):
-        await server._load_adapter_policy(
-            SimpleNamespace(),
-            policy_dir=tmp_path / "policy",
-            step=3,
-            load_inplace=True,
-            expected_artifact_sha256="0" * 64,
-            config=RLConfig(),
-        )
-
-
-@pytest.mark.anyio
-async def test_load_policy_routes_lora_artifact_digest(monkeypatch) -> None:
+async def test_load_policy_routes_lora_policy(monkeypatch) -> None:
     config = RLConfig()
     monkeypatch.setattr(server, "_CONFIG", config)
     captured = {}
@@ -158,7 +141,6 @@ async def test_load_policy_routes_lora_artifact_digest(monkeypatch) -> None:
             "policy_dir": "/tmp/policy",
             "step": 4,
             "load_inplace": True,
-            "artifact_sha256": "a" * 64,
         },
         SimpleNamespace(),
     )
@@ -168,7 +150,6 @@ async def test_load_policy_routes_lora_artifact_digest(monkeypatch) -> None:
         "policy_dir": Path("/tmp/policy"),
         "step": 4,
         "load_inplace": True,
-        "expected_artifact_sha256": "a" * 64,
         "config": config,
     }
 

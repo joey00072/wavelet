@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -837,9 +836,8 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
     adapter_dir.mkdir(parents=True)
     (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
     (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
-    artifact_sha256 = hashlib.sha256(b"weights").hexdigest()
     (policy_dir / "policy.json").write_text(
-        json.dumps({"artifact": {"sha256": artifact_sha256}}),
+        json.dumps({"artifact": {"bytes": len(b"weights")}}),
         encoding="utf-8",
     )
     config = RLConfig(
@@ -860,10 +858,7 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
         calls.append((method, path, payload, base_url))
         if payload is None:
             return {"status": "ok"}
-        return {
-            "policy_step": payload["step"],
-            "artifact_sha256": payload.get("artifact_sha256"),
-        }
+        return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
 
@@ -882,7 +877,6 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
     ).read_bytes() == b"weights"
     assert payload["adapter_name"] == "policy"
     assert payload["load_inplace"] is True
-    assert payload["artifact_sha256"] == artifact_sha256
 
 
 def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
