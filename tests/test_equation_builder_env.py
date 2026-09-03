@@ -59,6 +59,16 @@ def test_accepts_correct_equation_with_reordered_numbers() -> None:
     assert result.reason == "correct"
 
 
+def test_tagged_equation_requires_complete_think_and_answer_contract() -> None:
+    response = "<think>Check the arithmetic.</think><answer>13+31-18-21=5</answer>"
+
+    assert ENV.extract_tagged_equation(response) == "13+31-18-21=5"
+    assert ENV.extract_tagged_equation("<answer>13+31-18-21=5</answer>") == ""
+    assert (
+        ENV.extract_tagged_equation(response + "<answer>13+31-18-21=5</answer>") == ""
+    )
+
+
 def test_accepts_parentheses_with_only_addition_and_subtraction() -> None:
     result = ENV.check_equation(
         "31-(21-(13-18))=5",

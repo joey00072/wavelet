@@ -7,7 +7,8 @@ Generation constructs a valid equation to guarantee that the target is solvable,
 then discards that equation before creating the dataset row.
 
 The model may reorder the numbers and add parentheses. A submission receives a
-reward of `1.0` only when the content of `<answer>...</answer>`:
+reward of `1.0` only when it has exactly one nonempty `<think>` block followed
+by exactly one `<answer>` block, with no surrounding text, and that answer:
 
 - contains exactly one equation and integer target
 - uses every supplied number exactly once, including duplicate-aware counting
