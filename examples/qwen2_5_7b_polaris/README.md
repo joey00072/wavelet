@@ -10,7 +10,7 @@ detected incomplete labels such as empty fraction operands; after all default
 filters, the current training split contains 29,105 examples.
 
 Every response must be exactly
-`<think>...</think><answer>...</answer>`. Training uses eight problems per
+`<think>...</think><answer>...</answer>`. The canonical run uses 32 problems per
 optimizer step and eight rollouts per problem. Zero-advantage filtering retries
 all-correct and all-wrong groups so the trainer receives mixed groups.
 
@@ -29,17 +29,15 @@ uv run python -m wavelet debug preflight \
 uv run python -m wavelet rl \
   @ examples/qwen2_5_7b_polaris/eval_baseline.yaml
 uv run python -m wavelet debug preflight \
-  @ examples/qwen2_5_7b_polaris/rl_100k.yaml --json
-uv run python -m wavelet rl @ examples/qwen2_5_7b_polaris/rl_100k.yaml
+  @ examples/qwen2_5_7b_polaris/rl_smoke.yaml --json
+uv run python -m wavelet rl @ examples/qwen2_5_7b_polaris/rl_smoke.yaml
 ```
 
-The long run evaluates AIME 2024 every 100 policy steps. It retains five policy
-exports, two checkpoints, five consumed training batches, and two evaluation
-rollout sets. The monitor retains at most eight sampled completions every ten
-steps for reward-hacking inspection. Async checkpoint staging uses threads and
-ordinary CPU tensors instead of allocating one POSIX shared-memory file
-descriptor per tensor storage. The smoke config writes a checkpoint at step one
-to validate that path before a long run.
+The smoke config writes a checkpoint at step one to validate the complete path
+before the canonical long run documented below. The long run evaluates AIME
+2024 every 100 policy steps and retains only recent policies, checkpoints,
+consumed training batches, evaluation sets, and sampled completions needed for
+reward-hacking inspection.
 
 ## Incorrect synthetic solutions
 
