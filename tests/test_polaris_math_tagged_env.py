@@ -23,6 +23,11 @@ def _load_environment_module() -> ModuleType:
 ENV = _load_environment_module()
 
 
+def test_training_and_eval_datasets_are_pinned() -> None:
+    assert ENV.POLARIS_REVISION == "296f8e34132e63f4a1d70e0dcc8bddebb43f03e4"
+    assert ENV.AIME_2024_REVISION == "2fe88a2f1091d5048c0f36abc874fb997b3dd99a"
+
+
 def test_extract_tagged_answer_requires_exact_complete_structure() -> None:
     assert ENV.extract_tagged_answer("<think>work</think><answer>42</answer>") == "42"
     assert ENV.extract_tagged_answer("<answer>42</answer>") == ""
@@ -157,7 +162,12 @@ def test_resilient_math_rubric_scores_the_strict_tagged_answer() -> None:
     reward = asyncio.run(
         rubric.correct_answer(
             rubric.parser,
-            [{"role": "assistant", "content": "<think>6 * 7</think><answer>42</answer>"}],
+            [
+                {
+                    "role": "assistant",
+                    "content": "<think>6 * 7</think><answer>42</answer>",
+                }
+            ],
             answer="42",
         )
     )

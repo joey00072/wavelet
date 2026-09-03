@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 
 
 POLARIS_DATASET = "POLARIS-Project/Polaris-Dataset-53K"
+POLARIS_REVISION = "296f8e34132e63f4a1d70e0dcc8bddebb43f03e4"
 AIME_2024_DATASET = "HuggingFaceH4/aime_2024"
 AIME_2024_REVISION = "2fe88a2f1091d5048c0f36abc874fb997b3dd99a"
 
@@ -220,7 +221,12 @@ def load_environment(
         trust_remote_code=False,
     )
     aime_rows = format_aime_rows(dict(row) for row in raw_aime)
-    raw_polaris = load_dataset(POLARIS_DATASET, split="train")
+    raw_polaris = load_dataset(
+        POLARIS_DATASET,
+        split="train",
+        revision=POLARIS_REVISION,
+        trust_remote_code=False,
+    )
     polaris_rows = build_polaris_rows(
         (dict(row) for row in raw_polaris),
         held_out_problems=(row["question"] for row in aime_rows),
