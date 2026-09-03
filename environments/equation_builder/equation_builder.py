@@ -22,6 +22,11 @@ Reason inside <think>...</think>. Put only the final equation inside
 """
 
 _INTEGER_PATTERN = re.compile(r"[+-]?\d+")
+_TAGGED_RESPONSE = re.compile(
+    r"\A\s*<think>\s*.+?\s*</think>\s*"
+    r"<answer>\s*(?P<answer>.+?)\s*</answer>\s*\Z",
+    re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,16 @@ class EquationCheck:
 
 class _InvalidExpression(ValueError):
     pass
+
+
+def extract_tagged_equation(text: str) -> str:
+    """Extract an equation only from one complete think/answer response."""
+    if any(
+        text.count(tag) != 1 for tag in ("<think>", "</think>", "<answer>", "</answer>")
+    ):
+        return ""
+    match = _TAGGED_RESPONSE.fullmatch(text)
+    return "" if match is None else match.group("answer").strip()
 
 
 def _evaluate_expression(node: ast.AST) -> tuple[int, list[int], int]:
@@ -107,7 +122,7 @@ def check_equation(
         )
 
     if operation_count != len(expected_numbers) - 1:
-        return EquationCheck(False, "the equation must connect the four given numbers")
+        return EquationCheck(False, "the equation must connect all given numbers")
 
     if value != target:
         return EquationCheck(
@@ -216,7 +231,7 @@ def load_environment(
             )
         )
 
-    parser = vf.XMLParser(["answer"], answer_field="answer")
+    parser = vf.Parser(extract_fn=extract_tagged_equation)
 
     def equation_reward(
         completion: Any,
