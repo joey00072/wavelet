@@ -167,7 +167,7 @@ def append_event_best_effort(events_dir: Path | None, event: QueueEvent) -> None
         return
     try:
         append_event(events_dir, event)
-    except Exception as exc:  # pragma: no cover - defensive observability guard
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to append queue event: %s", exc)
 
 
@@ -315,7 +315,7 @@ def record_rollout_claim(
     trainer_step_before: int,
     consumer_id: str | None = None,
     events_dir: Path | None = None,
-) -> ClaimRecord | None:
+) -> ClaimRecord:
     consumer_id = consumer_id or process_identity("rl-trainer")
     claim = ClaimRecord(
         format_version=1,
@@ -324,11 +324,7 @@ def record_rollout_claim(
         trainer_step_before=trainer_step_before,
         claimed_at=utc_now(),
     )
-    try:
-        write_claim(batch.step_dir, claim)
-    except Exception as exc:  # pragma: no cover - defensive observability guard
-        logger.warning("Failed to write rollout claim for step %s: %s", batch.step, exc)
-        return None
+    write_claim(batch.step_dir, claim)
     manifest = _read_manifest_best_effort(batch)
     append_event_best_effort(
         events_dir,
@@ -367,7 +363,7 @@ def record_rollout_consumed(
     optimizer_step_completed: bool,
     consumer_id: str | None = None,
     events_dir: Path | None = None,
-) -> ConsumedRecord | None:
+) -> ConsumedRecord:
     consumer_id = consumer_id or process_identity("rl-trainer")
     consumed = ConsumedRecord(
         format_version=1,
@@ -378,15 +374,7 @@ def record_rollout_consumed(
         optimizer_step_completed=optimizer_step_completed,
         consumed_at=utc_now(),
     )
-    try:
-        write_consumed(batch.step_dir, consumed)
-    except Exception as exc:  # pragma: no cover - defensive observability guard
-        logger.warning(
-            "Failed to write rollout consumed record for step %s: %s",
-            batch.step,
-            exc,
-        )
-        return None
+    write_consumed(batch.step_dir, consumed)
     manifest = _read_manifest_best_effort(batch)
     append_event_best_effort(
         events_dir,
@@ -452,7 +440,7 @@ def _read_record(path: Path, record_type: type[RecordT]) -> RecordT | None:
         return None
     row = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(row, dict):
-        raise ValueError(f"Expected object in {path}.")
+        raise TypeError(f"Expected object in {path}.")
     return record_type(**row)
 
 
@@ -647,12 +635,7 @@ class FileSystemRolloutSender:
                 payload_bytes=payload_bytes,
                 transfer_seconds=transfer_seconds,
             )
-            try:
-                write_manifest(step_dir, manifest)
-            except Exception as exc:  # pragma: no cover - fail-open observability
-                logger.warning(
-                    "Failed to write rollout manifest for step %s: %s", step, exc
-                )
+            write_manifest(step_dir, manifest)
             append_event_best_effort(
                 events_dir or (self.output_dir / "events"),
                 QueueEvent(

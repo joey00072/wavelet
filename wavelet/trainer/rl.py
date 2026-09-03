@@ -392,14 +392,14 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     ) -> None:
         if not self.is_main_process():
             return
-        consumed = record_rollout_consumed(
+        record_rollout_consumed(
             batch,
             trainer_step_before=trainer_step_before,
             trainer_step_after=self.step,
             optimizer_step_completed=optimizer_step_completed,
             events_dir=self.output_dir / "events",
         )
-        if consumed is not None and self.config.transport.cleanup_consumed:
+        if self.config.transport.cleanup_consumed:
             prune_consumed_rollout_batches(
                 self.output_dir,
                 self.config.transport,
@@ -425,7 +425,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def _packed_dataloader_batch_count(self) -> int:
         if not isinstance(self.dataset, PackedRLDataset):
-            raise RuntimeError("Packed batch count requires a packed RL dataset.")
+            raise RuntimeError(  # noqa: TRY004 - invalid internal trainer state
+                "Packed batch count requires a packed RL dataset."
+            )
         return max(
             ceil(self.dataset.micro_batch_count() / self.config.data.micro_batch_size),
             1,
@@ -554,7 +556,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                     add_generation_prompt=False,
                 )
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - sample logging has a JSON fallback
             return json.dumps(messages, ensure_ascii=False)
 
     def finalize(self, *, status: str = "completed") -> None:
@@ -584,7 +586,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             return
         model = unwrap_model(self.model)
         if not callable(getattr(model, "disable_adapter", None)):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - incompatible dataset/model config
                 "RL data is missing inference_logprobs for at least one sample, but the "
                 "current model cannot derive a reference policy by disabling adapters. "
                 "Use LoRA or provide inference_logprobs in the dataset."
@@ -828,7 +830,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         model = unwrap_model(self.model)
         disable_adapter = getattr(model, "disable_adapter", None)
         if not callable(disable_adapter):
-            raise RuntimeError(
+            raise RuntimeError(  # noqa: TRY004 - invalid initialized model state
                 "inference_logprobs are required when the model cannot disable adapters."
             )
 
@@ -1590,7 +1592,7 @@ def _dummy_rollout_row(
     row = dict(source)
     loss_mask = row.get("loss_mask")
     if not isinstance(loss_mask, list):
-        raise ValueError("Cannot create a dummy rollout row without a loss_mask.")
+        raise TypeError("Cannot create a dummy rollout row without a loss_mask.")
     row["loss_mask"] = [False] * len(loss_mask)
     row[config.data.advantage_column] = 0.0
     row[config.data.reward_column] = None
