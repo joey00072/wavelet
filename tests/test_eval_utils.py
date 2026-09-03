@@ -12,6 +12,7 @@ from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.scheduler import (
+    _initial_eval_steps,
     _run_evals,
     _run_evals_async,
     _run_final_evals,
@@ -65,6 +66,27 @@ def test_compute_eval_policy_step_can_skip_base_model() -> None:
         )
         is None
     )
+
+
+def test_every_scheduler_starts_with_base_eval_due() -> None:
+    config = RLConfig(
+        eval={
+            "eval_base_model": True,
+            "env": [{"id": "aime", "name": "aime2024"}],
+        }
+    )
+
+    last_eval_steps = _initial_eval_steps(config)
+
+    assert last_eval_steps == {"aime2024": -1}
+    assert [
+        env.resolved_name
+        for env in select_due_eval_envs(
+            config,
+            policy_step=0,
+            last_eval_steps=last_eval_steps,
+        )
+    ] == ["aime2024"]
 
 
 def test_pass_at_k_for_binary_rewards() -> None:

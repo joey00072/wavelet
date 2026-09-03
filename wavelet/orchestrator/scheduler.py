@@ -1200,11 +1200,7 @@ class _SchedulerStateMachine:
     def __post_init__(self) -> None:
         self.pending: dict[Future[tuple[int, object, float, float]], int] = {}
         self.completed: dict[int, tuple[object, float, float]] = {}
-        self.last_eval_steps = (
-            {env.resolved_name: -1 for env in self.config.eval.env}
-            if self.config.eval is not None
-            else {}
-        )
+        self.last_eval_steps = _initial_eval_steps(self.config)
 
     def submit_step(self, pool: ThreadPoolExecutor, step: int) -> None:
         future = pool.submit(
@@ -2214,11 +2210,7 @@ async def _run_verifier_scheduler(
         rollout_sender=FileSystemRolloutSender(config.output_dir, config.transport),
         state=state,
         chunks_per_step=chunks_per_step,
-        last_eval_steps=(
-            {env.resolved_name: start_step for env in config.eval.env}
-            if config.eval is not None
-            else {}
-        ),
+        last_eval_steps=_initial_eval_steps(config),
     )
     target_chunks = target_step * chunks_per_step
     try:
@@ -2237,6 +2229,12 @@ async def _run_verifier_scheduler(
         return 0
     finally:
         await context.close()
+
+
+def _initial_eval_steps(config: RLConfig) -> dict[str, int]:
+    if config.eval is None:
+        return {}
+    return {env.resolved_name: -1 for env in config.eval.env}
 
 
 async def _load_policy_async(
