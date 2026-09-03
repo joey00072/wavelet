@@ -3,6 +3,8 @@ import pytest
 from wavelet.configs.rl_config import RLSamplingConfig
 from wavelet.inference.engine import (
     VLLMPolicyInferenceEngine,
+    extract_vllm_generation_logprobs,
+    extract_vllm_prompt_logprobs,
     fit_generation_context,
     openai_payload_to_vllm_kwargs,
     openai_sampling_payload,
@@ -16,6 +18,20 @@ def test_embedded_vllm_server_rejects_missing_generation_logprobs() -> None:
 
     with pytest.raises(RuntimeError, match="did not return sampled-token logprobs"):
         engine._openai_logprob_content([1], None)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("token_key", [7, "7"])
+def test_generation_logprobs_preserve_exact_zero(token_key: int | str) -> None:
+    assert extract_vllm_generation_logprobs([{token_key: 0.0}], [7]) == [0.0]
+
+
+@pytest.mark.parametrize("token_key", [7, "7"])
+def test_prompt_logprobs_preserve_exact_zero(token_key: int | str) -> None:
+    assert extract_vllm_prompt_logprobs(
+        [None, {token_key: 0.0}],
+        target_ids=[7],
+        loss_mask=[True],
+    ) == [0.0]
 
 
 def test_sampling_payloads_preserve_backend_contracts() -> None:

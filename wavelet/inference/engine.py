@@ -155,6 +155,15 @@ def logprob_value(value: object) -> float:
     raise TypeError(f"Unsupported vLLM logprob value: {type(value)!r}")
 
 
+def _token_logprob(row: dict[object, object], token_id: int) -> object | None:
+    if token_id in row:
+        return row[token_id]
+    string_token_id = str(token_id)
+    if string_token_id in row:
+        return row[string_token_id]
+    return None
+
+
 def extract_vllm_generation_logprobs(
     logprobs: object, token_ids: list[int]
 ) -> list[float]:
@@ -169,7 +178,7 @@ def extract_vllm_generation_logprobs(
     values: list[float] = []
     for token_id, row in zip(token_ids, rows, strict=False):
         if isinstance(row, dict):
-            candidate = row.get(token_id) or row.get(str(token_id))
+            candidate = _token_logprob(row, token_id)
             if candidate is None:
                 raise ValueError(
                     f"vLLM logprobs are missing sampled token id {token_id}."
@@ -204,7 +213,7 @@ def extract_vllm_prompt_logprobs(
         if not isinstance(row, dict):
             values.append(logprob_value(row))
             continue
-        candidate = row.get(token_id) or row.get(str(token_id))
+        candidate = _token_logprob(row, token_id)
         if candidate is None:
             raise ValueError(
                 f"vLLM prompt_logprobs are missing target token id {token_id}."
