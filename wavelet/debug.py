@@ -1357,6 +1357,10 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
     if config.orchestrator.examples_per_step is not None:
         schedule["rollout_chunk_examples"] = rollout_chunk_examples(config)
         schedule["chunks_per_step"] = chunks_per_step(config)
+        schedule["rollouts_per_optimizer_step"] = (
+            config.orchestrator.examples_per_step
+            * (config.orchestrator.rollouts_per_example or 1)
+        )
     return {
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "data": {
@@ -1898,11 +1902,23 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
         )
     ]
     if config.orchestrator.examples_per_step is not None:
+        examples = config.orchestrator.examples_per_step
+        rollouts = config.orchestrator.rollouts_per_example or 1
         checks.append(
             PreflightCheck(
                 name="rollout_chunks",
                 status="ok",
-                message=f"Resolved chunks per optimizer step: {chunks_per_step(config)}",
+                message=(
+                    f"Resolved optimizer batch: {examples} group(s) x {rollouts} "
+                    f"rollout(s) = {examples * rollouts} rollout(s) across "
+                    f"{chunks_per_step(config)} chunk(s)."
+                ),
+                details={
+                    "groups": examples,
+                    "rollouts_per_group": rollouts,
+                    "rollouts": examples * rollouts,
+                    "chunks": chunks_per_step(config),
+                },
             )
         )
     return checks

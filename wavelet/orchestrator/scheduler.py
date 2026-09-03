@@ -1027,6 +1027,7 @@ from wavelet.orchestrator.schedule import (
     policy_step_to_load as _policy_step_to_load,
     required_policy_step as _required_policy_step,
     rollout_chunk_examples as _rollout_chunk_examples,
+    rollout_groups_for_chunk as _rollout_groups_for_chunk,
     select_due_eval_envs,
     target_steps as _target_steps,
 )
@@ -1817,7 +1818,6 @@ class _VerifierPublisherStrategy:
     scheduler: object
     rollout_sender: FileSystemRolloutSender
     state: OrchestratorRunState | None
-    chunk_groups: int
     chunks_per_step: int
     last_eval_steps: dict[str, int]
     loaded_policy_step: int | None = None
@@ -1985,7 +1985,9 @@ class _VerifierPublisherStrategy:
             print(existing.path)
             return
         generate_started_at = perf_counter()
-        records = await self.scheduler.generate_batch(target_groups=self.chunk_groups)
+        chunk_index = queue_step % self.chunks_per_step
+        chunk_groups = _rollout_groups_for_chunk(self.config, chunk_index)
+        records = await self.scheduler.generate_batch(target_groups=chunk_groups)
         generate_seconds = perf_counter() - generate_started_at
         rollout_policy_step = _rollout_records_policy_step(
             records,
@@ -2034,7 +2036,7 @@ class _VerifierPublisherStrategy:
             "inference_chunk",
             queue_step=queue_step,
             optimizer_step=optimizer_step,
-            groups=self.chunk_groups,
+            groups=chunk_groups,
             wait_policy=wait_policy_seconds,
             load_policy=load_policy_seconds,
             generate=generate_seconds,
@@ -2211,7 +2213,6 @@ async def _run_verifier_scheduler(
         scheduler=scheduler,
         rollout_sender=FileSystemRolloutSender(config.output_dir, config.transport),
         state=state,
-        chunk_groups=_rollout_chunk_examples(config),
         chunks_per_step=chunks_per_step,
         last_eval_steps=(
             {env.resolved_name: start_step for env in config.eval.env}

@@ -57,6 +57,7 @@ def test_orchestrator_debug_state_exposes_schedule() -> None:
     assert state["schedule"]["examples_per_step"] == 8
     assert state["schedule"]["rollouts_per_example"] == 2
     assert state["schedule"]["chunks_per_step"] >= 1
+    assert state["schedule"]["rollouts_per_optimizer_step"] == 16
     assert state["algo"] == {"type": "max_rl"}
 
 

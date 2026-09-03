@@ -35,6 +35,22 @@ def chunks_per_step(config: RLConfig) -> int:
     return max(ceil(examples_per_step / rollout_chunk_examples(config)), 1)
 
 
+def rollout_groups_for_chunk(config: RLConfig, chunk_index: int) -> int:
+    """Return the exact group count for one optimizer-step chunk."""
+    examples_per_step = config.orchestrator.examples_per_step
+    if examples_per_step is None:
+        raise ValueError("orchestrator.examples_per_step is required.")
+    if chunk_index < 0:
+        raise ValueError("chunk_index must be non-negative.")
+    chunk_examples = rollout_chunk_examples(config)
+    remaining = examples_per_step - chunk_index * chunk_examples
+    if remaining <= 0:
+        raise ValueError(
+            f"chunk_index {chunk_index} exceeds the configured optimizer batch."
+        )
+    return min(chunk_examples, remaining)
+
+
 def required_policy_step(config: RLConfig, rollout_step: int) -> int:
     """Oldest policy step allowed for a rollout under the async window."""
     async_level = config.orchestrator.max_async_level

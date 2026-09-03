@@ -47,6 +47,9 @@ larger; async capacity never silently widens the configured freshness window.
 Queue directories and stable markers are the synchronization contract. Run
 state and queue events provide observability; process-local memory is never the
 source of truth for a completed batch or policy.
+Preflight reports optimizer batches explicitly as groups times rollouts and the
+number of transport chunks. A non-divisible final chunk contains only the
+remaining groups; chunking never rounds the optimizer batch upward.
 
 ## Inference Scheduling
 
