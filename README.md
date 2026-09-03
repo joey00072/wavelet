@@ -156,6 +156,9 @@ verifier resources on both success and failure before finalizing trainer state.
 Trainers consume queue batches in exact queue order. Every batch manifest must
 agree with its queue step, optimizer step, chunk index, row count, and configured
 policy-freshness window before any tokens are trained.
+Online RL requires stochastic sampling with a positive temperature, and the data
+boundary rejects non-finite advantages, rewards, policy log-probabilities, and
+temperatures as well as non-positive temperatures before model execution.
 Integrated generation also records the policy version loaded by its inference
 engine in every rollout manifest.
 Persistent verifier requests retain the policy version used at dispatch; mixed

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -353,6 +354,28 @@ def _validate_trainable_values(
         raise ValueError(
             f"{field_name} must align with the number of trainable tokens in the sample"
         )
+    _validate_numeric_stream(
+        values,
+        field_name=field_name,
+        strictly_positive=field_name == "temperatures",
+    )
+
+
+def _validate_numeric_stream(
+    values: float | list[float] | None,
+    *,
+    field_name: str,
+    strictly_positive: bool = False,
+) -> None:
+    if values is None:
+        return
+    sequence = values if isinstance(values, list) else [values]
+    for value in sequence:
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise ValueError(f"{field_name} must contain only finite values.")
+        if strictly_positive and numeric <= 0.0:
+            raise ValueError(f"{field_name} must contain only positive values.")
 
 
 def _expand_trainable_values(
@@ -539,7 +562,8 @@ def _coerce_advantages(
     if isinstance(value, list):
         if len(value) < num_trainable_tokens:
             raise ValueError(
-                "Token-level advantages are shorter than the number of trainable tokens "
+                "Token-level advantages are shorter than the number of trainable "
+                "tokens "
                 f"({len(value)} < {num_trainable_tokens})."
             )
         return [float(item) for item in value[:num_trainable_tokens]]
@@ -652,6 +676,21 @@ def prepare_rl_sample(
     data_config: RLDataConfig,
     seq_len: int,
 ) -> RLSample | None:
+    _validate_numeric_stream(record.advantage, field_name="advantage")
+    _validate_numeric_stream(record.reward, field_name="reward")
+    _validate_numeric_stream(
+        record.inference_logprobs,
+        field_name="inference_logprobs",
+    )
+    _validate_numeric_stream(
+        record.teacher_logprobs,
+        field_name="teacher_logprobs",
+    )
+    _validate_numeric_stream(
+        record.temperatures,
+        field_name="temperatures",
+        strictly_positive=True,
+    )
     base_sample: Sample | RLSample | None = _pretokenized_sample(record, seq_len)
     if base_sample is None:
         base_sample = build_sample(
