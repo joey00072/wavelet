@@ -105,12 +105,13 @@ to be copied into Wavelet or added to Wavelet's built-in configuration union.
 
 ### 1. Write and register the algorithm
 
-Create a Python file such as `/home/user/my_training/algorithms.py`:
+From the repository root, create a Python file such as
+`custom/algorithms.py`:
 
 ```python
 from dataclasses import dataclass, replace
 
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 from wavelet.orchestrator.algorithms import BaseAlgorithm, register_algorithm
 
 
@@ -136,7 +137,7 @@ unchanged and makes the returned state explicit.
 
 ```yaml
 algo:
-  file: /home/user/my_training/algorithms.py
+  file: custom/algorithms.py
   algorithm: centered_reward
   scope: group
   kwargs:
@@ -147,7 +148,8 @@ algo:
 The `file` or `algorithm` field is enough for Wavelet to infer the custom
 variant. `type: custom` is accepted but redundant. Relative paths are resolved
 from the process working directory; an absolute path is less ambiguous for
-distributed launches.
+distributed launches and should still resolve inside the shared Wavelet
+checkout.
 
 `algorithm` normally refers to the name passed to `register_algorithm`. It may
 also name an undecorated class or factory attribute in the file. `kwargs` are
