@@ -91,8 +91,9 @@ function App() {
   useEffect(() => {
     let cancelled = false;
     let timer: number | undefined;
+    let controller: AbortController | undefined;
     const poll = async () => {
-      const controller = new AbortController();
+      controller = new AbortController();
       try {
         const [nextState, nextMetrics, nextEvalMetrics, nextEvents] = await Promise.all([
           fetchJson<RunState>(`${apiBase}/state`, controller.signal),
@@ -124,15 +125,18 @@ function App() {
     poll();
     return () => {
       cancelled = true;
+      controller?.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [apiBase]);
 
   useEffect(() => {
+    if (activeView !== "rollouts") return;
     let cancelled = false;
     let timer: number | undefined;
+    let controller: AbortController | undefined;
     const poll = async () => {
-      const controller = new AbortController();
+      controller = new AbortController();
       try {
         const seed = Math.floor(Date.now() / ROLLOUT_INSPECT_POLL_MS);
         const nextInspection = await fetchJson<RolloutInspection>(
@@ -159,9 +163,10 @@ function App() {
     poll();
     return () => {
       cancelled = true;
+      controller?.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [apiBase, rolloutInspectRefresh]);
+  }, [activeView, apiBase, rolloutInspectRefresh]);
 
   const latest = latestMetric(metrics);
   const counts = eventCounts(events);
