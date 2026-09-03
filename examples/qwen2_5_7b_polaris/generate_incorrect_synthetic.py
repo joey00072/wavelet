@@ -22,6 +22,7 @@ from environments.polaris_math_tagged.polaris_math_tagged import (
     AIME_2024_DATASET,
     AIME_2024_REVISION,
     POLARIS_DATASET,
+    POLARIS_REVISION,
     SYSTEM_PROMPT,
     build_polaris_rows,
     extract_tagged_answer,
@@ -189,7 +190,8 @@ async def generate_one_prompt(
     max_tokens = min(args.max_completion_tokens, available_tokens)
     if max_tokens < 128:
         raise ValueError(
-            f"Prompt {example['example_id']} leaves only {max_tokens} completion tokens."
+            f"Prompt {example['example_id']} leaves only {max_tokens} completion "
+            "tokens."
         )
 
     messages = [
@@ -265,6 +267,7 @@ def load_examples(args: argparse.Namespace) -> list[dict[str, Any]]:
     raw_polaris = load_dataset(
         POLARIS_DATASET,
         split="train",
+        revision=POLARIS_REVISION,
         trust_remote_code=False,
     )
     return select_hard_examples(
