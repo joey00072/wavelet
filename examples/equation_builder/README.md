@@ -59,26 +59,27 @@ so the BF16 base model, LoRA trainer, and inference server can share a 96 GB GPU
 It uses groups of eight rollouts for each of eight questions per optimizer step
 and a sequence length of 1,024 tokens.
 
-The 7B config keeps every consumed rollout batch by setting
-`transport.cleanup_consumed: false`. Raw batches remain at
-`outputs/equation_builder_qwen2_5_7b_rl/rollouts/step-*/rollouts.jsonl`, and
-sampled responses are also appended to `samples.jsonl`. Zero-advantage groups
-are retained so the saved population is not biased toward mixed-reward groups.
+Consumed rollout cleanup uses the library default: the latest two batches stay
+under the run's `rollouts/` directory for inspection while older consumed
+batches are removed. Sampled responses are appended to `samples.jsonl`.
+Zero-advantage groups are retained so the saved population is not biased toward
+mixed-reward groups.
 
 Run the independent reward-hacking audit after or during training:
 
 ```bash
 uv run --no-sync python examples/equation_builder/audit_rollouts.py \
-  --run-dir outputs/equation_builder_qwen2_5_7b_rl
+  --run-dir outputs/equation_builder_qwen2_5_7b_lora_10k
 ```
 
 The report is saved as `reward_hacking_audit.json` in the run directory. It
 reparses each prompt and completion and flags positive rewards that fail the
 standalone equation checker.
 
-The 7B recipe uses `launcher.mode: colocate`: vLLM and the QLoRA trainer share
-GPU 0, with vLLM capped at 55% memory utilization. Check available memory before
-launching and lower that cap if another process is using the device.
+Both 7B recipes use `launcher.mode: colocate`. The smoke config uses QLoRA and a
+55% vLLM cap; the 10,000-step config uses unquantized BF16 LoRA and a 35% cap.
+In each case vLLM and the trainer share GPU 0. Check available memory before
+launching and lower the configured cap if another process is using the device.
 
 The RL config enables the state server on port 8765. Start the dashboard in a
 second terminal:
@@ -91,5 +92,6 @@ bun run dev --host 0.0.0.0
 
 Open `http://<host>:5173/?api=http://<host>:8765`.
 
-The default launcher assigns vLLM to GPU 0 and the trainer to GPU 1. Adjust the
-`launcher` block before running if those devices are not available.
+The smaller `rl.yaml` example instead uses process mode and assigns vLLM to GPU
+0 and the trainer to GPU 1. Adjust the selected config's `launcher` block before
+running if those devices are not available.

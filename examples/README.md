@@ -6,7 +6,7 @@ that are expected to run on this host.
 | Example | Status | Notes |
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL. |
-| `equation_builder` | working | Local 3–5 number `+`/`-` environment; 0.6B LoRA and 7B QLoRA RL configs with rollout auditing. |
+| `equation_builder` | working | Local 3–5 number `+`/`-` environment; 0.6B LoRA plus 7B QLoRA smoke and BF16 LoRA long-run configs with rollout auditing. |
 | `reverse_text` | working | 0.6B LoRA RL with explicit GRPO plus SFT config; includes a 2-GPU INT4 QLoRA 4B experiment. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
