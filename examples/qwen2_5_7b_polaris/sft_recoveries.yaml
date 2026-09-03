@@ -8,7 +8,7 @@ model:
 
 data:
   source: local
-  path: outputs/polaris_recovery_combined_step208/correct_recoveries.jsonl
+  path: outputs/polaris_wait_recoveries/correct_recoveries.jsonl
   batch_size: 8
   micro_batch_size: 1
   seq_len: 2048
@@ -43,7 +43,6 @@ lora:
 loss_impl: torch
 max_grad_norm: 1.0
 epochs: 3
-# 312 samples / global batch 8 = 39 steps per epoch; 3 epochs = 117.
 max_steps: null
 seed: 47
 

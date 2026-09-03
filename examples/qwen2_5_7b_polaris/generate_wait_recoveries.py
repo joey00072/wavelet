@@ -27,15 +27,11 @@ from examples.qwen2_5_7b_polaris.generate_incorrect_synthetic import (
 )
 
 RECOVERY_PHRASES = (
-    "Wait,",
-    "Wait, no",
-    "Wait, actually",
-    "I think I made a mistake",
-    "Maybe I made a mistake",
     "Alternatively,",
+    "Wait,",
 )
-DEFAULT_SOURCE = Path("outputs/polaris_synthetic_hard100_step208/incorrect.jsonl")
-DEFAULT_OUTPUT_DIR = Path("outputs/polaris_wait_recovery_step208")
+DEFAULT_SOURCE = Path("outputs/polaris_incorrect_synthetic/incorrect.jsonl")
+DEFAULT_OUTPUT_DIR = Path("outputs/polaris_wait_recoveries")
 _THINK_BLOCK = re.compile(r"<think>(?P<think>.*?)</think>", re.DOTALL)
 
 
@@ -45,9 +41,8 @@ class ContinuationPrefix:
     question: str
     reference_answer: str
     source_completion: str
-    cut_from_end: int | None
-    cut_character_index: int | None
-    cut_separator: str | None
+    cut_character_index: int
+    cut_separator: str
     recovery_phrase: str
     assistant_prefix: str
 
@@ -65,12 +60,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--rollouts", type=int, default=4)
     parser.add_argument(
-        "--cut-mode",
-        choices=("newline-from-end", "midpoint"),
-        default="newline-from-end",
-    )
-    parser.add_argument("--cut-from-end", type=int, nargs="+", default=[2, 4])
-    parser.add_argument(
         "--recovery-phrases",
         nargs="+",
         default=list(RECOVERY_PHRASES),
@@ -87,23 +76,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-workers", type=int, default=16)
     parser.add_argument("--verify-timeout", type=int, default=60)
     return parser.parse_args()
-
-
-def truncate_think_at_newline(
-    completion: str, *, newline_from_end: int, recovery_phrase: str
-) -> str | None:
-    """Replace a think-block suffix after the requested newline."""
-    if newline_from_end <= 0:
-        raise ValueError("newline_from_end must be positive")
-    match = _THINK_BLOCK.search(completion)
-    if match is None:
-        return None
-    think = match.group("think")
-    newline_ends = [newline.end() for newline in re.finditer(r"\n", think)]
-    if len(newline_ends) < newline_from_end:
-        return None
-    cut = newline_ends[-newline_from_end]
-    return f"<think>{think[:cut]}{recovery_phrase} "
 
 
 def truncate_think_at_midpoint(
@@ -133,44 +105,6 @@ def truncate_think_at_midpoint(
     return f"<think>{think[:cut]}{recovery_phrase} ", cut, separator
 
 
-def build_continuation_prefixes(
-    rows: list[dict[str, Any]],
-    cut_positions: list[int],
-    recovery_phrases: tuple[str, ...] = RECOVERY_PHRASES,
-) -> tuple[list[ContinuationPrefix], Counter[str]]:
-    """Build deterministic, evenly rotated recovery interventions."""
-    prefixes: list[ContinuationPrefix] = []
-    counts: Counter[str] = Counter()
-    phrase_index = 0
-    for row in rows:
-        for cut_from_end in cut_positions:
-            phrase = recovery_phrases[phrase_index % len(recovery_phrases)]
-            phrase_index += 1
-            assistant_prefix = truncate_think_at_newline(
-                str(row["completion"]),
-                newline_from_end=cut_from_end,
-                recovery_phrase=phrase,
-            )
-            if assistant_prefix is None:
-                counts[f"skipped_missing_cut_{cut_from_end}"] += 1
-                continue
-            prefixes.append(
-                ContinuationPrefix(
-                    source_id=str(row["id"]),
-                    question=str(row["question"]),
-                    reference_answer=str(row["reference_answer"]),
-                    source_completion=str(row["completion"]),
-                    cut_from_end=cut_from_end,
-                    cut_character_index=None,
-                    cut_separator=None,
-                    recovery_phrase=phrase,
-                    assistant_prefix=assistant_prefix,
-                )
-            )
-            counts[f"phrase/{phrase}"] += 1
-    return prefixes, counts
-
-
 def build_midpoint_prefixes(
     rows: list[dict[str, Any]], recovery_phrases: tuple[str, ...]
 ) -> tuple[list[ContinuationPrefix], Counter[str]]:
@@ -192,7 +126,6 @@ def build_midpoint_prefixes(
                     question=str(row["question"]),
                     reference_answer=str(row["reference_answer"]),
                     source_completion=str(row["completion"]),
-                    cut_from_end=None,
                     cut_character_index=cut_character_index,
                     cut_separator=cut_separator,
                     recovery_phrase=phrase,
@@ -234,7 +167,7 @@ async def generate_one_prefix(
     max_tokens = min(args.max_completion_tokens, available_tokens)
     if max_tokens < 128:
         raise ValueError(
-            f"Prefix {prefix.source_id}/{prefix.cut_from_end or 'midpoint'} leaves only "
+            f"Prefix {prefix.source_id}/midpoint leaves only "
             f"{max_tokens} completion tokens."
         )
 
@@ -328,11 +261,7 @@ def write_outputs(
             request_errors.append(
                 {
                     "source_id": prefix.source_id,
-                    "cut": (
-                        prefix.cut_from_end
-                        if prefix.cut_from_end is not None
-                        else prefix.cut_character_index
-                    ),
+                    "cut": prefix.cut_character_index,
                     "error": repr(result),
                 }
             )
@@ -376,11 +305,7 @@ def write_outputs(
             continue
         seen.add(dedupe_key)
         counts["retained_correct"] += 1
-        cut_label = (
-            f"from-end-{prefix.cut_from_end}"
-            if prefix.cut_from_end is not None
-            else f"midpoint-{prefix.cut_character_index}"
-        )
+        cut_label = f"midpoint-{prefix.cut_character_index}"
         phrase_slug = re.sub(r"[^a-z0-9]+", "-", prefix.recovery_phrase.casefold())
         retained.append(
             {
@@ -399,8 +324,7 @@ def write_outputs(
                     {"role": "user", "content": prefix.question},
                     {"role": "assistant", "content": completion},
                 ],
-                "cut_mode": args.cut_mode,
-                "cut_newline_from_end": prefix.cut_from_end,
+                "cut_mode": "midpoint",
                 "cut_character_index": prefix.cut_character_index,
                 "cut_separator": prefix.cut_separator,
                 "recovery_phrase": prefix.recovery_phrase,
@@ -421,10 +345,7 @@ def write_outputs(
         "source_dataset": str(args.source.resolve()),
         "source_traces": source_count,
         "eligible_prefixes": len(prefixes),
-        "cut_mode": args.cut_mode,
-        "cut_newlines_from_end": (
-            args.cut_from_end if args.cut_mode == "newline-from-end" else []
-        ),
+        "cut_mode": "midpoint",
         "recovery_phrases": args.recovery_phrases,
         "rollouts_per_prefix": args.rollouts,
         "requested_completions": len(prefixes) * args.rollouts,
@@ -437,14 +358,9 @@ def write_outputs(
         "rejected_duplicate": counts["rejected_duplicate"],
         "request_failed": counts["request_failed"],
         "request_errors": request_errors,
-        "skipped_missing_cut": (
-            {
-                str(cut): counts[f"skipped_missing_cut_{cut}"]
-                for cut in args.cut_from_end
-            }
-            if args.cut_mode == "newline-from-end"
-            else {"midpoint_boundary": counts["skipped_missing_midpoint_boundary"]}
-        ),
+        "skipped_missing_cut": {
+            "midpoint_boundary": counts["skipped_missing_midpoint_boundary"]
+        },
         "prefixes_per_phrase": {
             phrase: counts[f"phrase/{phrase}"] for phrase in args.recovery_phrases
         },
@@ -472,11 +388,6 @@ def main() -> int:
         not phrase.strip() for phrase in args.recovery_phrases
     ):
         raise ValueError("--recovery-phrases values must be non-empty.")
-    if args.cut_mode == "newline-from-end" and (
-        not args.cut_from_end or any(cut <= 0 for cut in args.cut_from_end)
-    ):
-        raise ValueError("--cut-from-end values must be positive.")
-
     policy_metadata = read_policy_metadata(args.policy_dir)
     if int(policy_metadata.get("step", -1)) != args.policy_step:
         raise ValueError(
@@ -489,12 +400,7 @@ def main() -> int:
         if line.strip()
     ]
     phrases = tuple(args.recovery_phrases)
-    if args.cut_mode == "midpoint":
-        prefixes, prefix_counts = build_midpoint_prefixes(rows, phrases)
-    else:
-        prefixes, prefix_counts = build_continuation_prefixes(
-            rows, args.cut_from_end, phrases
-        )
+    prefixes, prefix_counts = build_midpoint_prefixes(rows, phrases)
     if not prefixes:
         raise RuntimeError("No source traces had the requested newline cut positions.")
 
