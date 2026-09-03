@@ -220,3 +220,14 @@ def test_process_eval_only_does_not_require_initial_policy_export() -> None:
     )
 
     assert config.policy_transfer.export_initial is False
+
+
+def test_policy_transport_retains_current_and_previous_by_default() -> None:
+    config = RLConfig()
+
+    assert config.policy_transfer.keep_last == 2
+
+
+def test_policy_transport_rejects_single_snapshot_retention() -> None:
+    with pytest.raises(ValueError, match="greater than or equal to 2"):
+        RLConfig(policy_transfer={"keep_last": 1})
