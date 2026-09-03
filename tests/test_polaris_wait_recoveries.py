@@ -5,6 +5,7 @@ from examples.qwen2_5_7b_polaris.generate_wait_recoveries import (
     build_midpoint_prefixes,
     truncate_think_at_midpoint,
 )
+from examples.qwen2_5_7b_polaris.serve_recoveries import PAGE
 
 
 def test_midpoint_prefers_nearest_paragraph_or_line_boundary() -> None:
@@ -37,3 +38,10 @@ def test_midpoint_builds_each_requested_phrase_for_every_trace() -> None:
         "Wait,",
     ]
     assert counts["separator/\\n"] == 2
+
+
+def test_recovery_viewer_uses_midpoint_schema() -> None:
+    assert "row.cut_mode" in PAGE
+    assert "row.cut_separator" in PAGE
+    assert "row.cut_character_index" in PAGE
+    assert "cut_newline_from_end" not in PAGE
