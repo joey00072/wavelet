@@ -399,7 +399,10 @@ class RLPolicyTransferConfig(BaseModel):
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
     export_initial: bool = True
     export_every_steps: int = Field(default=1, ge=1)
-    keep_last: int | None = Field(default=None, ge=1)
+    # Policy snapshots are transport artifacts, not checkpoints. Keep the
+    # active version and its predecessor so a lagging filesystem load cannot
+    # lose its source while the next version is published.
+    keep_last: int = Field(default=2, ge=2)
     lightweight_lora: bool = True
     nccl_host: str = "127.0.0.1"
     nccl_port: int = Field(default=29501, ge=1, le=65535)

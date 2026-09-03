@@ -102,6 +102,9 @@ without rereading the file. Inference advances its loaded policy step only after
 every server acknowledges loading the immutable, versioned snapshot.
 
 Process and colocated training require `policy_transfer.export_initial: true`.
+Filesystem policy exports are transient transport artifacts: Wavelet keeps the
+current and previous snapshot by default and requires `keep_last >= 2`. Use
+trainer checkpoints, not policy exports, for durable resume history.
 This publishes policy step 0 before rollout generation and prevents the trainer
 and inference scheduler from waiting on each other at startup.
 
