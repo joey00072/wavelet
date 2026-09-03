@@ -185,6 +185,12 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
         return 5
 
     class Scheduler:
+        def begin_policy_update(self) -> None:
+            calls.append(("begin", 0))
+
+        async def drain_policy_update_requests(self) -> None:
+            calls.append(("drain", 0))
+
         def set_policy_step(
             self,
             policy_step: int,
@@ -197,6 +203,9 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
         async def mark_policy_update(self) -> int:
             calls.append(("mark", 0))
             return 0
+
+        def finish_policy_update(self) -> None:
+            calls.append(("finish", 0))
 
     monkeypatch.setattr(
         "wavelet.orchestrator.rollout_worker._load_policy_async",
@@ -214,7 +223,15 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
     )
 
     assert loaded_step == 5
-    assert calls == [("load", 4), ("set", 5), ("model", "policy"), ("mark", 0)]
+    assert calls == [
+        ("begin", 0),
+        ("drain", 0),
+        ("load", 4),
+        ("set", 5),
+        ("model", "policy"),
+        ("mark", 0),
+        ("finish", 0),
+    ]
 
 
 def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None:
@@ -224,6 +241,12 @@ def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None
         return 5
 
     class Scheduler:
+        def begin_policy_update(self) -> None:
+            calls.append(("begin", 0))
+
+        async def drain_policy_update_requests(self) -> None:
+            calls.append(("drain", 0))
+
         def set_policy_step(
             self,
             policy_step: int,
@@ -236,6 +259,9 @@ def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None
         async def mark_policy_update(self) -> int:
             calls.append(("mark", 0))
             return 0
+
+        def finish_policy_update(self) -> None:
+            calls.append(("finish", 0))
 
     monkeypatch.setattr(
         "wavelet.orchestrator.rollout_worker._load_policy_async",
@@ -255,4 +281,48 @@ def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None
 
     asyncio.run(context._load_now(5, optimizer_step=5))  # noqa: SLF001
 
-    assert calls == [("set", 5), ("model", "policy"), ("mark", 0)]
+    assert calls == [
+        ("begin", 0),
+        ("drain", 0),
+        ("set", 5),
+        ("model", "policy"),
+        ("mark", 0),
+        ("finish", 0),
+    ]
+
+
+def test_background_policy_refresh_closes_submission_gate_immediately(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    class Scheduler:
+        def begin_policy_update(self) -> None:
+            calls.append("begin")
+
+        def finish_policy_update(self) -> None:
+            calls.append("finish")
+
+    async def fake_update(*_args) -> int:
+        calls.append("task")
+        return 4
+
+    monkeypatch.setattr(
+        "wavelet.orchestrator.rollout_worker._load_policy_and_update_scheduler",
+        fake_update,
+    )
+    context = object.__new__(_VerifierPublisherStrategy)
+    context.config = _config()
+    context.inference_engine = object()
+    context.policy_receiver = object()
+    context.scheduler = Scheduler()
+    context.state = None
+
+    async def run() -> None:
+        context._start_background_load(4)  # noqa: SLF001
+        assert calls == ["begin"]
+        await context.pending_policy_update
+
+    asyncio.run(run())
+
+    assert calls == ["begin", "task"]
