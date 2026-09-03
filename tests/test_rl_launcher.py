@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
@@ -827,12 +826,9 @@ def test_launcher_derives_nccl_inference_world_size() -> None:
     assert resolved.policy_transfer.nccl_rank_offset == 1
 
 
-def test_http_openai_load_policy_stages_adapter_in_tmpfs(
+def test_http_openai_load_policy_uses_immutable_snapshot_path(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cache_root = tmp_path / "cache"
-    monkeypatch.setenv("WAVELET_POLICY_CACHE_DIR", str(cache_root))
     policy_dir = tmp_path / "policy"
     adapter_dir = policy_dir / "adapter"
     adapter_dir.mkdir(parents=True)
@@ -868,15 +864,7 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
 
     payload = calls[0][2]
     assert payload is not None
-    cached_policy_dir = Path(payload["policy_dir"])
-    assert cached_policy_dir != policy_dir
-    assert (
-        cached_policy_dir.parent.parent
-        == cache_root / f"wavelet-policy-cache-{os.getuid()}"
-    )
-    assert (
-        cached_policy_dir / "adapter" / "adapter_model.safetensors"
-    ).read_bytes() == b"weights"
+    assert Path(payload["policy_dir"]) == policy_dir
     assert payload["adapter_name"] == "policy"
     assert payload["load_inplace"] is True
 
