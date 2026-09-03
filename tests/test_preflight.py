@@ -60,6 +60,29 @@ def test_preflight_reports_missing_local_data(tmp_path) -> None:
     )
 
 
+def test_preflight_reports_effective_rollout_batch_shape(tmp_path) -> None:
+    config = RLConfig(
+        data={"source": "local", "path": _write_local_data(tmp_path)},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+        orchestrator={
+            "examples_per_step": 17,
+            "rollouts_per_example": 8,
+            "rollout_chunk_examples": 3,
+        },
+    )
+
+    report = build_preflight_report(config)
+    check = next(item for item in report["checks"] if item["name"] == "rollout_chunks")
+
+    assert check["details"] == {
+        "groups": 17,
+        "rollouts_per_group": 8,
+        "rollouts": 136,
+        "chunks": 6,
+    }
+
+
 def test_preflight_reports_missing_model_adapter(tmp_path) -> None:
     data_path = _write_local_data(tmp_path)
     adapter_path = tmp_path / "missing-adapter"

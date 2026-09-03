@@ -43,7 +43,11 @@ from wavelet.orchestrator.queue import (
     publish_adapter_policy_snapshot,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
-from wavelet.orchestrator.schedule import chunks_per_step, rollout_chunk_examples
+from wavelet.orchestrator.schedule import (
+    chunks_per_step,
+    rollout_chunk_examples,
+    rollout_groups_for_chunk,
+)
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.utils.policy_transfer import NCCL_READY_MARKER
 
@@ -232,6 +236,14 @@ def test_rollout_chunk_examples_defaults_to_async_split() -> None:
 
     assert rollout_chunk_examples(config) == 3
     assert chunks_per_step(config) == 6
+    assert [rollout_groups_for_chunk(config, index) for index in range(6)] == [
+        3,
+        3,
+        3,
+        3,
+        3,
+        2,
+    ]
 
 
 def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
