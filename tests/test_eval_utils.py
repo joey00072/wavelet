@@ -89,6 +89,28 @@ def test_every_scheduler_starts_with_base_eval_due() -> None:
     ] == ["aime2024"]
 
 
+def test_resumed_scheduler_does_not_repeat_completed_evals() -> None:
+    config = RLConfig(
+        eval={
+            "interval": 100,
+            "eval_base_model": True,
+            "env": [{"id": "aime", "name": "aime2024"}],
+        }
+    )
+
+    last_eval_steps = _initial_eval_steps(config, start_step=553)
+
+    assert last_eval_steps == {"aime2024": 553}
+    assert (
+        select_due_eval_envs(
+            config,
+            policy_step=553,
+            last_eval_steps=last_eval_steps,
+        )
+        == []
+    )
+
+
 def test_pass_at_k_for_binary_rewards() -> None:
     metrics = pass_at_k([0.0, 1.0, 0.0, 1.0])
 

@@ -1200,7 +1200,10 @@ class _SchedulerStateMachine:
     def __post_init__(self) -> None:
         self.pending: dict[Future[tuple[int, object, float, float]], int] = {}
         self.completed: dict[int, tuple[object, float, float]] = {}
-        self.last_eval_steps = _initial_eval_steps(self.config)
+        self.last_eval_steps = _initial_eval_steps(
+            self.config,
+            start_step=self._rollout_step(self.next_step_to_submit),
+        )
 
     def submit_step(self, pool: ThreadPoolExecutor, step: int) -> None:
         future = pool.submit(
@@ -2210,7 +2213,7 @@ async def _run_verifier_scheduler(
         rollout_sender=FileSystemRolloutSender(config.output_dir, config.transport),
         state=state,
         chunks_per_step=chunks_per_step,
-        last_eval_steps=_initial_eval_steps(config),
+        last_eval_steps=_initial_eval_steps(config, start_step=start_step),
     )
     target_chunks = target_step * chunks_per_step
     try:
@@ -2231,10 +2234,15 @@ async def _run_verifier_scheduler(
         await context.close()
 
 
-def _initial_eval_steps(config: RLConfig) -> dict[str, int]:
+def _initial_eval_steps(
+    config: RLConfig,
+    *,
+    start_step: int = 0,
+) -> dict[str, int]:
     if config.eval is None:
         return {}
-    return {env.resolved_name: -1 for env in config.eval.env}
+    last_eval_step = -1 if start_step == 0 else start_step
+    return {env.resolved_name: last_eval_step for env in config.eval.env}
 
 
 async def _load_policy_async(
