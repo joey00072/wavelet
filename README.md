@@ -213,3 +213,6 @@ the denominator. Corresponding `eval/<env>/effective/...` metrics describe only
 successful verifier responses, and `failed_rollouts` reports the failure rate.
 The orchestrator writes these fixed-policy metrics to `eval_metrics.jsonl` and
 its W&B run at the matching optimizer step.
+Standalone trainers use the same resolved step count for optimization and the
+learning-rate scheduler; in particular, RL `max_steps: 0` remains evaluation-only
+instead of falling back to an implicit training run.

@@ -153,6 +153,15 @@ def test_dynamic_loss_backward_accumulates_sums_before_final_scaling() -> None:
     assert loss.grad.item() == pytest.approx(1.0)
 
 
+def test_standalone_rl_train_honors_zero_max_steps() -> None:
+    trainer = RLTrainer(RLConfig(max_steps=0))
+    trainer.train_until = Mock()
+
+    trainer.train()
+
+    trainer.train_until.assert_called_once_with(0, finish_run=True)
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_nonfinite_loss_aborts_and_clears_accumulated_gradients(value) -> None:
     trainer = RLTrainer(RLConfig())
