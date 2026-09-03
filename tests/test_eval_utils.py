@@ -12,6 +12,7 @@ from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.scheduler import (
+    _VerifierPublisherStrategy,
     _initial_eval_steps,
     _run_evals,
     _run_evals_async,
@@ -210,6 +211,69 @@ def test_final_eval_runs_policy_not_seen_at_an_interval() -> None:
 
     assert [env.resolved_name for env in envs] == ["aime2024"]
     assert last_eval_steps == {"aime2024": 137}
+
+
+def test_sync_final_eval_does_not_wake_for_duplicate_policy(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = RLConfig.model_validate(
+        {
+            "max_steps": 100,
+            "output_dir": tmp_path,
+            "eval": {"env": [{"id": "aime", "name": "aime2024"}]},
+        }
+    )
+    inference_engine = Mock()
+    wake = Mock()
+    run_evals = Mock()
+    monkeypatch.setattr(
+        "wavelet.orchestrator.scheduler._wake_for_colocated_sleep", wake
+    )
+    monkeypatch.setattr("wavelet.orchestrator.scheduler._run_evals", run_evals)
+
+    loaded_step = _run_final_evals(
+        config,
+        Mock(),
+        inference_engine,
+        Mock(),
+        target_step=100,
+        loaded_policy_step=100,
+        last_eval_steps={"aime2024": 100},
+    )
+
+    assert loaded_step == 100
+    wake.assert_not_called()
+    run_evals.assert_not_called()
+
+
+def test_async_final_eval_cancels_unused_scheduler_work(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = RLConfig.model_validate(
+        {
+            "max_steps": 101,
+            "output_dir": tmp_path,
+            "eval": {"env": [{"id": "aime", "name": "aime2024"}]},
+        }
+    )
+    scheduler = Mock()
+    scheduler.aclose = AsyncMock()
+    run_evals = AsyncMock()
+    monkeypatch.setattr("wavelet.orchestrator.scheduler._run_evals_async", run_evals)
+    context = object.__new__(_VerifierPublisherStrategy)
+    context.config = config
+    context.orchestrator = Mock()
+    context.inference_engine = Mock()
+    context.policy_receiver = Mock()
+    context.scheduler = scheduler
+    context.last_eval_steps = {"aime2024": 100}
+    context.loaded_policy_step = 101
+
+    asyncio.run(context.run_final_evals(101))
+
+    scheduler.aclose.assert_awaited_once_with()
+    run_evals.assert_awaited_once()
+    assert run_evals.await_args.kwargs["policy_step"] == 101
 
 
 def test_eval_only_base_model_does_not_wait_for_policy_snapshot(

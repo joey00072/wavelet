@@ -267,14 +267,10 @@ class _VerifierBatchStats:
             return metrics
 
         solve_none = sum(value == 0.0 for value in self.group_reward_sums)
-        solve_all = sum(
-            value >= rollouts_per_group for value in self.group_reward_sums
-        )
+        solve_all = sum(value >= rollouts_per_group for value in self.group_reward_sums)
         metrics.update(
             {
-                "generation/groups/admission_rate": (
-                    self.admitted_groups / completed
-                ),
+                "generation/groups/admission_rate": (self.admitted_groups / completed),
                 "generation/reward/mean": (
                     sum(self.rollout_rewards) / len(self.rollout_rewards)
                     if self.rollout_rewards
@@ -282,9 +278,7 @@ class _VerifierBatchStats:
                 ),
                 "generation/solve_none/rate": solve_none / completed,
                 "generation/solve_all/rate": solve_all / completed,
-                "generation/effective_groups/rate": (
-                    completed - solve_none - solve_all
-                )
+                "generation/effective_groups/rate": (completed - solve_none - solve_all)
                 / completed,
             }
         )
@@ -436,9 +430,7 @@ class VerifierRolloutScheduler:
         base_groups = self.target_groups
         pending_chunk_limit = self.config.orchestrator.max_pending_rollout_chunks
         if pending_chunk_limit is not None:
-            bounded_groups = (
-                _rollout_chunk_examples(self.config) * pending_chunk_limit
-            )
+            bounded_groups = _rollout_chunk_examples(self.config) * pending_chunk_limit
             return bounded_groups
         oversampled_groups = math.ceil(
             base_groups * self.config.orchestrator.oversampling_factor
@@ -572,10 +564,7 @@ class VerifierRolloutScheduler:
         target_groups: int,
         rejected_groups: int,
     ) -> None:
-        if (
-            accepted_groups >= target_groups
-            or completed_groups < max_completed_groups
-        ):
+        if accepted_groups >= target_groups or completed_groups < max_completed_groups:
             return
         raise RuntimeError(
             "Verifier scheduler could not produce enough trainable rollout groups "
@@ -2094,6 +2083,18 @@ class _VerifierPublisherStrategy:
         final_policy_step = _final_eval_policy_step(self.config, target_step)
         if final_policy_step is None:
             return
+        envs = _select_final_eval_envs(
+            self.config,
+            policy_step=final_policy_step,
+            last_eval_steps=self.last_eval_steps,
+        )
+        if not envs:
+            return
+
+        # No generated work is consumed after this point. Cancel speculative
+        # requests before a possible policy load and before eval consumes the
+        # inference capacity.
+        await self.scheduler.aclose()
         if (
             target_step == 0
             and self.loaded_policy_step is None
@@ -2130,11 +2131,6 @@ class _VerifierPublisherStrategy:
             )
         else:
             _wake_for_colocated_sleep(self.config, self.inference_engine)
-        envs = _select_final_eval_envs(
-            self.config,
-            policy_step=self.loaded_policy_step,
-            last_eval_steps=self.last_eval_steps,
-        )
         await _run_evals_async(
             self.config,
             self.orchestrator,
@@ -2477,6 +2473,13 @@ def _run_final_evals(
     final_policy_step = _final_eval_policy_step(config, target_step)
     if final_policy_step is None:
         return loaded_policy_step
+    envs = _select_final_eval_envs(
+        config,
+        policy_step=final_policy_step,
+        last_eval_steps=last_eval_steps,
+    )
+    if not envs:
+        return loaded_policy_step
 
     if (
         target_step == 0
@@ -2492,11 +2495,6 @@ def _run_final_evals(
         loaded_policy_step = policy.step
     else:
         _wake_for_colocated_sleep(config, inference_engine)
-    envs = _select_final_eval_envs(
-        config,
-        policy_step=loaded_policy_step,
-        last_eval_steps=last_eval_steps,
-    )
     _run_evals(
         config,
         orchestrator,
