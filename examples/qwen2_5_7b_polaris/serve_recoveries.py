@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-DEFAULT_DATASET = Path("outputs/polaris_wait_recovery_step208/correct_recoveries.jsonl")
+DEFAULT_DATASET = Path("outputs/polaris_wait_recoveries/correct_recoveries.jsonl")
 
 PAGE = """<!doctype html>
 <html lang="en">

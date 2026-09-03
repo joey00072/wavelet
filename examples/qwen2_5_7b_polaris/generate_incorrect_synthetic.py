@@ -28,7 +28,7 @@ from environments.polaris_math_tagged.polaris_math_tagged import (
     extract_tagged_answer,
 )
 
-DEFAULT_OUTPUT_DIR = Path("outputs/polaris_synthetic_hard100_step208")
+DEFAULT_OUTPUT_DIR = Path("outputs/polaris_incorrect_synthetic")
 _THINK_BLOCK = re.compile(r"<think>(?P<think>.*?)</think>", re.DOTALL)
 _NUMBERED_REASONING_MARKERS = tuple(
     re.compile(rf"^\s*{number}\.\s+", re.MULTILINE) for number in (1, 2, 3)

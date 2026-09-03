@@ -54,35 +54,20 @@ With a Wavelet inference server running, generate from a stable adapter using:
 
 ```bash
 uv run python examples/qwen2_5_7b_polaris/generate_incorrect_synthetic.py \
-  --policy-dir outputs/<run>/final_adapter_step-000208 \
-  --policy-step 208
+  --policy-dir outputs/<run>/policies/step-000100 \
+  --policy-step 100
 ```
 
 `generate_wait_recoveries.py` turns those incorrect traces into recovery data.
-For each trace it replaces the suffix after the second- and fourth-last newline
-inside `<think>` with one of six evenly rotated phrases such as `Wait,` or
-`I think I made a mistake`, then continues from that exact assistant-token
-prefix. By default it samples four continuations per prefix. It retains only
-deduplicated, strict-format, non-numbered traces that Prime's math verifier marks
-correct:
+For each trace it snaps the center of `<think>` to the nearest paragraph or line
+boundary and creates one `Alternatively,` prefix and one `Wait,` prefix. It
+samples four continuations from each prefix and retains only deduplicated,
+strict-format, non-numbered traces that the math verifier marks correct:
 
 ```bash
 uv run python examples/qwen2_5_7b_polaris/generate_wait_recoveries.py \
-  --policy-dir outputs/<run>/final_adapter_step-000208 \
-  --policy-step 208 \
-  --rollouts 4
-```
-
-For midpoint interventions, the generator snaps the center of `<think>` to the
-nearest paragraph or line boundary and can expand every source trace with an
-explicit phrase set:
-
-```bash
-uv run python examples/qwen2_5_7b_polaris/generate_wait_recoveries.py \
-  --policy-dir outputs/<run>/final_adapter_step-000208 \
-  --policy-step 208 \
-  --cut-mode midpoint \
-  --recovery-phrases "Alternatively," "Wait," \
+  --policy-dir outputs/<run>/policies/step-000100 \
+  --policy-step 100 \
   --rollouts 4
 ```
 
