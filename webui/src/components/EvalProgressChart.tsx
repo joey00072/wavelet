@@ -2,19 +2,18 @@ import { useMemo, useState } from "react";
 
 import type { EvalMetricRow } from "../types";
 
-const SERIES = [
-  { suffix: "/avg@8", color: "#10b981", label: "avg@8" },
-  { suffix: "/pass@8", color: "#3b82f6", label: "pass@8" },
+const METRICS = [
+  { name: "avg@8", color: "#10b981" },
+  { name: "pass@8", color: "#3b82f6" },
 ];
 
 type Point = { step: number; value: number };
 type HoveredPoint = Point & { color: string; label: string; x: number; y: number };
 
-function pointsFor(metrics: EvalMetricRow[], suffix: string): Point[] {
+function pointsFor(metrics: EvalMetricRow[], key: string): Point[] {
   return metrics
     .flatMap((row) => {
-      const key = Object.keys(row).find((candidate) => candidate.startsWith("eval/") && candidate.endsWith(suffix));
-      const rawValue = key === undefined ? undefined : row[key];
+      const rawValue = row[key];
       const rawStep = row["progress/policy_step"] ?? row.step;
       if (typeof rawValue !== "number" || typeof rawStep !== "number") return [];
       return [{ step: rawStep, value: rawValue * 100 }];
@@ -24,10 +23,27 @@ function pointsFor(metrics: EvalMetricRow[], suffix: string): Point[] {
 
 export function EvalProgressChart({ metrics }: { metrics: EvalMetricRow[] }) {
   const [hoveredPoint, setHoveredPoint] = useState<HoveredPoint | null>(null);
-  const series = useMemo(
-    () => SERIES.map((definition) => ({ ...definition, points: pointsFor(metrics, definition.suffix) })),
-    [metrics],
-  );
+  const series = useMemo(() => {
+    const definitions = new Map(METRICS.map((metric) => [metric.name, metric]));
+    const keys = new Set(
+      metrics.flatMap((row) =>
+        Object.keys(row).filter((key) => {
+          const parts = key.split("/");
+          return parts.length === 3 && parts[0] === "eval" && definitions.has(parts[2]);
+        }),
+      ),
+    );
+    return [...keys].sort().map((key) => {
+      const [, envName, metricName] = key.split("/");
+      const definition = definitions.get(metricName)!;
+      return {
+        key,
+        color: definition.color,
+        label: `${envName} ${metricName}`,
+        points: pointsFor(metrics, key),
+      };
+    });
+  }, [metrics]);
   const references = series.flatMap((item) => {
     const baseline = item.points.find((point) => point.step === 0);
     return baseline === undefined
@@ -54,14 +70,14 @@ export function EvalProgressChart({ metrics }: { metrics: EvalMetricRow[] }) {
       <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h3 className="text-xs font-semibold uppercase tracking-widest text-slate-500 dark:text-slate-400">
-            AIME 2024 evaluation
+            Evaluation progress
           </h3>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            30 held-out problems · 8 rollouts · every 100 policy steps
+            Fixed-policy avg@8 and pass@8 from each configured environment
           </p>
         </div>
         <div className="flex flex-wrap gap-4">
-          {[...references, ...SERIES].map((item) => (
+          {[...references, ...series].map((item) => (
             <span key={item.label} className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
               <span className="inline-block h-[2px] w-3 rounded-full" style={{ background: item.color }} />
               {item.label}
@@ -111,10 +127,10 @@ export function EvalProgressChart({ metrics }: { metrics: EvalMetricRow[] }) {
               opacity="0.9"
             />
           ))}
-          {SERIES.map((definition, index) => {
-            const points = series[index].points;
+          {series.map((definition) => {
+            const points = definition.points;
             return (
-              <g key={definition.label}>
+              <g key={definition.key}>
                 <path
                   d={pathFor(points)}
                   fill="none"
