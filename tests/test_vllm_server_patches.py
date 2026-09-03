@@ -155,6 +155,46 @@ async def test_load_policy_routes_lora_policy(monkeypatch) -> None:
 
 
 @pytest.mark.anyio
+async def test_adapter_load_resets_sticky_load_inplace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    adapter_dir = tmp_path / "policy" / "adapter"
+    adapter_dir.mkdir(parents=True)
+    registered: dict[str, LoRARequest] = {}
+
+    async def load_lora_adapter(request: LoadLoRAAdapterRequest) -> str:
+        registered[request.lora_name] = LoRARequest(
+            request.lora_name,
+            1,
+            request.lora_path,
+            load_inplace=request.load_inplace,
+        )
+        return "ok"
+
+    models = SimpleNamespace(
+        lora_requests=registered,
+        load_lora_adapter=load_lora_adapter,
+    )
+    monkeypatch.setattr(server, "_models", lambda _request: models)
+    state = SimpleNamespace(
+        policy_step=None,
+        policy_adapter_name=None,
+        policy_adapter_path=None,
+    )
+
+    result = await server._load_adapter_policy(
+        SimpleNamespace(app=SimpleNamespace(state=state)),
+        policy_dir=tmp_path / "policy",
+        step=3,
+        load_inplace=True,
+        config=RLConfig(),
+    )
+
+    assert result["policy_step"] == 3
+    assert registered["policy"].load_inplace is False
+
+
+@pytest.mark.anyio
 async def test_policy_update_pause_drains_without_clearing_cache() -> None:
     calls = []
 
