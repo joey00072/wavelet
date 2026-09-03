@@ -45,13 +45,13 @@ orchestrator:
 
 The server exposes read-only endpoints and allows browser CORS by default.
 
-The overview plots AIME 2024 `avg@8` and `pass@8` at the base policy and every
-100 training steps. The step-zero `avg@8` and `pass@8` results are also drawn as
-horizontal base-model references on a fixed 0–100% y-axis. Hover over an
-evaluation point to see its metric value and policy step. These primary metrics
-count failed generations as incorrect; `eval/<env>/effective/...` metrics retain
-the successful-response-only view for diagnosis. The same fixed-policy metrics
-are logged on the orchestrator W&B run for remote progress tracking.
+The overview plots each configured environment's `avg@8` and `pass@8` values.
+Step-zero results are also drawn as horizontal base-model references on a fixed
+0–100% y-axis. Hover over an evaluation point to see its metric value and policy
+step. Evaluation cadence and dataset size come from the run config rather than
+UI assumptions. Primary metrics count failed generations as incorrect;
+`eval/<env>/effective/...` retains the successful-response-only view for
+diagnosis. The same fixed-policy metrics are logged on the orchestrator W&B run.
 
 ## Rollout Inspection API
 
