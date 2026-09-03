@@ -145,6 +145,9 @@ Verifier thread and math-process pools scale to the scheduler's real in-flight
 request high-water mark, which is logged as `generation/executor_concurrency`.
 When `max_pending_rollout_chunks` is set, that queue-derived capacity is a hard
 in-flight bound; `oversampling_factor` does not multiply it a second time.
+`max_inflight_rollouts` is also an exact request ceiling. These explicit bounds
+may intentionally leave inference client routes idle rather than exceed the
+configured memory budget.
 Cached verifier environments and registered executors are torn down when the
 inference scheduler closes. Integrated runs also close the inference engine and
 verifier resources on both success and failure before finalizing trainer state.
