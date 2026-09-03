@@ -6,7 +6,6 @@ import random
 from pathlib import Path
 from typing import Any
 
-
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 SYSTEM_PROMPT = (
     "Return only the reversed text from the user message. "
