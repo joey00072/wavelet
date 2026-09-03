@@ -250,6 +250,35 @@ def test_rollout_metrics_prefer_exact_dispatch_group_identity() -> None:
     assert metrics["solve_all/all"] == pytest.approx(0.5)
 
 
+def test_rollout_metrics_do_not_count_extra_trajectory_branches_as_rollouts() -> None:
+    rows = [
+        {
+            "example_id": "a",
+            "reward": 1.0,
+            "metadata": {"_wavelet_rollout_count": 1},
+        },
+        {
+            "example_id": "a",
+            "reward": 1.0,
+            "metadata": {"_wavelet_rollout_count": 0},
+        },
+        {
+            "example_id": "a",
+            "reward": 0.0,
+            "metadata": {"_wavelet_rollout_count": 1},
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=2, step=1)
+    )
+
+    assert metrics["reward/all/mean"] == pytest.approx(0.5)
+    assert metrics["solve_none/all"] == 0.0
+    assert metrics["solve_all/all"] == 0.0
+    assert metrics["effective_batch_size/all"] == 1.0
+
+
 def test_rollout_metrics_reject_extra_metric_overrides() -> None:
     with pytest.raises(ValueError, match="replace core metrics: step"):
         rollout_metrics(

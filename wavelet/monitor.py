@@ -762,11 +762,19 @@ def _add_group_metrics(
     for name, value_fn in (
         ("seq_len", _seq_len),
         ("decode_len", _decode_len),
-        ("reward", lambda row: _float_or_none(row.get("reward"))),
     ):
         metrics.update(
             series_stats(f"{name}/{suffix}", _grouped_means(grouped, value_fn))
         )
+    metrics.update(
+        series_stats(
+            f"reward/{suffix}",
+            _grouped_rollout_means(
+                grouped,
+                lambda row: _float_or_none(row.get("reward")),
+            ),
+        )
+    )
     solve_none, solve_all, effective = _solve_rates(grouped, rollouts_per_example)
     metrics.update(
         {
@@ -899,6 +907,26 @@ def _grouped_means(
     return values
 
 
+def _grouped_rollout_means(
+    grouped: dict[tuple[str, str], list[dict[str, Any]]],
+    value_fn,
+) -> list[float]:
+    values: list[float] = []
+    for rows in grouped.values():
+        weighted_values = [
+            (value, max(_sample_count(row), 0))
+            for row in rows
+            if (value := _float_or_none(value_fn(row))) is not None
+        ]
+        total_weight = sum(weight for _, weight in weighted_values)
+        if total_weight > 0:
+            values.append(
+                sum(value * weight for value, weight in weighted_values)
+                / total_weight
+            )
+    return values
+
+
 def _solve_rates(
     grouped: dict[tuple[str, str], list[dict[str, Any]]],
     rollouts_per_example: int,
@@ -908,7 +936,11 @@ def _solve_rates(
     reward_sums = []
     for rows in grouped.values():
         reward_sums.append(
-            sum(_float_or_none(row.get("reward")) or 0.0 for row in rows)
+            sum(
+                (_float_or_none(row.get("reward")) or 0.0)
+                * max(_sample_count(row), 0)
+                for row in rows
+            )
         )
     solve_none = sum(value == 0.0 for value in reward_sums) / len(reward_sums)
     solve_all = sum(value >= rollouts_per_example for value in reward_sums) / len(
