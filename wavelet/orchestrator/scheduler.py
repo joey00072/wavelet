@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import Callable
 
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
 
 
 from wavelet.orchestrator.schedule import rollout_chunk_examples
@@ -1417,6 +1417,7 @@ class _SchedulerStateMachine:
             self.policy_receiver,
             target_step=target_step,
             loaded_policy_step=self.loaded_policy_step,
+            last_eval_steps=self.last_eval_steps,
         )
         if self.state is not None:
             self.state.set_status("completed", phase="completed")
@@ -1687,6 +1688,7 @@ class _ChunkPublisherStrategy(_SchedulerStateMachine):
             self.policy_receiver,
             target_step=target_step,
             loaded_policy_step=self.loaded_policy_step,
+            last_eval_steps=self.last_eval_steps,
         )
         if self.state is not None:
             self.state.set_status("completed", phase="completed")
@@ -2128,12 +2130,17 @@ class _VerifierPublisherStrategy:
             )
         else:
             _wake_for_colocated_sleep(self.config, self.inference_engine)
+        envs = _select_final_eval_envs(
+            self.config,
+            policy_step=self.loaded_policy_step,
+            last_eval_steps=self.last_eval_steps,
+        )
         await _run_evals_async(
             self.config,
             self.orchestrator,
             policy_step=self.loaded_policy_step,
             rollout_step=target_step,
-            envs=self.config.eval.env,
+            envs=envs,
         )
         _sleep_for_colocated_sleep(self.config, self.inference_engine)
 
@@ -2463,6 +2470,7 @@ def _run_final_evals(
     *,
     target_step: int,
     loaded_policy_step: int | None,
+    last_eval_steps: dict[str, int] | None = None,
 ) -> int | None:
     """Load the final policy when necessary and run configured final evals."""
     if config.eval is None or not config.eval.final_eval:
@@ -2485,15 +2493,40 @@ def _run_final_evals(
         loaded_policy_step = policy.step
     else:
         _wake_for_colocated_sleep(config, inference_engine)
+    envs = _select_final_eval_envs(
+        config,
+        policy_step=loaded_policy_step,
+        last_eval_steps=last_eval_steps,
+    )
     _run_evals(
         config,
         orchestrator,
         policy_step=loaded_policy_step,
         rollout_step=target_step,
-        envs=config.eval.env,
+        envs=envs,
     )
     _sleep_for_colocated_sleep(config, inference_engine)
     return loaded_policy_step
+
+
+def _select_final_eval_envs(
+    config: RLConfig,
+    *,
+    policy_step: int,
+    last_eval_steps: dict[str, int] | None,
+) -> list[RLEvalEnvConfig]:
+    if config.eval is None:
+        return []
+    if last_eval_steps is None:
+        return list(config.eval.env)
+    envs = [
+        env
+        for env in config.eval.env
+        if last_eval_steps.get(env.resolved_name, -1) < policy_step
+    ]
+    for env in envs:
+        last_eval_steps[env.resolved_name] = policy_step
+    return envs
 
 
 def _final_eval_policy_step(config: RLConfig, target_step: int) -> int | None:
