@@ -7,7 +7,6 @@ from pathlib import Path
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-
 REASONING_START = "<start_working_out>"
 REASONING_END = "<end_working_out>"
 SOLUTION_START = "<SOLUTION>"
