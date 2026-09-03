@@ -73,8 +73,8 @@ Use the configured `inference.http.host` and `inference.http.port` or the full
   server. The public RL path uses HTTP serving for continuous batching.
 - `server_backend`: `openai` should expose `/v1/chat/completions/tokens`.
 - `policy_step`: must match the expected trainer export after policy load.
-- `generation_paused`: should be false outside the short, drain-first policy
-  update transaction.
+- `generation_paused`: should be false outside a full-model or collective
+  update. LoRA refreshes are quiesced by the rollout scheduler instead.
 - `policy_adapter_path` or `policy_weight_path`: must point at the intended
   policy snapshot, not an old run.
 - `records_with_inference_logprobs`: should equal `records` for RL generation.

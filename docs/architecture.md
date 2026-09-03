@@ -86,10 +86,11 @@ tensors after inference workers enter the update collective.
 
 HTTP policy refreshes are transactions across all inference replicas. The
 rollout scheduler first blocks new submissions and drains requests already
-admitted. It then pauses generation without clearing the version-salted prefix
-cache, loads and verifies the policy on every replica, and resumes generation
-even when loading fails. Never replace adapter or model weights while a request
-is decoding or enqueue old-version work behind a paused update.
+admitted. LoRA adapters then use vLLM's in-place load directly; a second server
+pause would only repeat the scheduler drain. Full-model and collective updates
+pause generation without clearing the version-salted prefix cache, update every
+replica, and resume even when loading fails. Never replace adapter or model
+weights while a request is decoding.
 
 Only the intended distributed rank writes metadata, stable markers, queue
 events, and final directories. Barriers protect visibility across trainer

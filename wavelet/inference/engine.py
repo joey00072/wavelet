@@ -272,7 +272,10 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         if self._uses_openai_rollouts() and self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name
             payload["load_inplace"] = True
-        responses = self._load_policy_while_generation_paused(payload)
+        if self.config.lora is not None:
+            responses = self._request_all("POST", "/load_policy", payload)
+        else:
+            responses = self._load_policy_while_generation_paused(payload)
         for response in responses:
             if int(response.get("policy_step", -1)) != step:
                 raise RuntimeError(
