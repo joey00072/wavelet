@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.policy_metadata import (
     adapter_artifact_metadata,
@@ -69,7 +67,7 @@ def test_policy_metadata_wraps_precision_contract() -> None:
     assert metadata["precision"]["trainer"]["torch_dtype"] == "float32"
 
 
-def test_adapter_artifact_metadata_identifies_exact_tensor_bytes(tmp_path) -> None:
+def test_adapter_artifact_metadata_records_tensor_size(tmp_path) -> None:
     adapter_dir = tmp_path / "adapter"
     adapter_dir.mkdir()
     tensor_bytes = b"adapter-weights"
@@ -80,5 +78,4 @@ def test_adapter_artifact_metadata_identifies_exact_tensor_bytes(tmp_path) -> No
     assert metadata == {
         "path": "adapter/adapter_model.safetensors",
         "bytes": len(tensor_bytes),
-        "sha256": hashlib.sha256(tensor_bytes).hexdigest(),
     }

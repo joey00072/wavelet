@@ -97,9 +97,9 @@ transfer time in the manifest and queue event log for transfer observability.
 Trainer receivers can also emit queue wait time and payload-byte events when
 they claim filesystem batches.
 Inference policy receivers emit matching wait-time and payload-byte events when
-they observe exported policies. LoRA snapshots include the tensor artifact's
-SHA-256 digest; inference verifies and acknowledges that digest before advancing
-its loaded policy step, and exposes it through `/debug/state`.
+they observe exported policies. LoRA snapshots record the tensor artifact size
+without rereading the file. Inference advances its loaded policy step only after
+every server acknowledges loading the immutable, versioned snapshot.
 
 Process and colocated training require `policy_transfer.export_initial: true`.
 This publishes policy step 0 before rollout generation and prevents the trainer

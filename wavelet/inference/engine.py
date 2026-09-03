@@ -23,7 +23,6 @@ from wavelet.data.rl import (
     rl_examples_from_payload,
     rl_examples_to_payload,
 )
-from wavelet.transport.queue import POLICY_META_FILENAME
 
 
 def openai_sampling_payload(sampling: RLSamplingConfig) -> dict[str, Any]:
@@ -260,7 +259,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         ) from last_error
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
-        artifact_sha256 = self._policy_artifact_sha256(policy_dir)
         if self._uses_openai_rollouts() and self.config.lora is not None:
             policy_dir = self._cache_lora_policy_dir(policy_dir, step=step)
         if (
@@ -271,8 +269,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         ):
             (policy_dir / NCCL_READY_MARKER).touch()
         payload: dict[str, Any] = {"policy_dir": str(policy_dir), "step": step}
-        if artifact_sha256 is not None:
-            payload["artifact_sha256"] = artifact_sha256
         if self._uses_openai_rollouts() and self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name
             payload["load_inplace"] = True
@@ -282,14 +278,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 raise RuntimeError(
                     "vLLM server acknowledged the wrong policy step: "
                     f"expected {step}, received {response.get('policy_step')}."
-                )
-            if (
-                artifact_sha256 is not None
-                and response.get("artifact_sha256") != artifact_sha256
-            ):
-                raise RuntimeError(
-                    "vLLM server did not acknowledge the expected policy artifact "
-                    f"SHA-256 for step {step}."
                 )
         self.policy_step = step
         if self.config.lora is not None:
@@ -317,18 +305,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                     "Inference policy loading also failed to resume every replica: "
                     f"{exc}"
                 )
-
-    @staticmethod
-    def _policy_artifact_sha256(policy_dir: Path) -> str | None:
-        metadata_path = Path(policy_dir) / POLICY_META_FILENAME
-        if not metadata_path.is_file():
-            return None
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        artifact = metadata.get("artifact")
-        if not isinstance(artifact, dict):
-            return None
-        digest = artifact.get("sha256")
-        return digest if isinstance(digest, str) and digest else None
 
     def _default_policy_cache_root(self) -> Path:
         configured = os.environ.get("WAVELET_POLICY_CACHE_DIR")
