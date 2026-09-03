@@ -1,4 +1,4 @@
-# ruff: noqa: E402, F811
+# ruff: noqa: F811
 
 from __future__ import annotations
 
@@ -13,8 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.nn as nn
-from torch import Tensor
+from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import IterableDataset
@@ -53,7 +52,7 @@ def _lora_dtype(dtype: str) -> torch.dtype | None:
 
 
 class BaseTrainer:
-    def __init__(self, config: SFTConfig | "RLConfig") -> None:
+    def __init__(self, config: SFTConfig | RLConfig) -> None:
         self.config = config
         self.tokenizer: PreTrainedTokenizerBase | None = None
         self.model: PreTrainedModel | None = None

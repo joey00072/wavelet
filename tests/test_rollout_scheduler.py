@@ -1,14 +1,15 @@
-import pytest
 from unittest.mock import Mock
+
+import pytest
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.scheduler import (
     IntegratedRolloutScheduler,
     PublishMode,
     _ChunkPublisherStrategy,
-    _SchedulerStateMachine,
     _resume_optimizer_step,
     _reusable_rollout_batch,
+    _SchedulerStateMachine,
     resolve_rollout_schedule,
 )
 from wavelet.orchestrator.sources import RolloutSourceKind

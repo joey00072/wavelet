@@ -90,8 +90,7 @@ def test_skip_warning_patch_still_suppresses_upstream_module_warnings() -> None:
 
 
 def test_pin_memory_patch_controls_both_vllm_import_sites(monkeypatch) -> None:
-    import vllm.lora.lora_model as lora_model
-    import vllm.lora.model_manager as model_manager
+    from vllm.lora import lora_model, model_manager
 
     original_lora = lora_model.is_pin_memory_available
     original_manager = model_manager.is_pin_memory_available
@@ -105,7 +104,7 @@ def test_pin_memory_patch_controls_both_vllm_import_sites(monkeypatch) -> None:
 
 
 def test_tool_parser_patch_silences_upstream_parser_logger(monkeypatch) -> None:
-    import vllm.tool_parsers.hermes_tool_parser as hermes_tool_parser
+    from vllm.tool_parsers import hermes_tool_parser
 
     original_level = hermes_tool_parser.logger.level
     monkeypatch.setattr(hermes_tool_parser.logger, "level", original_level)

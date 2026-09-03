@@ -33,8 +33,8 @@ from wavelet.orchestrator.schedule import required_policy_step
 from wavelet.orchestrator.schedule import (
     target_steps as _target_steps,
 )
-from wavelet.trainer.distributed import barrier
 from wavelet.trainer.ckpt import TrainerState
+from wavelet.trainer.distributed import barrier
 from wavelet.trainer.losses import (
     compute_loss,
     normalization_unit_count,
@@ -835,9 +835,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         training = self.model.training
         self.model.eval()
         try:
-            with torch.no_grad():
-                with disable_adapter():
-                    computed_inference = self._model_logprobs(batch, attention_mask)
+            with torch.no_grad(), disable_adapter():
+                computed_inference = self._model_logprobs(batch, attention_mask)
         finally:
             if training:
                 self.model.train()

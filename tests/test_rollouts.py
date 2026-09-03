@@ -276,7 +276,7 @@ def test_group_reward_token_length_penalty_prefers_short_correct_rollouts() -> N
         ),
     ]
 
-    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+    updated = orchestrator._assign_advantages(records)
 
     assert updated[0].advantage > updated[1].advantage
     assert updated[1].advantage > updated[2].advantage
@@ -301,7 +301,7 @@ def test_group_reward_zero_length_cost_falls_back_to_plain_reward() -> None:
         replace(_example(), reward=0.0, metadata={"group_key": "a"}),
     ]
 
-    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+    updated = orchestrator._assign_advantages(records)
 
     assert [record.advantage for record in updated] == pytest.approx(
         [1 / 3, 1 / 3, -2 / 3]
@@ -315,6 +315,6 @@ def test_native_orchestrator_dispatches_max_rl() -> None:
         replace(_example(), reward=0.0, metadata={"group_key": "a"}),
     ]
 
-    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+    updated = orchestrator._assign_advantages(records)
 
     assert [record.advantage for record in updated] == pytest.approx([1.0, -1.0])

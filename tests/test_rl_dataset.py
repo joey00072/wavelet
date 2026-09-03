@@ -31,7 +31,7 @@ def test_packed_rl_dataset_gives_each_rank_same_micro_batch_count(rank: int) -> 
         data_world_size=4,
     )
 
-    bins = dataset._bins_for_epoch(0)  # noqa: SLF001
+    bins = dataset._bins_for_epoch(0)
 
     assert len(bins) == 2
     assert dataset.micro_batch_count() == 2
@@ -47,7 +47,7 @@ def test_packed_rl_dataset_pads_incomplete_distributed_tail_with_zero_loss() -> 
         data_world_size=4,
     )
 
-    bins = dataset._bins_for_epoch(0)  # noqa: SLF001
+    bins = dataset._bins_for_epoch(0)
 
     assert len(bins) == 2
     assert sum(bins[-1]["loss_mask"]) == 0
@@ -83,7 +83,7 @@ def test_packed_rl_dataset_allows_dummy_only_distributed_ranks() -> None:
         data_world_size=4,
     )
 
-    bins = dataset._bins_for_epoch(0)  # noqa: SLF001
+    bins = dataset._bins_for_epoch(0)
 
     assert len(bins) == 1
     assert sum(bins[0]["loss_mask"]) == 0

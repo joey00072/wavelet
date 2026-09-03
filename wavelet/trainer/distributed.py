@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from functools import cached_property
+
+import torch
 import torch.distributed as dist
 from torch._utils import _get_available_device_type
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-import os
-import torch
-
 
 DEFAULT_DEVICE_TYPE = _get_available_device_type() or "cuda"
 

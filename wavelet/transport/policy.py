@@ -7,7 +7,7 @@ import shutil
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any
@@ -408,7 +408,7 @@ class PolicyExportMixin:
             format_version=1,
             step=export_step,
             kind=kind,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
             extra={"artifact": artifact} if artifact is not None else None,
         )
         (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(metadata))

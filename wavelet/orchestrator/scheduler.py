@@ -1,71 +1,156 @@
-# ruff: noqa: E402, F811
+# ruff: noqa: F811
 
+from collections.abc import Callable
 from dataclasses import dataclass
-
-
 from enum import StrEnum
 
-
-from typing import Callable
-
-
 from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
-
-
-from wavelet.orchestrator.schedule import rollout_chunk_examples
-
-
-from wavelet.orchestrator.sources import RolloutSourceKind, source_kind
 from wavelet.orchestrator.envs import (
-    _ensure_verifier_openai_patches as _ensure_verifier_openai_patches,  # noqa: F401
-    _load_verifiers as _load_verifiers,  # noqa: F401
-    evaluate_env as evaluate_env,  # noqa: F401
-    evaluate_env_async as evaluate_env_async,  # noqa: F401
-    _evaluate_env_async as _evaluate_env_async,  # noqa: F401
-    _run_eval_examples as _run_eval_examples,  # noqa: F401
-    _eval_metrics as _eval_metrics,  # noqa: F401
-    _completion_len as _completion_len,  # noqa: F401
-    _write_eval_rollouts as _write_eval_rollouts,  # noqa: F401
-    _append_eval_metrics as _append_eval_metrics,  # noqa: F401
-    _verifier_client_routes as _verifier_client_routes,  # noqa: F401
-    _verifier_clients as _verifier_clients,  # noqa: F401
-    _verifier_base_urls as _verifier_base_urls,  # noqa: F401
-    _verifier_model as _verifier_model,  # noqa: F401
-    _verifier_extra_env_kwargs as _verifier_extra_env_kwargs,  # noqa: F401
-    _load_cached_env as _load_cached_env,  # noqa: F401
-    _run_all as _run_all,  # noqa: F401
-    _run_complete_record_set as _run_complete_record_set,  # noqa: F401
-    _run_until_target_groups as _run_until_target_groups,  # noqa: F401
-    _run_group as _run_group,  # noqa: F401
-    _env_name as _env_name,  # noqa: F401
-    _stamp_env_name as _stamp_env_name,  # noqa: F401
-    _run_single_rollout as _run_single_rollout,  # noqa: F401
-    _successful_rollout_outputs as _successful_rollout_outputs,  # noqa: F401
-    _assign_completed_group_advantages as _assign_completed_group_advantages,  # noqa: F401
-    _completed_group_outputs as _completed_group_outputs,  # noqa: F401
-    _raise_if_external_rate_limit as _raise_if_external_rate_limit,  # noqa: F401
-    _truncate_error as _truncate_error,  # noqa: F401
-    _assign_group_advantages as _assign_group_advantages,  # noqa: F401
-    _algorithm_record_from_output as _algorithm_record_from_output,  # noqa: F401
-    _has_trainable_advantage as _has_trainable_advantage,  # noqa: F401
-    _is_usable_training_group as _is_usable_training_group,  # noqa: F401
-    _is_complete_training_group as _is_complete_training_group,  # noqa: F401
-    _has_trainable_rollout_record as _has_trainable_rollout_record,  # noqa: F401
-    _mark_zero_advantage_records_metric_only as _mark_zero_advantage_records_metric_only,  # noqa: E501
-    _has_trainable_trajectory as _has_trainable_trajectory,  # noqa: F401
-    _patch_env_response_messages as _patch_env_response_messages,  # noqa: F401
-    _coerce_vf_message as _coerce_vf_message,  # noqa: F401
-    _verifier_example as _verifier_example,  # noqa: F401
-    _sampling_args as _sampling_args,  # noqa: F401
-    _sampling_args_with_cache_salt as _sampling_args_with_cache_salt,  # noqa: F401
-    _assign_rollout_advantages as _assign_rollout_advantages,  # noqa: F401
-    _records_from_output as _records_from_output,  # noqa: F401
-    _output_group_key as _output_group_key,  # noqa: F401
-    _interleave_output as _interleave_output,  # noqa: F401
-    _step_token_segment as _step_token_segment,  # noqa: F401
-    _messages as _messages,  # noqa: F401
-    _mask_prompt_history as _mask_prompt_history,  # noqa: F401
+    _algorithm_record_from_output as _algorithm_record_from_output,
 )
+from wavelet.orchestrator.envs import (
+    _append_eval_metrics as _append_eval_metrics,
+)
+from wavelet.orchestrator.envs import (
+    _assign_completed_group_advantages as _assign_completed_group_advantages,
+)
+from wavelet.orchestrator.envs import (
+    _assign_group_advantages as _assign_group_advantages,
+)
+from wavelet.orchestrator.envs import (
+    _assign_rollout_advantages as _assign_rollout_advantages,
+)
+from wavelet.orchestrator.envs import (
+    _coerce_vf_message as _coerce_vf_message,
+)
+from wavelet.orchestrator.envs import (
+    _completed_group_outputs as _completed_group_outputs,
+)
+from wavelet.orchestrator.envs import (
+    _completion_len as _completion_len,
+)
+from wavelet.orchestrator.envs import (
+    _ensure_verifier_openai_patches as _ensure_verifier_openai_patches,
+)
+from wavelet.orchestrator.envs import (
+    _env_name as _env_name,
+)
+from wavelet.orchestrator.envs import (
+    _eval_metrics as _eval_metrics,
+)
+from wavelet.orchestrator.envs import (
+    _evaluate_env_async as _evaluate_env_async,
+)
+from wavelet.orchestrator.envs import (
+    _has_trainable_advantage as _has_trainable_advantage,
+)
+from wavelet.orchestrator.envs import (
+    _has_trainable_rollout_record as _has_trainable_rollout_record,
+)
+from wavelet.orchestrator.envs import (
+    _has_trainable_trajectory as _has_trainable_trajectory,
+)
+from wavelet.orchestrator.envs import (
+    _interleave_output as _interleave_output,
+)
+from wavelet.orchestrator.envs import (
+    _is_complete_training_group as _is_complete_training_group,
+)
+from wavelet.orchestrator.envs import (
+    _is_usable_training_group as _is_usable_training_group,
+)
+from wavelet.orchestrator.envs import (
+    _load_cached_env as _load_cached_env,
+)
+from wavelet.orchestrator.envs import (
+    _load_verifiers as _load_verifiers,
+)
+from wavelet.orchestrator.envs import (
+    _mark_zero_advantage_records_metric_only as _mark_zero_advantage_records_metric_only,
+)
+from wavelet.orchestrator.envs import (
+    _mask_prompt_history as _mask_prompt_history,
+)
+from wavelet.orchestrator.envs import (
+    _messages as _messages,
+)
+from wavelet.orchestrator.envs import (
+    _output_group_key as _output_group_key,
+)
+from wavelet.orchestrator.envs import (
+    _patch_env_response_messages as _patch_env_response_messages,
+)
+from wavelet.orchestrator.envs import (
+    _raise_if_external_rate_limit as _raise_if_external_rate_limit,
+)
+from wavelet.orchestrator.envs import (
+    _records_from_output as _records_from_output,
+)
+from wavelet.orchestrator.envs import (
+    _run_all as _run_all,
+)
+from wavelet.orchestrator.envs import (
+    _run_complete_record_set as _run_complete_record_set,
+)
+from wavelet.orchestrator.envs import (
+    _run_eval_examples as _run_eval_examples,
+)
+from wavelet.orchestrator.envs import (
+    _run_group as _run_group,
+)
+from wavelet.orchestrator.envs import (
+    _run_single_rollout as _run_single_rollout,
+)
+from wavelet.orchestrator.envs import (
+    _run_until_target_groups as _run_until_target_groups,
+)
+from wavelet.orchestrator.envs import (
+    _sampling_args as _sampling_args,
+)
+from wavelet.orchestrator.envs import (
+    _sampling_args_with_cache_salt as _sampling_args_with_cache_salt,
+)
+from wavelet.orchestrator.envs import (
+    _stamp_env_name as _stamp_env_name,
+)
+from wavelet.orchestrator.envs import (
+    _step_token_segment as _step_token_segment,
+)
+from wavelet.orchestrator.envs import (
+    _successful_rollout_outputs as _successful_rollout_outputs,
+)
+from wavelet.orchestrator.envs import (
+    _truncate_error as _truncate_error,
+)
+from wavelet.orchestrator.envs import (
+    _verifier_base_urls as _verifier_base_urls,
+)
+from wavelet.orchestrator.envs import (
+    _verifier_client_routes as _verifier_client_routes,
+)
+from wavelet.orchestrator.envs import (
+    _verifier_clients as _verifier_clients,
+)
+from wavelet.orchestrator.envs import (
+    _verifier_example as _verifier_example,
+)
+from wavelet.orchestrator.envs import (
+    _verifier_extra_env_kwargs as _verifier_extra_env_kwargs,
+)
+from wavelet.orchestrator.envs import (
+    _verifier_model as _verifier_model,
+)
+from wavelet.orchestrator.envs import (
+    _write_eval_rollouts as _write_eval_rollouts,
+)
+from wavelet.orchestrator.envs import (
+    evaluate_env as evaluate_env,
+)
+from wavelet.orchestrator.envs import (
+    evaluate_env_async as evaluate_env_async,
+)
+from wavelet.orchestrator.schedule import rollout_chunk_examples
+from wavelet.orchestrator.sources import RolloutSourceKind, source_kind
 
 
 class PublishMode(StrEnum):
@@ -129,48 +214,23 @@ def resolve_rollout_schedule(config: RLConfig) -> RolloutSchedule:
 
 
 import asyncio
-
-
 import json
-
-
 import math
-
-
 import random
-
-
 from dataclasses import dataclass, field
-
-
 from pathlib import Path
-
-
 from time import perf_counter
-
-
 from typing import Any
 
-
 from wavelet.data.rl import RLExample, load_rl_records
-
-
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
 )
-
-
 from wavelet.orchestrator.rollouts import RLOrchestrator
-
-
 from wavelet.orchestrator.schedule import (
     rollout_chunk_examples as _rollout_chunk_examples,
 )
-
-
 from wavelet.utils.monitoring import emit_perf
-
-
 from wavelet.utils.pathing import resolve_resume_checkpoint
 
 
@@ -196,26 +256,26 @@ def _resume_optimizer_step(config: RLConfig) -> int:
 
 
 from wavelet.orchestrator.envs import (
-    _load_verifiers,
-    _verifier_clients,
-    _verifier_base_urls,
-    _verifier_model,
-    _verifier_extra_env_kwargs,
-    _load_cached_env,
-    _run_all,
-    _run_group,
-    _env_name,
-    _stamp_env_name,
-    _run_single_rollout,
     _assign_completed_group_advantages,
     _completed_group_outputs,
+    _env_name,
     _has_trainable_rollout_record,
+    _load_cached_env,
+    _load_verifiers,
     _mark_zero_advantage_records_metric_only,
-    _verifier_example,
-    _sampling_args,
     _records_from_output,
+    _run_all,
+    _run_group,
+    _run_single_rollout,
+    _sampling_args,
     _scale_verifier_executors,
+    _stamp_env_name,
     _teardown_cached_verifier_envs,
+    _verifier_base_urls,
+    _verifier_clients,
+    _verifier_example,
+    _verifier_extra_env_kwargs,
+    _verifier_model,
 )
 
 
@@ -959,38 +1019,43 @@ class VerifierRolloutScheduler:
 
 
 import asyncio
-
-
 import json
-
-
 import subprocess
-
-
 import sys
-
-
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-
-
 from dataclasses import dataclass
-
-
 from pathlib import Path
-
-
 from time import perf_counter, sleep
 
-
 from wavelet.configs.rl_config import RLConfig
-
-
 from wavelet.data.rl import RLExample
-
-
 from wavelet.inference.policy import create_policy_inference_engine
-
-
+from wavelet.orchestrator.metrics import log_eval_metrics, log_rollout_metrics
+from wavelet.orchestrator.policy_metadata import policy_metadata
+from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import (
+    chunks_per_step as _chunks_per_step,
+)
+from wavelet.orchestrator.schedule import (
+    policy_step_to_load as _policy_step_to_load,
+)
+from wavelet.orchestrator.schedule import (
+    required_policy_step as _required_policy_step,
+)
+from wavelet.orchestrator.schedule import (
+    rollout_chunk_examples as _rollout_chunk_examples,
+)
+from wavelet.orchestrator.schedule import (
+    rollout_groups_for_chunk as _rollout_groups_for_chunk,
+)
+from wavelet.orchestrator.schedule import (
+    select_due_eval_envs,
+)
+from wavelet.orchestrator.schedule import (
+    target_steps as _target_steps,
+)
+from wavelet.orchestrator.sources import RolloutSourceKind
+from wavelet.orchestrator.state_server import OrchestratorRunState, maybe_state_server
 from wavelet.transport.queue import (
     FileSystemPolicyReceiver,
     FileSystemRolloutSender,
@@ -1000,37 +1065,7 @@ from wavelet.transport.queue import (
     utc_now,
     validate_rollout_manifest,
 )
-
-
-from wavelet.orchestrator.policy_metadata import policy_metadata
-
-
-from wavelet.orchestrator.metrics import log_eval_metrics, log_rollout_metrics
-
-
-from wavelet.orchestrator.rollouts import RLOrchestrator
-
-
-from wavelet.orchestrator.schedule import (
-    chunks_per_step as _chunks_per_step,
-    policy_step_to_load as _policy_step_to_load,
-    required_policy_step as _required_policy_step,
-    rollout_chunk_examples as _rollout_chunk_examples,
-    rollout_groups_for_chunk as _rollout_groups_for_chunk,
-    select_due_eval_envs,
-    target_steps as _target_steps,
-)
-
-
-from wavelet.orchestrator.state_server import OrchestratorRunState, maybe_state_server
-
-
-from wavelet.orchestrator.sources import RolloutSourceKind
-
-
 from wavelet.utils.config import load_config
-
-
 from wavelet.utils.monitoring import emit_perf
 
 

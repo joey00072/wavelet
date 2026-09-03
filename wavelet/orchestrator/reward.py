@@ -9,7 +9,6 @@ from typing import Any
 from wavelet.configs.rl_config import RLRewardConfig
 from wavelet.data.rl import RLExample
 
-
 _NUMBER_RE = re.compile(
     r"[-+]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+)(?:/\d+(?:\.\d+)?)?"
 )

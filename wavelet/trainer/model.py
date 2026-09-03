@@ -582,7 +582,7 @@ def export_model_for_save(
 def unwrap_model(model: nn.Module) -> PreTrainedModel:
     current = model
     while hasattr(current, "module"):
-        current = cast(nn.Module, getattr(current, "module"))
+        current = cast(nn.Module, current.module)
     return cast(PreTrainedModel, current)
 
 

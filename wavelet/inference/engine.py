@@ -1,4 +1,4 @@
-# ruff: noqa: E402, F811
+# ruff: noqa: F811
 
 from __future__ import annotations
 
@@ -7,14 +7,13 @@ import os
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.rl_config import RLSamplingConfig
+from wavelet.configs.rl_config import RLConfig, RLSamplingConfig
 from wavelet.data.rl import (
     RLExample,
     rl_examples_from_payload,
@@ -145,7 +144,7 @@ def logprob_value(value: object) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     if hasattr(value, "logprob"):
-        return float(getattr(value, "logprob"))
+        return float(value.logprob)
     if isinstance(value, dict) and "logprob" in value:
         return float(value["logprob"])
     raise TypeError(f"Unsupported vLLM logprob value: {type(value)!r}")

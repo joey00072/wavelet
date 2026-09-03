@@ -48,7 +48,6 @@ from wavelet.inference.diagnostics import inference_debug_state
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
 
-
 _CONFIG: RLConfig | None = None
 router = APIRouter()
 CONTEXT_FIT_SAFETY_TOKENS = 16
@@ -616,8 +615,7 @@ def _log_lora_add_adapter_perf(
 
 
 def _patch_lora_cpu_pin_memory() -> None:
-    import vllm.lora.lora_model as lora_model
-    import vllm.lora.model_manager as model_manager
+    from vllm.lora import lora_model, model_manager
 
     def pin_memory_unavailable() -> bool:
         return False
@@ -628,7 +626,7 @@ def _patch_lora_cpu_pin_memory() -> None:
 
 def _patch_noisy_tool_parser_errors() -> None:
     try:
-        import vllm.tool_parsers.hermes_tool_parser as hermes_tool_parser
+        from vllm.tool_parsers import hermes_tool_parser
     except ImportError:
         return
 
@@ -1013,7 +1011,7 @@ async def custom_init_app_state(
 
 
 def _patch_build_app() -> None:
-    import vllm.entrypoints.openai.api_server as api_server
+    from vllm.entrypoints.openai import api_server
 
     original_build_app = api_server.build_app
 

@@ -33,7 +33,7 @@ def test_sft_batch_size_is_global_across_distributed_ranks() -> None:
     )
     trainer.world = _world(4)
 
-    trainer._setup_accumulation_steps()  # noqa: SLF001
+    trainer._setup_accumulation_steps()
 
     assert trainer.accumulation_steps == 128
 
@@ -50,7 +50,7 @@ def test_sft_global_batch_must_divide_distributed_micro_batch() -> None:
     trainer.world = _world(4)
 
     with pytest.raises(ValueError, match="global optimizer batch size"):
-        trainer._setup_accumulation_steps()  # noqa: SLF001
+        trainer._setup_accumulation_steps()
 
 
 def test_sft_gradient_clipping_uses_model_wrapper_operation() -> None:
@@ -67,7 +67,7 @@ def test_sft_gradient_clipping_uses_model_wrapper_operation() -> None:
     model = WrappedModel()
     trainer.model = model  # type: ignore[assignment]
 
-    assert trainer._clip_grad_norm() == 1.5  # noqa: SLF001
+    assert trainer._clip_grad_norm() == 1.5
     assert model.max_norm == 0.25
 
 
@@ -82,7 +82,7 @@ def test_rl_batch_size_is_global_across_distributed_ranks() -> None:
     )
     trainer.world = _world(4)
 
-    trainer._setup_accumulation_steps()  # noqa: SLF001
+    trainer._setup_accumulation_steps()
 
     assert trainer.accumulation_steps == 128
 
@@ -103,9 +103,9 @@ def test_rl_batch_size_uses_data_parallel_world_with_tensor_parallel() -> None:
     trainer.world = _world(8)
     trainer.parallel_dims = ParallelDims(tp=4, world_size=8)
 
-    trainer._setup_accumulation_steps()  # noqa: SLF001
+    trainer._setup_accumulation_steps()
 
-    assert trainer._data_partition() == (0, 2)  # noqa: SLF001
+    assert trainer._data_partition() == (0, 2)
     assert trainer.accumulation_steps == 16
 
 
@@ -120,7 +120,7 @@ def test_data_partition_ignores_tensor_parallel_rank() -> None:
     )
     trainer.parallel_dims = ParallelDims(tp=4, world_size=8)
 
-    assert trainer._data_partition() == (1, 2)  # noqa: SLF001
+    assert trainer._data_partition() == (1, 2)
 
 
 def test_tensor_parallel_metrics_count_once_per_data_parallel_group() -> None:
@@ -135,7 +135,7 @@ def test_tensor_parallel_metrics_count_once_per_data_parallel_group() -> None:
             device=torch.device("cpu"),
         )
         trainer.parallel_dims = ParallelDims(tp=4, world_size=8)
-        if trainer._is_data_parallel_metric_leader():  # noqa: SLF001
+        if trainer._is_data_parallel_metric_leader():
             leaders.append(rank)
 
     assert leaders == [0, 4]
@@ -174,7 +174,7 @@ def test_tensor_parallel_metric_sync_does_not_multiply_counts(monkeypatch) -> No
         lambda _payload, src: None,
     )
 
-    synced = trainer._sync_metrics(  # noqa: SLF001
+    synced = trainer._sync_metrics(
         {
             "rollout/count": 256.0,
             "micro_batch/count": 128.0,
@@ -219,4 +219,4 @@ def test_packed_rl_accumulation_counts_dataloader_batches() -> None:
     )
 
     assert trainer.dataset.micro_batch_count() == 4
-    assert trainer._packed_dataloader_batch_count() == 2  # noqa: SLF001
+    assert trainer._packed_dataloader_batch_count() == 2

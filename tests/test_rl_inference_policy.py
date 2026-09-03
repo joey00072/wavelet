@@ -165,11 +165,11 @@ def test_checkpoint_resume_can_force_export_between_intervals() -> None:
         local_world_size=1,
         device=torch.device("cpu"),
     )
-    exporter._export_nccl_policy = Mock(return_value=Path("policy"))  # noqa: SLF001
+    exporter._export_nccl_policy = Mock(return_value=Path("policy"))
 
     assert exporter.export_policy(step=7) is None
     assert exporter.export_policy(step=7, force=True) == Path("policy")
-    exporter._export_nccl_policy.assert_called_once_with(7)  # noqa: SLF001
+    exporter._export_nccl_policy.assert_called_once_with(7)
 
 
 def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
@@ -281,7 +281,7 @@ def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None
     context.last_eval_steps = {}
     context.orchestrator = Mock()
 
-    asyncio.run(context._load_now(5, optimizer_step=5))  # noqa: SLF001
+    asyncio.run(context._load_now(5, optimizer_step=5))
 
     assert calls == [
         ("begin", 0),
@@ -321,7 +321,7 @@ def test_background_policy_refresh_closes_submission_gate_immediately(
     context.state = None
 
     async def run() -> None:
-        context._start_background_load(4)  # noqa: SLF001
+        context._start_background_load(4)
         assert calls == ["begin"]
         await context.pending_policy_update
 

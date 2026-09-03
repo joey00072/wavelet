@@ -1226,12 +1226,12 @@ class RolloutChunkAccumulator:
     accumulated_loss_scale: float = 0.0
     chunk_index: int = 0
     pending_paths: list[Path] = field(default_factory=list)
-    pending_batches: list[RolloutBatch] = field(default_factory=list)  # noqa: F405
+    pending_batches: list[RolloutBatch] = field(default_factory=list)
     pending_rows: int = 0
 
-    def buffer(self, batch: RolloutBatch | Path, rows: int) -> None:  # noqa: F405
+    def buffer(self, batch: RolloutBatch | Path, rows: int) -> None:
         self.chunk_index += 1
-        if isinstance(batch, RolloutBatch):  # noqa: F405
+        if isinstance(batch, RolloutBatch):
             self.pending_paths.append(batch.path)
             self.pending_batches.append(batch)
         else:
@@ -1245,7 +1245,7 @@ class RolloutChunkAccumulator:
 
     def drain_pending_batches(
         self,
-    ) -> tuple[list[Path], list[RolloutBatch], int]:  # noqa: F405
+    ) -> tuple[list[Path], list[RolloutBatch], int]:
         paths = self.pending_paths
         batches = self.pending_batches
         loaded_chunks = len(paths)

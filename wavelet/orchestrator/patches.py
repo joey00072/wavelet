@@ -81,7 +81,7 @@ def monkey_patch_oai_iterable_types() -> None:
 def monkey_patch_chat_completion_logprobs() -> None:
     """Avoid expensive validation of large chat-completion logprob payloads."""
     try:
-        import openai.types.chat.chat_completion as chat_completion
+        from openai.types.chat import chat_completion
         from openai.types.chat.chat_completion import ChatCompletion, Choice
     except ImportError:
         return

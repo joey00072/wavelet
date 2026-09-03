@@ -1399,9 +1399,9 @@ def sample_orchestrator_records(
     all_records = load_rl_records(config.data)
     load_seconds = time.perf_counter() - started_at
     started_at = time.perf_counter()
-    records = orchestrator._select_step_records(  # noqa: SLF001
+    records = orchestrator._select_step_records(
         all_records,
-        seed=orchestrator._step_seed(step=step, retry=retry),  # noqa: SLF001
+        seed=orchestrator._step_seed(step=step, retry=retry),
     )
     select_seconds = time.perf_counter() - started_at
     seconds = load_seconds + select_seconds
@@ -1434,31 +1434,31 @@ def probe_orchestrator(
     timings["load_records"] = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    selected_records = orchestrator._select_step_records(  # noqa: SLF001
+    selected_records = orchestrator._select_step_records(
         all_records,
-        seed=orchestrator._step_seed(step=step, retry=retry),  # noqa: SLF001
+        seed=orchestrator._step_seed(step=step, retry=retry),
     )
     timings["select_records"] = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    scored_records = orchestrator._generate_and_score(  # noqa: SLF001
+    scored_records = orchestrator._generate_and_score(
         selected_records,
         inference_engine=inference_engine,
     )
     timings["generate_score"] = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    trainable_records = orchestrator._filter_zero_advantage_records(scored_records)  # noqa: SLF001
+    trainable_records = orchestrator._filter_zero_advantage_records(scored_records)
     timings["filter_zero_advantage"] = time.perf_counter() - started_at
 
     output_path = None
     if write:
         started_at = time.perf_counter()
-        output_path = str(orchestrator._write_records(trainable_records, step=step))  # noqa: SLF001
+        output_path = str(orchestrator._write_records(trainable_records, step=step))
         timings["write"] = time.perf_counter() - started_at
 
     timings["total"] = sum(timings.values())
-    rows = [orchestrator._serialize_record(record) for record in trainable_records]  # noqa: SLF001
+    rows = [orchestrator._serialize_record(record) for record in trainable_records]
     metrics = rollout_metrics(
         RolloutMetricInputs(
             rows=rows,

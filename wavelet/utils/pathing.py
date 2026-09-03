@@ -4,7 +4,6 @@ import shutil
 from collections.abc import Iterable
 from pathlib import Path
 
-
 STABLE_CHECKPOINT_MARKER = "STABLE"
 OUTPUT_RUN_STATE_MARKERS = (
     "configs",

@@ -932,7 +932,7 @@ def _patch_env_response_messages(vf, env) -> None:
         response = await env_response(*args, **kwargs)
         return [_coerce_vf_message(vf, message) for message in response]
 
-    setattr(env, "env_response", wrapped_env_response)
+    env.env_response = wrapped_env_response
 
 
 def _coerce_vf_message(vf, message: Any):

@@ -6,7 +6,6 @@ from pathlib import Path
 
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizer
 
-
 DEBUG_MODEL_NAME = "debug/tiny-random"
 DEBUG_ROLE_TOKENS = [
     "<|system|>",

@@ -11,9 +11,9 @@ from wavelet.configs.rl_config import (
     GRPOAlgorithmConfig,
     MaxRLAlgorithmConfig,
     PassthroughAlgorithmConfig,
+    RewardAlgorithmConfig,
     RLAlgorithmConfig,
     RLConfig,
-    RewardAlgorithmConfig,
 )
 from wavelet.data.rl_dataset import RLExample
 from wavelet.orchestrator.algorithms import (
@@ -30,7 +30,6 @@ from wavelet.orchestrator.algorithms import (
     uses_group_advantages,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
-
 
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
 
@@ -158,7 +157,7 @@ def test_native_orchestrator_uses_external_algorithm() -> None:
     )
     records = [replace(_example(reward=1.5), metadata={"group_key": "a"})]
 
-    scored = orchestrator._assign_advantages(records)  # noqa: SLF001
+    scored = orchestrator._assign_advantages(records)
 
     assert scored[0].advantage == pytest.approx(3.0)
 

@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-
 TRACE_DIRNAME = "traces"
 TRACE_FILENAME = "trace.jsonl"
 
