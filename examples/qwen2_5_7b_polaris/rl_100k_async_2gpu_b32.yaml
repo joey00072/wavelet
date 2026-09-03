@@ -1,6 +1,6 @@
 model:
   name: "Qwen/Qwen2.5-7B-Instruct"
-  adapter_path: outputs/qwen2_5_7b_polaris_recovery_sft_fresh_lr2e4/adapter
+  adapter_path: outputs/qwen2_5_7b_polaris_recovery_sft/adapter
   torch_dtype: bfloat16
   attn_implementation: flash_attention_2
   load_in_4bit: false

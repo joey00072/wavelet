@@ -172,40 +172,9 @@ def test_moe_reverse_text_sft_uses_int4_moe_qlora_shape() -> None:
     assert config.max_steps == 2
 
 
-def test_polaris_recovery_sft_continues_step208_adapter_for_three_epochs() -> None:
+def test_polaris_recovery_sft_initializes_fresh_lora() -> None:
     config = SFTConfig.model_validate(
         load_yaml(Path("examples/qwen2_5_7b_polaris/sft_recoveries.yaml"))
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_grpo_100k_v2/final_adapter_step-000208/adapter"
-    )
-    assert config.model.load_in_4bit is False
-    assert config.data.batch_size == 8
-    assert config.data.seq_len == 2048
-    assert config.optim.lr == pytest.approx(1e-5)
-    assert config.epochs == 3
-    assert config.max_steps == 117
-
-
-def test_polaris_recovery_sft_plus3_continues_sft_adapter_at_requested_lr() -> None:
-    config = SFTConfig.model_validate(
-        load_yaml(Path("examples/qwen2_5_7b_polaris/sft_recoveries_plus3_lr1e4.yaml"))
-    )
-
-    assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_recovery_sft_step208/adapter"
-    )
-    assert config.model.load_in_4bit is False
-    assert config.data.batch_size == 8
-    assert config.optim.lr == pytest.approx(1e-4)
-    assert config.epochs == 3
-    assert config.max_steps == 117
-
-
-def test_polaris_recovery_fresh_sft_initializes_new_lora_at_requested_lr() -> None:
-    config = SFTConfig.model_validate(
-        load_yaml(Path("examples/qwen2_5_7b_polaris/sft_recoveries_fresh_lr2e4.yaml"))
     )
 
     assert config.model.adapter_path is None
@@ -225,7 +194,7 @@ def test_polaris_async_rl_uses_canonical_two_gpu_batch_shape() -> None:
     )
 
     assert config.model.adapter_path == Path(
-        "outputs/qwen2_5_7b_polaris_recovery_sft_fresh_lr2e4/adapter"
+        "outputs/qwen2_5_7b_polaris_recovery_sft/adapter"
     )
     assert config.model.load_in_4bit is False
     assert config.model.attn_implementation == "flash_attention_2"

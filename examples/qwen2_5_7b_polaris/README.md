@@ -94,56 +94,25 @@ Browse random verified recovery traces with the read-only viewer:
 uv run python examples/qwen2_5_7b_polaris/serve_recoveries.py --port 8781
 ```
 
-Fine-tune the step-208 RL adapter on the 312 verified recovery traces for three
-epochs at learning rate `1e-5`, then evaluate the resulting adapter on all 30
-AIME 2024 problems with eight samples per problem:
+Train a fresh rank-16 LoRA on the verified recovery traces for three epochs at
+learning rate `2e-4`, then evaluate it on all 30 AIME 2024 problems with eight
+samples per problem:
 
 ```bash
 uv run python -m wavelet sft \
   @ examples/qwen2_5_7b_polaris/sft_recoveries.yaml
 uv run python -m wavelet debug preflight \
-  @ examples/qwen2_5_7b_polaris/eval_recovery_sft.yaml --json
+  @ examples/qwen2_5_7b_polaris/eval_sft.yaml --json
 uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/eval_recovery_sft.yaml
+  @ examples/qwen2_5_7b_polaris/eval_sft.yaml
 ```
 
-The SFT config uses full BF16 LoRA, a global batch size of eight, and 117
-optimizer steps (`312 / 8 * 3`). Its 2,048-token training window covers every
-verified trace; AIME evaluation retains the 8,192-token generation window and
-the same strict tagged system prompt and verifier used by the baseline.
+The SFT config uses full BF16 LoRA and a global batch size of eight. Its
+2,048-token training window covers the verified traces; AIME evaluation retains
+the 8,192-token generation window and the same strict tagged system prompt and
+verifier used by `eval_baseline.yaml`.
 
-To continue that resulting adapter for three more epochs at learning rate
-`1e-4`, while preserving the three-epoch output, run:
-
-```bash
-uv run python -m wavelet sft \
-  @ examples/qwen2_5_7b_polaris/sft_recoveries_plus3_lr1e4.yaml
-```
-
-This continuation performs 117 optimizer steps (`312 / 8 * 3`) and writes to
-a separate output directory.
-
-Evaluate the continued adapter on the same AIME 2024 pass@8 setup:
-
-```bash
-uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/eval_recovery_sft_plus3_lr1e4.yaml
-```
-
-For a clean comparison that does not inherit the RL adapter, rerun the base
-model baseline, train a newly initialized LoRA for three epochs at `2e-4`, and
-evaluate it with the identical AIME 2024 settings:
-
-```bash
-uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/eval_baseline_rerun.yaml
-uv run python -m wavelet sft \
-  @ examples/qwen2_5_7b_polaris/sft_recoveries_fresh_lr2e4.yaml
-uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/eval_recovery_sft_fresh_lr2e4.yaml
-```
-
-Start the canonical 100,000-step two-GPU GRPO run from that clean SFT adapter:
+Start the canonical 100,000-step two-GPU GRPO run from that SFT adapter:
 
 ```bash
 uv run python -m wavelet debug preflight \
