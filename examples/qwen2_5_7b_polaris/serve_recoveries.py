@@ -66,7 +66,8 @@ PAGE = """<!doctype html>
       for (const field of fields) document.getElementById(field).textContent = row[field];
       document.getElementById("answer").textContent = row.reference_answer;
       document.getElementById("phrase").textContent = `phrase: ${row.recovery_phrase}`;
-      document.getElementById("cut").textContent = `cut: ${row.cut_newline_from_end}th-last newline`;
+      document.getElementById("cut").textContent =
+        `cut: ${row.cut_mode} at ${row.cut_separator} (character ${row.cut_character_index})`;
       document.getElementById("source").textContent = `source: ${row.source_trace_id}`;
     } catch (error) { document.getElementById("error").textContent = String(error); }
   }
