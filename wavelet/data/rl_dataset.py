@@ -1,25 +1,7 @@
-"""Compatibility wrapper; implementation lives in wavelet.data.rl."""
+"""Compatibility alias for :mod:`wavelet.data.rl`."""
 
-from wavelet.data.rl import (
-    count_nonempty_jsonl_rows as count_nonempty_jsonl_rows,
-    _coerce_advantages as _coerce_advantages,
-    _coerce_optional_sequence as _coerce_optional_sequence,
-    _trim_loss_mask_to_sequence as _trim_loss_mask_to_sequence,
-    _pretokenized_sample as _pretokenized_sample,
-    prepare_rl_sample as prepare_rl_sample,
-    _normalize_rl_record as _normalize_rl_record,
-    load_rl_records as load_rl_records,
-    RLDataset as RLDataset,
-    PackedRLDataset as PackedRLDataset,
-    FakeRLDataset as FakeRLDataset,
-    setup_rl_dataset as setup_rl_dataset,
-    setup_rl_dataloader as setup_rl_dataloader,
-    RLBatch as RLBatch,
-    RLExample as RLExample,
-    RLSample as RLSample,
-    collate_rl_batch as collate_rl_batch,
-    rl_example_from_payload as rl_example_from_payload,
-    rl_example_to_payload as rl_example_to_payload,
-    rl_examples_from_payload as rl_examples_from_payload,
-    rl_examples_to_payload as rl_examples_to_payload,
-)
+import sys
+
+from wavelet.data import rl as _rl
+
+sys.modules[__name__] = _rl

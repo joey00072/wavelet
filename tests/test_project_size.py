@@ -41,18 +41,8 @@ def test_project_size_summarizes_python_complexity(tmp_path: Path) -> None:
     source_dir.mkdir(parents=True)
     source = source_dir / "module.py"
     source.write_text(
-        "\n".join(
-            [
-                "# comment",
-                "",
-                "class Runner:",
-                "    def run(self, flag):",
-                "        if flag:",
-                "            return 1",
-                "        return 0",
-            ]
-        )
-        + "\n",
+        "# comment\n\nclass Runner:\n    def run(self, flag):\n"
+        "        if flag:\n            return 1\n        return 0\n",
         encoding="utf-8",
     )
 

@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import argparse
-import json
-import sys
-from pathlib import Path
-from typing import Any, Literal
 import importlib.util
+import json
 import os
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 from wavelet.configs.config import CustomAlgorithmConfig, RLConfig
 from wavelet.data.rl import RLExample, load_rl_records
@@ -22,8 +22,14 @@ from wavelet.orchestrator.algorithms import build_algorithm
 from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
 from wavelet.orchestrator.placement import (
     device_group_size as _device_group_size,
+)
+from wavelet.orchestrator.placement import (
     device_groups as _as_device_groups,
+)
+from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
+)
+from wavelet.orchestrator.placement import (
     trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -38,7 +44,6 @@ from wavelet.transport.queue import (
     resolve_policy_dir,
     resolve_queue_dir,
 )
-
 
 DEBUG_COMMANDS = {
     "preflight": (
@@ -1321,7 +1326,7 @@ def _quantile(values: list[float], q: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * q)))
     return ordered[index]
 
 
@@ -1352,6 +1357,10 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
     if config.orchestrator.examples_per_step is not None:
         schedule["rollout_chunk_examples"] = rollout_chunk_examples(config)
         schedule["chunks_per_step"] = chunks_per_step(config)
+        schedule["rollouts_per_optimizer_step"] = (
+            config.orchestrator.examples_per_step
+            * (config.orchestrator.rollouts_per_example or 1)
+        )
     return {
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "data": {
@@ -1390,9 +1399,9 @@ def sample_orchestrator_records(
     all_records = load_rl_records(config.data)
     load_seconds = time.perf_counter() - started_at
     started_at = time.perf_counter()
-    records = orchestrator._select_step_records(  # noqa: SLF001
+    records = orchestrator._select_step_records(
         all_records,
-        seed=orchestrator._step_seed(step=step, retry=retry),  # noqa: SLF001
+        seed=orchestrator._step_seed(step=step, retry=retry),
     )
     select_seconds = time.perf_counter() - started_at
     seconds = load_seconds + select_seconds
@@ -1425,31 +1434,31 @@ def probe_orchestrator(
     timings["load_records"] = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    selected_records = orchestrator._select_step_records(  # noqa: SLF001
+    selected_records = orchestrator._select_step_records(
         all_records,
-        seed=orchestrator._step_seed(step=step, retry=retry),  # noqa: SLF001
+        seed=orchestrator._step_seed(step=step, retry=retry),
     )
     timings["select_records"] = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    scored_records = orchestrator._generate_and_score(  # noqa: SLF001
+    scored_records = orchestrator._generate_and_score(
         selected_records,
         inference_engine=inference_engine,
     )
     timings["generate_score"] = time.perf_counter() - started_at
 
     started_at = time.perf_counter()
-    trainable_records = orchestrator._filter_zero_advantage_records(scored_records)  # noqa: SLF001
+    trainable_records = orchestrator._filter_zero_advantage_records(scored_records)
     timings["filter_zero_advantage"] = time.perf_counter() - started_at
 
     output_path = None
     if write:
         started_at = time.perf_counter()
-        output_path = str(orchestrator._write_records(trainable_records, step=step))  # noqa: SLF001
+        output_path = str(orchestrator._write_records(trainable_records, step=step))
         timings["write"] = time.perf_counter() - started_at
 
     timings["total"] = sum(timings.values())
-    rows = [orchestrator._serialize_record(record) for record in trainable_records]  # noqa: SLF001
+    rows = [orchestrator._serialize_record(record) for record in trainable_records]
     metrics = rollout_metrics(
         RolloutMetricInputs(
             rows=rows,
@@ -1521,6 +1530,7 @@ def build_preflight_report(config: RLConfig) -> dict[str, Any]:
         *_port_checks(config),
         *_schedule_checks(config),
         *_algorithm_checks(config),
+        *_attention_backend_checks(config),
         *_low_precision_checks(config),
     ]
     commands: list[dict[str, Any]] = []
@@ -1551,11 +1561,40 @@ def _summary(config: RLConfig) -> dict[str, Any]:
         "orchestrator_enabled": config.orchestrator.enabled,
         "inference_mode": config.inference.mode,
         "inference_backend": config.inference.vllm.server_backend,
+        "trainer_attention": config.model.attn_implementation,
         "policy_transfer": config.policy_transfer.type,
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "target_steps": target_steps(config),
         "low_precision": _low_precision_summary(config),
     }
+
+
+def _attention_backend_checks(config: RLConfig) -> list[PreflightCheck]:
+    attention = config.model.attn_implementation
+    if attention != "flash_attention_2":
+        return [
+            PreflightCheck(
+                name="trainer_attention",
+                status="ok",
+                message=f"Trainer attention implementation is {attention!r}.",
+                details={"attn_implementation": attention},
+            )
+        ]
+
+    available = importlib.util.find_spec("flash_attn") is not None
+    return [
+        PreflightCheck(
+            name="flash_attention_available",
+            status="ok" if available else "error",
+            message=(
+                "FlashAttention 2 is available for the trainer."
+                if available
+                else "model.attn_implementation='flash_attention_2' requires "
+                "flash-attn. Install it with `uv sync --extra flash-attn`."
+            ),
+            details={"attn_implementation": attention},
+        )
+    ]
 
 
 def _low_precision_summary(config: RLConfig) -> dict[str, Any]:
@@ -1572,6 +1611,7 @@ def _low_precision_summary(config: RLConfig) -> dict[str, Any]:
 def _paths(config: RLConfig) -> dict[str, str]:
     return {
         "output_dir": str(config.output_dir),
+        "checkpoint_dir": str(config.checkpoint_output_dir),
         "queue_dir": str(resolve_queue_dir(config.output_dir, config.transport)),
         "policy_dir": str(
             resolve_policy_dir(config.output_dir, config.policy_transfer)
@@ -1583,7 +1623,14 @@ def _paths(config: RLConfig) -> dict[str, str]:
 def _path_checks(config: RLConfig) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
     checks.extend(_data_path_checks(config))
+    checks.extend(_adapter_path_checks(config))
     checks.append(_output_dir_check(config.output_dir, clean=config.clean_output_dir))
+    checks.append(
+        _parent_writable_check(
+            config.checkpoint_output_dir,
+            name="checkpoint_parent_writable",
+        )
+    )
     checks.append(
         _parent_writable_check(
             resolve_queue_dir(config.output_dir, config.transport),
@@ -1597,6 +1644,46 @@ def _path_checks(config: RLConfig) -> list[PreflightCheck]:
         )
     )
     return checks
+
+
+def _adapter_path_checks(config: RLConfig) -> list[PreflightCheck]:
+    adapter_path = config.model.adapter_path
+    if adapter_path is None:
+        return []
+
+    required_files = ("adapter_config.json", "adapter_model.safetensors")
+    missing_files = [
+        filename
+        for filename in required_files
+        if not (adapter_path / filename).is_file()
+    ]
+    removed_by_clean = (
+        config.clean_output_dir
+        and adapter_path.absolute().is_relative_to(config.output_dir.absolute())
+    )
+    valid = adapter_path.is_dir() and not missing_files and not removed_by_clean
+    return [
+        PreflightCheck(
+            name="model_adapter_path",
+            status="ok" if valid else "error",
+            message=(
+                f"Model adapter is ready: {adapter_path}"
+                if valid
+                else (
+                    "clean_output_dir=true would remove model.adapter_path before "
+                    f"launch: {adapter_path}"
+                    if removed_by_clean
+                    else "Model adapter is not a loadable Wavelet LoRA snapshot: "
+                    f"{adapter_path}"
+                )
+            ),
+            details={
+                "path": str(adapter_path),
+                "missing_files": missing_files,
+                "removed_by_clean_output_dir": removed_by_clean,
+            },
+        )
+    ]
 
 
 def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:
@@ -1818,11 +1905,23 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
         )
     ]
     if config.orchestrator.examples_per_step is not None:
+        examples = config.orchestrator.examples_per_step
+        rollouts = config.orchestrator.rollouts_per_example or 1
         checks.append(
             PreflightCheck(
                 name="rollout_chunks",
                 status="ok",
-                message=f"Resolved chunks per optimizer step: {chunks_per_step(config)}",
+                message=(
+                    f"Resolved optimizer batch: {examples} group(s) x {rollouts} "
+                    f"rollout(s) = {examples * rollouts} rollout(s) across "
+                    f"{chunks_per_step(config)} chunk(s)."
+                ),
+                details={
+                    "groups": examples,
+                    "rollouts_per_group": rollouts,
+                    "rollouts": examples * rollouts,
+                    "chunks": chunks_per_step(config),
+                },
             )
         )
     return checks
@@ -1931,22 +2030,28 @@ def _trainer_4bit_checks(config: RLConfig) -> list[PreflightCheck]:
                 "qlora_adapter",
                 lora_enabled,
                 "QLoRA adapter training is enabled.",
-                "model.load_in_4bit=true requires a LoRA config; Wavelet does "
-                "not support full-model 4-bit training.",
+                (
+                    "model.load_in_4bit=true requires a LoRA config; Wavelet does "
+                    "not support full-model 4-bit training."
+                ),
             ),
             (
                 "qlora_fsdp",
                 fsdp_disabled,
                 "FSDP is disabled for QLoRA training.",
-                "QLoRA training uses replicated DDP in Wavelet. Disable "
-                "fsdp.enabled for model.load_in_4bit=true.",
+                (
+                    "QLoRA training uses replicated DDP in Wavelet. Disable "
+                    "fsdp.enabled for model.load_in_4bit=true."
+                ),
             ),
             (
                 "qlora_colocate_sleep",
                 movable,
                 "Launcher mode is compatible with QLoRA.",
-                "QLoRA does not support colocate_sleep yet because bitsandbytes "
-                "4-bit modules cannot be moved between CPU and GPU.",
+                (
+                    "QLoRA does not support colocate_sleep yet because bitsandbytes "
+                    "4-bit modules cannot be moved between CPU and GPU."
+                ),
             ),
         )
     ]

@@ -8,9 +8,8 @@ from contextlib import nullcontext
 
 import psutil
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from torch.autograd.graph import saved_tensors_hooks
-from torch import nn
 from torch.optim import SGD, Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import (
     ConstantLR,

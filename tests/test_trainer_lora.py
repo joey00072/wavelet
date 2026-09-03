@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 import torch
@@ -11,7 +12,9 @@ class _FakePeftModel:
     pass
 
 
-def test_fsdp_lora_snapshot_uses_sharded_lora_gather(monkeypatch, tmp_path: Path) -> None:
+def test_fsdp_lora_snapshot_uses_sharded_lora_gather(
+    monkeypatch, tmp_path: Path
+) -> None:
     wrapped = object()
     unwrapped = _FakePeftModel()
     gathered_state = {"base_model.model.layer.lora_A.weight": torch.ones(1)}
@@ -19,7 +22,7 @@ def test_fsdp_lora_snapshot_uses_sharded_lora_gather(monkeypatch, tmp_path: Path
     calls: dict[str, object] = {}
 
     monkeypatch.setattr(lora_utils, "PeftModel", _FakePeftModel)
-    monkeypatch.setattr(lora_utils, "_unwrap_model", lambda model: unwrapped)
+    monkeypatch.setattr(lora_utils, "unwrap_model", lambda model: unwrapped)
 
     def fake_gather(
         model: object,
@@ -86,7 +89,7 @@ def test_fsdp_lora_gather_preserves_adapter_name_before_peft_filter(
 
 def test_single_lora_guard_rejects_multiple_peft_adapters(monkeypatch) -> None:
     class FakePeftModel:
-        peft_config = {"default": object(), "policy_old": object()}
+        peft_config: ClassVar = {"default": object(), "policy_old": object()}
 
         def active_adapters(self):
             return ["default"]
@@ -102,7 +105,7 @@ def test_fsdp_lora_gather_filters_to_single_adapter(monkeypatch) -> None:
     old = torch.nn.Parameter(torch.full((2, 2), 9.0))
 
     class FakePeftModel:
-        peft_config = {"default": object()}
+        peft_config: ClassVar = {"default": object()}
 
         def active_adapters(self):
             return ["default"]
@@ -133,14 +136,19 @@ def test_fused_lora_parameters_reject_multiple_active_adapters() -> None:
 
 
 def test_saved_lora_keys_strip_nested_fsdp_wrapped_module_segments() -> None:
-    assert lora_utils._strip_fsdp_wrapped_module_segments(
-        "base_model.model.layers.0._fsdp_wrapped_module.mlp.up_proj."
-        "lora_A.weight"
-    ) == "base_model.model.layers.0.mlp.up_proj.lora_A.weight"
-    assert lora_utils._strip_fsdp_wrapped_module_segments(
-        "_fsdp_wrapped_module.base_model.model.layers.0.self_attn.q_proj."
-        "lora_B.weight"
-    ) == "base_model.model.layers.0.self_attn.q_proj.lora_B.weight"
+    assert (
+        lora_utils._strip_fsdp_wrapped_module_segments(
+            "base_model.model.layers.0._fsdp_wrapped_module.mlp.up_proj.lora_A.weight"
+        )
+        == "base_model.model.layers.0.mlp.up_proj.lora_A.weight"
+    )
+    assert (
+        lora_utils._strip_fsdp_wrapped_module_segments(
+            "_fsdp_wrapped_module.base_model.model.layers.0.self_attn.q_proj."
+            "lora_B.weight"
+        )
+        == "base_model.model.layers.0.self_attn.q_proj.lora_B.weight"
+    )
 
 
 def test_hf_tp_lora_gather_dim_follows_parallel_plan() -> None:
@@ -160,21 +168,15 @@ def test_hf_tp_lora_gather_dim_follows_parallel_plan() -> None:
     model = FakeModel()
 
     assert (
-        lora_utils._hf_tp_lora_gather_dim(
-            model, "model.q_proj.lora_B.default.weight"
-        )
+        lora_utils._hf_tp_lora_gather_dim(model, "model.q_proj.lora_B.default.weight")
         == 0
     )
     assert (
-        lora_utils._hf_tp_lora_gather_dim(
-            model, "model.o_proj.lora_A.default.weight"
-        )
+        lora_utils._hf_tp_lora_gather_dim(model, "model.o_proj.lora_A.default.weight")
         == 1
     )
     assert (
-        lora_utils._hf_tp_lora_gather_dim(
-            model, "model.q_proj.lora_A.default.weight"
-        )
+        lora_utils._hf_tp_lora_gather_dim(model, "model.q_proj.lora_A.default.weight")
         is None
     )
 
@@ -216,9 +218,7 @@ def test_hf_tp_lora_gather_uses_tp_mesh_group(monkeypatch) -> None:
     def fake_all_gather_object(gathered, local_state, group=None):
         calls["group"] = group
         gathered[0] = local_state
-        gathered[1] = {
-            "model.q_proj.lora_B.default.weight": torch.full((1, 2), 2.0)
-        }
+        gathered[1] = {"model.q_proj.lora_B.default.weight": torch.full((1, 2), 2.0)}
 
     monkeypatch.setattr(
         lora_utils.torch.distributed,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
 from wavelet.orchestrator.queue import (
     FileSystemPolicyReceiver,
@@ -37,6 +39,25 @@ def test_rollout_receiver_wait_available_skips_missing_step(tmp_path: Path) -> N
 def test_queue_public_imports_are_compatible() -> None:
     assert RolloutBatch.__name__ == "RolloutBatch"
     assert FileSystemPolicyReceiver.__name__ == "FileSystemPolicyReceiver"
+
+
+def test_publish_does_not_mark_batch_stable_when_manifest_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = RLTransportConfig()
+    sender = FileSystemRolloutSender(tmp_path, config)
+    source = _write_source(tmp_path / "source.jsonl", "{}\n")
+
+    def fail_manifest(*_args, **_kwargs) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("wavelet.transport.queue.write_manifest", fail_manifest)
+
+    with pytest.raises(OSError, match="disk full"):
+        sender.publish(source, step=0, optimizer_step=0)
+
+    assert not (tmp_path / "rollouts" / "step-000000" / "STABLE").exists()
 
 
 def test_rollout_receiver_wait_available_advances_past_late_gap(
@@ -101,11 +122,31 @@ def test_publish_with_metadata_writes_manifest(tmp_path: Path) -> None:
     assert events[0].details["transfer_seconds"] >= 0
 
 
+def test_stable_rollout_batch_cannot_be_overwritten(tmp_path: Path) -> None:
+    config = RLTransportConfig(poll_interval_seconds=0.001)
+    sender = FileSystemRolloutSender(tmp_path, config)
+    first = _write_source(tmp_path / "first.jsonl", '{"value": 1}\n')
+    second = _write_source(tmp_path / "second.jsonl", '{"value": 2}\n')
+    batch = sender.publish(first, step=0)
+
+    with pytest.raises(FileExistsError, match="already stable"):
+        sender.publish(second, step=0)
+
+    assert sender.stable_batch(0) == batch
+    assert batch.path.read_text(encoding="utf-8") == '{"value": 1}\n'
+
+
 def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
     config = RLTransportConfig(poll_interval_seconds=0.001)
     sender = FileSystemRolloutSender(tmp_path, config)
     source = _write_source(tmp_path / "rollouts.jsonl", "{}\n")
-    sender.publish(source, step=0)
+    sender.publish(
+        source,
+        step=0,
+        optimizer_step=0,
+        policy_step=0,
+        rows=1,
+    )
     receiver = FileSystemRolloutReceiver(
         tmp_path,
         config,
@@ -120,6 +161,8 @@ def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert len(events) == 1
     assert events[0].kind == "rollout_received"
     assert events[0].queue_step == 0
+    assert events[0].optimizer_step == 0
+    assert events[0].policy_step == 0
     assert events[0].consumer_id == "trainer"
     assert events[0].details is not None
     assert events[0].details["mode"] == "wait"
@@ -131,6 +174,8 @@ def test_rollout_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert trace["subsystem"] == "trainer"
     assert trace["event"] == "rollout_received"
     assert trace["queue_step"] == 0
+    assert trace["optimizer_step"] == 0
+    assert trace["policy_step"] == 0
     assert trace["details"]["consumer_id"] == "trainer"
 
 
@@ -138,7 +183,10 @@ def test_policy_receiver_records_wait_metrics(tmp_path: Path) -> None:
     config = RLPolicyTransferConfig(poll_interval_seconds=0.001)
     policy_dir = tmp_path / "policies" / "step-000000"
     policy_dir.mkdir(parents=True)
-    (policy_dir / "policy.json").write_text("{}", encoding="utf-8")
+    (policy_dir / "policy.json").write_text(
+        json.dumps({"artifact": {"bytes": len(b"weights")}}),
+        encoding="utf-8",
+    )
     (policy_dir / "adapter").mkdir()
     (policy_dir / "adapter" / "adapter_model.safetensors").write_bytes(b"weights")
     (policy_dir / "STABLE").touch()
@@ -159,7 +207,7 @@ def test_policy_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert events[0].consumer_id == "inference"
     assert events[0].details is not None
     assert events[0].details["mode"] == "wait"
-    assert events[0].details["payload_bytes"] >= len(b"weights")
+    assert events[0].details["payload_bytes"] == len(b"weights")
     assert events[0].details["wait_seconds"] >= 0
     trace = json.loads(
         (tmp_path / "traces" / "step-000000.jsonl").read_text(encoding="utf-8")

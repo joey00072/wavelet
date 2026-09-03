@@ -89,9 +89,12 @@ class TrainingDataConfig(BaseModel):
     def validate_source(self):
         if self.batch_size % self.micro_batch_size != 0:
             raise ValueError("batch_size must be divisible by micro_batch_size")
-        if self.hf_subsets is not None and self.hf_splits is not None:
-            if len(self.hf_subsets) != len(self.hf_splits):
-                raise ValueError("hf_subsets and hf_splits must have the same length")
+        if (
+            self.hf_subsets is not None
+            and self.hf_splits is not None
+            and len(self.hf_subsets) != len(self.hf_splits)
+        ):
+            raise ValueError("hf_subsets and hf_splits must have the same length")
         if self.source == "hf" and self.hf_name is None:
             raise ValueError("hf_name is required when data.source='hf'")
         if self.source == "local" and self.hf_name is not None:
@@ -172,7 +175,7 @@ class CheckpointConfig(BaseModel):
     interval: int | None = Field(default=None, ge=1)
     # Counts optimizer steps, not micro-steps.
     resume_step: int | None = None
-    keep_last: int | None = Field(default=None, ge=1)
+    keep_last: int = Field(default=2, ge=1)
     mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
     output_dir: Path | None = Field(default=None)
 
@@ -218,6 +221,7 @@ class SampleLogConfig(BaseModel):
     interval: int = Field(default=10, ge=1)
     sample_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
     max_samples: int | None = Field(default=None, ge=1)
+    keep_last: int = Field(default=256, ge=1)
 
 
 class MonitorConfig(BaseModel):
@@ -257,11 +261,12 @@ class TrainerConfig(BaseModel):
     seed: int = 0
     activation_offloading: ActivationOffloadingConfig | None = None
 
-    @model_validator(mode="after")
-    def resolve_checkpoint_output_dir(self):
+    @property
+    def checkpoint_output_dir(self) -> Path:
+        """Directory containing checkpoint step directories for this run."""
         if self.ckpt is not None and self.ckpt.output_dir is not None:
-            self.output_dir = self.ckpt.output_dir
-        return self
+            return self.ckpt.output_dir
+        return self.output_dir
 
     @model_validator(mode="after")
     def validate_checkpoint_config(self):
@@ -385,7 +390,8 @@ class RLTransportConfig(BaseModel):
     queue_dir: Path | None = None
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
-    cleanup_consumed: bool = False
+    cleanup_consumed: bool = True
+    keep_last_consumed: int = Field(default=2, ge=1)
 
 
 class RLPolicyTransferConfig(BaseModel):
@@ -395,8 +401,12 @@ class RLPolicyTransferConfig(BaseModel):
     adapter_id: int = Field(default=1, ge=1)
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
-    export_initial: bool = False
+    export_initial: bool = True
     export_every_steps: int = Field(default=1, ge=1)
+    # Policy snapshots are transport artifacts, not checkpoints. Keep the
+    # active version and its predecessor so a lagging filesystem load cannot
+    # lose its source while the next version is published.
+    keep_last: int = Field(default=2, ge=2)
     lightweight_lora: bool = True
     nccl_host: str = "127.0.0.1"
     nccl_port: int = Field(default=29501, ge=1, le=65535)
@@ -490,6 +500,7 @@ class RLEvalConfig(BaseModel):
     max_retries: int = Field(default=0, ge=0)
     eval_base_model: bool = True
     final_eval: bool = True
+    keep_last_rollout_sets: int = Field(default=2, ge=1)
 
     @model_validator(mode="after")
     def resolve_env_defaults(self) -> "RLEvalConfig":
@@ -756,9 +767,12 @@ def _normalize_algorithm_config(value: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(value)
     if "algo" in normalized:
         algo = normalized["algo"]
-        if isinstance(algo, dict) and "type" not in algo:
-            if "file" in algo or "algorithm" in algo:
-                normalized["algo"] = {"type": "custom", **algo}
+        if (
+            isinstance(algo, dict)
+            and "type" not in algo
+            and ("file" in algo or "algorithm" in algo)
+        ):
+            normalized["algo"] = {"type": "custom", **algo}
         return normalized
 
     orchestrator = normalized.get("orchestrator")
@@ -812,6 +826,116 @@ class RLConfig(TrainerConfig):
             raise ValueError(
                 "reward.mode must score generated completions when inference.mode "
                 "generates rollouts."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_train_sampling_replay(self) -> "RLConfig":
+        if (
+            not self.orchestrator.enabled
+            or not self.inference.enabled
+            or self.inference.mode != "vllm_http"
+        ):
+            return self
+
+        sampling = self.inference.sampling
+        unsupported: list[str] = []
+        if sampling.top_p < 1.0:
+            unsupported.append("top_p")
+        if sampling.top_k > 0:
+            unsupported.append("top_k")
+        if sampling.min_p > 0.0:
+            unsupported.append("min_p")
+        if sampling.min_tokens > 0:
+            unsupported.append("min_tokens")
+        if sampling.repetition_penalty != 1.0:
+            unsupported.append("repetition_penalty")
+        distribution_overrides = {
+            "frequency_penalty",
+            "logit_bias",
+            "min_p",
+            "min_tokens",
+            "presence_penalty",
+            "repetition_penalty",
+            "seed",
+            "temperature",
+            "top_k",
+            "top_p",
+        }
+        unsupported.extend(
+            f"extra_body.{field}"
+            for field in sorted(distribution_overrides & sampling.extra_body.keys())
+        )
+        if unsupported:
+            fields = ", ".join(unsupported)
+            raise ValueError(
+                "RL train sampling changes the token distribution with "
+                f"{fields}, but Wavelet does not yet replay those transforms in "
+                "the trainer. Use top_p=1, top_k=-1, min_p=0, min_tokens=0, "
+                "repetition_penalty=1, and keep distribution controls out of "
+                "extra_body for correct importance ratios."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_group_sampling_diversity(self) -> "RLConfig":
+        if (
+            not self.orchestrator.enabled
+            or not self.inference.enabled
+            or self.max_steps == 0
+            or not isinstance(self.algo, (GRPOAlgorithmConfig, MaxRLAlgorithmConfig))
+            or (self.orchestrator.rollouts_per_example or 1) <= 1
+        ):
+            return self
+
+        sampling = self.inference.sampling
+        deterministic: list[str] = []
+        if not sampling.do_sample:
+            deterministic.append("do_sample=false")
+        if sampling.temperature <= 0:
+            deterministic.append("temperature=0")
+        if sampling.seed is not None:
+            deterministic.append("a fixed sampling seed")
+        if deterministic:
+            settings = ", ".join(deterministic)
+            raise ValueError(
+                "Group-relative RL needs diverse rollouts, but the configured "
+                f"sampling can repeat each completion ({settings}). Use "
+                "do_sample=true, temperature>0, and sampling.seed=null; data.seed "
+                "still provides deterministic task ordering."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_online_sampling_temperature(self) -> "RLConfig":
+        if (
+            not self.orchestrator.enabled
+            or not self.inference.enabled
+            or self.max_steps == 0
+        ):
+            return self
+
+        sampling = self.inference.sampling
+        if sampling.do_sample and sampling.temperature > 0:
+            return self
+        raise ValueError(
+            "Online RL requires stochastic sampling with a positive temperature "
+            "so behavior log-probabilities can be replayed by the trainer. Use "
+            "do_sample=true and temperature>0, or set max_steps=0 for evaluation."
+        )
+
+    @model_validator(mode="after")
+    def validate_initial_policy_for_process_training(self) -> "RLConfig":
+        if (
+            self.orchestrator.enabled
+            and self.launcher.mode != "integrated"
+            and (self.max_steps is None or self.max_steps > 0)
+            and not self.policy_transfer.export_initial
+        ):
+            raise ValueError(
+                "Process and colocated RL training require "
+                "policy_transfer.export_initial=true so rollout step 0 can load "
+                "the trainer's initial policy."
             )
         return self
 

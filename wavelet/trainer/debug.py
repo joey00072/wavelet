@@ -3,9 +3,9 @@ from __future__ import annotations
 import json
 import string
 from pathlib import Path
+from typing import ClassVar
 
 from transformers import GPT2Config, GPT2LMHeadModel, PreTrainedTokenizer
-
 
 DEBUG_MODEL_NAME = "debug/tiny-random"
 DEBUG_ROLE_TOKENS = [
@@ -24,7 +24,7 @@ def _debug_vocab_tokens() -> list[str]:
 
 
 class DebugTokenizer(PreTrainedTokenizer):
-    model_input_names = ["input_ids", "attention_mask"]
+    model_input_names: ClassVar[list[str]] = ["input_ids", "attention_mask"]
 
     def __init__(self, *, model_max_length: int = 256) -> None:
         tokens = _debug_vocab_tokens()

@@ -1,4 +1,4 @@
-# ruff: noqa: E402, F811
+# ruff: noqa: F811
 
 from __future__ import annotations
 
@@ -13,11 +13,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-import torch.nn as nn
-from torch import Tensor
+from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import IterableDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
@@ -52,7 +52,7 @@ def _lora_dtype(dtype: str) -> torch.dtype | None:
 
 
 class BaseTrainer:
-    def __init__(self, config: SFTConfig | "RLConfig") -> None:
+    def __init__(self, config: SFTConfig | RLConfig) -> None:
         self.config = config
         self.tokenizer: PreTrainedTokenizerBase | None = None
         self.model: PreTrainedModel | None = None
@@ -97,11 +97,22 @@ class BaseTrainer:
     def _after_resume(self) -> None:
         pass
 
+    def _validate_resume_state(self, state: TrainerState) -> None:
+        if state.micro_step != state.step * self.accumulation_steps:
+            raise ValueError(
+                "Checkpoint micro_step does not match the expected optimizer-step "
+                "boundary for this trainer configuration."
+            )
+
+    def _checkpoint_dataloader(self) -> StatefulDataLoader | None:
+        return self.dataloader
+
     def _setup_run(self) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         config = self.config.monitor
         self.monitor = RunMonitor(
             output_dir=self.output_dir,
+            checkpoint_dir=self.config.checkpoint_output_dir,
             enabled=config.enabled,
             write_events=config.write_events,
             write_metrics_jsonl=config.write_metrics_jsonl,
@@ -110,6 +121,7 @@ class BaseTrainer:
             write_heartbeat=config.write_heartbeat,
             log_cuda_memory=config.log_cuda_memory,
             log_disk_usage=config.log_disk_usage,
+            sample_history_size=config.samples.keep_last,
             wandb=config.wandb,
         )
         assert self.model is not None
@@ -120,23 +132,19 @@ class BaseTrainer:
             self.optimizer,
             self.scheduler,
             self.config.ckpt,
-            self.output_dir,
+            self.config.checkpoint_output_dir,
             self.world,
         )
         if self.config.ckpt is not None and self.config.ckpt.resume_step is not None:
             self.resume_checkpoint_dir = resolve_resume_checkpoint(
-                self.output_dir,
+                self.config.checkpoint_output_dir,
                 self.config.ckpt.resume_step,
             )
             state = self.ckpt_manager.load(
                 self.resume_checkpoint_dir,
-                dataloader=self.dataloader,
+                dataloader=self._checkpoint_dataloader(),
             )
-            if state.micro_step != state.step * self.accumulation_steps:
-                raise ValueError(
-                    "Checkpoint micro_step does not match the expected optimizer-step "
-                    "boundary for this trainer configuration."
-                )
+            self._validate_resume_state(state)
             self.step = state.step
             self._micro_step = state.micro_step
             self._after_resume()
@@ -158,7 +166,7 @@ class BaseTrainer:
             torch.cuda.manual_seed_all(seed)
 
     def train(self) -> None:
-        self.train_until(self.config.max_steps or 1000, finish_run=True)
+        self.train_until(self._compute_total_steps(), finish_run=True)
 
     def train_until(self, target_step: int, *, finish_run: bool = False) -> None:
         self._validate_ready()
@@ -225,15 +233,13 @@ class BaseTrainer:
                     timeout=timedelta(minutes=30),
                 )
             else:
-                rendezvous_file = tempfile.NamedTemporaryFile(
-                    prefix="wavelet-dist-",
-                    suffix=".init",
-                    delete=False,
-                )
-                rendezvous_file.close()
+                with tempfile.NamedTemporaryFile(
+                    prefix="wavelet-dist-", suffix=".init", delete=False
+                ) as rendezvous_file:
+                    rendezvous_path = rendezvous_file.name
                 torch.distributed.init_process_group(
                     backend=backend,
-                    init_method=f"file://{rendezvous_file.name}",
+                    init_method=f"file://{rendezvous_path}",
                     rank=0,
                     world_size=1,
                     timeout=timedelta(minutes=30),
@@ -303,10 +309,11 @@ class BaseTrainer:
 
     def _setup_model_standard(self) -> None:
         from wavelet.trainer.model import (
+            apply_liger_kernel,
             apply_lora,
             prepare_hf_tp_lora_for_training,
+            setup_model,
         )
-        from wavelet.trainer.model import apply_liger_kernel, setup_model
 
         # Apply Liger kernel patches before from_pretrained so the class methods
         # are in place when model weights are loaded.
@@ -483,8 +490,8 @@ class BaseTrainer:
         return self.world.rank % ranks_per_pipeline_stage
 
     def _setup_optimizer(self) -> None:
-        from wavelet.trainer.optim import setup_optimizer
         from wavelet.trainer.model import enforce_single_lora_adapter
+        from wavelet.trainer.optim import setup_optimizer
 
         if not self.model:
             raise RuntimeError("Model must be set up before optimizer")
@@ -568,7 +575,7 @@ class BaseTrainer:
         self.ckpt_manager.poll_pending_save()
         did_save = self.ckpt_manager.save(
             TrainerState(step=self.step, micro_step=self._micro_step),
-            dataloader=self.dataloader,
+            dataloader=self._checkpoint_dataloader(),
         )
         if did_save:
             self.monitor.log_event(
@@ -599,6 +606,31 @@ class BaseTrainer:
         if isinstance(clipped, Tensor):
             return float(clipped.detach().item())
         return float(clipped)
+
+    def _require_finite_loss(self, loss: Tensor, *, label: str) -> None:
+        """Abort every rank together when any rank observes a non-finite loss."""
+        local_finite = bool(torch.isfinite(loss.detach()).all().item())
+        all_finite = local_finite
+        if torch.distributed.is_initialized():
+            finite_flag = torch.tensor(
+                int(local_finite),
+                dtype=torch.int32,
+                device=loss.device,
+            )
+            torch.distributed.all_reduce(
+                finite_flag,
+                op=torch.distributed.ReduceOp.MIN,
+            )
+            all_finite = bool(finite_flag.item())
+        if all_finite:
+            return
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+        location = "this rank" if not local_finite else "another rank"
+        raise FloatingPointError(
+            f"Non-finite {label} detected on {location} at optimizer step "
+            f"{self.step}; aborting before backward to keep ranks synchronized."
+        )
 
     def _save_model(self) -> None:
         if self.world is None or self.model is None or self.tokenizer is None:
@@ -688,16 +720,7 @@ class SFTTrainer(BaseTrainer):
                 loss_output = self.compute_loss(outputs.logits, batch["labels"])
             loss = loss_output.loss
 
-            if torch.isnan(loss):
-                logger.warning(f"NaN loss at step {self.step}, skipping backward")
-                self._micro_step += 1
-                return TrainOutput(
-                    loss=loss_output,
-                    stepped=False,
-                    step=self.step,
-                    micro_step=self._micro_step,
-                    skipped=True,
-                )
+            self._require_finite_loss(loss, label="SFT loss")
 
             (loss / self.accumulation_steps).backward()
 
@@ -806,10 +829,14 @@ def main(argv: list[str] | None = None) -> int:
             config.output_dir,
             resuming=resuming,
             clean=config.clean_output_dir,
+            protected_paths=(config.model.adapter_path,),
         )
         if resuming:
             assert config.ckpt is not None
-            resolve_resume_checkpoint(config.output_dir, config.ckpt.resume_step)
+            resolve_resume_checkpoint(
+                config.checkpoint_output_dir,
+                config.ckpt.resume_step,
+            )
         dump_yaml(
             config_path,
             config.model_dump(mode="json", exclude_none=True),

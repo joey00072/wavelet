@@ -18,9 +18,7 @@ def _record(response: str, expected: str = "439") -> RLExample:
 def test_math_reward_keeps_wrong_formatted_answer_near_zero() -> None:
     scorer = RLRewardScorer(RLRewardConfig(mode="math_format"))
 
-    reward = scorer.score(
-        _record("<end_working_out><SOLUTION>3062</SOLUTION>")
-    )
+    reward = scorer.score(_record("<end_working_out><SOLUTION>3062</SOLUTION>"))
 
     assert reward == 0.05
 
@@ -28,9 +26,7 @@ def test_math_reward_keeps_wrong_formatted_answer_near_zero() -> None:
 def test_math_reward_gives_full_credit_for_exact_formatted_answer() -> None:
     scorer = RLRewardScorer(RLRewardConfig(mode="math_format"))
 
-    reward = scorer.score(
-        _record("<end_working_out><SOLUTION>439</SOLUTION>")
-    )
+    reward = scorer.score(_record("<end_working_out><SOLUTION>439</SOLUTION>"))
 
     assert reward == 1.0
 
@@ -46,9 +42,7 @@ def test_math_reward_can_extract_boxed_answer_without_tags() -> None:
 def test_math_reward_gives_limited_partial_credit_for_close_number() -> None:
     scorer = RLRewardScorer(RLRewardConfig(mode="math_format"))
 
-    reward = scorer.score(
-        _record("<end_working_out><SOLUTION>440</SOLUTION>")
-    )
+    reward = scorer.score(_record("<end_working_out><SOLUTION>440</SOLUTION>"))
 
     assert reward == 0.39999999999999997
 

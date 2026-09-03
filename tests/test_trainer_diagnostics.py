@@ -81,7 +81,9 @@ def test_trainer_debug_inspect_outputs_json(tmp_path: Path, capsys) -> None:
     )
 
     assert (
-        debug_main(["trainer", "inspect", "--rollout-path", str(rollout_path), "--json"])
+        debug_main(
+            ["trainer", "inspect", "--rollout-path", str(rollout_path), "--json"]
+        )
         == 0
     )
 
@@ -119,7 +121,9 @@ def test_export_rollout_token_debug_writes_compact_jsonl(tmp_path: Path) -> None
         write_path=write_path,
     )
 
-    rows = [json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()]
+    rows = [
+        json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert report["ok"] is True
     assert report["rows_exported"] == 1
     assert rows[0]["example_id"] == "ex-1"
@@ -160,7 +164,9 @@ def test_trainer_debug_tokens_writes_export(tmp_path: Path, capsys) -> None:
     )
 
     report = json.loads(capsys.readouterr().out)
-    rows = [json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()]
+    rows = [
+        json.loads(line) for line in write_path.read_text(encoding="utf-8").splitlines()
+    ]
     assert report["rows_exported"] == 1
     assert rows[0]["trainable_target_ids"] == [3]
 

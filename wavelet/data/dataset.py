@@ -1,8 +1,7 @@
-"""Compatibility wrapper; implementation lives in wavelet.data.sft."""
+"""Compatibility alias for :mod:`wavelet.data.sft`."""
 
-from wavelet.data.sft import (
-    Batch as Batch,
-    SFTDataset as SFTDataset,
-    CatDataset as CatDataset,
-    setup_dataset as setup_dataset,
-)
+import sys
+
+from wavelet.data import sft as _sft
+
+sys.modules[__name__] = _sft

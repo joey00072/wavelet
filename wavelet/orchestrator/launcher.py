@@ -11,7 +11,6 @@ from typing import Any, TextIO
 
 from wavelet.configs.rl_config import RLConfig
 
-
 _TERMINATE_TIMEOUT_SECONDS = 10.0
 
 
@@ -78,7 +77,7 @@ def _run_role_subprocess(
     cuda_visible_devices: str | None,
     torchrun_nproc_per_node: int = 1,
 ) -> int:
-    with Path(log_path).open("w", encoding="utf-8") as log_file:
+    with Path(log_path).open("a", encoding="utf-8") as log_file:
         command_args = _role_command(
             command,
             config_path,
@@ -100,7 +99,7 @@ def _start_local_role(
     *,
     output_dir: Path,
 ) -> tuple[subprocess.Popen, TextIO]:
-    log_file = _log_path(output_dir, spec.log_name).open("w", encoding="utf-8")
+    log_file = _log_path(output_dir, spec.log_name).open("a", encoding="utf-8")
     process = subprocess.Popen(
         _role_command(
             spec.command,
@@ -170,6 +169,9 @@ class LocalRoleLauncher:
         process, log_file = _start_local_role(spec, output_dir=self.output_dir)
         return LocalRoleHandle(spec, process, log_file)
 
+    def close(self) -> None:
+        return None
+
 
 class RayRoleLauncher:
     def __init__(self, config: RLConfig) -> None:
@@ -200,6 +202,9 @@ class RayRoleLauncher:
             torchrun_nproc_per_node=spec.torchrun_nproc_per_node,
         )
         return RayRoleHandle(spec, ref, self.ray, log_path)
+
+    def close(self) -> None:
+        self.ray.shutdown()
 
 
 RoleHandle = LocalRoleHandle | RayRoleHandle

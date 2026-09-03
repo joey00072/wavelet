@@ -18,8 +18,10 @@ agent-readable map of workflows, diagnostics, and repository guidance.
   collation contracts
 - Run preflight checks before expensive RL launches:
   `uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
+  This also validates local training data and required LoRA adapter artifacts.
   The report includes low-precision checks for QLoRA and vLLM quantized
-  inference settings.
+  inference settings. Config loading rejects duplicate YAML keys instead of
+  silently accepting the last value.
 - [Inference diagnostics](docs/inference.skill.md): model serving, policy loading,
   logprobs, and throughput checks
 - [Orchestrator diagnostics](docs/orchestrator.skill.md): scheduling, rollout,
@@ -43,6 +45,12 @@ Run the SFT warmup:
 ```bash
 uv run python -m wavelet sft @ examples/unsloth_math/sft.yaml
 ```
+
+To continue training an existing LoRA, set `model.adapter_path` to its adapter
+directory. Wavelet uses tokenizer artifacts from that directory when present
+and otherwise falls back to the tokenizer named by `model.name`.
+Keep that adapter outside a new run's `output_dir` when `clean_output_dir: true`;
+preflight rejects layouts where cleanup would delete the input adapter.
 
 Run the RL example:
 
@@ -79,6 +87,10 @@ The RL stack is now split into minimal but scalable pieces:
 - `wavelet rl`: convenience launcher; set `launcher.mode: process` to supervise
   `rl-trainer` and `rl-inference` as separate subprocesses
 
+Role logs append under `<output_dir>/logs/`, so a resume attempt preserves the
+trace from the process that produced its checkpoint. Ray-backed launchers
+disconnect from Ray during teardown after their role handles are closed.
+
 The transport is intentionally simple and durable: each batch is written under
 `<output_dir>/rollouts/step-000000/rollouts.jsonl` with an atomic stable marker.
 When rollout metadata is enabled, each batch also records payload size and
@@ -86,7 +98,113 @@ transfer time in the manifest and queue event log for transfer observability.
 Trainer receivers can also emit queue wait time and payload-byte events when
 they claim filesystem batches.
 Inference policy receivers emit matching wait-time and payload-byte events when
-they observe exported policies.
+they observe exported policies. LoRA snapshots record the tensor artifact size
+without rereading the file. Inference advances its loaded policy step only after
+every server acknowledges loading the immutable, versioned snapshot.
+
+Process and colocated training require `policy_transfer.export_initial: true`.
+Filesystem policy exports are transient transport artifacts: Wavelet keeps the
+current and previous snapshot by default and requires `keep_last >= 2`. Use
+trainer checkpoints, not policy exports, for durable resume history.
+Consumed rollout queues likewise retain the latest two batches by default.
+Increase `transport.keep_last_consumed` for a larger reward-hacking audit
+window; do not disable cleanup for long runs.
+Checkpoint and evaluation-rollout retention also default to the latest two
+sets when those features are enabled. Metrics and traces remain the compact
+long-term record.
+Sample logging retains a rolling window of 256 rows by default
+(`monitor.samples.keep_last`) and compacts it in batches, so enabling rollout
+examples cannot grow `samples.jsonl` without bound during a long run.
+This publishes policy step 0 before rollout generation and prevents the trainer
+and inference scheduler from waiting on each other at startup.
+
+Checkpoint resume is absolute-step based. Both trainer and process-mode rollout
+scheduler restart from the resolved checkpoint optimizer step; streaming modes
+convert that step to the corresponding queue-chunk offset. Completed runs wait
+for a pending async checkpoint to become stable before process teardown. A
+restored trainer also forces one policy export at the checkpoint step, even when
+that step is between normal export intervals.
+Set `ckpt.output_dir` to place large checkpoint step directories on a separate
+volume without moving logs, rollouts, policies, or other run state out of the
+top-level `output_dir`. Resume and preflight resolve the same checkpoint volume.
+Trainer metrics report byte counts and free-space ratios for both the run and
+checkpoint filesystems, including when either configured directory has not yet
+been created.
+Run-directory cleanup refuses to start when it would delete the configured
+input adapter, even if the launch skips the optional preflight command.
+SFT examples longer than `data.seq_len` train on the available assistant-token
+prefix; an end-of-sequence token is required in the rendered sample, but it need
+not fit inside the truncated context window.
+Concatenative SFT packing checkpoints both the source-row position and its
+unconsumed token remainder, so resuming does not skip tokens already read into a
+partially filled packed sequence.
+Static packed-RL checkpoints likewise persist the next packed-bin cursor rather
+than replaying the current epoch from its first bin.
+
+With `orchestrator.filter_zero_advantage: true`, the persistent verifier
+scheduler resamples zero-signal groups until `examples_per_step` admitted groups
+are available. Rejected groups remain visible in scheduler diagnostics but do
+not silently occupy most of an optimizer batch as zero-loss rows.
+Finite verifier training datasets are traversed once per epoch instead of
+sampled with replacement. `data.shuffle: true` uses a deterministic permutation
+for each epoch; sampler cursor and epoch are included in generation metrics.
+Synchronous and native rollout paths apply the same full-group-count invariant;
+a single surviving group cannot silently stand in for a requested batch, and
+native groups must contain exactly the configured rollout count.
+The orchestrator separately logs `generation/reward/mean`, group admission,
+and generated solve-rate metrics before filtering. Use those raw generation
+metrics to judge policy progress; reward on admitted mixed groups is
+selection-biased by design.
+Fresh schedulers initialize evaluation from an unevaluated state, so
+`eval_base_model: true` records policy step 0 before interval evaluations and
+provides the fixed baseline used by the progress chart. Resumed schedulers use
+persisted `eval_metrics.jsonl` policy steps as their evaluation cursor. Missing
+eval records remain due instead of being inferred from the checkpoint step.
+Final evaluation reuses an interval result from the same policy rather than
+generating an identical benchmark twice. Before a required final evaluation,
+the persistent scheduler cancels speculative rollout requests that can no
+longer be consumed, then loads and evaluates the final policy in isolation.
+Verifier thread and math-process pools scale to the scheduler's real in-flight
+request high-water mark, which is logged as `generation/executor_concurrency`.
+When `max_pending_rollout_chunks` is set, that queue-derived capacity is a hard
+in-flight bound; `oversampling_factor` does not multiply it a second time.
+`max_inflight_rollouts` is also an exact request ceiling. These explicit bounds
+may intentionally leave inference client routes idle rather than exceed the
+configured memory budget.
+Cached verifier environments and registered executors are torn down when the
+inference scheduler closes. Integrated runs also close the inference engine and
+verifier resources on both success and failure before finalizing trainer state.
+Secret-valued config fields are redacted before resolved configuration reaches
+run metadata, the state API, or W&B; token-count and tokenizer fields remain
+visible for debugging.
+
+Trainers consume queue batches in exact queue order. Every batch manifest must
+agree with its queue step, optimizer step, chunk index, row count, and configured
+policy-freshness window before any tokens are trained.
+Online RL requires stochastic sampling with a positive temperature, and the data
+boundary rejects non-finite advantages, rewards, policy log-probabilities, and
+temperatures as well as non-positive temperatures before model execution.
+Integrated generation also records the policy version loaded by its inference
+engine in every rollout manifest.
+Persistent verifier requests retain the policy version used at dispatch; mixed
+async chunks are labeled with their oldest contributing policy, and incomplete
+groups are never refilled from a newer policy.
+Checkpoint resume reuses an existing stable rollout only after the same manifest
+checks pass. A stable queue directory is immutable and cannot be overwritten by
+a racing producer.
+Queue receive, claim, and consume events retain the originating optimizer and
+policy steps so policy lag remains traceable through the full lifecycle.
+Temporary files used to merge small streaming chunks are deleted after all
+trainer ranks finish reading them; retained consumed queue batches remain the
+auditable rollout source.
+
+RL loss normalization is optimizer-batch exact for variable-length examples.
+When dataloader workers prevent deterministic look-ahead, the trainer sums raw
+microbatch losses and applies the measured global token or sequence denominator
+once at the optimizer boundary.
+If any distributed rank observes a non-finite loss, all ranks abort before
+backward and accumulated gradients are cleared; the trainer never silently
+skips a microbatch into a later optimizer update.
 
 Implementation ownership is similarly explicit: `wavelet.transport` owns queue
 and policy transfer, `wavelet.orchestrator.scheduler` owns rollout scheduling,
@@ -107,3 +225,30 @@ That command will:
 1. Generate math rollouts from `outputs/unsloth_math_data/rl_train.jsonl`
 2. Train a LoRA-adapted policy from the generated rollout batches
 3. Save the resulting adapter under `outputs/unsloth_math_rl/adapter`
+
+Training rollouts currently use full-distribution sampling (`top_p: 1`,
+`top_k: -1`, `min_p: 0`, `min_tokens: 0`, and `repetition_penalty: 1`).
+Wavelet rejects truncated, stop-suppressed, or penalty-adjusted training
+sampling—including distribution controls hidden in `extra_body`—because the
+trainer cannot yet replay those transforms when computing importance ratios.
+Missing sampled-token
+logprobs and pre-tokenized source streams with misaligned response-side values
+are rejected instead of being trimmed or replaced with synthetic values.
+Legitimate context-tail truncation keeps the aligned prefix. Evaluation sampling
+is unaffected by this restriction.
+Verifier advantages are computed inside each dispatched rollout group, so
+duplicate dataset `example_id` values cannot merge otherwise independent GRPO
+comparisons. The internal dispatch-group identity is retained through rollout
+metadata, complete-group admission, and per-problem rollout metrics; interleaved
+rows are summarized against their own group rather than their file position,
+and extra trajectory branches do not count as additional rollouts.
+
+Evaluation `avg@k` and `pass@k` metrics count every requested generation;
+failed or missing-reward attempts count as incorrect instead of disappearing from
+the denominator. Corresponding `eval/<env>/effective/...` metrics describe only
+successful verifier responses, and `failed_rollouts` reports the failure rate.
+The orchestrator writes these fixed-policy metrics to `eval_metrics.jsonl` and
+its W&B run at the matching optimizer step.
+Standalone trainers use the same resolved step count for optimization and the
+learning-rate scheduler; in particular, RL `max_steps: 0` remains evaluation-only
+instead of falling back to an implicit training run.

@@ -1,33 +1,49 @@
 from __future__ import annotations
 
-import json
 import csv
+import json
 import logging
+import math
 import os
 import random
 import shutil
 from collections import defaultdict
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
+from statistics import mean, pstdev
+from typing import Any
 
 import torch
 
 from wavelet.configs.config import RLConfig, WandbConfig
-from wavelet.trainer.distributed import World, get_world
 from wavelet.orchestrator.rollout_metadata import (
     metadata_harness_name,
     metadata_task_name,
 )
 from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
-from collections import deque
-from collections.abc import Iterable, Iterator
-from pathlib import Path
-from statistics import mean, pstdev
-from typing import Any
+from wavelet.trainer.distributed import World, get_world
 
-
-_SECRET_KEY_PARTS = ("api_key", "token", "secret", "password")
+_SECRET_KEYS = {
+    "api_key",
+    "access_token",
+    "auth_token",
+    "credentials",
+    "password",
+    "secret",
+    "token",
+}
+_SECRET_KEY_SUFFIXES = (
+    "_api_key",
+    "_access_token",
+    "_auth_token",
+    "_password",
+    "_secret",
+    "_token",
+)
 logger = logging.getLogger(__name__)
+_TAIL_READ_BLOCK_BYTES = 64 * 1024
 
 
 def _state_timestamp() -> str:
@@ -61,6 +77,14 @@ def append_jsonl(
         handle.write(json.dumps(row, sort_keys=sort_keys) + "\n")
 
 
+def _replace_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    temporary.replace(path)
+
+
 def tail_jsonl(
     path: Path,
     *,
@@ -70,9 +94,7 @@ def tail_jsonl(
     """Return the last dictionary records and the number of malformed rows."""
     if limit <= 0 or not path.exists():
         return [], 0
-    lines: deque[str] = deque(maxlen=limit)
-    with path.open("r", encoding="utf-8") as handle:
-        lines.extend(line for line in handle if line.strip())
+    lines = _tail_nonempty_lines(path, limit=limit)
 
     rows: list[dict[str, Any]] = []
     parse_errors = 0
@@ -91,6 +113,32 @@ def tail_jsonl(
     return rows, parse_errors
 
 
+def _tail_nonempty_lines(path: Path, *, limit: int) -> list[str]:
+    selected: list[bytes] = []
+    buffered = b""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        while position > 0 and len(selected) < limit:
+            read_size = min(position, _TAIL_READ_BLOCK_BYTES)
+            position -= read_size
+            handle.seek(position)
+            buffered = handle.read(read_size) + buffered
+            parts = buffered.split(b"\n")
+            if position > 0:
+                buffered = parts[0]
+                parts = parts[1:]
+            else:
+                buffered = b""
+            for line in reversed(parts):
+                if not line.strip():
+                    continue
+                selected.append(line)
+                if len(selected) == limit:
+                    break
+    return [line.decode("utf-8") for line in reversed(selected)]
+
+
 def tail_jsonl_rows(path: Path, *, limit: int) -> list[dict[str, Any]]:
     """Return only valid tail records for state and UI endpoints."""
     return tail_jsonl(path, limit=limit)[0]
@@ -100,16 +148,17 @@ def redact(value: Any) -> Any:
     """Recursively redact values whose keys look credential-bearing."""
     if isinstance(value, dict):
         return {
-            key: (
-                "<redacted>"
-                if any(part in str(key).lower() for part in _SECRET_KEY_PARTS)
-                else redact(item)
-            )
+            key: ("<redacted>" if _is_secret_key(key) else redact(item))
             for key, item in value.items()
         }
     if isinstance(value, list):
         return [redact(item) for item in value]
     return value
+
+
+def _is_secret_key(key: object) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    return normalized in _SECRET_KEYS or normalized.endswith(_SECRET_KEY_SUFFIXES)
 
 
 def series_stats(
@@ -218,6 +267,7 @@ class RunMonitor:
         self,
         output_dir: Path,
         *,
+        checkpoint_dir: Path | None = None,
         enabled: bool = True,
         write_events: bool = True,
         write_metrics_jsonl: bool = True,
@@ -226,9 +276,13 @@ class RunMonitor:
         write_heartbeat: bool = True,
         log_cuda_memory: bool = True,
         log_disk_usage: bool = True,
+        sample_history_size: int = 256,
         wandb: WandbConfig | None = None,
     ) -> None:
+        if sample_history_size < 1:
+            raise ValueError("sample_history_size must be at least 1.")
         self.output_dir = output_dir
+        self.checkpoint_dir = checkpoint_dir
         self.enabled = enabled
         self.write_events = write_events
         self.write_metrics_jsonl = write_metrics_jsonl
@@ -237,6 +291,7 @@ class RunMonitor:
         self.write_heartbeat = write_heartbeat
         self.log_cuda_memory = log_cuda_memory
         self.log_disk_usage = log_disk_usage
+        self.sample_history_size = sample_history_size
         self.wandb = wandb or WandbConfig()
         self.metrics_file = output_dir / "metrics.jsonl"
         self.csv_file = output_dir / "metrics.csv"
@@ -247,6 +302,7 @@ class RunMonitor:
         self._wandb_run: Any | None = None
         self._wandb_samples_table: Any | None = None
         self._wandb_samples_columns: list[str] = []
+        self._sample_rows_since_compaction: int | None = None
 
     def start_run(
         self,
@@ -259,6 +315,7 @@ class RunMonitor:
             return
         self.output_dir.mkdir(parents=True, exist_ok=True)
         world = world or get_world()
+        safe_run_config = redact(run_config)
 
         if self.write_run_metadata:
             metadata = {
@@ -273,11 +330,11 @@ class RunMonitor:
                     "device": str(world.device),
                 },
                 "resumed_from": resumed_from,
-                "config": run_config,
+                "config": safe_run_config,
             }
             self.run_metadata_file.write_text(json.dumps(metadata, indent=2))
 
-        self._init_wandb(run_config, resumed_from)
+        self._init_wandb(safe_run_config, resumed_from)
         event = "run_resumed" if resumed_from is not None else "run_started"
         self.log_event(event, payload={"resumed_from": resumed_from})
         self._write_heartbeat(status="running", step=None)
@@ -326,11 +383,8 @@ class RunMonitor:
             return
 
         timestamp = self._timestamp()
-        for sample in samples:
-            append_jsonl(
-                self.samples_file,
-                {"timestamp": timestamp, "step": step, **sample},
-            )
+        rows = [{"timestamp": timestamp, "step": step, **sample} for sample in samples]
+        self._append_sample_history(rows)
 
         if self._wandb_run is None:
             return
@@ -352,6 +406,30 @@ class RunMonitor:
                 *[step if column == "step" else sample[column] for column in columns]
             )
         self._wandb_run.log({"samples": self._wandb_samples_table}, step=step)
+
+    def _append_sample_history(self, rows: list[dict[str, Any]]) -> None:
+        if self._sample_rows_since_compaction is None:
+            retained = tail_jsonl_rows(
+                self.samples_file,
+                limit=self.sample_history_size,
+            )
+            _replace_jsonl(
+                self.samples_file,
+                [*retained, *rows][-self.sample_history_size :],
+            )
+            self._sample_rows_since_compaction = 0
+            return
+
+        for row in rows:
+            append_jsonl(self.samples_file, row)
+        self._sample_rows_since_compaction += len(rows)
+        if self._sample_rows_since_compaction < self.sample_history_size:
+            return
+        _replace_jsonl(
+            self.samples_file,
+            tail_jsonl_rows(self.samples_file, limit=self.sample_history_size),
+        )
+        self._sample_rows_since_compaction = 0
 
     def finish(
         self,
@@ -395,12 +473,28 @@ class RunMonitor:
         }
 
     def _disk_metrics(self) -> dict[str, Any]:
-        usage = shutil.disk_usage(self.output_dir)
-        return {
+        usage = shutil.disk_usage(_existing_path(self.output_dir))
+        metrics: dict[str, Any] = {
             "disk_total_bytes": usage.total,
             "disk_used_bytes": usage.used,
             "disk_free_bytes": usage.free,
+            "disk_free_ratio": usage.free / usage.total if usage.total else 0.0,
         }
+        if self.checkpoint_dir is not None:
+            checkpoint_usage = shutil.disk_usage(_existing_path(self.checkpoint_dir))
+            metrics.update(
+                {
+                    "checkpoint_disk_total_bytes": checkpoint_usage.total,
+                    "checkpoint_disk_used_bytes": checkpoint_usage.used,
+                    "checkpoint_disk_free_bytes": checkpoint_usage.free,
+                    "checkpoint_disk_free_ratio": (
+                        checkpoint_usage.free / checkpoint_usage.total
+                        if checkpoint_usage.total
+                        else 0.0
+                    ),
+                }
+            )
+        return metrics
 
     def _write_heartbeat(
         self,
@@ -430,16 +524,16 @@ class RunMonitor:
             return
         import wandb
 
-        init_kwargs = dict(
-            project=self.wandb.project or "wavelet",
-            entity=self.wandb.entity,
-            name=self.wandb.name,
-            group=self.wandb.group,
-            tags=self.wandb.tags,
-            dir=str(self.output_dir),
-            config=run_config,
-            resume="allow" if resumed_from is not None else None,
-        )
+        init_kwargs = {
+            "project": self.wandb.project or "wavelet",
+            "entity": self.wandb.entity,
+            "name": self.wandb.name,
+            "group": self.wandb.group,
+            "tags": self.wandb.tags,
+            "dir": str(self.output_dir),
+            "config": run_config,
+            "resume": "allow" if resumed_from is not None else None,
+        }
         settings_factory = getattr(wandb, "Settings", None)
         if callable(settings_factory):
             init_kwargs["settings"] = settings_factory(
@@ -450,7 +544,7 @@ class RunMonitor:
         except Exception:
             if self.wandb.mode != "online" or not self.wandb.offline_fallback:
                 raise
-            logging.warning(
+            logger.warning(
                 "W&B online initialization failed; falling back to offline W&B "
                 "logging in %s.",
                 self.output_dir,
@@ -481,7 +575,15 @@ class RunMonitor:
         return aliases
 
     def _timestamp(self) -> str:
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(UTC).isoformat()
+
+
+def _existing_path(path: Path) -> Path:
+    """Return the nearest existing path whose filesystem contains ``path``."""
+    cursor = path
+    while not cursor.exists() and cursor != cursor.parent:
+        cursor = cursor.parent
+    return cursor
 
 
 def setup_logger(name: str, level: str = "info") -> Any:
@@ -505,6 +607,7 @@ class RolloutMetricInputs:
     optimizer_step: int | None = None
     chunk_index: int | None = None
     timings: dict[str, float] | None = None
+    extra_metrics: dict[str, float] | None = None
 
 
 def log_rollout_metrics(
@@ -517,6 +620,7 @@ def log_rollout_metrics(
     optimizer_step: int | None = None,
     chunk_index: int | None = None,
     timings: dict[str, float] | None = None,
+    extra_metrics: dict[str, float] | None = None,
 ) -> dict[str, float]:
     rows = read_jsonl(path)
     metrics = rollout_metrics(
@@ -529,6 +633,7 @@ def log_rollout_metrics(
             optimizer_step=optimizer_step,
             chunk_index=chunk_index,
             timings=timings,
+            extra_metrics=extra_metrics,
         )
     )
     _append_metrics(config.output_dir, metrics, step=step)
@@ -543,6 +648,30 @@ def log_rollout_metrics(
     )
     _wandb_log(config, metrics, step=step)
     return metrics
+
+
+def log_eval_metrics(
+    config: RLConfig,
+    metrics: dict[str, float],
+    *,
+    step: int,
+    policy_step: int,
+) -> None:
+    """Publish fixed-policy evaluation metrics to the orchestrator monitor."""
+    _wandb_log(config, metrics, step=step)
+    append_trace_event_best_effort(
+        config.output_dir,
+        make_trace_event(
+            subsystem="orchestrator",
+            event="eval_metrics_logged",
+            step=step,
+            optimizer_step=step,
+            policy_step=policy_step,
+            details={
+                key: value for key, value in metrics.items() if key.startswith("eval/")
+            },
+        ),
+    )
 
 
 def _append_rollout_trace(
@@ -601,9 +730,6 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         for seq_len, decode_len in zip(seq_lens, decode_lens, strict=True)
     ]
     advantages = [_float_or_none(row.get("advantage")) for row in rows]
-    is_truncated = [_bool_metric(_metadata(row).get("is_truncated")) for row in rows]
-    sample_counts = [_sample_count(row) for row in rows]
-    turn_counts = [_turn_count(row) for row in rows]
     metrics: dict[str, float] = {
         "progress/tokens": float(sum(seq_lens)),
         "progress/prefill_tokens": float(sum(prefill_lens)),
@@ -628,16 +754,24 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     if inputs.chunk_index is not None:
         metrics["progress/chunk_index"] = float(inputs.chunk_index)
 
-    for name, values, include_min in (
-        ("prefill_len", prefill_lens, True),
-        ("is_truncated", is_truncated, False),
-        ("samples_per_rollout", sample_counts, True),
-        ("num_turns", turn_counts, True),
+    for name, value_fn, include_min in (
+        (
+            "prefill_len",
+            lambda row: max(_seq_len(row) - _decode_len(row), 0),
+            True,
+        ),
+        (
+            "is_truncated",
+            lambda row: _bool_metric(_metadata(row).get("is_truncated")),
+            False,
+        ),
+        ("samples_per_rollout", _sample_count, True),
+        ("num_turns", _turn_count, True),
     ):
         metrics.update(
             series_stats(
                 f"{name}/all",
-                _grouped_means_from_values(grouped, values),
+                _grouped_means(grouped, value_fn),
                 include_min=include_min,
             )
         )
@@ -659,6 +793,17 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     if inputs.timings:
         for key, value in inputs.timings.items():
             metrics[f"time/{key}"] = float(value)
+
+    if inputs.extra_metrics:
+        duplicate_keys = metrics.keys() & inputs.extra_metrics.keys()
+        if duplicate_keys:
+            duplicates = ", ".join(sorted(duplicate_keys))
+            raise ValueError(
+                f"Extra rollout metrics replace core metrics: {duplicates}"
+            )
+        metrics.update(
+            {key: float(value) for key, value in inputs.extra_metrics.items()}
+        )
 
     return metrics
 
@@ -693,11 +838,19 @@ def _add_group_metrics(
     for name, value_fn in (
         ("seq_len", _seq_len),
         ("decode_len", _decode_len),
-        ("reward", lambda row: _float_or_none(row.get("reward"))),
     ):
         metrics.update(
             series_stats(f"{name}/{suffix}", _grouped_means(grouped, value_fn))
         )
+    metrics.update(
+        series_stats(
+            f"reward/{suffix}",
+            _grouped_rollout_means(
+                grouped,
+                lambda row: _float_or_none(row.get("reward")),
+            ),
+        )
+    )
     solve_none, solve_all, effective = _solve_rates(grouped, rollouts_per_example)
     metrics.update(
         {
@@ -732,7 +885,7 @@ def _add_stop_condition_metrics(
 def _append_metrics(output_dir: Path, metrics: dict[str, float], *, step: int) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     row = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "step": step,
         **metrics,
     }
@@ -788,12 +941,12 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
                 tags=wandb_config.tags,
                 mode=wandb_config.mode,
                 dir=str(config.output_dir),
-                config=config.model_dump(mode="json"),
+                config=redact(config.model_dump(mode="json")),
             )
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")
         _WANDB_RUN.log({**metrics, "step": step}, step=step)
-    except Exception as exc:  # pragma: no cover - diagnostics must not kill training
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
 
 
@@ -804,7 +957,7 @@ def _group_by_example(
     for row in rows:
         env_name = str(row.get("env_name") or row.get("source") or "all")
         example_id = str(
-            row.get("example_id") or _metadata(row).get("group_key") or len(grouped)
+            _metadata(row).get("group_key") or row.get("example_id") or len(grouped)
         )
         grouped[(env_name, example_id)].append(row)
     return dict(grouped)
@@ -830,19 +983,23 @@ def _grouped_means(
     return values
 
 
-def _grouped_means_from_values(
+def _grouped_rollout_means(
     grouped: dict[tuple[str, str], list[dict[str, Any]]],
-    values: list[float | int | bool | None],
+    value_fn,
 ) -> list[float]:
-    by_key: dict[tuple[str, str], list[float]] = defaultdict(list)
-    row_index = 0
-    for key, rows in grouped.items():
-        for _ in rows:
-            value = _float_or_none(values[row_index])
-            if value is not None:
-                by_key[key].append(value)
-            row_index += 1
-    return [float(mean(items)) for items in by_key.values() if items]
+    values: list[float] = []
+    for rows in grouped.values():
+        weighted_values = [
+            (value, max(_sample_count(row), 0))
+            for row in rows
+            if (value := _float_or_none(value_fn(row))) is not None
+        ]
+        total_weight = sum(weight for _, weight in weighted_values)
+        if total_weight > 0:
+            values.append(
+                sum(value * weight for value, weight in weighted_values) / total_weight
+            )
+    return values
 
 
 def _solve_rates(
@@ -854,7 +1011,10 @@ def _solve_rates(
     reward_sums = []
     for rows in grouped.values():
         reward_sums.append(
-            sum(_float_or_none(row.get("reward")) or 0.0 for row in rows)
+            sum(
+                (_float_or_none(row.get("reward")) or 0.0) * max(_sample_count(row), 0)
+                for row in rows
+            )
         )
     solve_none = sum(value == 0.0 for value in reward_sums) / len(reward_sums)
     solve_all = sum(value >= rollouts_per_example for value in reward_sums) / len(
@@ -1019,7 +1179,7 @@ def _numeric(row: dict[str, Any], key: str) -> float | None:
         numeric = float(value)
     except (TypeError, ValueError):
         return None
-    if numeric != numeric:
+    if math.isnan(numeric):
         return None
     return numeric
 

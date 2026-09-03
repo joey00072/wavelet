@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from unittest.mock import Mock
+
+import pytest
 import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import ModelConfig
+from wavelet.data.rl_dataset import RLDataset, RLExample
 from wavelet.distributed.world import World
 from wavelet.trainer import model as model_utils
+from wavelet.trainer.ckpt import TrainerState
 from wavelet.trainer.model import _fsdp_mixed_precision
 from wavelet.trainer.rl_trainer import (
     RLTrainer,
@@ -81,19 +86,19 @@ def test_packed_reward_mean_is_weighted_by_rollout_count() -> None:
     rewards = torch.tensor([0.0, 1.0])
     sample_counts = torch.tensor([1, 3])
 
-    assert trainer._reward_mean(rewards, sample_counts=sample_counts) == 0.75  # noqa: SLF001
+    assert trainer._reward_mean(rewards, sample_counts=sample_counts) == 0.75
 
 
 def test_rollout_reward_metric_is_weighted_by_rollout_count() -> None:
     trainer = RLTrainer(RLConfig())
 
-    metrics = trainer._aggregate_rollout_metrics(  # noqa: SLF001
+    metrics = trainer._aggregate_rollout_metrics(
         [
             {"reward/all/mean": 0.0, "rollout/count": 1.0},
             {"reward/all/mean": 1.0, "rollout/count": 3.0},
         ]
     )
-    metrics = trainer._finalize_synced_metrics(metrics)  # noqa: SLF001
+    metrics = trainer._finalize_synced_metrics(metrics)
 
     assert metrics["reward/all/mean"] == 0.75
     assert metrics["reward_mean"] == 0.75
@@ -106,11 +111,193 @@ def test_gradient_accumulation_loss_scale_divides_grads_once() -> None:
     model = torch.nn.Linear(2, 1, bias=False)
     model.weight.grad = torch.tensor([[6.0, 12.0]])
     trainer.model = model
-    trainer._gradient_accumulation_loss_scale = 6.0  # noqa: SLF001
+    trainer._gradient_accumulation_loss_scale = 6.0
 
-    trainer._apply_gradient_accumulation_loss_scale()  # noqa: SLF001
+    trainer._apply_gradient_accumulation_loss_scale()
 
     assert torch.allclose(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+
+
+def test_dynamic_loss_scale_normalizes_accumulated_raw_gradients() -> None:
+    trainer = RLTrainer(RLConfig(data={"num_workers": 1}, max_grad_norm=0.0))
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    trainer._optimizer_batch_loss_scale = None
+    trainer._dynamic_loss_scale_local = 6.0
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[6.0, 12.0]])
+    trainer.model = model
+    trainer.optimizer = Mock()
+    trainer.scheduler = Mock()
+
+    trainer._apply_optimizer_step()
+
+    assert torch.allclose(model.weight.grad, torch.tensor([[1.0, 2.0]]))
+    assert trainer._dynamic_loss_scale_local == 0.0
+
+
+def test_dynamic_loss_backward_accumulates_sums_before_final_scaling() -> None:
+    trainer = RLTrainer(RLConfig(data={"num_workers": 1}))
+    trainer.accumulation_steps = 2
+    trainer._optimizer_batch_loss_scale = None
+    loss = torch.tensor(6.0, requires_grad=True)
+
+    trainer._backward_rl_loss(loss)
+
+    assert loss.grad is not None
+    assert loss.grad.item() == pytest.approx(1.0)
+
+
+def test_standalone_rl_train_honors_zero_max_steps() -> None:
+    trainer = RLTrainer(RLConfig(max_steps=0))
+    trainer.train_until = Mock()
+
+    trainer.train()
+
+    trainer.train_until.assert_called_once_with(0, finish_run=True)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_loss_aborts_and_clears_accumulated_gradients(value) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.optimizer = Mock()
+
+    with pytest.raises(FloatingPointError, match="Non-finite RL loss"):
+        trainer._require_finite_loss(
+            torch.tensor(value),
+            label="RL loss",
+        )
+
+    trainer.optimizer.zero_grad.assert_called_once_with(set_to_none=True)
+
+
+def test_remote_nonfinite_loss_aborts_before_backward(monkeypatch) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.optimizer = Mock()
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def mark_remote_failure(flag, *, op) -> None:
+        assert op == torch.distributed.ReduceOp.MIN
+        flag.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", mark_remote_failure)
+
+    with pytest.raises(FloatingPointError, match="another rank"):
+        trainer._require_finite_loss(
+            torch.tensor(1.0),
+            label="RL loss",
+        )
+
+
+def test_finalize_waits_for_pending_async_checkpoint(monkeypatch) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.monitor = Mock()
+    trainer.ckpt_manager = Mock()
+    monkeypatch.setattr(trainer, "_save_model", Mock())
+
+    trainer.finalize(status="completed")
+
+    trainer.ckpt_manager.wait_for_pending_save.assert_called_once_with()
+
+
+def test_orchestrated_rl_resume_accepts_dynamic_micro_step_count() -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.accumulation_steps = 2
+
+    trainer._validate_resume_state(TrainerState(step=100, micro_step=1600))
+
+
+def test_orchestrated_rl_checkpoint_excludes_transient_dataloader() -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.dataloader = object()
+
+    assert trainer._checkpoint_dataloader() is None
+
+
+def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch() -> None:
+    config = RLConfig(data={"batch_size": 32, "micro_batch_size": 16, "seq_len": 8})
+    trainer = RLTrainer(config)
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    trainer.accumulation_steps = 2
+    trainer.dataset = RLDataset(
+        records=[
+            RLExample(
+                prompt=[],
+                completion=[],
+                advantage=1.0,
+                reward=1.0,
+                input_ids=[1, 2],
+                target_ids=[2, 3],
+                loss_mask=[True, True],
+                inference_logprobs=[-1.0, -1.0],
+                temperatures=[1.0, 1.0],
+            )
+            for _ in range(32)
+        ],
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config.data,
+    )
+
+    assert trainer._estimate_optimizer_batch_loss_scale() == 64.0
+
+
+def test_loss_scale_uses_global_token_mean_for_averaged_dp_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        local_world_size=2,
+        device=torch.device("cpu"),
+    )
+    dp_group = object()
+
+    class _Mesh:
+        def get_group(self) -> object:
+            return dp_group
+
+    class _ParallelDims:
+        dp_replicate = 1
+        dp_shard = 2
+        cp = 1
+        tp = 1
+        ep = 1
+
+        def get_mesh(self, name: str) -> _Mesh:
+            assert name == "dp"
+            return _Mesh()
+
+    trainer.parallel_dims = _ParallelDims()  # type: ignore[assignment]
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def fake_all_reduce(
+        tensor: torch.Tensor,
+        *,
+        op: object,
+        group: object,
+    ) -> None:
+        assert op == torch.distributed.ReduceOp.SUM
+        assert group is dp_group
+        tensor.add_(8.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    assert trainer._average_data_parallel_loss_scale(4.0) == 6.0
 
 
 def test_packed_flash_attention_uses_varlen_position_ids() -> None:
@@ -163,7 +350,7 @@ def test_model_logprobs_uses_fp32_for_bfloat16_logits() -> None:
     model = _LogitModel(logits)
     trainer.model = model  # type: ignore[assignment]
 
-    actual = trainer._model_logprobs(  # noqa: SLF001
+    actual = trainer._model_logprobs(
         {
             "input_ids": targets,
             "position_ids": targets,
@@ -197,7 +384,7 @@ def test_model_logprobs_casts_chunked_output_to_fp32() -> None:
     model = _LogprobModel(logprobs)
     trainer.model = model  # type: ignore[assignment]
 
-    actual = trainer._model_logprobs(  # noqa: SLF001
+    actual = trainer._model_logprobs(
         {
             "input_ids": torch.ones((2, 3), dtype=torch.long),
             "position_ids": torch.ones((2, 3), dtype=torch.long),
@@ -219,7 +406,7 @@ def test_float32_fsdp_config_uses_bfloat16_params_and_float32_reduce(
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
-    policy = _fsdp_mixed_precision(ModelConfig(torch_dtype="float32"))  # noqa: SLF001
+    policy = _fsdp_mixed_precision(ModelConfig(torch_dtype="float32"))
 
     assert policy is not None
     assert policy.param_dtype is torch.bfloat16

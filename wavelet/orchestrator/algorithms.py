@@ -11,8 +11,8 @@ from wavelet.configs.rl_config import (
     LengthPenaltyConfig,
     MaxRLAlgorithmConfig,
     PassthroughAlgorithmConfig,
-    RLAlgorithmConfig,
     RewardAlgorithmConfig,
+    RLAlgorithmConfig,
 )
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.advantage import (
@@ -21,7 +21,9 @@ from wavelet.orchestrator.advantage import (
 )
 from wavelet.orchestrator.custom_algorithms import (
     load_custom_algorithm,
-    register_algorithm as register_algorithm,
+)
+from wavelet.orchestrator.custom_algorithms import (
+    register_algorithm as register_algorithm,  # noqa: PLC0414 - public re-export
 )
 
 

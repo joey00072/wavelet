@@ -48,7 +48,6 @@ from wavelet.inference.diagnostics import inference_debug_state
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
 
-
 _CONFIG: RLConfig | None = None
 router = APIRouter()
 CONTEXT_FIT_SAFETY_TOKENS = 16
@@ -494,7 +493,7 @@ def _patch_load_lora_adapter() -> None:
                 lora_request.base_model_name = base_model_name
             try:
                 await self.engine_client.add_lora(lora_request)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - translate vLLM failures to HTTP
                 error_type = "BadRequestError"
                 status_code = HTTPStatus.BAD_REQUEST
                 if "No adapter found" in str(exc):
@@ -616,8 +615,7 @@ def _log_lora_add_adapter_perf(
 
 
 def _patch_lora_cpu_pin_memory() -> None:
-    import vllm.lora.lora_model as lora_model
-    import vllm.lora.model_manager as model_manager
+    from vllm.lora import lora_model, model_manager
 
     def pin_memory_unavailable() -> bool:
         return False
@@ -628,7 +626,7 @@ def _patch_lora_cpu_pin_memory() -> None:
 
 def _patch_noisy_tool_parser_errors() -> None:
     try:
-        import vllm.tool_parsers.hermes_tool_parser as hermes_tool_parser
+        from vllm.tool_parsers import hermes_tool_parser
     except ImportError:
         return
 
@@ -730,9 +728,38 @@ async def debug_state(request: Request) -> dict[str, Any]:
         "policy_adapter_name": getattr(request.app.state, "policy_adapter_name", None),
         "policy_adapter_path": getattr(request.app.state, "policy_adapter_path", None),
         "policy_weight_path": getattr(request.app.state, "policy_weight_path", None),
+        "generation_paused": getattr(request.app.state, "generation_paused", False),
         "asleep": getattr(request.app.state, "asleep", False),
     }
     return state
+
+
+@router.post("/pause")
+async def pause(raw_request: Request) -> dict[str, str]:
+    """Drain active requests and hold new generation during a policy update."""
+    client = _engine_client(raw_request)
+    if not hasattr(client, "pause_generation"):
+        raise RuntimeError(
+            "This vLLM engine does not support safe policy updates because "
+            "pause_generation is unavailable."
+        )
+    await client.pause_generation(mode="keep", clear_cache=False)
+    raw_request.app.state.generation_paused = True
+    return {"status": "paused"}
+
+
+@router.post("/resume")
+async def resume(raw_request: Request) -> dict[str, str]:
+    """Allow generation after a policy update transaction."""
+    client = _engine_client(raw_request)
+    if not hasattr(client, "resume_generation"):
+        raise RuntimeError(
+            "This vLLM engine does not support safe policy updates because "
+            "resume_generation is unavailable."
+        )
+    await client.resume_generation()
+    raw_request.app.state.generation_paused = False
+    return {"status": "resumed"}
 
 
 @router.post("/sleep")
@@ -855,20 +882,33 @@ async def _load_adapter_policy(
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
 
+    models = _models(raw_request)
     adapter_path = str(adapter_dir.resolve())
     if (
         getattr(raw_request.app.state, "policy_step", None) == step
         and getattr(raw_request.app.state, "policy_adapter_name", None) == adapter_name
         and getattr(raw_request.app.state, "policy_adapter_path", None) == adapter_path
     ):
-        return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
-    response = await _models(raw_request).load_lora_adapter(
-        LoadLoRAAdapterRequest(
-            lora_name=adapter_name,
-            lora_path=adapter_path,
-            load_inplace=load_inplace,
+        stored = models.lora_requests.get(adapter_name)
+        if stored is not None:
+            stored.load_inplace = False
+        return {
+            "status": "ok",
+            "policy_step": step,
+            "adapter_name": adapter_name,
+        }
+    try:
+        response = await models.load_lora_adapter(
+            LoadLoRAAdapterRequest(
+                lora_name=adapter_name,
+                lora_path=adapter_path,
+                load_inplace=load_inplace,
+            )
         )
-    )
+    finally:
+        stored = models.lora_requests.get(adapter_name)
+        if stored is not None:
+            stored.load_inplace = False
     if isinstance(response, ErrorResponse):
         return JSONResponse(
             content=response.model_dump(),
@@ -877,7 +917,11 @@ async def _load_adapter_policy(
     raw_request.app.state.policy_step = step
     raw_request.app.state.policy_adapter_name = adapter_name
     raw_request.app.state.policy_adapter_path = adapter_path
-    return {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
+    return {
+        "status": "ok",
+        "policy_step": step,
+        "adapter_name": adapter_name,
+    }
 
 
 @router.post("/init_broadcaster")
@@ -954,6 +998,7 @@ async def custom_init_app_state(
     state.policy_adapter_name = None
     state.policy_adapter_path = None
     state.policy_weight_path = None
+    state.generation_paused = False
     if "generate" in supported_tasks and state.openai_serving_chat is not None:
         serving_chat = object.__new__(OpenAIServingChatWithTokens)
         serving_chat.__dict__.update(state.openai_serving_chat.__dict__)
@@ -964,7 +1009,7 @@ async def custom_init_app_state(
 
 
 def _patch_build_app() -> None:
-    import vllm.entrypoints.openai.api_server as api_server
+    from vllm.entrypoints.openai import api_server
 
     original_build_app = api_server.build_app
 
@@ -1067,11 +1112,23 @@ def _append_lora_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--fully-sharded-loras")
 
 
-def _serve_args(config: RLConfig) -> Namespace:
+def _serve_argv(config: RLConfig) -> list[str]:
+    """Build vLLM server arguments without initializing the GPU platform."""
     argv = _base_serve_argv(config)
     _append_optional_serve_args(argv, config)
     _append_parser_serve_args(argv, config)
     _append_lora_serve_args(argv, config)
+    worker_extension_cls = (
+        "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
+        if config.policy_transfer.type == "nccl"
+        else "wavelet.inference.vllm_weight_update.FileSystemWeightUpdateWorker"
+    )
+    argv.extend(["--worker-extension-cls", worker_extension_cls])
+    return argv
+
+
+def _serve_args(config: RLConfig) -> Namespace:
+    argv = _serve_argv(config)
 
     parser = FlexibleArgumentParser(
         description="Wavelet vLLM OpenAI-compatible RL server."
@@ -1079,14 +1136,6 @@ def _serve_args(config: RLConfig) -> Namespace:
     parser = make_arg_parser(parser)
     args = parser.parse_args(argv)
     assert args is not None
-    if config.policy_transfer.type == "nccl":
-        args.worker_extension_cls = (
-            "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
-        )
-    else:
-        args.worker_extension_cls = (
-            "wavelet.inference.vllm_weight_update.FileSystemWeightUpdateWorker"
-        )
     validate_parsed_serve_args(args)
     return args
 

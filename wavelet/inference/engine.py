@@ -1,23 +1,19 @@
-# ruff: noqa: E402, F811
+# ruff: noqa: F811
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
-import tempfile
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from hashlib import sha1
 from pathlib import Path
 from typing import Any
 
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.rl_config import RLSamplingConfig
+from wavelet.configs.rl_config import RLConfig, RLSamplingConfig
 from wavelet.data.rl import (
     RLExample,
     rl_examples_from_payload,
@@ -148,10 +144,19 @@ def logprob_value(value: object) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     if hasattr(value, "logprob"):
-        return float(getattr(value, "logprob"))
+        return float(value.logprob)
     if isinstance(value, dict) and "logprob" in value:
         return float(value["logprob"])
     raise TypeError(f"Unsupported vLLM logprob value: {type(value)!r}")
+
+
+def _token_logprob(row: dict[object, object], token_id: int) -> object | None:
+    if token_id in row:
+        return row[token_id]
+    string_token_id = str(token_id)
+    if string_token_id in row:
+        return row[string_token_id]
+    return None
 
 
 def extract_vllm_generation_logprobs(
@@ -160,15 +165,15 @@ def extract_vllm_generation_logprobs(
     if logprobs is None:
         raise ValueError("vLLM output did not include token logprobs.")
     rows = list(logprobs)
-    if len(rows) < len(token_ids):
+    if len(rows) != len(token_ids):
         raise ValueError(
-            "vLLM returned fewer logprob rows than generated tokens "
-            f"({len(rows)} < {len(token_ids)})."
+            "vLLM returned a different number of logprob rows and generated "
+            f"tokens ({len(rows)} != {len(token_ids)})."
         )
     values: list[float] = []
-    for token_id, row in zip(token_ids, rows, strict=False):
+    for token_id, row in zip(token_ids, rows, strict=True):
         if isinstance(row, dict):
-            candidate = row.get(token_id) or row.get(str(token_id))
+            candidate = _token_logprob(row, token_id)
             if candidate is None:
                 raise ValueError(
                     f"vLLM logprobs are missing sampled token id {token_id}."
@@ -188,10 +193,11 @@ def extract_vllm_prompt_logprobs(
     if prompt_logprobs is None:
         raise ValueError("vLLM scoring output did not include prompt_logprobs.")
     rows = list(prompt_logprobs)
-    if len(rows) < len(target_ids) + 1:
+    expected_rows = len(target_ids) + 1
+    if len(rows) != expected_rows:
         raise ValueError(
-            "vLLM returned fewer prompt logprob rows than scored tokens "
-            f"({len(rows)} < {len(target_ids) + 1})."
+            "vLLM returned a different number of prompt logprob rows and scored "
+            f"tokens ({len(rows)} != {expected_rows})."
         )
     values: list[float] = []
     for index, (token_id, trainable) in enumerate(
@@ -203,7 +209,7 @@ def extract_vllm_prompt_logprobs(
         if not isinstance(row, dict):
             values.append(logprob_value(row))
             continue
-        candidate = row.get(token_id) or row.get(str(token_id))
+        candidate = _token_logprob(row, token_id)
         if candidate is None:
             raise ValueError(
                 f"vLLM prompt_logprobs are missing target token id {token_id}."
@@ -229,7 +235,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         self.base_url = self.base_urls[0]
         self.tokenizer = None
         self.policy_model_name = config.model.name
-        self._policy_cache_root = self._default_policy_cache_root()
 
     def setup(self) -> None:
         deadline = time.monotonic() + self.config.inference.http.startup_timeout_seconds
@@ -249,8 +254,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         ) from last_error
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
-        if self._uses_openai_rollouts() and self.config.lora is not None:
-            policy_dir = self._cache_lora_policy_dir(policy_dir, step=step)
         if (
             self._uses_openai_rollouts()
             and self.config.lora is None
@@ -262,69 +265,42 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         if self._uses_openai_rollouts() and self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name
             payload["load_inplace"] = True
-        self._request_all("POST", "/load_policy", payload)
+        if self.config.lora is not None:
+            responses = self._request_all("POST", "/load_policy", payload)
+        else:
+            responses = self._load_policy_while_generation_paused(payload)
+        for response in responses:
+            if int(response.get("policy_step", -1)) != step:
+                raise RuntimeError(
+                    "vLLM server acknowledged the wrong policy step: "
+                    f"expected {step}, received {response.get('policy_step')}."
+                )
         self.policy_step = step
         if self.config.lora is not None:
             self.policy_model_name = self.config.policy_transfer.adapter_name
 
-    def _default_policy_cache_root(self) -> Path:
-        configured = os.environ.get("WAVELET_POLICY_CACHE_DIR")
-        if configured:
-            base_dir = Path(configured)
-        else:
-            shm_dir = Path("/dev/shm")
-            base_dir = shm_dir if shm_dir.is_dir() else Path(tempfile.gettempdir())
-        output_hash = sha1(
-            str(self.config.output_dir.resolve()).encode("utf-8")
-        ).hexdigest()[:12]
-        return (
-            base_dir
-            / f"wavelet-policy-cache-{os.getuid()}"
-            / f"{os.getpid()}-{output_hash}"
-        )
-
-    def _cache_lora_policy_dir(self, policy_dir: Path, *, step: int) -> Path:
-        adapter_dir = policy_dir / "adapter"
-        tensor_path = adapter_dir / "adapter_model.safetensors"
-        if not tensor_path.is_file():
-            return policy_dir
-
-        cached_policy_dir = self._policy_cache_root / f"step-{step:06d}"
-        marker_path = cached_policy_dir / ".complete"
-        if marker_path.is_file():
-            return cached_policy_dir
-
-        tmp_policy_dir = cached_policy_dir.with_name(
-            f"{cached_policy_dir.name}.tmp-{time.monotonic_ns()}"
-        )
+    def _load_policy_while_generation_paused(
+        self,
+        payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Drain generation on every replica before replacing policy weights."""
+        primary_error: Exception | None = None
         try:
-            shutil.rmtree(tmp_policy_dir, ignore_errors=True)
-            tmp_adapter_dir = tmp_policy_dir / "adapter"
-            tmp_adapter_dir.mkdir(parents=True, exist_ok=True)
-            for source in adapter_dir.iterdir():
-                if source.is_file():
-                    shutil.copy2(source, tmp_adapter_dir / source.name)
-            (tmp_policy_dir / ".complete").write_text("ok\n", encoding="utf-8")
-            if cached_policy_dir.exists():
-                shutil.rmtree(cached_policy_dir)
-            os.replace(tmp_policy_dir, cached_policy_dir)
-            self._prune_policy_cache(keep_steps={step, step - 1})
-        except OSError:
-            shutil.rmtree(tmp_policy_dir, ignore_errors=True)
-            return policy_dir
-        return cached_policy_dir
-
-    def _prune_policy_cache(self, *, keep_steps: set[int]) -> None:
-        if not self._policy_cache_root.is_dir():
-            return
-        keep_names = {f"step-{step:06d}" for step in keep_steps if step >= 0}
-        for child in self._policy_cache_root.iterdir():
-            if (
-                child.is_dir()
-                and child.name.startswith("step-")
-                and child.name not in keep_names
-            ):
-                shutil.rmtree(child, ignore_errors=True)
+            self._request_all("POST", "/pause")
+            return self._request_all("POST", "/load_policy", payload)
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                self._request_all("POST", "/resume")
+            except Exception as exc:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "Inference policy loading also failed to resume every replica: "
+                    f"{exc}"
+                )
 
     def sleep(self) -> None:
         self._request_all("POST", "/sleep", {"level": 1})
@@ -414,9 +390,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
             )
             prompt_ids, max_completion_tokens = fit_generation_context(
                 prompt_ids,
-                max_prompt_tokens=(
-                    self.config.inference.sampling.max_prompt_tokens
-                ),
+                max_prompt_tokens=(self.config.inference.sampling.max_prompt_tokens),
                 max_model_len=self.config.inference.vllm.max_model_len,
                 max_completion_tokens=(
                     self.config.inference.sampling.max_completion_tokens
@@ -521,10 +495,20 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         completion_ids: list[int],
     ) -> list[float]:
         raw_logprobs = (choice.get("logprobs") or {}).get("content") or []
-        values = [float(item.get("logprob", 0.0)) for item in raw_logprobs]
-        if len(values) < len(completion_ids):
-            values.extend([0.0] * (len(completion_ids) - len(values)))
-        return values[: len(completion_ids)]
+        if len(raw_logprobs) != len(completion_ids):
+            raise RuntimeError(
+                "OpenAI rollout logprobs do not align with completion token ids "
+                f"({len(raw_logprobs)} != {len(completion_ids)})."
+            )
+        values: list[float] = []
+        for index, item in enumerate(raw_logprobs):
+            if not isinstance(item, dict) or item.get("logprob") is None:
+                raise RuntimeError(
+                    "OpenAI rollout response is missing the sampled-token logprob "
+                    f"at completion index {index}."
+                )
+            values.append(float(item["logprob"]))
+        return values
 
     def close(self) -> None:
         return None
@@ -534,10 +518,9 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         method: str,
         path: str,
         payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         if len(self.base_urls) == 1:
-            self._request(method, path, payload, base_url=self.base_url)
-            return
+            return [self._request(method, path, payload, base_url=self.base_url)]
         with ThreadPoolExecutor(max_workers=len(self.base_urls)) as executor:
             futures = [
                 executor.submit(
@@ -549,8 +532,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 )
                 for base_url in self.base_urls
             ]
-            for future in futures:
-                future.result()
+            return [future.result() for future in futures]
 
     def _request(
         self,
@@ -709,6 +691,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "tensor_parallel_size": vllm_config.tensor_parallel_size,
             "gpu_memory_utilization": vllm_config.gpu_memory_utilization,
             "enforce_eager": vllm_config.enforce_eager,
+            "logprobs_mode": "processed_logprobs",
             "enable_lora": self.config.lora is not None,
             "max_loras": 1,
             "max_cpu_loras": 1,
@@ -865,7 +848,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 results = self._openai_chat_completion_batch(
                     [request.payload for request in batch],
                 )
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001 - unblock every waiter
                 for request in batch:
                     request.error = exc
                     request.done.set()
@@ -1076,15 +1059,10 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         if self.tokenizer is None:
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
         if logprobs is None:
-            return [
-                {
-                    "token": "",
-                    "logprob": 0.0,
-                    "bytes": None,
-                    "top_logprobs": [],
-                }
-                for token_id in token_ids
-            ]
+            raise RuntimeError(
+                "vLLM generation did not return sampled-token logprobs. Enable "
+                "generation logprobs for RL rollouts."
+            )
         values = extract_vllm_generation_logprobs(logprobs, token_ids)
         return [
             {

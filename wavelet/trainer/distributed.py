@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from functools import cached_property
+
+import torch
 import torch.distributed as dist
 from torch._utils import _get_available_device_type
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-import os
-import torch
-
 
 DEFAULT_DEVICE_TYPE = _get_available_device_type() or "cuda"
 
@@ -266,13 +266,13 @@ def get_world() -> World:
             if torch.distributed.is_initialized()
             else 0
         )
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         world_size = (
             int(torch.distributed.get_world_size())
             if torch.distributed.is_initialized()
             else 1
         )
-        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 0)) or (
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0")) or (
             int(torch.cuda.device_count()) if torch.cuda.is_available() else 1
         )
         if torch.cuda.is_available() and distributed_uses_cuda():

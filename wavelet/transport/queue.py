@@ -2,25 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
 import json
 import logging
-from dataclasses import asdict
-from wavelet.monitor import tail_jsonl
 import os
-import socket
-from datetime import UTC, datetime
-from typing import TypeVar
-from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 import shutil
+import socket
 import time
-from collections.abc import Callable
-from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, TypeVar
 
+from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
+from wavelet.monitor import tail_jsonl
+from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 
 STEP_DIR_PREFIX = "step-"
 
@@ -170,7 +167,7 @@ def append_event_best_effort(events_dir: Path | None, event: QueueEvent) -> None
         return
     try:
         append_event(events_dir, event)
-    except Exception as exc:  # pragma: no cover - defensive observability guard
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to append queue event: %s", exc)
 
 
@@ -212,6 +209,57 @@ def read_manifest(step_dir: Path) -> RolloutManifest | None:
     return _read_record(step_dir / MANIFEST_FILENAME, RolloutManifest)
 
 
+def validate_rollout_manifest(
+    batch: RolloutBatch,
+    *,
+    queue_step: int,
+    optimizer_step: int,
+    chunk_index: int | None,
+    rows: int,
+    minimum_policy_step: int,
+    maximum_policy_step: int,
+) -> RolloutManifest:
+    """Validate immutable rollout provenance before reuse or training."""
+    manifest = read_manifest(batch.step_dir)
+    if manifest is None:
+        raise ValueError(f"Rollout queue step {batch.step} is missing manifest.json.")
+    expected = {
+        "queue_step": queue_step,
+        "optimizer_step": optimizer_step,
+        "chunk_index": chunk_index,
+        "rows": rows,
+    }
+    actual = {
+        "queue_step": manifest.queue_step,
+        "optimizer_step": manifest.optimizer_step,
+        "chunk_index": manifest.chunk_index,
+        "rows": manifest.rows,
+    }
+    invalid = [
+        f"{name}={actual[name]!r} (expected {value!r})"
+        for name, value in expected.items()
+        if actual[name] != value
+    ]
+    if invalid:
+        raise ValueError(
+            f"Rollout queue step {batch.step} has invalid manifest metadata: "
+            + ", ".join(invalid)
+        )
+
+    policy_step = manifest.policy_step
+    if (
+        policy_step is None
+        or policy_step < minimum_policy_step
+        or policy_step > maximum_policy_step
+    ):
+        raise ValueError(
+            f"Rollout queue step {batch.step} has policy_step={policy_step!r}; "
+            f"optimizer step {optimizer_step} requires a policy step in "
+            f"[{minimum_policy_step}, {maximum_policy_step}]."
+        )
+    return manifest
+
+
 def write_claim(step_dir: Path, claim: ClaimRecord) -> Path:
     return _write_record(step_dir / CLAIM_FILENAME, claim)
 
@@ -228,13 +276,46 @@ def read_consumed(step_dir: Path) -> ConsumedRecord | None:
     return _read_record(step_dir / CONSUMED_FILENAME, ConsumedRecord)
 
 
+def prune_consumed_rollout_batches(
+    output_dir: Path,
+    config: RLTransportConfig,
+    *,
+    keep_last: int | None,
+) -> list[Path]:
+    """Remove old consumed queue batches while preserving recent audit samples."""
+    if keep_last is None:
+        return []
+    queue_dir = resolve_queue_dir(output_dir, config)
+    if not queue_dir.exists():
+        return []
+
+    consumed: list[tuple[int, Path]] = []
+    for candidate in queue_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
+            continue
+        try:
+            step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
+        except ValueError:
+            continue
+        if (candidate / CONSUMED_FILENAME).exists():
+            consumed.append((step, candidate))
+
+    removed: list[Path] = []
+    for step, path in sorted(consumed)[:-keep_last]:
+        shutil.rmtree(path)
+        materialized = queue_dir / f"materialized-step-{step:06d}.jsonl"
+        materialized.unlink(missing_ok=True)
+        removed.append(path)
+    return removed
+
+
 def record_rollout_claim(
     batch: RolloutBatch,
     *,
     trainer_step_before: int,
     consumer_id: str | None = None,
     events_dir: Path | None = None,
-) -> ClaimRecord | None:
+) -> ClaimRecord:
     consumer_id = consumer_id or process_identity("rl-trainer")
     claim = ClaimRecord(
         format_version=1,
@@ -243,17 +324,16 @@ def record_rollout_claim(
         trainer_step_before=trainer_step_before,
         claimed_at=utc_now(),
     )
-    try:
-        write_claim(batch.step_dir, claim)
-    except Exception as exc:  # pragma: no cover - defensive observability guard
-        logger.warning("Failed to write rollout claim for step %s: %s", batch.step, exc)
-        return None
+    write_claim(batch.step_dir, claim)
+    manifest = _read_manifest_best_effort(batch)
     append_event_best_effort(
         events_dir,
         QueueEvent(
             time=claim.claimed_at,
             kind="rollout_claimed",
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             consumer_id=claim.consumer_id,
         ),
     )
@@ -264,6 +344,8 @@ def record_rollout_claim(
             event="rollout_claimed",
             step=trainer_step_before,
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             details={
                 "consumer_id": claim.consumer_id,
                 "path": str(batch.path),
@@ -281,7 +363,7 @@ def record_rollout_consumed(
     optimizer_step_completed: bool,
     consumer_id: str | None = None,
     events_dir: Path | None = None,
-) -> ConsumedRecord | None:
+) -> ConsumedRecord:
     consumer_id = consumer_id or process_identity("rl-trainer")
     consumed = ConsumedRecord(
         format_version=1,
@@ -292,21 +374,16 @@ def record_rollout_consumed(
         optimizer_step_completed=optimizer_step_completed,
         consumed_at=utc_now(),
     )
-    try:
-        write_consumed(batch.step_dir, consumed)
-    except Exception as exc:  # pragma: no cover - defensive observability guard
-        logger.warning(
-            "Failed to write rollout consumed record for step %s: %s",
-            batch.step,
-            exc,
-        )
-        return None
+    write_consumed(batch.step_dir, consumed)
+    manifest = _read_manifest_best_effort(batch)
     append_event_best_effort(
         events_dir,
         QueueEvent(
             time=consumed.consumed_at,
             kind="rollout_consumed",
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             consumer_id=consumed.consumer_id,
         ),
     )
@@ -317,7 +394,10 @@ def record_rollout_consumed(
             event="rollout_consumed",
             step=trainer_step_after,
             queue_step=batch.step,
-            optimizer_step=trainer_step_after,
+            optimizer_step=(
+                trainer_step_after if manifest is None else manifest.optimizer_step
+            ),
+            policy_step=None if manifest is None else manifest.policy_step,
             details={
                 "consumer_id": consumed.consumer_id,
                 "trainer_step_before": trainer_step_before,
@@ -326,6 +406,18 @@ def record_rollout_consumed(
         ),
     )
     return consumed
+
+
+def _read_manifest_best_effort(batch: RolloutBatch) -> RolloutManifest | None:
+    try:
+        return read_manifest(batch.step_dir)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Failed to read rollout manifest for lifecycle event step %s: %s",
+            batch.step,
+            exc,
+        )
+        return None
 
 
 def _trace_output_dir(events_dir: Path | None) -> Path | None:
@@ -348,7 +440,7 @@ def _read_record(path: Path, record_type: type[RecordT]) -> RecordT | None:
         return None
     row = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(row, dict):
-        raise ValueError(f"Expected object in {path}.")
+        raise TypeError(f"Expected object in {path}.")
     return record_type(**row)
 
 
@@ -445,6 +537,7 @@ def _record_received(
     payload_bytes: int | None,
     wait_seconds: float,
     queue_step: int | None = None,
+    optimizer_step: int | None = None,
     policy_step: int | None = None,
 ) -> None:
     if events_dir is None:
@@ -460,6 +553,7 @@ def _record_received(
             time=utc_now(),
             kind=kind,
             queue_step=queue_step,
+            optimizer_step=optimizer_step,
             policy_step=policy_step,
             consumer_id=consumer_id,
             details=details,
@@ -472,6 +566,7 @@ def _record_received(
             event=kind,
             step=step,
             queue_step=queue_step,
+            optimizer_step=optimizer_step,
             policy_step=policy_step,
             details={"consumer_id": consumer_id, **details},
         ),
@@ -499,6 +594,12 @@ class FileSystemRolloutSender:
         events_dir: Path | None = None,
     ) -> RolloutBatch:
         step_dir = get_step_dir(self.queue_dir, step)
+        existing = self.stable_batch(step)
+        if existing is not None:
+            raise FileExistsError(
+                f"Rollout queue step {step} is already stable at "
+                f"'{existing.step_dir}' and cannot be overwritten."
+            )
         step_dir.mkdir(parents=True, exist_ok=True)
         target_path = step_dir / self.config.rollout_filename
         tmp_path = step_dir / f"{self.config.rollout_filename}.tmp"
@@ -534,12 +635,7 @@ class FileSystemRolloutSender:
                 payload_bytes=payload_bytes,
                 transfer_seconds=transfer_seconds,
             )
-            try:
-                write_manifest(step_dir, manifest)
-            except Exception as exc:  # pragma: no cover - fail-open observability
-                logger.warning(
-                    "Failed to write rollout manifest for step %s: %s", step, exc
-                )
+            write_manifest(step_dir, manifest)
             append_event_best_effort(
                 events_dir or (self.output_dir / "events"),
                 QueueEvent(
@@ -556,6 +652,14 @@ class FileSystemRolloutSender:
                 ),
             )
         (step_dir / STABLE_BATCH_MARKER).touch()
+        return RolloutBatch(step=step, path=target_path, step_dir=step_dir)
+
+    def stable_batch(self, step: int) -> RolloutBatch | None:
+        """Return an immutable stable batch for idempotent scheduler resume."""
+        step_dir = get_step_dir(self.queue_dir, step)
+        target_path = step_dir / self.config.rollout_filename
+        if not _is_stable_dir(step_dir) or not target_path.is_file():
+            return None
         return RolloutBatch(step=step, path=target_path, step_dir=step_dir)
 
 
@@ -666,12 +770,15 @@ class FileSystemRolloutReceiver:
             payload_bytes = batch.path.stat().st_size
         except OSError:
             payload_bytes = None
+        manifest = _read_manifest_best_effort(batch)
         _record_received(
             self.events_dir,
             kind="rollout_received",
             subsystem="trainer",
             step=batch.step,
             queue_step=batch.step,
+            optimizer_step=(None if manifest is None else manifest.optimizer_step),
+            policy_step=None if manifest is None else manifest.policy_step,
             consumer_id=consumer_id,
             mode=mode,
             payload_bytes=payload_bytes,
@@ -741,7 +848,7 @@ class FileSystemPolicyReceiver:
         mode: str,
     ) -> None:
         consumer_id = self.consumer_id or process_identity("rl-inference")
-        payload_bytes = _directory_payload_bytes(snapshot.step_dir)
+        payload_bytes = _policy_artifact_bytes(snapshot.meta_path)
         _record_received(
             self.events_dir,
             kind="policy_received",
@@ -765,17 +872,16 @@ class FileSystemPolicyReceiver:
         self._record_received(snapshot, wait_seconds=wait_seconds, mode=mode)
 
 
-def _directory_payload_bytes(path: Path) -> int:
-    total = 0
-    for candidate in path.rglob("*"):
-        if not candidate.is_file():
-            continue
-        total += candidate.stat().st_size
-    return total
-
-
-def _trace_output_dir(events_dir: Path | None) -> Path | None:
-    return events_dir.parent if events_dir is not None else None
+def _policy_artifact_bytes(metadata_path: Path) -> int | None:
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    artifact = metadata.get("artifact") if isinstance(metadata, dict) else None
+    value = artifact.get("bytes") if isinstance(artifact, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
 
 
 def publish_adapter_policy_snapshot(
@@ -811,6 +917,11 @@ def publish_adapter_policy_snapshot(
     }
     if metadata:
         meta.update(metadata)
+    from wavelet.orchestrator.policy_metadata import adapter_artifact_metadata
+
+    artifact = adapter_artifact_metadata(tmp_adapter_dir)
+    if artifact is not None:
+        meta["artifact"] = artifact
     (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
     (tmp_dir / STABLE_BATCH_MARKER).touch()
     tmp_dir.replace(step_dir)
@@ -1094,12 +1205,12 @@ class RolloutChunkAccumulator:
     accumulated_loss_scale: float = 0.0
     chunk_index: int = 0
     pending_paths: list[Path] = field(default_factory=list)
-    pending_batches: list[RolloutBatch] = field(default_factory=list)  # noqa: F405
+    pending_batches: list[RolloutBatch] = field(default_factory=list)
     pending_rows: int = 0
 
-    def buffer(self, batch: RolloutBatch | Path, rows: int) -> None:  # noqa: F405
+    def buffer(self, batch: RolloutBatch | Path, rows: int) -> None:
         self.chunk_index += 1
-        if isinstance(batch, RolloutBatch):  # noqa: F405
+        if isinstance(batch, RolloutBatch):
             self.pending_paths.append(batch.path)
             self.pending_batches.append(batch)
         else:
@@ -1113,7 +1224,7 @@ class RolloutChunkAccumulator:
 
     def drain_pending_batches(
         self,
-    ) -> tuple[list[Path], list[RolloutBatch], int]:  # noqa: F405
+    ) -> tuple[list[Path], list[RolloutBatch], int]:
         paths = self.pending_paths
         batches = self.pending_batches
         loaded_chunks = len(paths)

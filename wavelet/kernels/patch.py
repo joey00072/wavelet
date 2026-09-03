@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 
-def _find_mlp_class(model: "PreTrainedModel") -> type | None:
+def _find_mlp_class(model: PreTrainedModel) -> type | None:
     """Return the actual MLP class used by the model's decoder layers."""
     for module in model.modules():
         if (
@@ -40,7 +40,7 @@ def _find_mlp_class(model: "PreTrainedModel") -> type | None:
     return None
 
 
-def _iter_decoder_layers(model: "PreTrainedModel"):
+def _iter_decoder_layers(model: PreTrainedModel):
     """Yield each transformer decoder layer (the sub-model layers list)."""
     # Unwrap PeftModel → base model → model → layers
     base = model
@@ -55,7 +55,7 @@ def _iter_decoder_layers(model: "PreTrainedModel"):
 # ── MLP fusion ────────────────────────────────────────────────────────────────
 
 
-def patch_fused_mlp(model: "PreTrainedModel") -> bool:
+def patch_fused_mlp(model: PreTrainedModel) -> bool:
     """Replace MLP.forward with wavelet's LoRA_MLP fused SwiGLU kernel.
 
     LoRA_MLP fuses gate_proj + up_proj + silu + down_proj + all three LoRA
@@ -79,7 +79,7 @@ def patch_fused_mlp(model: "PreTrainedModel") -> bool:
 # ── QKV fusion (Qwen3) ────────────────────────────────────────────────────────
 
 
-def patch_fused_qkv(model: "PreTrainedModel") -> bool:
+def patch_fused_qkv(model: PreTrainedModel) -> bool:
     """Replace Qwen3Attention.forward with a fused QKV + optional fused-O path.
 
     Patches the class-level forward so that any attention instance with
@@ -95,9 +95,9 @@ def patch_fused_qkv(model: "PreTrainedModel") -> bool:
 
     try:
         from transformers.models.qwen3.modeling_qwen3 import (
+            ALL_ATTENTION_FUNCTIONS,
             Qwen3Attention,
             apply_rotary_pos_emb,
-            ALL_ATTENTION_FUNCTIONS,
             eager_attention_forward,
         )
     except ImportError:
@@ -210,7 +210,7 @@ def patch_fused_qkv(model: "PreTrainedModel") -> bool:
 # ── O-proj fusion (standalone) ────────────────────────────────────────────────
 
 
-def patch_fused_o(model: "PreTrainedModel") -> bool:
+def patch_fused_o(model: PreTrainedModel) -> bool:
     """Replace o_proj.forward with the fused LoRA_W kernel.
 
     Patches each eligible o_proj module instance's forward so that when the
@@ -257,7 +257,7 @@ def patch_fused_o(model: "PreTrainedModel") -> bool:
 
 
 def patch_smart_gc(
-    model: "PreTrainedModel",
+    model: PreTrainedModel,
     *,
     seq_len: int,
     dtype: torch.dtype = torch.bfloat16,

@@ -106,3 +106,147 @@ def test_max_inflight_rollouts_must_cover_one_group() -> None:
                 "max_inflight_rollouts": 4,
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("top_p", 0.9),
+        ("top_k", 20),
+        ("min_p", 0.1),
+        ("min_tokens", 2),
+        ("repetition_penalty", 1.1),
+    ],
+)
+def test_rl_rejects_sampling_transforms_trainer_cannot_replay(
+    field: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        RLConfig(inference={"sampling": {field: value}})
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["temperature", "seed", "logit_bias", "presence_penalty"],
+)
+def test_rl_rejects_hidden_sampling_transforms_in_extra_body(field: str) -> None:
+    with pytest.raises(ValueError, match=f"extra_body.{field}"):
+        RLConfig(inference={"sampling": {"extra_body": {field: 1}}})
+
+
+def test_static_rl_data_allows_sampling_fields_that_are_not_used() -> None:
+    config = RLConfig(
+        orchestrator={"enabled": False},
+        inference={"sampling": {"min_p": 0.1}},
+    )
+
+    assert config.inference.sampling.min_p == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        {"do_sample": False},
+        {"temperature": 0.0},
+        {"seed": 123},
+    ],
+)
+def test_group_relative_rl_rejects_deterministic_rollouts(sampling) -> None:
+    with pytest.raises(ValueError, match="needs diverse rollouts"):
+        RLConfig(
+            algo={"type": "grpo"},
+            orchestrator={"rollouts_per_example": 8},
+            inference={"sampling": sampling},
+            max_steps=1,
+        )
+
+
+def test_eval_only_group_config_allows_deterministic_sampling() -> None:
+    config = RLConfig(
+        algo={"type": "grpo"},
+        orchestrator={"rollouts_per_example": 8},
+        inference={"sampling": {"seed": 123}},
+        max_steps=0,
+    )
+
+    assert config.inference.sampling.seed == 123
+
+
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        {"do_sample": False},
+        {"temperature": 0.0},
+    ],
+)
+def test_single_rollout_online_rl_rejects_zero_effective_temperature(
+    sampling,
+) -> None:
+    with pytest.raises(ValueError, match="positive temperature"):
+        RLConfig(
+            algo={"type": "reward"},
+            orchestrator={"rollouts_per_example": 1},
+            inference={"sampling": sampling},
+            max_steps=1,
+        )
+
+
+def test_eval_only_reward_config_allows_greedy_sampling() -> None:
+    config = RLConfig(
+        algo={"type": "reward"},
+        inference={"sampling": {"do_sample": False}},
+        max_steps=0,
+    )
+
+    assert config.inference.sampling.do_sample is False
+
+
+@pytest.mark.parametrize("mode", ["process", "colocate", "colocate_sleep"])
+def test_process_training_requires_initial_policy_export(mode: str) -> None:
+    with pytest.raises(ValueError, match="export_initial=true"):
+        RLConfig(
+            launcher={"mode": mode},
+            policy_transfer={"export_initial": False},
+            max_steps=1,
+        )
+
+
+def test_process_eval_only_does_not_require_initial_policy_export() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        policy_transfer={"export_initial": False},
+        max_steps=0,
+    )
+
+    assert config.policy_transfer.export_initial is False
+
+
+def test_policy_transport_retains_current_and_previous_by_default() -> None:
+    config = RLConfig()
+
+    assert config.policy_transfer.keep_last == 2
+
+
+def test_policy_transport_rejects_single_snapshot_retention() -> None:
+    with pytest.raises(ValueError, match="greater than or equal to 2"):
+        RLConfig(policy_transfer={"keep_last": 1})
+
+
+def test_rollout_transport_keeps_a_bounded_audit_window_by_default() -> None:
+    config = RLConfig()
+
+    assert config.transport.cleanup_consumed is True
+    assert config.transport.keep_last_consumed == 2
+
+
+def test_checkpoint_and_eval_artifacts_are_bounded_by_default() -> None:
+    config = RLConfig(
+        ckpt={"mode": "async", "interval": 1},
+        eval={"env": [{"id": "aime"}]},
+    )
+
+    assert config.ckpt is not None
+    assert config.ckpt.keep_last == 2
+    assert config.eval is not None
+    assert config.eval.keep_last_rollout_sets == 2

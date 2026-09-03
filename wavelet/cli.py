@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib
 import sys
 
-
 PUBLIC_COMMANDS = {
     "rl": ("wavelet.entrypoints.rl_launcher", "Run reinforcement learning launcher"),
     "sft": ("wavelet.entrypoints.sft", "Run supervised fine-tuning"),

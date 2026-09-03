@@ -20,8 +20,9 @@ The API base is also editable in the page header and is stored in local storage.
 
 ## Views
 
-- `Overview`: run health, trainer progress, queue throughput, policy state, and
-  latest trainer metrics.
+- `Overview`: run health, trainer progress, evaluation history, queue
+  throughput, policy state, and latest trainer metrics. The evaluation chart
+  reads `GET /eval-metrics` and plots available `avg@8` and `pass@8` values.
 - `Rollouts`: rollout inspection, recent rollout buffers, saved snapshots, and
   per-lane queue detail.
 
@@ -43,6 +44,14 @@ orchestrator:
 ```
 
 The server exposes read-only endpoints and allows browser CORS by default.
+
+The overview plots each configured environment's `avg@8` and `pass@8` values.
+Step-zero results are also drawn as horizontal base-model references on a fixed
+0–100% y-axis. Hover over an evaluation point to see its metric value and policy
+step. Evaluation cadence and dataset size come from the run config rather than
+UI assumptions. Primary metrics count failed generations as incorrect;
+`eval/<env>/effective/...` retains the successful-response-only view for
+diagnosis. The same fixed-policy metrics are logged on the orchestrator W&B run.
 
 ## Rollout Inspection API
 

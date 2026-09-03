@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
@@ -10,6 +11,7 @@ from pathlib import Path
 from time import perf_counter
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.data.rl import count_nonempty_jsonl_rows
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.launcher import (
     RoleHandle,
@@ -21,11 +23,18 @@ from wavelet.orchestrator.launcher import (
 )
 from wavelet.orchestrator.placement import (
     device_group_size as _device_group_size,
+)
+from wavelet.orchestrator.placement import (
     device_groups as _as_device_groups,
+)
+from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
+)
+from wavelet.orchestrator.placement import (
     trainer_device_group as _trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import target_steps as _target_steps
 from wavelet.orchestrator.scheduler import IntegratedRolloutScheduler
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.transport.queue import (
@@ -33,7 +42,6 @@ from wavelet.transport.queue import (
     FileSystemRolloutReceiver,
     RolloutBatch,
 )
-from wavelet.orchestrator.schedule import target_steps as _target_steps
 from wavelet.utils.config import load_config
 from wavelet.utils.pathing import (
     get_config_dir,
@@ -149,7 +157,10 @@ def _rollout_client_config(config: RLConfig, *, ports: list[int]) -> RLConfig:
         }
     )
     orchestrator = config.orchestrator
-    if config.inference.vllm.server_backend == "openai" and config.lora is not None:
+    serves_adapter = config.lora is not None and (
+        _target_steps(config) > 0 or config.model.adapter_path is not None
+    )
+    if config.inference.vllm.server_backend == "openai" and serves_adapter:
         orchestrator = orchestrator.model_copy(
             update={"verifier_model": config.policy_transfer.adapter_name}
         )
@@ -192,6 +203,7 @@ def _publish_rollout_timed(
     batch = orchestrator.publish(
         step=step,
         inference_engine=inference_engine,
+        policy_step=getattr(inference_engine, "policy_step", None),
     )
     return batch, perf_counter() - started_at
 
@@ -308,6 +320,11 @@ def _load_and_train_received_batch(
     timings: StepTimes,
 ) -> None:
     trainer_step_before = trainer.step
+    row_count = count_nonempty_jsonl_rows(
+        received.path,
+        description="Rollout batch",
+    )
+    trainer.validate_rollout_batch(received, row_count=row_count)
     trainer.record_rollout_claim(
         received,
         trainer_step_before=trainer_step_before,
@@ -465,8 +482,11 @@ def _run_process_launcher(config: RLConfig) -> int:
             poll_interval_seconds=config.launcher.poll_interval_seconds,
         )
     finally:
-        terminate_remaining(handles)
-        close_handles(handles)
+        try:
+            terminate_remaining(handles)
+            close_handles(handles)
+        finally:
+            launcher.close()
     print(f"Published rollout batches under {config.output_dir / 'rollouts'}")
     return 0
 
@@ -514,7 +534,7 @@ def _sleep_vllm_http_server(config: RLConfig, *, port: int | None = None) -> Non
         request,
         timeout=config.inference.http.request_timeout_seconds,
     ):
-        return None
+        return
 
 
 def _sleep_vllm_http_servers(config: RLConfig, *, ports: list[int]) -> None:
@@ -557,10 +577,14 @@ def _run_integrated_launcher(config: RLConfig) -> int:
             events_dir=config.output_dir / "events",
         )
         inference_engine = create_policy_inference_engine(config)
-        inference_engine.setup()
         orchestrator = RLOrchestrator(config)
+        status = "failed"
         try:
-            trainer.export_policy(step=trainer.step)
+            inference_engine.setup()
+            trainer.export_policy(
+                step=trainer.step,
+                force=trainer.resume_checkpoint_dir is not None,
+            )
             pipelined = (
                 config.orchestrator.max_async_level > 0
                 and config.orchestrator.max_off_policy_steps > 0
@@ -574,10 +598,17 @@ def _run_integrated_launcher(config: RLConfig) -> int:
                 orchestrator=orchestrator,
                 pipelined=pipelined,
             )
-        except Exception:
-            trainer.finalize(status="failed")
-            raise
-        trainer.finalize(status="completed")
+            status = "completed"
+        finally:
+            from wavelet.orchestrator.envs import _teardown_cached_verifier_envs
+
+            try:
+                asyncio.run(_teardown_cached_verifier_envs())
+            finally:
+                try:
+                    inference_engine.close()
+                finally:
+                    trainer.finalize(status=status)
         print(f"Published rollout batches under {queue_dir}")
     else:
         rollout_path = config.data.path
@@ -599,10 +630,14 @@ def main(argv: list[str] | None = None) -> int:
         config.output_dir,
         resuming=resuming,
         clean=config.clean_output_dir,
+        protected_paths=(config.model.adapter_path,),
     )
     if resuming:
         assert config.ckpt is not None
-        resolve_resume_checkpoint(config.output_dir, config.ckpt.resume_step)
+        resolve_resume_checkpoint(
+            config.checkpoint_output_dir,
+            config.ckpt.resume_step,
+        )
     dump_yaml(
         get_config_dir(config.output_dir) / "rl.yaml",
         _role_config_payload(config),

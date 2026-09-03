@@ -8,7 +8,6 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import SFTConfig
 from wavelet.utils.serialization import load_yaml
 
-
 RL_CONFIGS = [
     path
     for path in sorted(Path("examples").rglob("*.yaml"))
@@ -171,6 +170,67 @@ def test_moe_reverse_text_sft_uses_int4_moe_qlora_shape() -> None:
     assert config.optim.type == "paged_adamw_8bit"
     assert config.deployment.num_gpus == 1
     assert config.max_steps == 2
+
+
+def test_polaris_recovery_sft_initializes_fresh_lora() -> None:
+    config = SFTConfig.model_validate(
+        load_yaml(Path("examples/qwen2_5_7b_polaris/sft_recoveries.yaml"))
+    )
+
+    assert config.model.adapter_path is None
+    assert config.model.name == "Qwen/Qwen2.5-7B-Instruct"
+    assert config.model.load_in_4bit is False
+    assert config.lora is not None
+    assert config.lora.rank == 16
+    assert config.data.batch_size == 8
+    assert config.optim.lr == pytest.approx(2e-4)
+    assert config.epochs == 3
+    assert config.max_steps is None
+
+
+def test_polaris_async_rl_uses_canonical_two_gpu_batch_shape() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32.yaml"))
+    )
+
+    assert config.model.adapter_path == Path(
+        "outputs/qwen2_5_7b_polaris_recovery_sft/adapter"
+    )
+    assert config.model.load_in_4bit is False
+    assert config.model.attn_implementation == "flash_attention_2"
+    assert config.model.fused_lm_head_token_chunk_size == "auto"
+    assert config.orchestrator.examples_per_step == 32
+    assert config.orchestrator.rollouts_per_example == 8
+    assert config.orchestrator.rollout_chunk_examples == 8
+    assert config.orchestrator.max_async_level == 4
+    assert config.orchestrator.max_off_policy_steps == 4
+    assert config.orchestrator.max_pending_rollout_chunks == 8
+    assert config.orchestrator.zero_advantage_max_retries == 8
+    assert config.data.batch_size == 32
+    assert config.data.micro_batch_size == 16
+    assert config.data.pack_sequences is False
+    assert config.data.seq_len == 8192
+    assert config.loss.kl_tau == 0.0
+    assert config.optim.lr == pytest.approx(5e-5)
+    assert config.launcher.mode == "process"
+    assert config.launcher.trainer_cuda_visible_devices == "0"
+    assert config.launcher.inference_cuda_visible_devices == "1"
+    assert config.eval is not None
+    assert config.eval.interval == 100
+    assert config.policy_transfer.keep_last == 8
+    assert config.ckpt is not None
+    assert config.ckpt.keep_last == 2
+    assert config.max_steps == 100000
+
+
+def test_polaris_smoke_exercises_long_run_training_semantics() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/qwen2_5_7b_polaris/rl_smoke.yaml"))
+    )
+
+    assert config.data.pack_sequences is False
+    assert config.loss.kl_tau == 0.0
+    assert config.optim.lr == pytest.approx(5e-5)
 
 
 def test_moe_reverse_text_rl_starts_from_sft_adapter_on_two_gpus() -> None:

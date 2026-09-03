@@ -58,9 +58,26 @@ def test_orchestrator_state_config_redacts_secrets(tmp_path) -> None:
 
     sanitized = state.sanitized_config()
 
-    assert sanitized["orchestrator"]["verifier_api_key_var"] == "<redacted>"
+    assert sanitized["orchestrator"]["verifier_api_key_var"] == "MY_API_KEY"
     assert sanitized["orchestrator"]["verifier_env_args"]["api_key"] == "<redacted>"
     assert sanitized["orchestrator"]["verifier_env_args"]["safe"] == "value"
+
+
+def test_orchestrator_state_reads_training_and_eval_metrics_separately(
+    tmp_path,
+) -> None:
+    (tmp_path / "metrics.jsonl").write_text(
+        '{"step": 1, "loss": 0.5}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "eval_metrics.jsonl").write_text(
+        '{"step": 100, "eval/math500/avg@8": 0.8}\n',
+        encoding="utf-8",
+    )
+    state = OrchestratorRunState(RLConfig(output_dir=tmp_path), target_step=100)
+
+    assert state.metrics(limit=10) == [{"step": 1, "loss": 0.5}]
+    assert state.eval_metrics(limit=10) == [{"step": 100, "eval/math500/avg@8": 0.8}]
 
 
 def test_orchestrator_state_includes_queue_summary(tmp_path) -> None:

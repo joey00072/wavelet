@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import sys
-from contextlib import asynccontextmanager
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,44 @@ from wavelet.utils.config import load_config
 
 def _server_engine_config(config: RLConfig) -> RLConfig:
     return config
+
+
+class _GenerationGate:
+    """Drain active generation and block new work during policy replacement."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._paused = False
+        self._active = 0
+
+    @property
+    def paused(self) -> bool:
+        with self._condition:
+            return self._paused
+
+    def pause(self) -> None:
+        with self._condition:
+            self._paused = True
+            while self._active:
+                self._condition.wait()
+
+    def resume(self) -> None:
+        with self._condition:
+            self._paused = False
+            self._condition.notify_all()
+
+    @contextmanager
+    def generation(self):
+        with self._condition:
+            while self._paused:
+                self._condition.wait()
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active -= 1
+                self._condition.notify_all()
 
 
 def _lifespan(config: RLConfig, engine: Any):
@@ -48,10 +87,19 @@ def _lifespan(config: RLConfig, engine: Any):
     return lifespan
 
 
-def _register_status_routes(app: Any, config: RLConfig, engine: Any) -> None:
+def _register_status_routes(
+    app: Any,
+    config: RLConfig,
+    engine: Any,
+    generation_gate: _GenerationGate,
+) -> None:
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {"status": "ok", "policy_step": engine.policy_step}
+        return {
+            "status": "ok",
+            "policy_step": engine.policy_step,
+            "generation_paused": generation_gate.paused,
+        }
 
     @app.get("/debug/state")
     def debug_state() -> dict[str, Any]:
@@ -59,16 +107,19 @@ def _register_status_routes(app: Any, config: RLConfig, engine: Any) -> None:
         state["runtime"] = {
             "policy_step": engine.policy_step,
             "policy_adapter_loaded": getattr(engine, "_lora_request", None) is not None,
+            "generation_paused": generation_gate.paused,
         }
         return state
 
     @app.post("/pause")
     def pause() -> dict[str, str]:
-        return {"status": "ok"}
+        generation_gate.pause()
+        return {"status": "paused"}
 
     @app.post("/resume")
     def resume() -> dict[str, str]:
-        return {"status": "ok"}
+        generation_gate.resume()
+        return {"status": "resumed"}
 
 
 def _register_memory_routes(app: Any, engine: Any) -> None:
@@ -107,7 +158,7 @@ def _register_policy_routes(
             )
         adapter_path = Path(raw_adapter_path)
         step = int(payload.get("step", engine.policy_step or 0))
-        engine._load_adapter_policy(adapter_path, step=step)  # noqa: SLF001
+        engine._load_adapter_policy(adapter_path, step=step)
         engine.policy_step = step
         return {"status": "ok", "policy_step": engine.policy_step}
 
@@ -138,11 +189,16 @@ def _register_policy_routes(
         return {"status": "ok"}
 
 
-def _register_inference_routes(app: Any, engine: Any) -> None:
+def _register_inference_routes(
+    app: Any,
+    engine: Any,
+    generation_gate: _GenerationGate,
+) -> None:
     @app.post("/annotate")
     def annotate(payload: dict[str, Any]) -> dict[str, Any]:
-        records = rl_examples_from_payload(payload["records"])
-        annotated = engine.annotate(records)
+        with generation_gate.generation():
+            records = rl_examples_from_payload(payload["records"])
+            annotated = engine.annotate(records)
         return {
             "records": rl_examples_to_payload(annotated),
             "policy_step": engine.policy_step,
@@ -150,12 +206,14 @@ def _register_inference_routes(app: Any, engine: Any) -> None:
 
     @app.post("/v1/chat/completions")
     def openai_chat_completions(payload: dict[str, Any]) -> dict[str, Any]:
-        return engine.openai_chat_completion(payload)
+        with generation_gate.generation():
+            return engine.openai_chat_completion(payload)
 
     @app.post("/v1/chat/completions/tokens")
     @app.post("/chat/completions/tokens")
     def openai_chat_completions_tokens(payload: dict[str, Any]) -> dict[str, Any]:
-        return engine.openai_chat_completion(payload)
+        with generation_gate.generation():
+            return engine.openai_chat_completion(payload)
 
     @app.post("/v1/tokenize")
     @app.post("/tokenize")
@@ -173,14 +231,15 @@ def _build_app(config: RLConfig):
         ) from exc
 
     engine = VLLMPolicyInferenceEngine(_server_engine_config(config))
+    generation_gate = _GenerationGate()
     app = FastAPI(
         title="Wavelet vLLM RL Server",
         lifespan=_lifespan(config, engine),
     )
-    _register_status_routes(app, config, engine)
+    _register_status_routes(app, config, engine, generation_gate)
     _register_memory_routes(app, engine)
     _register_policy_routes(app, engine, HTTPException)
-    _register_inference_routes(app, engine)
+    _register_inference_routes(app, engine, generation_gate)
 
     return app
 

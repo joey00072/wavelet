@@ -1,5 +1,7 @@
-"""Compatibility wrapper; implementation lives in wavelet.data.sft."""
+"""Compatibility alias for :mod:`wavelet.data.sft`."""
 
-from wavelet.data.sft import (
-    setup_dataloader as setup_dataloader,
-)
+import sys
+
+from wavelet.data import sft as _sft
+
+sys.modules[__name__] = _sft

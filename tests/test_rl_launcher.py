@@ -1,38 +1,52 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import wavelet.orchestrator.envs as verifier_envs
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
+from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
+from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
+from wavelet.inference.vllm import VLLMPolicyInferenceEngine
+from wavelet.orchestrator import runtime
+from wavelet.orchestrator.queue import (
+    FileSystemRolloutSender,
+    publish_adapter_policy_snapshot,
+)
 from wavelet.orchestrator.rollout_worker import (
     _colocated_trainer_device_ids,
     _wait_for_colocated_training_memory,
 )
-from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
+from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.runtime import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
+    _publish_rollout_timed,
     _role_specs,
+    _rollout_client_config,
+    _run_integrated_launcher,
     _sleep_vllm_http_servers,
     _trainer_device_group,
     _wait_for_vllm_http_server,
 )
-from wavelet.trainer.rl_worker import (
-    _StreamingChunkAccumulator,
-    _dummy_rollout_row,
-    _use_streaming_rollout_chunks,
+from wavelet.orchestrator.schedule import (
+    chunks_per_step,
+    rollout_chunk_examples,
+    rollout_groups_for_chunk,
 )
-from wavelet.inference.server import _fit_chat_request_to_context, _serve_args
-from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
-from wavelet.inference.vllm import VLLMPolicyInferenceEngine
-from wavelet.orchestrator.queue import publish_adapter_policy_snapshot
-from wavelet.orchestrator.rollouts import RLOrchestrator
-from wavelet.orchestrator.schedule import chunks_per_step, rollout_chunk_examples
+from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
 from wavelet.trainer.rl_trainer import RLTrainer
+from wavelet.trainer.rl_worker import (
+    _dummy_rollout_row,
+    _StreamingChunkAccumulator,
+    _use_streaming_rollout_chunks,
+    _validate_rollout_batch,
+    _validate_streaming_rollout_batch,
+)
 from wavelet.utils.policy_transfer import NCCL_READY_MARKER
 
 
@@ -44,6 +58,68 @@ class _FakeWorld:
 class _FakeTrainer:
     def __init__(self, *, is_main: bool | None) -> None:
         self.world = None if is_main is None else _FakeWorld(is_main=is_main)
+
+
+def test_integrated_rollout_publish_records_loaded_policy_step() -> None:
+    published: dict[str, object] = {}
+
+    def publish(**kwargs):
+        published.update(kwargs)
+        return object()
+
+    orchestrator = type("Orchestrator", (), {"publish": staticmethod(publish)})()
+    inference_engine = type("InferenceEngine", (), {"policy_step": 7})()
+
+    batch, elapsed = _publish_rollout_timed(
+        orchestrator,  # type: ignore[arg-type]
+        step=9,
+        inference_engine=inference_engine,
+    )
+
+    assert batch is not None
+    assert elapsed >= 0.0
+    assert published == {
+        "step": 9,
+        "inference_engine": inference_engine,
+        "policy_step": 7,
+    }
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_integrated_launcher_closes_resources(tmp_path, monkeypatch, fails) -> None:
+    config = RLConfig(output_dir=tmp_path / "run")
+    trainer = Mock(step=0, resume_checkpoint_dir=None)
+    inference_engine = Mock()
+    teardown = AsyncMock()
+    rollout_loop = Mock(side_effect=RuntimeError("rollout failed") if fails else None)
+    monkeypatch.setattr(runtime, "RLTrainer", Mock(return_value=trainer))
+    monkeypatch.setattr(runtime, "FileSystemRolloutReceiver", Mock())
+    monkeypatch.setattr(runtime, "FileSystemPolicyReceiver", Mock())
+    monkeypatch.setattr(
+        runtime,
+        "create_policy_inference_engine",
+        Mock(return_value=inference_engine),
+    )
+    monkeypatch.setattr(runtime, "_run_rollout_loop", rollout_loop)
+    monkeypatch.setattr(
+        verifier_envs,
+        "_teardown_cached_verifier_envs",
+        teardown,
+    )
+
+    if fails:
+        with pytest.raises(RuntimeError, match="rollout failed"):
+            _run_integrated_launcher(config)
+    else:
+        assert _run_integrated_launcher(config) == 0
+
+    teardown.assert_awaited_once_with()
+    inference_engine.close.assert_called_once_with()
+    trainer.finalize.assert_called_once_with(status="failed" if fails else "completed")
+
+
+def _argv_value(argv: list[str], option: str) -> str:
+    return argv[argv.index(option) + 1]
 
 
 def test_colocate_launcher_defaults_trainer_to_inference_devices() -> None:
@@ -152,6 +228,14 @@ def test_rollout_chunk_examples_defaults_to_async_split() -> None:
 
     assert rollout_chunk_examples(config) == 3
     assert chunks_per_step(config) == 6
+    assert [rollout_groups_for_chunk(config, index) for index in range(6)] == [
+        3,
+        3,
+        3,
+        3,
+        3,
+        2,
+    ]
 
 
 def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
@@ -210,6 +294,129 @@ def test_streaming_chunk_accumulator_preserves_chunk_step_boundary(tmp_path) -> 
     assert accumulator.accumulated_loss_scale == 0.0
 
 
+def test_streaming_rollout_manifest_must_match_current_step(tmp_path: Path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={
+            "examples_per_step": 4,
+            "rollout_chunk_examples": 2,
+            "max_async_level": 2,
+            "max_off_policy_steps": 2,
+        },
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n{}\n", encoding="utf-8")
+    batch = FileSystemRolloutSender(tmp_path, config.transport).publish(
+        source,
+        step=2,
+        optimizer_step=1,
+        chunk_index=0,
+        policy_step=0,
+        rows=2,
+    )
+
+    _validate_streaming_rollout_batch(
+        config,
+        batch,
+        trainer_step=1,
+        row_count=2,
+    )
+    with pytest.raises(ValueError, match="trainer is at step 0"):
+        _validate_streaming_rollout_batch(
+            config,
+            batch,
+            trainer_step=0,
+            row_count=2,
+        )
+
+
+def test_streaming_rollout_rejects_stale_policy_and_wrong_manifest(
+    tmp_path: Path,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={
+            "examples_per_step": 4,
+            "rollout_chunk_examples": 2,
+            "max_async_level": 2,
+            "max_off_policy_steps": 1,
+        },
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n{}\n", encoding="utf-8")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    stale = sender.publish(
+        source,
+        step=4,
+        optimizer_step=2,
+        chunk_index=0,
+        policy_step=0,
+        rows=2,
+    )
+    wrong_rows = sender.publish(
+        source,
+        step=5,
+        optimizer_step=2,
+        chunk_index=1,
+        policy_step=1,
+        rows=99,
+    )
+
+    with pytest.raises(ValueError, match=r"requires a policy step in \[1, 2\]"):
+        _validate_streaming_rollout_batch(
+            config,
+            stale,
+            trainer_step=2,
+            row_count=2,
+        )
+    with pytest.raises(ValueError, match="rows=99"):
+        _validate_streaming_rollout_batch(
+            config,
+            wrong_rows,
+            trainer_step=2,
+            row_count=2,
+        )
+
+
+def test_synchronous_rollout_manifest_must_match_trainer_state(
+    tmp_path: Path,
+) -> None:
+    config = RLConfig(output_dir=tmp_path)
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n{}\n", encoding="utf-8")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    valid = sender.publish(
+        source,
+        step=3,
+        optimizer_step=3,
+        policy_step=3,
+        rows=2,
+    )
+    stale = sender.publish(
+        source,
+        step=4,
+        optimizer_step=4,
+        policy_step=2,
+        rows=2,
+    )
+
+    _validate_rollout_batch(
+        config,
+        valid,
+        trainer_step=3,
+        row_count=2,
+        chunk_index=None,
+    )
+    with pytest.raises(ValueError, match="policy_step=2"):
+        _validate_rollout_batch(
+            config,
+            stale,
+            trainer_step=4,
+            row_count=2,
+            chunk_index=None,
+        )
+
+
 def test_sleep_colocate_allows_multi_process_trainer() -> None:
     config = RLConfig(
         launcher={
@@ -240,9 +447,15 @@ def test_sleep_colocate_allows_multi_replica_inference() -> None:
 def test_sleep_colocate_enables_vllm_sleep_allocator() -> None:
     config = RLConfig(launcher={"mode": "colocate_sleep"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.enable_sleep_mode is True
+    assert "--enable-sleep-mode" in argv
+
+
+def test_inference_server_returns_sampling_distribution_logprobs() -> None:
+    argv = _serve_argv(RLConfig())
+
+    assert _argv_value(argv, "--logprobs-mode") == "processed_logprobs"
 
 
 def test_inference_server_enables_fully_sharded_loras() -> None:
@@ -251,13 +464,13 @@ def test_inference_server_enables_fully_sharded_loras() -> None:
         lora={"rank": 32, "target_modules": ["q_proj"]},
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.enable_lora is True
-    assert args.max_loras == 1
-    assert args.max_cpu_loras == 1
-    assert args.fully_sharded_loras is True
-    assert args.max_lora_rank == 32
+    assert "--enable-lora" in argv
+    assert _argv_value(argv, "--max-loras") == "1"
+    assert _argv_value(argv, "--max-cpu-loras") == "1"
+    assert "--fully-sharded-loras" in argv
+    assert _argv_value(argv, "--max-lora-rank") == "32"
 
 
 def test_inference_server_passes_quantized_load_args() -> None:
@@ -270,10 +483,10 @@ def test_inference_server_passes_quantized_load_args() -> None:
         }
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.quantization == "bitsandbytes"
-    assert args.load_format == "bitsandbytes"
+    assert _argv_value(argv, "--quantization") == "bitsandbytes"
+    assert _argv_value(argv, "--load-format") == "bitsandbytes"
 
 
 def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
@@ -284,10 +497,10 @@ def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
         policy_transfer={"type": "nccl"},
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
     assert (
-        args.worker_extension_cls
+        _argv_value(argv, "--worker-extension-cls")
         == "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
     )
 
@@ -299,7 +512,9 @@ def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
         launcher={"mode": "process", "inference_num_replicas": 1},
         inference={"mode": "vllm_http"},
         orchestrator={
-            "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
         },
         policy_transfer={"export_initial": True},
     )
@@ -315,13 +530,53 @@ def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
     assert roles[0].command == "inference-server"
 
 
-def test_launcher_uses_native_inference_server_only_when_requested(tmp_path: Path) -> None:
+def test_eval_only_base_model_keeps_served_model_name() -> None:
+    config = RLConfig(
+        max_steps=0,
+        model={"name": "Qwen/Qwen2.5-7B-Instruct"},
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        orchestrator={
+            "verifier_model": "Qwen/Qwen2.5-7B-Instruct",
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+        },
+    )
+
+    rollout_config = _rollout_client_config(config, ports=[8000])
+
+    assert rollout_config.orchestrator.verifier_model == ("Qwen/Qwen2.5-7B-Instruct")
+
+
+def test_training_lora_uses_policy_adapter_model_name() -> None:
+    config = RLConfig(
+        max_steps=1,
+        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            )
+        },
+    )
+
+    rollout_config = _rollout_client_config(config, ports=[8000])
+
+    assert rollout_config.orchestrator.verifier_model == (
+        config.policy_transfer.adapter_name
+    )
+
+
+def test_launcher_uses_native_inference_server_only_when_requested(
+    tmp_path: Path,
+) -> None:
     config = RLConfig(
         output_dir=tmp_path,
         launcher={"mode": "process", "inference_num_replicas": 1},
         inference={"mode": "vllm_http", "vllm": {"server_backend": "offline"}},
         orchestrator={
-            "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
         },
     )
 
@@ -364,28 +619,28 @@ def test_publish_adapter_policy_snapshot_copies_adapter(tmp_path: Path) -> None:
 def test_inference_server_auto_enables_qwen_tool_parser() -> None:
     config = RLConfig(model={"name": "Qwen/Qwen3-4B-Instruct-2507"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser == "hermes"
-    assert args.enable_auto_tool_choice is True
+    assert _argv_value(argv, "--tool-call-parser") == "hermes"
+    assert "--enable-auto-tool-choice" in argv
 
 
 def test_inference_server_auto_detects_qwen35_tool_parser() -> None:
     config = RLConfig(model={"name": "Qwen/Qwen3.5-397B-A17B"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser == "qwen3_coder"
-    assert args.enable_auto_tool_choice is True
+    assert _argv_value(argv, "--tool-call-parser") == "qwen3_coder"
+    assert "--enable-auto-tool-choice" in argv
 
 
 def test_inference_server_unknown_auto_tool_parser_disabled() -> None:
     config = RLConfig(model={"name": "some/unknown-model"})
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser is None
-    assert args.enable_auto_tool_choice is False
+    assert "--tool-call-parser" not in argv
+    assert "--enable-auto-tool-choice" not in argv
 
 
 def test_inference_server_allows_disabling_tool_parser() -> None:
@@ -394,10 +649,10 @@ def test_inference_server_allows_disabling_tool_parser() -> None:
         inference={"vllm": {"tool_call_parser": None}},
     )
 
-    args = _serve_args(config)
+    argv = _serve_argv(config)
 
-    assert args.tool_call_parser is None
-    assert args.enable_auto_tool_choice is False
+    assert "--tool-call-parser" not in argv
+    assert "--enable-auto-tool-choice" not in argv
 
 
 def test_sleep_colocate_resolves_memory_wait_devices() -> None:
@@ -479,7 +734,9 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        return {}
+        if payload is None:
+            return {"status": "ok"}
+        return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
 
@@ -496,7 +753,7 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
                 "load_inplace": True,
             },
             "http://127.0.0.1:8000",
-        )
+        ),
     ]
     assert engine.policy_model_name == "policy"
 
@@ -519,7 +776,9 @@ def test_http_openai_nccl_load_policy_signals_ready(tmp_path: Path) -> None:
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        return {}
+        if payload is None:
+            return {"status": "ok"}
+        return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
 
@@ -529,12 +788,14 @@ def test_http_openai_nccl_load_policy_signals_ready(tmp_path: Path) -> None:
 
     assert (policy_dir / NCCL_READY_MARKER).is_file()
     assert calls == [
+        ("POST", "/pause", None, "http://127.0.0.1:8000"),
         (
             "POST",
             "/load_policy",
             {"policy_dir": str(policy_dir), "step": 3},
             "http://127.0.0.1:8000",
-        )
+        ),
+        ("POST", "/resume", None, "http://127.0.0.1:8000"),
     ]
 
 
@@ -559,17 +820,18 @@ def test_launcher_derives_nccl_inference_world_size() -> None:
     assert resolved.policy_transfer.nccl_rank_offset == 1
 
 
-def test_http_openai_load_policy_stages_adapter_in_tmpfs(
+def test_http_openai_load_policy_uses_immutable_snapshot_path(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    cache_root = tmp_path / "cache"
-    monkeypatch.setenv("WAVELET_POLICY_CACHE_DIR", str(cache_root))
     policy_dir = tmp_path / "policy"
     adapter_dir = policy_dir / "adapter"
     adapter_dir.mkdir(parents=True)
     (adapter_dir / "adapter_config.json").write_text("{}", encoding="utf-8")
     (adapter_dir / "adapter_model.safetensors").write_bytes(b"weights")
+    (policy_dir / "policy.json").write_text(
+        json.dumps({"artifact": {"bytes": len(b"weights")}}),
+        encoding="utf-8",
+    )
     config = RLConfig(
         inference={"vllm": {"server_backend": "openai"}},
         lora={"rank": 4, "target_modules": ["q_proj"]},
@@ -586,7 +848,9 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        return {}
+        if payload is None:
+            return {"status": "ok"}
+        return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
 
@@ -594,15 +858,7 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
 
     payload = calls[0][2]
     assert payload is not None
-    cached_policy_dir = Path(payload["policy_dir"])
-    assert cached_policy_dir != policy_dir
-    assert (
-        cached_policy_dir.parent.parent
-        == cache_root / f"wavelet-policy-cache-{os.getuid()}"
-    )
-    assert (
-        cached_policy_dir / "adapter" / "adapter_model.safetensors"
-    ).read_bytes() == b"weights"
+    assert Path(payload["policy_dir"]) == policy_dir
     assert payload["adapter_name"] == "policy"
     assert payload["load_inplace"] is True
 
@@ -645,6 +901,7 @@ def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
 
 def test_http_openai_payload_sets_vllm_request_fields() -> None:
     config = RLConfig(
+        orchestrator={"enabled": False},
         inference={
             "sampling": {
                 "top_k": 20,
@@ -652,7 +909,7 @@ def test_http_openai_payload_sets_vllm_request_fields() -> None:
                 "extra_body": {"return_token_ids": False, "allowed_token_ids": [1, 2]},
             },
             "vllm": {"server_backend": "openai"},
-        }
+        },
     )
     engine = HTTPPolicyInferenceEngine(config)
     engine.policy_step = 123
@@ -721,7 +978,7 @@ def test_openai_sampling_kwargs_passes_stop_strings() -> None:
     )
     engine = VLLMPolicyInferenceEngine(config)
 
-    kwargs = engine._openai_sampling_kwargs(  # noqa: SLF001
+    kwargs = engine._openai_sampling_kwargs(
         {
             "temperature": 1.0,
             "top_p": 1.0,

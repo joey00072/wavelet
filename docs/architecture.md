@@ -40,9 +40,16 @@ separately:
 3. The next inference step observes the exported policy subject to the
    configured off-policy window.
 
+`max_off_policy_steps` is always a hard freshness ceiling. Setting it to zero
+requires the policy for the current optimizer step even if `max_async_level` is
+larger; async capacity never silently widens the configured freshness window.
+
 Queue directories and stable markers are the synchronization contract. Run
 state and queue events provide observability; process-local memory is never the
 source of truth for a completed batch or policy.
+Preflight reports optimizer batches explicitly as groups times rollouts and the
+number of transport chunks. A non-divisible final chunk contains only the
+remaining groups; chunking never rounds the optimizer batch upward.
 
 ## Inference Scheduling
 
@@ -76,11 +83,31 @@ Filesystem policy exports use a temporary directory followed by an atomic
 rename and stable marker. Metadata is written beside the model or adapter. NCCL
 transfer uses the same metadata and readiness concepts, but broadcasts named
 tensors after inference workers enter the update collective.
+Inference loads LoRA adapters directly from the immutable published directory;
+it does not make a second tmpfs copy of every policy.
+Policy receive events reuse the tensor byte count recorded in `policy.json`;
+they do not walk or reread the artifact to reconstruct diagnostic metadata.
+Checkpoint resume removes policy versions beyond the restored step and reuses
+an exact complete snapshot when present. Ordinary exports never overwrite a
+stable policy directory.
+The one-shot `load_inplace` flag is cleared immediately after refresh so vLLM
+does not reread the adapter during later generation scheduler work.
+
+HTTP policy refreshes are transactions across all inference replicas. The
+rollout scheduler first blocks new submissions and drains requests already
+admitted. LoRA adapters then use vLLM's in-place load directly; a second server
+pause would only repeat the scheduler drain. Full-model and collective updates
+pause generation without clearing the version-salted prefix cache, update every
+replica, and resume even when loading fails. Never replace adapter or model
+weights while a request is decoding.
 
 Only the intended distributed rank writes metadata, stable markers, queue
 events, and final directories. Barriers protect visibility across trainer
 ranks; they do not replace stable markers between trainer and inference
 processes.
+Rollout manifests and claim/consumed records are required queue state. Their
+write failures stop the run; only duplicate diagnostic events and traces are
+best-effort.
 
 ## Extension Points
 

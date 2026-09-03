@@ -1,10 +1,53 @@
+import pytest
+
 from wavelet.configs.rl_config import RLSamplingConfig
 from wavelet.inference.engine import (
+    VLLMPolicyInferenceEngine,
+    extract_vllm_generation_logprobs,
+    extract_vllm_prompt_logprobs,
     fit_generation_context,
     openai_payload_to_vllm_kwargs,
     openai_sampling_payload,
     vllm_sampling_kwargs,
 )
+
+
+def test_embedded_vllm_server_rejects_missing_generation_logprobs() -> None:
+    engine = VLLMPolicyInferenceEngine.__new__(VLLMPolicyInferenceEngine)
+    engine.tokenizer = object()
+
+    with pytest.raises(RuntimeError, match="did not return sampled-token logprobs"):
+        engine._openai_logprob_content([1], None)
+
+
+@pytest.mark.parametrize("token_key", [7, "7"])
+def test_generation_logprobs_preserve_exact_zero(token_key: int | str) -> None:
+    assert extract_vllm_generation_logprobs([{token_key: 0.0}], [7]) == [0.0]
+
+
+@pytest.mark.parametrize("token_key", [7, "7"])
+def test_prompt_logprobs_preserve_exact_zero(token_key: int | str) -> None:
+    assert extract_vllm_prompt_logprobs(
+        [None, {token_key: 0.0}],
+        target_ids=[7],
+        loss_mask=[True],
+    ) == [0.0]
+
+
+@pytest.mark.parametrize("row_count", [0, 2])
+def test_generation_logprobs_require_exact_row_count(row_count: int) -> None:
+    with pytest.raises(ValueError, match="different number"):
+        extract_vllm_generation_logprobs([{7: -0.1}] * row_count, [7])
+
+
+@pytest.mark.parametrize("row_count", [1, 3])
+def test_prompt_logprobs_require_exact_row_count(row_count: int) -> None:
+    with pytest.raises(ValueError, match="different number"):
+        extract_vllm_prompt_logprobs(
+            [None] * row_count,
+            target_ids=[7],
+            loss_mask=[True],
+        )
 
 
 def test_sampling_payloads_preserve_backend_contracts() -> None:

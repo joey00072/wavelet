@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wavelet.orchestrator.queue import (
     ClaimRecord,
     ConsumedRecord,
@@ -10,11 +12,11 @@ from wavelet.orchestrator.queue import (
     RolloutBatch,
     RolloutManifest,
     append_event,
-    record_rollout_claim,
-    record_rollout_consumed,
     read_claim,
     read_consumed,
     read_manifest,
+    record_rollout_claim,
+    record_rollout_consumed,
     tail_events,
     write_claim,
     write_consumed,
@@ -72,6 +74,34 @@ def test_missing_lifecycle_records_return_none(tmp_path: Path) -> None:
     assert read_consumed(tmp_path) is None
 
 
+@pytest.mark.parametrize("operation", ["claim", "consumed"])
+def test_required_lifecycle_write_failures_propagate(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    batch_path = tmp_path / "rollouts.jsonl"
+    batch_path.write_text("{}\n", encoding="utf-8")
+    batch = RolloutBatch(step=0, path=batch_path, step_dir=tmp_path)
+
+    def fail_write(*_args, **_kwargs) -> None:
+        raise OSError("disk full")
+
+    if operation == "claim":
+        monkeypatch.setattr("wavelet.transport.queue.write_claim", fail_write)
+        with pytest.raises(OSError, match="disk full"):
+            record_rollout_claim(batch, trainer_step_before=0)
+    else:
+        monkeypatch.setattr("wavelet.transport.queue.write_consumed", fail_write)
+        with pytest.raises(OSError, match="disk full"):
+            record_rollout_consumed(
+                batch,
+                trainer_step_before=0,
+                trainer_step_after=1,
+                optimizer_step_completed=True,
+            )
+
+
 def test_event_append_and_tail(tmp_path: Path) -> None:
     append_event(
         tmp_path,
@@ -119,6 +149,21 @@ def test_rollout_claim_and_consume_write_traces(tmp_path: Path) -> None:
     batch_path = step_dir / "rollouts.jsonl"
     batch_path.write_text("{}\n", encoding="utf-8")
     batch = RolloutBatch(step=3, path=batch_path, step_dir=step_dir)
+    write_manifest(
+        step_dir,
+        RolloutManifest(
+            format_version=1,
+            queue_step=3,
+            optimizer_step=1,
+            chunk_index=0,
+            policy_step=0,
+            rows=1,
+            tokens=None,
+            reward_mean=None,
+            producer_id="inference",
+            created_at="2026-05-10T00:00:00+00:00",
+        ),
+    )
 
     record_rollout_claim(
         batch,
@@ -143,5 +188,8 @@ def test_rollout_claim_and_consume_write_traces(tmp_path: Path) -> None:
     )
     assert step_one_trace["event"] == "rollout_claimed"
     assert step_one_trace["queue_step"] == 3
+    assert step_one_trace["optimizer_step"] == 1
+    assert step_one_trace["policy_step"] == 0
     assert step_two_trace["event"] == "rollout_consumed"
-    assert step_two_trace["optimizer_step"] == 2
+    assert step_two_trace["optimizer_step"] == 1
+    assert step_two_trace["policy_step"] == 0

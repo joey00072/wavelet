@@ -5,11 +5,10 @@ import ast
 import json
 import subprocess
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
-
 
 IGNORED_PARTS = {
     ".git",
@@ -269,7 +268,7 @@ def _is_comment_line(suffix: str, stripped: str) -> bool:
     if suffix == ".py":
         return stripped.startswith("#")
     if suffix in {".js", ".ts", ".tsx", ".css"}:
-        return stripped.startswith("//") or stripped.startswith("/*")
+        return stripped.startswith(("//", "/*"))
     if suffix in {".md", ".toml", ".yaml", ".yml"}:
         return stripped.startswith("#")
     return False

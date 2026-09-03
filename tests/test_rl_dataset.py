@@ -31,7 +31,7 @@ def test_packed_rl_dataset_gives_each_rank_same_micro_batch_count(rank: int) -> 
         data_world_size=4,
     )
 
-    bins = dataset._bins_for_epoch(0)  # noqa: SLF001
+    bins = dataset._bins_for_epoch(0)
 
     assert len(bins) == 2
     assert dataset.micro_batch_count() == 2
@@ -47,7 +47,7 @@ def test_packed_rl_dataset_pads_incomplete_distributed_tail_with_zero_loss() -> 
         data_world_size=4,
     )
 
-    bins = dataset._bins_for_epoch(0)  # noqa: SLF001
+    bins = dataset._bins_for_epoch(0)
 
     assert len(bins) == 2
     assert sum(bins[-1]["loss_mask"]) == 0
@@ -83,14 +83,14 @@ def test_packed_rl_dataset_allows_dummy_only_distributed_ranks() -> None:
         data_world_size=4,
     )
 
-    bins = dataset._bins_for_epoch(0)  # noqa: SLF001
+    bins = dataset._bins_for_epoch(0)
 
     assert len(bins) == 1
     assert sum(bins[0]["loss_mask"]) == 0
     assert bins[0]["advantages"] == []
     assert bins[0]["sample_count"] == 0
     assert dataset.local_real_sample_count() == 0
-    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(1.0)
+    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(0.0)
 
 
 def test_pretokenized_dummy_rollout_keeps_zero_loss_sample() -> None:
@@ -152,3 +152,73 @@ def test_pretokenized_rollout_count_metadata_sets_sample_count() -> None:
 
     assert sample is not None
     assert sample["sample_count"] == 0
+
+
+def test_pretokenized_source_lengths_are_checked_before_truncation() -> None:
+    record = _record(0, length=10)
+    record.target_ids.append(11)
+
+    with pytest.raises(ValueError, match="mismatched source"):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )
+
+
+def test_pretokenized_logprobs_must_cover_every_source_trainable_token() -> None:
+    record = _record(0, length=10)
+    record.inference_logprobs = [-1.0] * 8
+
+    with pytest.raises(ValueError, match="inference_logprobs.*8 != 10"):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )
+
+
+def test_pretokenized_tail_truncation_keeps_aligned_logprob_prefix() -> None:
+    record = _record(0, length=10)
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sample["input_ids"] == list(range(8))
+    assert sample["inference_logprobs"] == [-1.0] * 8
+    assert len(sample["advantages"]) == 8
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("advantage", float("nan"), "advantage.*finite"),
+        ("reward", float("inf"), "reward.*finite"),
+        ("inference_logprobs", [float("-inf")] * 6, "inference_logprobs.*finite"),
+        ("teacher_logprobs", [float("nan")] * 6, "teacher_logprobs.*finite"),
+        ("temperatures", [0.0] * 6, "temperatures.*positive"),
+        ("temperatures", [-1.0] * 6, "temperatures.*positive"),
+    ],
+)
+def test_rl_samples_reject_invalid_numeric_streams(
+    field_name: str,
+    value,
+    message: str,
+) -> None:
+    record = _record(0)
+    setattr(record, field_name, value)
+
+    with pytest.raises(ValueError, match=message):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )

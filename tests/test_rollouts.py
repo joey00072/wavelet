@@ -145,6 +145,157 @@ def test_native_rollout_materialization_retries_incomplete_groups(
     assert {row["reward"] for row in rows} == {1.0}
 
 
+def test_native_rollouts_reject_oversized_groups() -> None:
+    config = RLConfig(
+        orchestrator={
+            "rollouts_per_example": 2,
+            "advantage_mode": "group_reward",
+        }
+    )
+    orchestrator = RLOrchestrator(config)
+    records = [
+        replace(
+            _example(),
+            metadata={"group_key": "duplicate-group", "rollout_index": index},
+        )
+        for index in range(3)
+    ]
+
+    assert orchestrator._drop_incomplete_native_rollout_groups(records) == []
+
+
+def test_native_rollout_retries_when_only_part_of_batch_is_complete(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        inference={"enabled": True},
+        reward={"mode": "reference_match"},
+        orchestrator={
+            "examples_per_step": 2,
+            "rollouts_per_example": 2,
+            "advantage_mode": "group_reward",
+            "filter_zero_advantage": False,
+            "zero_advantage_max_retries": 1,
+        },
+    )
+    orchestrator = RLOrchestrator(config)
+    second = replace(
+        _example(),
+        prompt=[{"role": "user", "content": "What is 20 + 22?"}],
+    )
+    monkeypatch.setattr(
+        "wavelet.orchestrator.rollouts.load_rl_records",
+        lambda _config: [_example(), second],
+    )
+
+    engine = _FlakyIncompleteGroupEngine()
+    path = orchestrator.materialize_native_chunk(
+        optimizer_step=0,
+        chunk_index=0,
+        queue_step=0,
+        chunk_examples=2,
+        inference_engine=engine,
+    )
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert engine.calls == 2
+    assert len(rows) == 4
+
+
+def test_materialize_accumulates_trainable_groups_across_retries(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={
+            "examples_per_step": 2,
+            "rollouts_per_example": 2,
+            "advantage_mode": "group_reward",
+            "filter_zero_advantage": True,
+            "zero_advantage_max_retries": 1,
+        },
+    )
+    orchestrator = RLOrchestrator(config)
+    attempts = [
+        [
+            replace(
+                _example(),
+                reward=reward,
+                advantage=advantage,
+                temperatures=[1.0],
+                metadata={"group_key": "first"},
+            )
+            for reward, advantage in ((0.0, -0.5), (1.0, 0.5))
+        ],
+        [
+            replace(
+                _example(),
+                reward=reward,
+                advantage=advantage,
+                temperatures=[1.0],
+                metadata={"group_key": "second"},
+            )
+            for reward, advantage in ((0.0, -0.5), (1.0, 0.5))
+        ],
+    ]
+    monkeypatch.setattr(orchestrator, "_load_step_records", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "_generate_and_score",
+        lambda *_args, **_kwargs: attempts.pop(0),
+    )
+
+    path = orchestrator.materialize(step=0)
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 4
+    assert len({row["example_id"] for row in rows}) == 2
+    assert {row["reward"] for row in rows} == {0.0, 1.0}
+
+
+def test_materialize_does_not_duplicate_groups_across_retries(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={
+            "examples_per_step": 2,
+            "rollouts_per_example": 1,
+            "advantage_mode": "reward",
+            "filter_zero_advantage": False,
+            "zero_advantage_max_retries": 1,
+        },
+    )
+    orchestrator = RLOrchestrator(config)
+
+    def record(group_key: str) -> RLExample:
+        return replace(
+            _example(),
+            reward=1.0,
+            advantage=1.0,
+            temperatures=[1.0],
+            metadata={"group_key": group_key},
+        )
+
+    attempts = [[record("first")], [record("first"), record("second")]]
+    monkeypatch.setattr(orchestrator, "_load_step_records", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        orchestrator,
+        "_generate_and_score",
+        lambda *_args, **_kwargs: attempts.pop(0),
+    )
+
+    path = orchestrator.materialize(step=0)
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(rows) == 2
+    assert len({row["example_id"] for row in rows}) == 2
+
+
 def test_native_rollout_materialization_fails_on_repeated_empty_completions(
     tmp_path,
     monkeypatch,
@@ -177,7 +328,7 @@ def test_native_rollout_materialization_fails_on_repeated_empty_completions(
                 for record in records
             ]
 
-    with pytest.raises(RuntimeError, match="All rollout groups"):
+    with pytest.raises(RuntimeError, match="requested native chunk group count"):
         orchestrator.materialize_native_chunk(
             optimizer_step=0,
             chunk_index=0,
@@ -217,7 +368,7 @@ def test_group_reward_token_length_penalty_prefers_short_correct_rollouts() -> N
         ),
     ]
 
-    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+    updated = orchestrator._assign_advantages(records)
 
     assert updated[0].advantage > updated[1].advantage
     assert updated[1].advantage > updated[2].advantage
@@ -242,7 +393,7 @@ def test_group_reward_zero_length_cost_falls_back_to_plain_reward() -> None:
         replace(_example(), reward=0.0, metadata={"group_key": "a"}),
     ]
 
-    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+    updated = orchestrator._assign_advantages(records)
 
     assert [record.advantage for record in updated] == pytest.approx(
         [1 / 3, 1 / 3, -2 / 3]
@@ -256,6 +407,6 @@ def test_native_orchestrator_dispatches_max_rl() -> None:
         replace(_example(), reward=0.0, metadata={"group_key": "a"}),
     ]
 
-    updated = orchestrator._assign_advantages(records)  # noqa: SLF001
+    updated = orchestrator._assign_advantages(records)
 
     assert [record.advantage for record in updated] == pytest.approx([1.0, -1.0])

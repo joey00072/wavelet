@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from dataclasses import dataclass
 import logging
 import types
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import TypedDict
 
 import torch
@@ -116,6 +116,31 @@ def _sequence_spans(position_ids: Tensor, seq_len: int) -> list[tuple[int, int]]
     ]
 
 
+def normalization_unit_count(
+    loss_mask: Tensor,
+    *,
+    normalization: str,
+    position_ids: Tensor | None = None,
+) -> int:
+    """Count the units used to normalize one RL loss batch."""
+    if normalization == "token":
+        return int(loss_mask.sum().item())
+    if normalization != "sequence":
+        raise ValueError(f"Unsupported RL loss normalization: {normalization!r}")
+
+    seq_len = loss_mask.shape[1]
+    spans_by_row = (
+        [[(0, seq_len)] for _ in range(loss_mask.shape[0])]
+        if position_ids is None
+        else [_sequence_spans(row, seq_len) for row in position_ids]
+    )
+    return sum(
+        int(loss_mask[row_index, start:end].any().item())
+        for row_index, spans in enumerate(spans_by_row)
+        for start, end in spans
+    )
+
+
 def _iter_trainable_spans(
     trainer_logprobs: Tensor,
     inference_logprobs: Tensor,
@@ -153,7 +178,7 @@ def _iter_trainable_spans(
 
 
 def _resolve_loss_scale(
-    loss_scale: int | float | Tensor | None,
+    loss_scale: float | Tensor | None,
     *,
     normalization: str,
     sequence_count: int,
@@ -193,7 +218,7 @@ def compute_loss(
     loss_mask: Tensor,
     loss_config: RLLossConfig,
     *,
-    loss_scale: int | float | Tensor | None = None,
+    loss_scale: float | Tensor | None = None,
     position_ids: Tensor | None = None,
 ) -> LossOutput:
     total_loss: Tensor | None = None

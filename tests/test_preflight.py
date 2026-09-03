@@ -7,7 +7,6 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.entrypoints.rl_debug import main as debug_main
 from wavelet.orchestrator.preflight import build_preflight_report
 
-
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
 
 
@@ -57,6 +56,98 @@ def test_preflight_reports_missing_local_data(tmp_path) -> None:
     assert report["ok"] is False
     assert any(
         check["name"] == "data_path_0" and check["status"] == "error"
+        for check in report["checks"]
+    )
+
+
+def test_preflight_reports_effective_rollout_batch_shape(tmp_path) -> None:
+    config = RLConfig(
+        data={"source": "local", "path": _write_local_data(tmp_path)},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+        orchestrator={
+            "examples_per_step": 17,
+            "rollouts_per_example": 8,
+            "rollout_chunk_examples": 3,
+        },
+    )
+
+    report = build_preflight_report(config)
+    check = next(item for item in report["checks"] if item["name"] == "rollout_chunks")
+
+    assert check["details"] == {
+        "groups": 17,
+        "rollouts_per_group": 8,
+        "rollouts": 136,
+        "chunks": 6,
+    }
+
+
+def test_preflight_reports_missing_model_adapter(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    adapter_path = tmp_path / "missing-adapter"
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"adapter_path": adapter_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert any(
+        check["name"] == "model_adapter_path"
+        and check["status"] == "error"
+        and check["details"]["missing_files"]
+        == ["adapter_config.json", "adapter_model.safetensors"]
+        for check in report["checks"]
+    )
+
+
+def test_preflight_accepts_loadable_model_adapter(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    adapter_path = tmp_path / "adapter"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"weights")
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"adapter_path": adapter_path},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert any(
+        check["name"] == "model_adapter_path" and check["status"] == "ok"
+        for check in report["checks"]
+    )
+
+
+def test_preflight_rejects_adapter_removed_by_clean_output_dir(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    output_dir = tmp_path / "run"
+    adapter_path = output_dir / "policies" / "step-000001" / "adapter"
+    adapter_path.mkdir(parents=True)
+    (adapter_path / "adapter_config.json").write_text("{}\n", encoding="utf-8")
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"weights")
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"adapter_path": adapter_path},
+        output_dir=output_dir,
+        clean_output_dir=True,
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert any(
+        check["name"] == "model_adapter_path"
+        and check["status"] == "error"
+        and check["details"]["removed_by_clean_output_dir"] is True
         for check in report["checks"]
     )
 
@@ -166,6 +257,34 @@ def test_preflight_resolves_process_commands(tmp_path, monkeypatch) -> None:
     assert report["paths"]["policy_dir"] == str(tmp_path / "run" / "policies")
 
 
+def test_checkpoint_output_dir_does_not_replace_run_output_dir(
+    tmp_path, monkeypatch
+) -> None:
+    data_path = _write_local_data(tmp_path)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.preflight._available_gpu_indices",
+        lambda: {"0"},
+    )
+    run_dir = tmp_path / "run"
+    checkpoint_dir = tmp_path / "large-volume"
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        output_dir=run_dir,
+        ckpt={"mode": "async", "interval": 10, "output_dir": checkpoint_dir},
+    )
+
+    report = build_preflight_report(config)
+
+    assert config.output_dir == run_dir
+    assert config.checkpoint_output_dir == checkpoint_dir
+    assert report["paths"]["output_dir"] == str(run_dir)
+    assert report["paths"]["checkpoint_dir"] == str(checkpoint_dir)
+    assert any(
+        check["name"] == "checkpoint_parent_writable" and check["status"] == "ok"
+        for check in report["checks"]
+    )
+
+
 def test_preflight_cli_returns_nonzero_for_errors(tmp_path, capsys) -> None:
     config_path = tmp_path / "rl.yaml"
     config_path.write_text(
@@ -234,6 +353,34 @@ def test_preflight_reports_missing_bitsandbytes_for_qlora(
     assert report["ok"] is False
     assert any(
         check["name"] == "bitsandbytes_available" and check["status"] == "error"
+        for check in report["checks"]
+    )
+
+
+def test_preflight_requires_flash_attention_when_explicit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    data_path = _write_local_data(tmp_path)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        lambda name: None if name == "flash_attn" else object(),
+    )
+    config = RLConfig(
+        data={"source": "local", "path": data_path},
+        model={"attn_implementation": "flash_attention_2"},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+    )
+
+    report = build_preflight_report(config)
+
+    assert report["ok"] is False
+    assert report["summary"]["trainer_attention"] == "flash_attention_2"
+    assert any(
+        check["name"] == "flash_attention_available"
+        and check["status"] == "error"
+        and "uv sync --extra flash-attn" in check["message"]
         for check in report["checks"]
     )
 

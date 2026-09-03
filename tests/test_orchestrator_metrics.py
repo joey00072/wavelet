@@ -3,12 +3,20 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import sys
+import types
+from unittest.mock import Mock
 
 import pytest
 
+import wavelet.monitor as monitor_module
 from wavelet.configs.rl_config import RLConfig
-from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
-from wavelet.orchestrator.metrics import log_rollout_metrics
+from wavelet.orchestrator.metrics import (
+    RolloutMetricInputs,
+    log_eval_metrics,
+    log_rollout_metrics,
+    rollout_metrics,
+)
 
 
 def test_rollout_metrics_match_reference_style_grouping() -> None:
@@ -146,3 +154,168 @@ def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:
     assert trace["optimizer_step"] == 6
     assert trace["policy_step"] == 3
     assert trace["details"]["trainable"] == 1.0
+
+
+def test_log_eval_metrics_uses_orchestrator_wandb_run(monkeypatch, tmp_path) -> None:
+    metrics = {
+        "eval/aime/avg@8": 0.25,
+        "eval/aime/pass@8": 0.75,
+        "progress/policy_step": 96.0,
+    }
+    wandb_log = Mock()
+    monkeypatch.setattr("wavelet.monitor._wandb_log", wandb_log)
+
+    log_eval_metrics(
+        RLConfig(output_dir=tmp_path),
+        metrics,
+        step=100,
+        policy_step=96,
+    )
+
+    wandb_log.assert_called_once()
+    assert wandb_log.call_args.args[1] == metrics
+    assert wandb_log.call_args.kwargs == {"step": 100}
+    trace = json.loads(
+        (tmp_path / "traces" / "step-000100.jsonl").read_text(encoding="utf-8")
+    )
+    assert trace["event"] == "eval_metrics_logged"
+    assert trace["policy_step"] == 96
+    assert trace["details"] == {
+        "eval/aime/avg@8": 0.25,
+        "eval/aime/pass@8": 0.75,
+    }
+
+
+def test_orchestrator_wandb_config_redacts_secrets(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    run = Mock()
+
+    def fake_init(**kwargs):
+        captured.update(kwargs)
+        return run
+
+    fake_wandb = types.SimpleNamespace(
+        init=fake_init,
+        define_metric=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    monkeypatch.setattr(monitor_module, "_WANDB_RUN", None)
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={"verifier_env_args": {"api_token": "secret"}},
+        monitor={"wandb": {"enabled": True, "mode": "offline"}},
+    )
+
+    monitor_module._wandb_log(config, {"reward": 1.0}, step=1)
+
+    wandb_config = captured["config"]
+    assert isinstance(wandb_config, dict)
+    assert wandb_config["orchestrator"]["verifier_env_args"] == {
+        "api_token": "<redacted>"
+    }
+
+
+def test_rollout_metrics_include_non_overlapping_generation_metrics() -> None:
+    metrics = rollout_metrics(
+        RolloutMetricInputs(
+            rows=[],
+            rollouts_per_example=8,
+            step=1,
+            extra_metrics={"generation/reward/mean": 0.25},
+        )
+    )
+
+    assert metrics["generation/reward/mean"] == 0.25
+
+
+def test_rollout_metrics_keep_interleaved_group_values_aligned() -> None:
+    rows = [
+        {
+            "example_id": "a",
+            "input_ids": [1, 2],
+            "loss_mask": [False, True],
+        },
+        {
+            "example_id": "b",
+            "input_ids": list(range(10)),
+            "loss_mask": [False] * 9 + [True],
+        },
+        {
+            "example_id": "a",
+            "input_ids": [1, 2, 3, 4],
+            "loss_mask": [False, False, True, True],
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=2, step=1)
+    )
+
+    assert metrics["seq_len/all/mean"] == pytest.approx(6.5)
+    assert metrics["decode_len/all/mean"] == pytest.approx(1.25)
+
+
+def test_rollout_metrics_prefer_exact_dispatch_group_identity() -> None:
+    rows = [
+        {
+            "env_name": "math",
+            "example_id": "duplicate-public-id",
+            "reward": 1.0,
+            "metadata": {"group_key": "dispatch-a"},
+        },
+        {
+            "env_name": "math",
+            "example_id": "duplicate-public-id",
+            "reward": 0.0,
+            "metadata": {"group_key": "dispatch-b"},
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=1, step=1)
+    )
+
+    assert metrics["progress/problems"] == 2
+    assert metrics["solve_none/all"] == pytest.approx(0.5)
+    assert metrics["solve_all/all"] == pytest.approx(0.5)
+
+
+def test_rollout_metrics_do_not_count_extra_trajectory_branches_as_rollouts() -> None:
+    rows = [
+        {
+            "example_id": "a",
+            "reward": 1.0,
+            "metadata": {"_wavelet_rollout_count": 1},
+        },
+        {
+            "example_id": "a",
+            "reward": 1.0,
+            "metadata": {"_wavelet_rollout_count": 0},
+        },
+        {
+            "example_id": "a",
+            "reward": 0.0,
+            "metadata": {"_wavelet_rollout_count": 1},
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=2, step=1)
+    )
+
+    assert metrics["reward/all/mean"] == pytest.approx(0.5)
+    assert metrics["solve_none/all"] == 0.0
+    assert metrics["solve_all/all"] == 0.0
+    assert metrics["effective_batch_size/all"] == 1.0
+
+
+def test_rollout_metrics_reject_extra_metric_overrides() -> None:
+    with pytest.raises(ValueError, match="replace core metrics: step"):
+        rollout_metrics(
+            RolloutMetricInputs(
+                rows=[],
+                rollouts_per_example=8,
+                step=1,
+                extra_metrics={"step": 99.0},
+            )
+        )

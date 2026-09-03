@@ -8,7 +8,6 @@ from typing import Protocol
 
 from wavelet.data.rl import RLExample
 
-
 VERIFIER_ROLLOUT_FUNCTION = "wavelet.orchestrator.verifiers:generate_rollouts"
 
 

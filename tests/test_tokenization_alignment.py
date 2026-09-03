@@ -81,6 +81,24 @@ def test_alignment_can_train_tool_tokens_when_configured() -> None:
     assert _trainable_text(sample).endswith("answer<eos>")
 
 
+def test_alignment_keeps_trainable_prefix_when_eos_is_beyond_context() -> None:
+    sample = build_sample(
+        Example(
+            prompt=[{"role": "user", "content": "x"}],
+            completion=[{"role": "assistant", "content": "y" * 128}],
+            source="test",
+        ),
+        _tokenizer(),
+        seq_len=32,
+        loss_mask_config=LossMaskConfig(),
+    )
+
+    assert sample is not None
+    assert len(sample["input_ids"]) == 32
+    assert sum(sample["loss_mask"]) > 0
+    assert _tokenizer().eos_token_id not in trainable_target_ids(sample)
+
+
 def test_validate_token_logprob_alignment_rejects_mismatch() -> None:
     sample = build_sample(
         Example(

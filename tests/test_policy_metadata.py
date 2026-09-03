@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.orchestrator.policy_metadata import policy_metadata, precision_metadata
+from wavelet.orchestrator.policy_metadata import (
+    adapter_artifact_metadata,
+    policy_metadata,
+    precision_metadata,
+)
 
 
 def test_precision_metadata_records_train_and_serve_settings() -> None:
@@ -61,3 +65,17 @@ def test_policy_metadata_wraps_precision_contract() -> None:
     assert metadata["created_at"] == "2026-06-04T00:00:00+00:00"
     assert metadata["source_adapter_path"] == "/tmp/adapter"
     assert metadata["precision"]["trainer"]["torch_dtype"] == "float32"
+
+
+def test_adapter_artifact_metadata_records_tensor_size(tmp_path) -> None:
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+    tensor_bytes = b"adapter-weights"
+    (adapter_dir / "adapter_model.safetensors").write_bytes(tensor_bytes)
+
+    metadata = adapter_artifact_metadata(adapter_dir)
+
+    assert metadata == {
+        "path": "adapter/adapter_model.safetensors",
+        "bytes": len(tensor_bytes),
+    }

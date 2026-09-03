@@ -12,6 +12,7 @@ from time import perf_counter
 import torch
 from torch import Tensor
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from wavelet.configs.rl_config import RLConfig
@@ -25,28 +26,37 @@ from wavelet.data.rl import (
     setup_rl_dataset,
 )
 from wavelet.data.sft import Example, build_sample
-from wavelet.transport.queue import (
-    FileSystemRolloutReceiver,
-    RolloutBatch,
-    RolloutChunkAccumulator,
-    record_rollout_claim,
-    record_rollout_consumed,
-)
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
+)
+from wavelet.orchestrator.schedule import required_policy_step
+from wavelet.orchestrator.schedule import (
     target_steps as _target_steps,
 )
-from wavelet.trainer.trainer import BaseTrainer
+from wavelet.trainer.ckpt import TrainerState
 from wavelet.trainer.distributed import barrier
+from wavelet.trainer.losses import (
+    compute_loss,
+    normalization_unit_count,
+    selective_log_softmax,
+)
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
-from wavelet.trainer.losses import compute_loss, selective_log_softmax
+from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.transport.policy import (
     PolicyExportMixin,
 )
+from wavelet.transport.queue import (
+    FileSystemRolloutReceiver,
+    RolloutBatch,
+    RolloutChunkAccumulator,
+    prune_consumed_rollout_batches,
+    record_rollout_claim,
+    record_rollout_consumed,
+    validate_rollout_manifest,
+)
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
-
 
 logger = logging.getLogger(__name__)
 SUM_SYNCED_METRIC_KEYS = {
@@ -229,6 +239,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._train_metric_accum: list[dict[str, float]] = []
         self._optimizer_batch_loss_scale: float | None = None
         self._gradient_accumulation_loss_scale: float | None = None
+        self._dynamic_loss_scale_local = 0.0
         self._loaded_micro_batch_count = 0
         self._run_closed = False
         self._init_policy_transport()
@@ -265,6 +276,19 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def _after_resume(self) -> None:
         self._accumulated_micro_batches = 0
+        self._dynamic_loss_scale_local = 0.0
+
+    def _validate_resume_state(self, state: TrainerState) -> None:
+        if state.step < 0 or state.micro_step < state.step:
+            raise ValueError(
+                "RL checkpoint step counters are invalid: expected non-negative "
+                "counters and at least one micro-step per optimizer step."
+            )
+
+    def _checkpoint_dataloader(self) -> StatefulDataLoader | None:
+        if self.config.orchestrator.enabled:
+            return None
+        return self.dataloader
 
     def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
         if self.monitor is None:
@@ -343,6 +367,22 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             events_dir=self.output_dir / "events",
         )
 
+    def validate_rollout_batch(
+        self,
+        batch: RolloutBatch,
+        *,
+        row_count: int,
+        chunk_index: int | None = None,
+    ) -> None:
+        """Validate queue provenance before loading a rollout batch."""
+        _validate_rollout_batch(
+            self.config,
+            batch,
+            trainer_step=self.step,
+            row_count=row_count,
+            chunk_index=chunk_index,
+        )
+
     def record_rollout_consumed(
         self,
         batch: RolloutBatch,
@@ -359,6 +399,12 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             optimizer_step_completed=optimizer_step_completed,
             events_dir=self.output_dir / "events",
         )
+        if self.config.transport.cleanup_consumed:
+            prune_consumed_rollout_batches(
+                self.output_dir,
+                self.config.transport,
+                keep_last=self.config.transport.keep_last_consumed,
+            )
 
     def rollout_events_dir(self) -> Path | None:
         if not self.is_main_process():
@@ -379,7 +425,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def _packed_dataloader_batch_count(self) -> int:
         if not isinstance(self.dataset, PackedRLDataset):
-            raise RuntimeError("Packed batch count requires a packed RL dataset.")
+            raise RuntimeError(  # noqa: TRY004 - invalid internal trainer state
+                "Packed batch count requires a packed RL dataset."
+            )
         return max(
             ceil(self.dataset.micro_batch_count() / self.config.data.micro_batch_size),
             1,
@@ -508,13 +556,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                     add_generation_prompt=False,
                 )
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - sample logging has a JSON fallback
             return json.dumps(messages, ensure_ascii=False)
 
     def finalize(self, *, status: str = "completed") -> None:
         self._close_policy_transport()
         if self.monitor is None or self._run_closed:
             return
+        if status == "completed" and self.ckpt_manager is not None:
+            self.ckpt_manager.wait_for_pending_save()
         self.monitor.finish(status=status, step=self.step)
         self._run_closed = True
         if status == "completed" and not self._uses_sleep_colocation():
@@ -536,7 +586,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             return
         model = unwrap_model(self.model)
         if not callable(getattr(model, "disable_adapter", None)):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - incompatible dataset/model config
                 "RL data is missing inference_logprobs for at least one sample, but the "
                 "current model cannot derive a reference policy by disabling adapters. "
                 "Use LoRA or provide inference_logprobs in the dataset."
@@ -565,10 +615,46 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             record.advantage is None and record.reward is None for record in records
         ):
             return None
-        return self.dataset.loss_scale_for_next_local_batch(
-            self.accumulation_steps,
+        local_optimizer_batch_size = (
+            self.accumulation_steps * self.config.data.micro_batch_size
+        )
+        local_loss_scale = self.dataset.loss_scale_for_next_local_batch(
+            local_optimizer_batch_size,
             normalization=self.config.loss.normalization,
         )
+        return self._average_data_parallel_loss_scale(local_loss_scale)
+
+    def _average_data_parallel_loss_scale(self, local_loss_scale: float) -> float:
+        """Return the denominator compatible with averaged DP gradients."""
+        _, data_world_size = self._data_partition()
+        if data_world_size == 1:
+            return max(float(local_loss_scale), 1.0)
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "Distributed RL loss normalization requires an initialized "
+                "process group."
+            )
+        if self.world is None or self.parallel_dims is None:
+            raise RuntimeError(
+                "Distributed world and parallel dimensions must be initialized "
+                "before RL loss normalization."
+            )
+
+        loss_scale = torch.tensor(
+            float(local_loss_scale),
+            dtype=torch.float64,
+            device=self.world.device,
+        )
+        dp_group = self.parallel_dims.get_mesh("dp").get_group()
+        torch.distributed.all_reduce(
+            loss_scale,
+            op=torch.distributed.ReduceOp.SUM,
+            group=dp_group,
+        )
+        # DDP and FSDP average gradients across the same data-parallel ranks.
+        # Dividing each local loss by the average token count therefore yields
+        # a global sum divided by the global token count after gradient sync.
+        return max(float(loss_scale.item()) / data_world_size, 1.0)
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
@@ -586,8 +672,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
         with self.act_offload_ctx:
             loss_output = self._forward_rl_loss(batch, attention_mask)
-            if torch.isnan(loss_output.loss):
-                return self._skip_nan_loss(loss_output)
+            self._require_finite_loss(loss_output.loss, label="RL loss")
+            if self._optimizer_batch_loss_scale is None:
+                self._dynamic_loss_scale_local += normalization_unit_count(
+                    batch["loss_mask"],
+                    normalization=self.config.loss.normalization,
+                    position_ids=batch["position_ids"],
+                )
             self._backward_rl_loss(loss_output.loss)
 
         self._record_micro_batch_metrics(batch, loss_output)
@@ -628,39 +719,17 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             batch["advantages"],
             batch["loss_mask"],
             self.config.loss,
-            loss_scale=self._optimizer_batch_loss_scale,
+            loss_scale=(
+                self._optimizer_batch_loss_scale
+                if self._optimizer_batch_loss_scale is not None
+                else 1.0
+            ),
             position_ids=batch["position_ids"],
         )
 
     def _backward_rl_loss(self, loss: Tensor) -> None:
         with self._maybe_no_sync():
-            backward_loss = (
-                loss / self.accumulation_steps
-                if self._optimizer_batch_loss_scale is None
-                else loss
-            )
-            backward_loss.backward()
-
-    def _skip_nan_loss(self, loss_output: LossOutput) -> TrainOutput:
-        logger.warning(f"NaN RL loss at step {self.step}, skipping backward")
-        self._micro_step += 1
-        self._accumulated_micro_batches += 1
-        if self._accumulated_micro_batches >= self.accumulation_steps:
-            self._reward_accum.clear()
-            self._rollout_metric_accum.clear()
-            self._train_loss_accum.clear()
-            self._train_metric_accum.clear()
-            self._accumulated_micro_batches = 0
-            self._optimizer_batch_loss_scale = (
-                self._estimate_optimizer_batch_loss_scale()
-            )
-        return TrainOutput(
-            loss=loss_output,
-            stepped=False,
-            step=self.step,
-            micro_step=self._micro_step,
-            skipped=True,
-        )
+            loss.backward()
 
     def _record_micro_batch_metrics(
         self,
@@ -683,6 +752,12 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         )
 
     def _apply_optimizer_step(self) -> float | None:
+        if self._optimizer_batch_loss_scale is None:
+            self._gradient_accumulation_loss_scale = (
+                self._average_data_parallel_loss_scale(
+                    self._dynamic_loss_scale_local,
+                )
+            )
         self._apply_gradient_accumulation_loss_scale()
         self._sync_tensor_parallel_lora_grads()
         grad_norm = self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
@@ -691,6 +766,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self.optimizer.zero_grad(set_to_none=True)
         self.step += 1
         self._accumulated_micro_batches = 0
+        self._dynamic_loss_scale_local = 0.0
         return grad_norm
 
     def _finalize_optimizer_metrics(self, grad_norm: float | None) -> dict[str, float]:
@@ -754,16 +830,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         model = unwrap_model(self.model)
         disable_adapter = getattr(model, "disable_adapter", None)
         if not callable(disable_adapter):
-            raise RuntimeError(
+            raise RuntimeError(  # noqa: TRY004 - invalid initialized model state
                 "inference_logprobs are required when the model cannot disable adapters."
             )
 
         training = self.model.training
         self.model.eval()
         try:
-            with torch.no_grad():
-                with disable_adapter():
-                    computed_inference = self._model_logprobs(batch, attention_mask)
+            with torch.no_grad(), disable_adapter():
+                computed_inference = self._model_logprobs(batch, attention_mask)
         finally:
             if training:
                 self.model.train()
@@ -1108,7 +1183,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         trainer.setup()
         if config.orchestrator.enabled:
-            trainer.export_policy(step=trainer.step)
+            trainer.export_policy(
+                step=trainer.step,
+                force=trainer.resume_checkpoint_dir is not None,
+            )
             trainer.offload_after_refit()
             try:
                 target_step = _target_steps(config)
@@ -1139,6 +1217,14 @@ def main(argv: list[str] | None = None) -> int:
                     batch = receiver.wait()
                     wait_seconds = perf_counter() - wait_started_at
                     trainer_step_before = trainer.step
+                    row_count = count_nonempty_jsonl_rows(
+                        batch.path,
+                        description="Rollout batch",
+                    )
+                    trainer.validate_rollout_batch(
+                        batch,
+                        row_count=row_count,
+                    )
                     trainer.record_rollout_claim(
                         batch,
                         trainer_step_before=trainer_step_before,
@@ -1207,16 +1293,22 @@ def _run_streaming_rollout_training(
     while trainer.step < target_step:
         loop_started_at = perf_counter()
         wait_started_at = perf_counter()
-        batch = receiver.wait_available()
+        batch = receiver.wait()
         wait_seconds = perf_counter() - wait_started_at
         trainer_step_before = trainer.step
-        trainer.record_rollout_claim(
-            batch,
-            trainer_step_before=trainer_step_before,
-        )
         row_count = count_nonempty_jsonl_rows(
             batch.path,
             description="Rollout chunk",
+        )
+        _validate_streaming_rollout_batch(
+            config,
+            batch,
+            trainer_step=trainer.step,
+            row_count=row_count,
+        )
+        trainer.record_rollout_claim(
+            batch,
+            trainer_step_before=trainer_step_before,
         )
         accumulator.buffer(batch, row_count)
         if not accumulator.should_load(min_rows=min_loadable_rows):
@@ -1267,6 +1359,7 @@ def _run_streaming_rollout_training(
                 trainer_step_before=trainer_step_before,
                 optimizer_step_completed=metrics is not None,
             )
+        _remove_combined_rollout_path(config, trainer=trainer, path=rollout_path)
 
         export_seconds = 0.0
         if metrics is not None:
@@ -1296,6 +1389,56 @@ def _run_streaming_rollout_training(
             optimizer_step=int(metrics is not None),
             total=total_seconds,
         )
+
+
+def _validate_streaming_rollout_batch(
+    config: RLConfig,
+    batch: RolloutBatch,
+    *,
+    trainer_step: int,
+    row_count: int,
+) -> None:
+    """Reject a chunk that cannot belong to the current optimizer step."""
+    chunks_per_step = _chunks_per_step(config)
+    expected_optimizer_step = batch.step // chunks_per_step
+    expected_chunk_index = batch.step % chunks_per_step
+    if expected_optimizer_step != trainer_step:
+        raise ValueError(
+            f"Rollout queue step {batch.step} belongs to optimizer step "
+            f"{expected_optimizer_step}, but trainer is at step {trainer_step}."
+        )
+
+    _validate_rollout_batch(
+        config,
+        batch,
+        trainer_step=trainer_step,
+        row_count=row_count,
+        chunk_index=expected_chunk_index,
+    )
+
+
+def _validate_rollout_batch(
+    config: RLConfig,
+    batch: RolloutBatch,
+    *,
+    trainer_step: int,
+    row_count: int,
+    chunk_index: int | None,
+) -> None:
+    """Reject rollout data whose manifest disagrees with trainer state."""
+    expected_queue_step = batch.step if chunk_index is not None else trainer_step
+    expected_optimizer_step = trainer_step
+
+    minimum_policy_step = required_policy_step(config, trainer_step)
+    validate_rollout_manifest(
+        batch,
+        queue_step=expected_queue_step,
+        optimizer_step=expected_optimizer_step,
+        chunk_index=chunk_index,
+        rows=row_count,
+        minimum_policy_step=minimum_policy_step,
+        maximum_policy_step=trainer_step,
+    )
 
 
 def _configure_streaming_accumulation(
@@ -1424,6 +1567,19 @@ def _combined_rollout_path(
     return path
 
 
+def _remove_combined_rollout_path(
+    config: RLConfig,
+    *,
+    trainer: RLTrainer,
+    path: Path,
+) -> None:
+    """Remove the redundant merged rollout after every rank has trained on it."""
+    combined_dir = config.output_dir / "rollouts" / "combined"
+    if path.parent != combined_dir or not trainer.is_main_process():
+        return
+    path.unlink(missing_ok=True)
+
+
 def _padded_row_count(row_count: int, *, multiple: int) -> int:
     if multiple <= 1:
         return row_count
@@ -1436,7 +1592,7 @@ def _dummy_rollout_row(
     row = dict(source)
     loss_mask = row.get("loss_mask")
     if not isinstance(loss_mask, list):
-        raise ValueError("Cannot create a dummy rollout row without a loss_mask.")
+        raise TypeError("Cannot create a dummy rollout row without a loss_mask.")
     row["loss_mask"] = [False] * len(loss_mask)
     row[config.data.advantage_column] = 0.0
     row[config.data.reward_column] = None

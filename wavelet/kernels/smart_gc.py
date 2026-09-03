@@ -171,7 +171,7 @@ def _recompute_checkpoint_outputs(ctx, inputs: list) -> tuple[tuple, object]:
 
 
 def patch_smart_gc(
-    model: "torch.nn.Module",
+    model: torch.nn.Module,
     *,
     seq_len: int,
     dtype: torch.dtype = torch.bfloat16,

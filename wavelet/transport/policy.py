@@ -4,34 +4,37 @@ from __future__ import annotations
 
 import json
 import shutil
+from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
 from time import monotonic, sleep
+from typing import TYPE_CHECKING, Any
 
+import torch
 from peft import PeftModel
+from torch import Tensor, nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.nn import Module
+from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
+from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
+from wavelet.orchestrator.policy_metadata import (
+    adapter_artifact_metadata,
+    policy_metadata,
+)
 from wavelet.trainer.distributed import barrier
-from wavelet.orchestrator.policy_metadata import policy_metadata
 from wavelet.transport.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
+    STEP_DIR_PREFIX,
     QueueEvent,
     append_event_best_effort,
     get_policy_step_dir,
     resolve_policy_dir,
     utc_now,
 )
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
-from collections.abc import Iterable
-
-import torch
-from torch import Tensor, nn
-from torch.nn import Module
-from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
@@ -41,6 +44,79 @@ else:
 NCCL_READY_MARKER = "NCCL_READY"
 NCCL_UPDATE_INFO_FILENAME = "update_info.json"
 NamedTensor = tuple[str, Tensor]
+
+
+def prune_policy_snapshots(policy_dir: Path, *, keep_last: int | None) -> list[Path]:
+    """Remove old stable filesystem policy snapshots and return removed paths."""
+    if keep_last is None or not policy_dir.exists():
+        return []
+
+    snapshots: list[tuple[int, Path]] = []
+    for candidate in policy_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
+            continue
+        try:
+            step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
+        except ValueError:
+            continue
+        if (candidate / STABLE_BATCH_MARKER).exists():
+            snapshots.append((step, candidate))
+
+    removed: list[Path] = []
+    for _, path in sorted(snapshots)[:-keep_last]:
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
+
+
+def prune_policy_snapshots_beyond(policy_dir: Path, *, step: int) -> list[Path]:
+    """Remove policy directories from an abandoned run beyond a resume step."""
+    if not policy_dir.exists():
+        return []
+    removed: list[Path] = []
+    for candidate in policy_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
+            continue
+        try:
+            candidate_step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
+        except ValueError:
+            continue
+        if candidate_step > step:
+            shutil.rmtree(candidate)
+            removed.append(candidate)
+    return sorted(removed)
+
+
+def _is_reusable_policy_snapshot(
+    step_dir: Path,
+    *,
+    step: int,
+    expected_kind: str,
+) -> bool:
+    metadata_path = step_dir / POLICY_META_FILENAME
+    if not (step_dir / STABLE_BATCH_MARKER).is_file() or not metadata_path.is_file():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(metadata, dict) or metadata.get("format_version") != 1:
+        return False
+    metadata_step = metadata.get("step")
+    if (
+        not isinstance(metadata_step, int)
+        or isinstance(metadata_step, bool)
+        or metadata_step != step
+    ):
+        return False
+    kind = metadata.get("kind")
+    if kind != expected_kind:
+        return False
+    if kind == "adapter":
+        return (step_dir / "adapter" / "adapter_model.safetensors").is_file()
+    if kind == "model":
+        return (step_dir / "model").is_dir()
+    return False
 
 
 def _require_vllm_nccl() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
@@ -242,6 +318,11 @@ class NCCLWeightUpdateWorker(Worker):
         update_info_path = Path(weight_path) / NCCL_UPDATE_INFO_FILENAME
         update_info = json.loads(update_info_path.read_text())
         model = _worker_model(self)
+        stream = (
+            torch.cuda.current_stream(communicator.device)
+            if communicator.device.type == "cuda"
+            else None
+        )
         for name, dtype_name, shape in zip(
             update_info["names"],
             update_info["dtype_names"],
@@ -250,7 +331,7 @@ class NCCLWeightUpdateWorker(Worker):
         ):
             dtype = getattr(torch, dtype_name)
             weight = torch.empty(shape, dtype=dtype, device=communicator.device)
-            communicator.broadcast(weight, src=0, stream=torch.cuda.current_stream())
+            communicator.broadcast(weight, src=0, stream=stream)
             model.load_weights([(name, weight)])  # type: ignore[arg-type]
             del weight
 
@@ -278,20 +359,47 @@ class PolicyExportMixin:
             return self.config.policy_transfer.export_initial
         return step % self.config.policy_transfer.export_every_steps == 0
 
-    def export_policy(self, *, step: int | None = None) -> Path | None:
+    def export_policy(
+        self,
+        *,
+        step: int | None = None,
+        force: bool = False,
+    ) -> Path | None:
         if self.model is None or self.tokenizer is None:
             raise RuntimeError("Trainer not set up. Call setup() first.")
         if self.world is None:
             raise RuntimeError("World not set up")
 
         export_step = self.step if step is None else step
-        if not self.should_export_policy(export_step):
+        if not force and not self.should_export_policy(export_step):
             return None
         if self.config.policy_transfer.type == "nccl":
             return self._export_nccl_policy(export_step)
 
         policy_dir = resolve_policy_dir(self.output_dir, self.config.policy_transfer)
         step_dir = get_policy_step_dir(policy_dir, export_step)
+        if force:
+            if self.world.is_main:
+                prune_policy_snapshots_beyond(policy_dir, step=export_step)
+            if self.world.world_size > 1:
+                barrier(self.world)
+            expected_kind = (
+                "adapter"
+                if self.config.lora is not None
+                and self.config.policy_transfer.lightweight_lora
+                else "model"
+            )
+            if _is_reusable_policy_snapshot(
+                step_dir,
+                step=export_step,
+                expected_kind=expected_kind,
+            ):
+                self.offload_after_refit()
+                return step_dir
+        elif (step_dir / STABLE_BATCH_MARKER).is_file():
+            raise FileExistsError(
+                f"Stable policy step {export_step} already exists at '{step_dir}'."
+            )
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
         self._prepare_export_directory(tmp_dir, step_dir)
         saved_path = self._save_filesystem_policy(tmp_dir)
@@ -311,11 +419,9 @@ class PolicyExportMixin:
 
     def _save_filesystem_policy(self, tmp_dir: Path) -> Path:
         from wavelet.trainer.model import (
+            export_model_for_save,
             save_lora_adapter_snapshot,
             save_lora_adapter_snapshot_from_fsdp,
-        )
-        from wavelet.trainer.model import (
-            export_model_for_save,
             save_model,
         )
 
@@ -368,12 +474,14 @@ class PolicyExportMixin:
         export_step: int,
         kind: str,
     ) -> None:
+        artifact = adapter_artifact_metadata(tmp_dir / "adapter")
         metadata = policy_metadata(
             config=self.config,
             format_version=1,
             step=export_step,
             kind=kind,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=datetime.now(UTC).isoformat(),
+            extra={"artifact": artifact} if artifact is not None else None,
         )
         (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(metadata))
 
@@ -392,6 +500,11 @@ class PolicyExportMixin:
             self._record_policy_export(export_step)
         if self.world.world_size > 1:
             barrier(self.world)
+        if self.world.is_main:
+            prune_policy_snapshots(
+                step_dir.parent,
+                keep_last=self.config.policy_transfer.keep_last,
+            )
 
     def _export_nccl_policy(self, export_step: int) -> Path:
         if self.model is None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import ceil
 from typing import Protocol
 
-from wavelet.configs.rl_config import RLEvalEnvConfig, RLConfig
+from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step
 
 
@@ -35,15 +35,28 @@ def chunks_per_step(config: RLConfig) -> int:
     return max(ceil(examples_per_step / rollout_chunk_examples(config)), 1)
 
 
+def rollout_groups_for_chunk(config: RLConfig, chunk_index: int) -> int:
+    """Return the exact group count for one optimizer-step chunk."""
+    examples_per_step = config.orchestrator.examples_per_step
+    if examples_per_step is None:
+        raise ValueError("orchestrator.examples_per_step is required.")
+    if chunk_index < 0:
+        raise ValueError("chunk_index must be non-negative.")
+    chunk_examples = rollout_chunk_examples(config)
+    remaining = examples_per_step - chunk_index * chunk_examples
+    if remaining <= 0:
+        raise ValueError(
+            f"chunk_index {chunk_index} exceeds the configured optimizer batch."
+        )
+    return min(chunk_examples, remaining)
+
+
 def required_policy_step(config: RLConfig, rollout_step: int) -> int:
     """Oldest policy step allowed for a rollout under the async window."""
     async_level = config.orchestrator.max_async_level
     async_lag = max(async_level - 1, 0)
     off_policy_steps = config.orchestrator.max_off_policy_steps
-    if async_level > 0 and off_policy_steps > 0:
-        allowed_lag = min(async_lag, off_policy_steps)
-    else:
-        allowed_lag = max(async_lag, off_policy_steps)
+    allowed_lag = min(async_lag, off_policy_steps)
     return max(rollout_step - allowed_lag, 0)
 
 
@@ -113,6 +126,10 @@ def select_due_eval_envs(
         )
         if eval_step is None:
             continue
-        last_eval_steps[env.resolved_name] = eval_step
+        # The currently loaded policy is what evaluation actually measures.
+        # A scheduler can jump over an interval boundary after resume or an
+        # asynchronous export, so retaining the nominal boundary would make a
+        # later final eval repeat the same loaded policy.
+        last_eval_steps[env.resolved_name] = policy_step
         envs.append(env)
     return envs

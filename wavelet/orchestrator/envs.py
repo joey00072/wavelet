@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+
 from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
 from wavelet.data.rl import RLExample
-from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.advantage import (
     output_completion_token_count,
     output_tool_response_token_count,
 )
+from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
     algorithm_scope,
@@ -28,8 +32,9 @@ from wavelet.orchestrator.patches import apply_verifier_openai_patches
 from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
-
 _ENV_CACHE: dict[tuple[str, str], Any] = {}
+_VERIFIER_EXECUTOR_CONCURRENCY = 0
+logger = logging.getLogger(__name__)
 
 
 _OPENAI_PATCHES_APPLIED = False
@@ -137,6 +142,10 @@ async def _evaluate_env_async(
     env_name = env_config.resolved_name
     output_path = config.output_dir / "evals" / f"step-{step:06d}" / f"{env_name}.jsonl"
     _write_eval_rollouts(output_path, outputs)
+    _prune_eval_rollout_sets(
+        config.output_dir / "evals",
+        keep_last=config.eval.keep_last_rollout_sets,
+    )
     metrics = _eval_metrics(
         env_name,
         outputs,
@@ -161,10 +170,15 @@ async def _run_eval_examples(
     rollouts_per_example: int,
     max_retries: int,
 ) -> list[dict[str, Any]]:
+    _scale_verifier_executors(len(examples) * rollouts_per_example)
     tasks = []
+    example_ids: list[str] = []
     for example_index, example in enumerate(examples):
         client = clients[example_index % len(clients)]
         for _ in range(rollouts_per_example):
+            example_ids.append(
+                str(example.get("example_id", example.get("id", example_index)))
+            )
             tasks.append(
                 env.run_rollout(
                     vf.RolloutInput(**example),
@@ -177,10 +191,30 @@ async def _run_eval_examples(
             )
     results = await asyncio.gather(*tasks, return_exceptions=True)
     outputs: list[dict[str, Any]] = []
-    for result in results:
+    for example_id, result in zip(example_ids, results, strict=True):
         if isinstance(result, Exception):
+            _raise_if_external_rate_limit(result)
+            outputs.append(
+                {
+                    "example_id": example_id,
+                    "error": _truncate_error(str(result)),
+                    "completion": [],
+                }
+            )
             continue
-        outputs.append(dict(result))
+        try:
+            output = dict(result)
+        except (TypeError, ValueError) as exc:
+            outputs.append(
+                {
+                    "example_id": example_id,
+                    "error": f"Invalid verifier result: {exc}",
+                    "completion": [],
+                }
+            )
+            continue
+        output.setdefault("example_id", example_id)
+        outputs.append(output)
     return outputs
 
 
@@ -199,14 +233,19 @@ def _eval_metrics(
         f"{prefix}/failed_rollouts": failed / max(total_rollouts, 1),
         f"{prefix}/time": elapsed_seconds,
     }
+
+    if total_rollouts > 0:
+        metrics[f"{prefix}/avg@{rollouts_per_example}"] = sum(rewards) / total_rollouts
+    if rewards:
+        metrics[f"{prefix}/effective/avg@{rollouts_per_example}"] = sum(rewards) / len(
+            rewards
+        )
     if not outputs:
         return metrics
 
     completion_lengths = [_completion_len(output) for output in outputs]
     truncations = [bool(output.get("is_truncated")) for output in outputs]
     no_responses = [not bool(output.get("completion")) for output in outputs]
-    if rewards:
-        metrics[f"{prefix}/avg@{rollouts_per_example}"] = sum(rewards) / len(rewards)
     if completion_lengths:
         metrics[f"{prefix}/completion_len/mean"] = sum(completion_lengths) / len(
             completion_lengths
@@ -215,13 +254,11 @@ def _eval_metrics(
         metrics[f"{prefix}/completion_len/max"] = float(max(completion_lengths))
     metrics[f"{prefix}/is_truncated/mean"] = sum(truncations) / len(truncations)
     metrics[f"{prefix}/no_response/mean"] = sum(no_responses) / len(no_responses)
-    if rewards and set(rewards).issubset({0.0, 1.0}):
+    if set(rewards).issubset({0.0, 1.0}):
         by_example: dict[str, list[float]] = {}
         for output in outputs:
-            if "reward" not in output:
-                continue
             by_example.setdefault(str(output.get("example_id")), []).append(
-                float(output["reward"])
+                float(output.get("reward", 0.0))
             )
         pass_metrics: dict[str, list[float]] = {}
         for group_rewards in by_example.values():
@@ -229,6 +266,19 @@ def _eval_metrics(
                 pass_metrics.setdefault(key, []).append(value)
         for key, values in pass_metrics.items():
             metrics[f"{prefix}/{key}"] = sum(values) / len(values)
+        effective_by_example: dict[str, list[float]] = {}
+        for output in outputs:
+            if "reward" not in output:
+                continue
+            effective_by_example.setdefault(str(output.get("example_id")), []).append(
+                float(output["reward"])
+            )
+        effective_pass_metrics: dict[str, list[float]] = {}
+        for group_rewards in effective_by_example.values():
+            for key, value in pass_at_k(group_rewards).items():
+                effective_pass_metrics.setdefault(key, []).append(value)
+        for key, values in effective_pass_metrics.items():
+            metrics[f"{prefix}/effective/{key}"] = sum(values) / len(values)
     return metrics
 
 
@@ -256,6 +306,28 @@ def _append_eval_metrics(path: Path, metrics: dict[str, float]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(metrics) + "\n")
+
+
+def _prune_eval_rollout_sets(eval_dir: Path, *, keep_last: int | None) -> list[Path]:
+    """Retain only the newest evaluation rollout directories."""
+    if keep_last is None or not eval_dir.exists():
+        return []
+
+    step_dirs: list[tuple[int, Path]] = []
+    for candidate in eval_dir.iterdir():
+        if not candidate.is_dir() or not candidate.name.startswith("step-"):
+            continue
+        try:
+            step = int(candidate.name.removeprefix("step-"))
+        except ValueError:
+            continue
+        step_dirs.append((step, candidate))
+
+    removed: list[Path] = []
+    for _, path in sorted(step_dirs)[:-keep_last]:
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
 
 
 def _verifier_client_routes(
@@ -359,6 +431,48 @@ def _load_cached_env(
     return env, False
 
 
+def _scale_verifier_executors(concurrency: int) -> int:
+    """Grow Verifiers executors to Wavelet's actual request concurrency."""
+    global _VERIFIER_EXECUTOR_CONCURRENCY
+    concurrency = max(int(concurrency), 1)
+    if concurrency <= _VERIFIER_EXECUTOR_CONCURRENCY:
+        return _VERIFIER_EXECUTOR_CONCURRENCY
+    try:
+        from verifiers.utils.thread_utils import scale_executors
+    except ImportError:
+        return _VERIFIER_EXECUTOR_CONCURRENCY
+    scale_executors(concurrency)
+    _VERIFIER_EXECUTOR_CONCURRENCY = concurrency
+    return concurrency
+
+
+async def _teardown_cached_verifier_envs() -> None:
+    """Close cached environments and registered executors exactly once."""
+    global _VERIFIER_EXECUTOR_CONCURRENCY
+    environments = list({id(env): env for env in _ENV_CACHE.values()}.values())
+    _ENV_CACHE.clear()
+    errors: list[Exception] = []
+    for env in environments:
+        teardown = getattr(env, "teardown", None)
+        if not callable(teardown):
+            continue
+        try:
+            result = teardown()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 - finish all teardown attempts
+            errors.append(exc)
+    try:
+        from verifiers.utils.thread_utils import shutdown_executors
+    except ImportError:
+        pass
+    else:
+        shutdown_executors()
+    _VERIFIER_EXECUTOR_CONCURRENCY = 0
+    if errors:
+        raise RuntimeError("Verifier environment teardown failed.") from errors[0]
+
+
 async def _run_all(
     vf,
     env,
@@ -377,6 +491,7 @@ async def _run_all(
 ) -> list[dict[str, Any]]:
     if not clients:
         raise ValueError("At least one verifier client is required.")
+    _scale_verifier_executors(len(records) * rollout_count)
     if target_groups is None or len(records) <= target_groups:
         return await _run_complete_record_set(
             vf,
@@ -420,43 +535,29 @@ async def _run_complete_record_set(
     algorithm_config: RLAlgorithmConfig,
     env_name: str,
 ) -> list[dict[str, Any]]:
-    if getattr(env, "requires_group_scoring", False):
-        tasks = [
-            _run_group(
-                vf,
-                env,
-                _verifier_example(record),
-                client=clients[index % len(clients)],
-                model=model,
-                sampling_args=sampling_args,
-                rollout_count=rollout_count,
-                max_retries=max_retries,
-                algorithm_config=algorithm_config,
-            )
-            for index, record in enumerate(records)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        outputs = [
-            output
-            for result in results
-            if not isinstance(result, Exception)
-            for output in result
-        ]
-    else:
-        tasks = [
-            env.run_rollout(
-                vf.RolloutInput(**_verifier_example(record)),
-                client=clients[index % len(clients)],
-                model=model,
-                sampling_args=sampling_args,
-                max_retries=max_retries,
-                state_columns=["trajectory", "sampling_args"],
-            )
-            for index, record in enumerate(records)
-            for _ in range(rollout_count)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        outputs = _successful_rollout_outputs(results, require_trainable=False)
+    tasks = [
+        _run_group(
+            vf,
+            env,
+            _verifier_example(record),
+            group_id=f"complete:{index}",
+            client=clients[index % len(clients)],
+            model=model,
+            sampling_args=sampling_args,
+            rollout_count=rollout_count,
+            max_retries=max_retries,
+            algorithm_config=algorithm_config,
+        )
+        for index, record in enumerate(records)
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    outputs: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            _raise_if_external_rate_limit(result)
+            logger.warning("Verifier rollout group failed: %r", result)
+            continue
+        outputs.extend(result)
     _stamp_env_name(outputs, env_name)
     return outputs
 
@@ -486,6 +587,7 @@ async def _run_until_target_groups(
                 vf,
                 env,
                 example,
+                group_id=f"target:{record_index}",
                 client=client,
                 model=model,
                 sampling_args=sampling_args,
@@ -531,6 +633,7 @@ async def _run_group(
     env,
     example: dict[str, Any],
     *,
+    group_id: str | None = None,
     client: Any,
     model: str,
     sampling_args: dict[str, Any],
@@ -555,6 +658,7 @@ async def _run_group(
             state_columns=["trajectory", "sampling_args"],
         )
         outputs = _successful_rollout_outputs(list(result))
+        _stamp_group_id(outputs, group_id)
         _assign_group_advantages(outputs, algorithm_config=algorithm_config)
         return outputs
 
@@ -571,8 +675,16 @@ async def _run_group(
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     outputs = _successful_rollout_outputs(results)
+    _stamp_group_id(outputs, group_id)
     _assign_group_advantages(outputs, algorithm_config=algorithm_config)
     return outputs
+
+
+def _stamp_group_id(outputs: list[dict[str, Any]], group_id: str | None) -> None:
+    if group_id is None:
+        return
+    for output in outputs:
+        output["_wavelet_group_id"] = group_id
 
 
 def _env_name(env: Any, *, fallback: str) -> str:
@@ -617,6 +729,7 @@ def _successful_rollout_outputs(
     for result in results:
         if isinstance(result, Exception):
             _raise_if_external_rate_limit(result)
+            logger.warning("Verifier rollout failed: %r", result)
             continue
         try:
             output = dict(result)
@@ -645,6 +758,7 @@ def _completed_group_outputs(
         return task.result()
     except Exception as exc:
         _raise_if_external_rate_limit(exc)
+        logger.warning("Verifier group rollout failed: %s", exc, exc_info=True)
         return []
 
 
@@ -818,7 +932,7 @@ def _patch_env_response_messages(vf, env) -> None:
         response = await env_response(*args, **kwargs)
         return [_coerce_vf_message(vf, message) for message in response]
 
-    setattr(env, "env_response", wrapped_env_response)
+    env.env_response = wrapped_env_response
 
 
 def _coerce_vf_message(vf, message: Any):
@@ -923,6 +1037,24 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
         temperatures = [
             float(sample["temperatures"][index]) for index in trainable_indexes
         ]
+        metadata = {
+            "group_key": group_key,
+            "rollout_key": f"{group_key}:{sample_index}",
+            "stop_condition": output.get("stop_condition"),
+            "is_truncated": output.get("is_truncated"),
+            "completion_token_count": output_completion_token_count(output),
+            "tool_response_token_count": output_tool_response_token_count(output),
+            "turn_count": len(output.get("trajectory") or []),
+            "_wavelet_rollout_count": 1 if sample_index == 0 else 0,
+            **rollout_task_harness_metadata(
+                output,
+                group_key=group_key,
+                sample_index=sample_index,
+            ),
+        }
+        policy_step = output.get("_wavelet_policy_step")
+        if isinstance(policy_step, int) and not isinstance(policy_step, bool):
+            metadata["policy_step"] = policy_step
         records.append(
             RLExample(
                 prompt=_mask_prompt_history(first_step.get("prompt") or []),
@@ -937,23 +1069,7 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 reward=float(output["reward"]),
                 inference_logprobs=inference_logprobs,
                 temperatures=temperatures,
-                metadata={
-                    "group_key": group_key,
-                    "rollout_key": f"{group_key}:{sample_index}",
-                    "stop_condition": output.get("stop_condition"),
-                    "is_truncated": output.get("is_truncated"),
-                    "completion_token_count": output_completion_token_count(output),
-                    "tool_response_token_count": output_tool_response_token_count(
-                        output
-                    ),
-                    "turn_count": len(output.get("trajectory") or []),
-                    "_wavelet_rollout_count": 1 if sample_index == 0 else 0,
-                    **rollout_task_harness_metadata(
-                        output,
-                        group_key=group_key,
-                        sample_index=sample_index,
-                    ),
-                },
+                metadata=metadata,
                 source=str(output.get("env_name") or output.get("task") or "verifier"),
             )
         )
@@ -963,8 +1079,12 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
 def _output_group_key(output: dict[str, Any]) -> str:
     env_name = str(output.get("env_name") or output.get("task") or "verifier")
     example_id = str(output.get("example_id", "unknown"))
+    dispatch_group_id = output.get("_wavelet_group_id")
+    payload = {"env_name": env_name, "example_id": example_id}
+    if dispatch_group_id is not None:
+        payload["rollout_group_id"] = str(dispatch_group_id)
     return json.dumps(
-        {"env_name": env_name, "example_id": example_id},
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )

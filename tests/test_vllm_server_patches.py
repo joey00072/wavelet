@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from logging import CRITICAL
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,7 @@ from vllm.lora.worker_manager import (
     WorkerLoRAManager,
 )
 
+from wavelet.configs.rl_config import RLConfig
 from wavelet.inference import server
 
 
@@ -88,8 +90,7 @@ def test_skip_warning_patch_still_suppresses_upstream_module_warnings() -> None:
 
 
 def test_pin_memory_patch_controls_both_vllm_import_sites(monkeypatch) -> None:
-    import vllm.lora.lora_model as lora_model
-    import vllm.lora.model_manager as model_manager
+    from vllm.lora import lora_model, model_manager
 
     original_lora = lora_model.is_pin_memory_available
     original_manager = model_manager.is_pin_memory_available
@@ -103,7 +104,7 @@ def test_pin_memory_patch_controls_both_vllm_import_sites(monkeypatch) -> None:
 
 
 def test_tool_parser_patch_silences_upstream_parser_logger(monkeypatch) -> None:
-    import vllm.tool_parsers.hermes_tool_parser as hermes_tool_parser
+    from vllm.tool_parsers import hermes_tool_parser
 
     original_level = hermes_tool_parser.logger.level
     monkeypatch.setattr(hermes_tool_parser.logger, "level", original_level)
@@ -120,3 +121,111 @@ def test_build_app_patch_is_required_for_wavelet_router_and_state() -> None:
     assert "wavelet" not in source
     assert "openai_serving_chat_with_tokens" not in init_source
     assert "policy_step" not in init_source
+
+
+@pytest.mark.anyio
+async def test_load_policy_routes_lora_policy(monkeypatch) -> None:
+    config = RLConfig()
+    monkeypatch.setattr(server, "_CONFIG", config)
+    captured = {}
+
+    async def fake_load_adapter_policy(raw_request, **kwargs):
+        captured.update(kwargs)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(server, "_load_adapter_policy", fake_load_adapter_policy)
+
+    result = await server.load_policy(
+        {
+            "policy_dir": "/tmp/policy",
+            "step": 4,
+            "load_inplace": True,
+        },
+        SimpleNamespace(),
+    )
+
+    assert result == {"status": "ok"}
+    assert captured == {
+        "policy_dir": Path("/tmp/policy"),
+        "step": 4,
+        "load_inplace": True,
+        "config": config,
+    }
+
+
+@pytest.mark.anyio
+async def test_adapter_load_resets_sticky_load_inplace(
+    monkeypatch, tmp_path: Path
+) -> None:
+    adapter_dir = tmp_path / "policy" / "adapter"
+    adapter_dir.mkdir(parents=True)
+    registered: dict[str, LoRARequest] = {}
+
+    async def load_lora_adapter(request: LoadLoRAAdapterRequest) -> str:
+        registered[request.lora_name] = LoRARequest(
+            request.lora_name,
+            1,
+            request.lora_path,
+            load_inplace=request.load_inplace,
+        )
+        return "ok"
+
+    models = SimpleNamespace(
+        lora_requests=registered,
+        load_lora_adapter=load_lora_adapter,
+    )
+    monkeypatch.setattr(server, "_models", lambda _request: models)
+    state = SimpleNamespace(
+        policy_step=None,
+        policy_adapter_name=None,
+        policy_adapter_path=None,
+    )
+
+    result = await server._load_adapter_policy(
+        SimpleNamespace(app=SimpleNamespace(state=state)),
+        policy_dir=tmp_path / "policy",
+        step=3,
+        load_inplace=True,
+        config=RLConfig(),
+    )
+
+    assert result["policy_step"] == 3
+    assert registered["policy"].load_inplace is False
+
+
+@pytest.mark.anyio
+async def test_policy_update_pause_drains_without_clearing_cache() -> None:
+    calls = []
+
+    async def pause_generation(*, mode: str, clear_cache: bool) -> None:
+        calls.append(("pause", mode, clear_cache))
+
+    state = SimpleNamespace(
+        engine_client=SimpleNamespace(pause_generation=pause_generation),
+        generation_paused=False,
+    )
+
+    result = await server.pause(SimpleNamespace(app=SimpleNamespace(state=state)))
+
+    assert result == {"status": "paused"}
+    assert calls == [("pause", "keep", False)]
+    assert state.generation_paused is True
+
+
+@pytest.mark.anyio
+async def test_policy_update_resume_releases_generation() -> None:
+    calls = []
+
+    async def resume_generation() -> None:
+        calls.append("resume")
+
+    state = SimpleNamespace(
+        engine_client=SimpleNamespace(resume_generation=resume_generation),
+        generation_paused=True,
+    )
+
+    result = await server.resume(SimpleNamespace(app=SimpleNamespace(state=state)))
+
+    assert result == {"status": "resumed"}
+    assert calls == ["resume"]
+    assert state.generation_paused is False
