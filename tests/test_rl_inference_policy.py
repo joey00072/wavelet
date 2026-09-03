@@ -8,8 +8,8 @@ import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.rollout_worker import (
-    _VerifierPublisherStrategy,
     _load_policy_and_update_scheduler,
+    _VerifierPublisherStrategy,
 )
 from wavelet.orchestrator.schedule import (
     latest_exported_policy_step_at_or_before,
@@ -53,8 +53,8 @@ def test_required_policy_step_uses_off_policy_window_when_stricter() -> None:
     assert required_policy_step(config, 3) == 1
 
 
-def test_required_policy_step_falls_back_to_async_window() -> None:
-    config = RLConfig(orchestrator={"max_async_level": 1, "max_off_policy_steps": 0})
+def test_zero_off_policy_window_requires_current_policy() -> None:
+    config = RLConfig(orchestrator={"max_async_level": 4, "max_off_policy_steps": 0})
 
     assert required_policy_step(config, 0) == 0
     assert required_policy_step(config, 1) == 1
