@@ -23,7 +23,7 @@ from wavelet.orchestrator.custom_algorithms import (
     load_custom_algorithm,
 )
 from wavelet.orchestrator.custom_algorithms import (
-    register_algorithm as register_algorithm,
+    register_algorithm as register_algorithm,  # noqa: PLC0414 - public re-export
 )
 
 
