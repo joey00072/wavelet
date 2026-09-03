@@ -143,92 +143,25 @@ uv run python -m wavelet rl \
   @ examples/qwen2_5_7b_polaris/eval_recovery_sft_fresh_lr2e4.yaml
 ```
 
-Start the 100,000-step GRPO run from that clean SFT adapter with 128 problems
-and eight rollouts per problem (1,024 rollouts per optimizer step). It uses a
-global training batch of 128, microbatch size one, learning rate `5e-5`, and no
-KL loss:
+Start the canonical 100,000-step two-GPU GRPO run from that clean SFT adapter:
 
 ```bash
 uv run python -m wavelet debug preflight \
-  @ examples/qwen2_5_7b_polaris/rl_100k_fresh_sft_lr2e4.yaml --json
+  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32.yaml --json
 uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/rl_100k_fresh_sft_lr2e4.yaml
+  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32.yaml
 ```
 
-The run evaluates AIME 2024 every 100 policy steps, retains five recent policy
-exports, two checkpoints, five consumed rollout batches, two evaluation sets,
-and bounded sampled rollouts for reward-hacking inspection. The Polaris RL
-configs require FlashAttention 2 in the trainer and use chunked selected-token
-log-probability computation. Preflight fails before launch if `flash-attn` is
-not installed; the trainer also verifies that the extension imports before
-loading the model.
+GPU 0 trains while GPU 1 serves vLLM. Each optimizer step contains 32 problems
+and eight rollouts per problem, published as four eight-problem chunks. The
+trainer uses unpacked microbatches of 16, FlashAttention 2, learning rate
+`5e-5`, and no KL loss. Policy lag is bounded by both the four-stage async
+pipeline and `max_off_policy_steps`. AIME 2024 runs every 100 policy steps, and
+retention keeps only the recent policies, checkpoints, consumed rollouts, eval
+sets, and sampled generations needed for debugging.
 
-For a two-GPU async restart from the latest policy produced by that run, use:
-
-```bash
-uv run python -m wavelet debug preflight \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step361.yaml --json
-uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step361.yaml
-```
-
-This restart initializes from policy step 361 with a fresh optimizer because
-its optimizer batch changes from 128 to 32. GPU 0 trains while GPU 1 serves
-vLLM. Four eight-example chunks per optimizer step bound the effective policy
-lag to three steps. At most eight chunks may be pending, which keeps enough
-generation in flight to saturate the inference GPU without exceeding ordinary
-rollout-client resource limits. Policy and consumed-rollout retention remain
-larger than the staleness window.
-
-To continue from that run's policy step 24 without sequence packing, use the
-unpacked microbatch-eight restart. Ordinary padded batches allow FlashAttention
-2 to process eight rows concurrently and use the additional memory on a 96 GB
-trainer GPU:
-
-```bash
-uv run python -m wavelet debug preflight \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step385_unpacked_mb8.yaml --json
-uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step385_unpacked_mb8.yaml
-```
-
-The tuned 96 GB continuation increases the unpacked microbatch to 16 and starts
-from the microbatch-eight run's policy step 8:
-
-```bash
-uv run python -m wavelet debug preflight \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step393_unpacked_mb16.yaml --json
-uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step393_unpacked_mb16.yaml
-```
-
-Microbatch 16 reached 97% reserved memory without expandable allocator
-segments. Enabling expandable CUDA segments removed that fragmentation and the
-same microbatch completed 145 policy steps. Streaming optimizes 32 problems
-with eight rollouts each. The Polaris verifier uses a five-second
-symbolic-comparison timeout and replaces its process pool after a hard timeout
-so a poisoned worker cannot stall all later rewards:
-
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step402_unpacked_mb16_expandable.yaml
-```
-
-After policy step 145 of that run, use the step-547 continuation config. It
-keeps the same trainer shape and includes the resilient five-second verifier:
-
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step547_unpacked_mb16.yaml
-```
-
-If a later policy makes mixed-correctness groups sparse, continue from policy
-step 6 of that run with the wider 64-attempt zero-advantage filtering window:
-
-```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  uv run python -m wavelet rl \
-  @ examples/qwen2_5_7b_polaris/rl_100k_async_2gpu_b32_from_step553_unpacked_mb16.yaml
-```
+To resume, set `model.adapter_path` to the chosen immutable policy adapter and
+set a new `output_dir`; checkpoint resume should use the checkpoint controls
+instead of adding a step-specific copy of this config. Set
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the shell if the target
+machine needs allocator fragmentation mitigation.
