@@ -37,10 +37,10 @@ def test_tail_jsonl_reads_long_utf8_rows_across_blocks(tmp_path):
     path = tmp_path / "long-records.jsonl"
     long_value = "λ" * 40_000
     path.write_text(
-        f'{json.dumps({"value": 1})}\n\n'
-        f'{json.dumps({"value": long_value})}\n'
+        f"{json.dumps({'value': 1})}\n\n"
+        f"{json.dumps({'value': long_value})}\n"
         "invalid\n"
-        f'{json.dumps({"value": 3})}\n',
+        f"{json.dumps({'value': 3})}\n",
         encoding="utf-8",
     )
 
@@ -51,9 +51,18 @@ def test_tail_jsonl_reads_long_utf8_rows_across_blocks(tmp_path):
 
 
 def test_redact_and_series_stats():
-    assert redact({"nested": [{"api_token": "secret"}], "safe": 1}) == {
+    assert redact(
+        {
+            "nested": [{"api_token": "secret"}],
+            "max_completion_tokens": 8192,
+            "tokenizer": "Qwen",
+            "verifier_api_key_var": "PRIME_API_KEY",
+        }
+    ) == {
         "nested": [{"api_token": "<redacted>"}],
-        "safe": 1,
+        "max_completion_tokens": 8192,
+        "tokenizer": "Qwen",
+        "verifier_api_key_var": "PRIME_API_KEY",
     }
     assert series_stats("reward/all", [1.0, 3.0]) == {
         "reward/all/mean": 2.0,

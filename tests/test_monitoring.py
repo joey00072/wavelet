@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import types
 from collections import namedtuple
@@ -43,13 +44,19 @@ def test_wandb_group_and_tags_are_forwarded(monkeypatch, tmp_path) -> None:
             mode="offline",
         ),
     )
-    monitor.start_run(run_config={"case": "wandb"})
+    monitor.start_run(run_config={"case": "wandb", "nested": {"api_token": "secret"}})
 
     assert captured["project"] == "wavelet-tests"
     assert captured["entity"] == "test-entity"
     assert captured["name"] == "test-run"
     assert captured["group"] == "test-group"
     assert captured["tags"] == ["rl", "multi-gpu"]
+    assert captured["config"] == {
+        "case": "wandb",
+        "nested": {"api_token": "<redacted>"},
+    }
+    metadata = json.loads((tmp_path / "run_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["config"]["nested"]["api_token"] == "<redacted>"
 
 
 def test_wandb_alias_metrics_include_lr() -> None:
