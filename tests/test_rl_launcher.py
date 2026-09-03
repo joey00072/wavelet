@@ -720,7 +720,8 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        assert payload is not None
+        if payload is None:
+            return {"status": "ok"}
         return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
@@ -728,6 +729,7 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
     engine.load_policy(Path("policy"), step=7)
 
     assert calls == [
+        ("POST", "/pause", None, "http://127.0.0.1:8000"),
         (
             "POST",
             "/load_policy",
@@ -738,7 +740,8 @@ def test_http_openai_load_policy_reuses_stable_adapter_name() -> None:
                 "load_inplace": True,
             },
             "http://127.0.0.1:8000",
-        )
+        ),
+        ("POST", "/resume", None, "http://127.0.0.1:8000"),
     ]
     assert engine.policy_model_name == "policy"
 
@@ -761,7 +764,8 @@ def test_http_openai_nccl_load_policy_signals_ready(tmp_path: Path) -> None:
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        assert payload is not None
+        if payload is None:
+            return {"status": "ok"}
         return {"policy_step": payload["step"]}
 
     engine._request = fake_request  # type: ignore[method-assign]
@@ -772,12 +776,14 @@ def test_http_openai_nccl_load_policy_signals_ready(tmp_path: Path) -> None:
 
     assert (policy_dir / NCCL_READY_MARKER).is_file()
     assert calls == [
+        ("POST", "/pause", None, "http://127.0.0.1:8000"),
         (
             "POST",
             "/load_policy",
             {"policy_dir": str(policy_dir), "step": 3},
             "http://127.0.0.1:8000",
-        )
+        ),
+        ("POST", "/resume", None, "http://127.0.0.1:8000"),
     ]
 
 
@@ -834,7 +840,8 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
         base_url: str | None = None,
     ) -> dict:
         calls.append((method, path, payload, base_url))
-        assert payload is not None
+        if payload is None:
+            return {"status": "ok"}
         return {
             "policy_step": payload["step"],
             "artifact_sha256": payload.get("artifact_sha256"),
@@ -844,7 +851,7 @@ def test_http_openai_load_policy_stages_adapter_in_tmpfs(
 
     engine.load_policy(policy_dir, step=7)
 
-    payload = calls[0][2]
+    payload = calls[1][2]
     assert payload is not None
     cached_policy_dir = Path(payload["policy_dir"])
     assert cached_policy_dir != policy_dir

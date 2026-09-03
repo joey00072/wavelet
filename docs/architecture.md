@@ -77,6 +77,11 @@ rename and stable marker. Metadata is written beside the model or adapter. NCCL
 transfer uses the same metadata and readiness concepts, but broadcasts named
 tensors after inference workers enter the update collective.
 
+HTTP policy refreshes are transactions across all inference replicas: pause and
+drain generation without clearing the version-salted prefix cache, load and
+verify the policy on every replica, then resume generation even when loading
+fails. Never replace adapter or model weights while a request is decoding.
+
 Only the intended distributed rank writes metadata, stable markers, queue
 events, and final directories. Barriers protect visibility across trainer
 ranks; they do not replace stable markers between trainer and inference

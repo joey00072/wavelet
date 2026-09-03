@@ -66,14 +66,16 @@ def test_round_robin_annotation_restores_input_order() -> None:
 
 def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -> None:
     engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
-    calls: list[tuple[str, str, dict[str, object]]] = []
+    calls: list[tuple[str, str, dict[str, object] | None]] = []
 
     def request_all(
         method: str,
         path: str,
-        payload: dict[str, object],
+        payload: dict[str, object] | None = None,
     ) -> list[dict[str, object]]:
         calls.append((method, path, payload))
+        if payload is None:
+            return [{"status": path.removeprefix("/")}]
         return [{"policy_step": payload["step"]}]
 
     monkeypatch.setattr(engine, "_request_all", request_all)
@@ -81,6 +83,7 @@ def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -
     engine.load_policy(tmp_path / "policy", step=3)
 
     assert calls == [
+        ("POST", "/pause", None),
         (
             "POST",
             "/load_policy",
@@ -90,6 +93,29 @@ def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -
                 "adapter_name": "policy",
                 "load_inplace": True,
             },
-        )
+        ),
+        ("POST", "/resume", None),
     ]
     assert engine.policy_step == 3
+
+
+def test_policy_load_resumes_servers_after_failure(tmp_path: Path, monkeypatch) -> None:
+    engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
+    paths: list[str] = []
+
+    def request_all(
+        _method: str,
+        path: str,
+        _payload: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        paths.append(path)
+        if path == "/load_policy":
+            raise RuntimeError("load failed")
+        return [{"status": "ok"}]
+
+    monkeypatch.setattr(engine, "_request_all", request_all)
+
+    with pytest.raises(RuntimeError, match="load failed"):
+        engine.load_policy(tmp_path / "policy", step=3)
+
+    assert paths == ["/pause", "/load_policy", "/resume"]

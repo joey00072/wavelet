@@ -266,7 +266,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         if self._uses_openai_rollouts() and self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name
             payload["load_inplace"] = True
-        responses = self._request_all("POST", "/load_policy", payload)
+        responses = self._load_policy_while_generation_paused(payload)
         for response in responses:
             if int(response.get("policy_step", -1)) != step:
                 raise RuntimeError(
@@ -284,6 +284,29 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         self.policy_step = step
         if self.config.lora is not None:
             self.policy_model_name = self.config.policy_transfer.adapter_name
+
+    def _load_policy_while_generation_paused(
+        self,
+        payload: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Drain generation on every replica before replacing policy weights."""
+        primary_error: Exception | None = None
+        try:
+            self._request_all("POST", "/pause")
+            return self._request_all("POST", "/load_policy", payload)
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                self._request_all("POST", "/resume")
+            except Exception as exc:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "Inference policy loading also failed to resume every replica: "
+                    f"{exc}"
+                )
 
     @staticmethod
     def _policy_artifact_sha256(policy_dir: Path) -> str | None:
