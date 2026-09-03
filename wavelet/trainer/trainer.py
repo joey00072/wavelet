@@ -166,7 +166,7 @@ class BaseTrainer:
             torch.cuda.manual_seed_all(seed)
 
     def train(self) -> None:
-        self.train_until(self.config.max_steps or 1000, finish_run=True)
+        self.train_until(self._compute_total_steps(), finish_run=True)
 
     def train_until(self, target_step: int, *, finish_run: bool = False) -> None:
         self._validate_ready()
@@ -311,10 +311,11 @@ class BaseTrainer:
 
     def _setup_model_standard(self) -> None:
         from wavelet.trainer.model import (
+            apply_liger_kernel,
             apply_lora,
             prepare_hf_tp_lora_for_training,
+            setup_model,
         )
-        from wavelet.trainer.model import apply_liger_kernel, setup_model
 
         # Apply Liger kernel patches before from_pretrained so the class methods
         # are in place when model weights are loaded.
@@ -491,8 +492,8 @@ class BaseTrainer:
         return self.world.rank % ranks_per_pipeline_stage
 
     def _setup_optimizer(self) -> None:
-        from wavelet.trainer.optim import setup_optimizer
         from wavelet.trainer.model import enforce_single_lora_adapter
+        from wavelet.trainer.optim import setup_optimizer
 
         if not self.model:
             raise RuntimeError("Model must be set up before optimizer")
