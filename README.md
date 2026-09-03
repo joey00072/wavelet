@@ -108,6 +108,9 @@ trainer checkpoints, not policy exports, for durable resume history.
 Consumed rollout queues likewise retain the latest two batches by default.
 Increase `transport.keep_last_consumed` for a larger reward-hacking audit
 window; do not disable cleanup for long runs.
+Checkpoint and evaluation-rollout retention also default to the latest two
+sets when those features are enabled. Metrics and traces remain the compact
+long-term record.
 This publishes policy step 0 before rollout generation and prevents the trainer
 and inference scheduler from waiting on each other at startup.
 

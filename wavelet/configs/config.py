@@ -175,7 +175,7 @@ class CheckpointConfig(BaseModel):
     interval: int | None = Field(default=None, ge=1)
     # Counts optimizer steps, not micro-steps.
     resume_step: int | None = None
-    keep_last: int | None = Field(default=None, ge=1)
+    keep_last: int = Field(default=2, ge=1)
     mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
     output_dir: Path | None = Field(default=None)
 
@@ -499,7 +499,7 @@ class RLEvalConfig(BaseModel):
     max_retries: int = Field(default=0, ge=0)
     eval_base_model: bool = True
     final_eval: bool = True
-    keep_last_rollout_sets: int | None = Field(default=None, ge=1)
+    keep_last_rollout_sets: int = Field(default=2, ge=1)
 
     @model_validator(mode="after")
     def resolve_env_defaults(self) -> "RLEvalConfig":
