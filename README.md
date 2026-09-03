@@ -147,7 +147,9 @@ Fresh schedulers initialize evaluation from an unevaluated state, so
 provides the fixed baseline used by the progress chart. Resumed schedulers use
 the checkpoint step as their evaluation cursor instead of repeating old evals.
 Final evaluation reuses an interval result from the same policy rather than
-generating an identical benchmark twice.
+generating an identical benchmark twice. Before a required final evaluation,
+the persistent scheduler cancels speculative rollout requests that can no
+longer be consumed, then loads and evaluates the final policy in isolation.
 Verifier thread and math-process pools scale to the scheduler's real in-flight
 request high-water mark, which is logged as `generation/executor_concurrency`.
 When `max_pending_rollout_chunks` is set, that queue-derived capacity is a hard
