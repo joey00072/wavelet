@@ -33,6 +33,23 @@ def test_jsonl_readers_preserve_strict_and_tail_contracts(tmp_path):
         read_jsonl(path)
 
 
+def test_tail_jsonl_reads_long_utf8_rows_across_blocks(tmp_path):
+    path = tmp_path / "long-records.jsonl"
+    long_value = "λ" * 40_000
+    path.write_text(
+        f'{json.dumps({"value": 1})}\n\n'
+        f'{json.dumps({"value": long_value})}\n'
+        "invalid\n"
+        f'{json.dumps({"value": 3})}\n',
+        encoding="utf-8",
+    )
+
+    rows, errors = tail_jsonl(path, limit=3)
+
+    assert rows == [{"value": long_value}, {"value": 3}]
+    assert errors == 1
+
+
 def test_redact_and_series_stats():
     assert redact({"nested": [{"api_token": "secret"}], "safe": 1}) == {
         "nested": [{"api_token": "<redacted>"}],

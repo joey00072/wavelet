@@ -7,7 +7,7 @@ import math
 import os
 import random
 import shutil
-from collections import defaultdict, deque
+from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,6 +27,7 @@ from wavelet.trainer.distributed import World, get_world
 
 _SECRET_KEY_PARTS = ("api_key", "token", "secret", "password")
 logger = logging.getLogger(__name__)
+_TAIL_READ_BLOCK_BYTES = 64 * 1024
 
 
 def _state_timestamp() -> str:
@@ -77,9 +78,7 @@ def tail_jsonl(
     """Return the last dictionary records and the number of malformed rows."""
     if limit <= 0 or not path.exists():
         return [], 0
-    lines: deque[str] = deque(maxlen=limit)
-    with path.open("r", encoding="utf-8") as handle:
-        lines.extend(line for line in handle if line.strip())
+    lines = _tail_nonempty_lines(path, limit=limit)
 
     rows: list[dict[str, Any]] = []
     parse_errors = 0
@@ -96,6 +95,32 @@ def tail_jsonl(
         else:
             parse_errors += 1
     return rows, parse_errors
+
+
+def _tail_nonempty_lines(path: Path, *, limit: int) -> list[str]:
+    selected: list[bytes] = []
+    buffered = b""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        while position > 0 and len(selected) < limit:
+            read_size = min(position, _TAIL_READ_BLOCK_BYTES)
+            position -= read_size
+            handle.seek(position)
+            buffered = handle.read(read_size) + buffered
+            parts = buffered.split(b"\n")
+            if position > 0:
+                buffered = parts[0]
+                parts = parts[1:]
+            else:
+                buffered = b""
+            for line in reversed(parts):
+                if not line.strip():
+                    continue
+                selected.append(line)
+                if len(selected) == limit:
+                    break
+    return [line.decode("utf-8") for line in reversed(selected)]
 
 
 def tail_jsonl_rows(path: Path, *, limit: int) -> list[dict[str, Any]]:
