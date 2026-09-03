@@ -886,24 +886,33 @@ async def _load_adapter_policy(
     if not adapter_dir.exists():
         raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
 
+    models = _models(raw_request)
     adapter_path = str(adapter_dir.resolve())
     if (
         getattr(raw_request.app.state, "policy_step", None) == step
         and getattr(raw_request.app.state, "policy_adapter_name", None) == adapter_name
         and getattr(raw_request.app.state, "policy_adapter_path", None) == adapter_path
     ):
+        stored = models.lora_requests.get(adapter_name)
+        if stored is not None:
+            stored.load_inplace = False
         return {
             "status": "ok",
             "policy_step": step,
             "adapter_name": adapter_name,
         }
-    response = await _models(raw_request).load_lora_adapter(
-        LoadLoRAAdapterRequest(
-            lora_name=adapter_name,
-            lora_path=adapter_path,
-            load_inplace=load_inplace,
+    try:
+        response = await models.load_lora_adapter(
+            LoadLoRAAdapterRequest(
+                lora_name=adapter_name,
+                lora_path=adapter_path,
+                load_inplace=load_inplace,
+            )
         )
-    )
+    finally:
+        stored = models.lora_requests.get(adapter_name)
+        if stored is not None:
+            stored.load_inplace = False
     if isinstance(response, ErrorResponse):
         return JSONResponse(
             content=response.model_dump(),

@@ -85,6 +85,8 @@ transfer uses the same metadata and readiness concepts, but broadcasts named
 tensors after inference workers enter the update collective.
 Inference loads LoRA adapters directly from the immutable published directory;
 it does not make a second tmpfs copy of every policy.
+The one-shot `load_inplace` flag is cleared immediately after refresh so vLLM
+does not reread the adapter during later generation scheduler work.
 
 HTTP policy refreshes are transactions across all inference replicas. The
 rollout scheduler first blocks new submissions and drains requests already
