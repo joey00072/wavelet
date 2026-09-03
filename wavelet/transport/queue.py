@@ -222,9 +222,7 @@ def validate_rollout_manifest(
     """Validate immutable rollout provenance before reuse or training."""
     manifest = read_manifest(batch.step_dir)
     if manifest is None:
-        raise ValueError(
-            f"Rollout queue step {batch.step} is missing manifest.json."
-        )
+        raise ValueError(f"Rollout queue step {batch.step} is missing manifest.json.")
     expected = {
         "queue_step": queue_step,
         "optimizer_step": optimizer_step,
@@ -409,9 +407,7 @@ def record_rollout_consumed(
             step=trainer_step_after,
             queue_step=batch.step,
             optimizer_step=(
-                trainer_step_after
-                if manifest is None
-                else manifest.optimizer_step
+                trainer_step_after if manifest is None else manifest.optimizer_step
             ),
             policy_step=None if manifest is None else manifest.policy_step,
             details={
@@ -869,7 +865,7 @@ class FileSystemPolicyReceiver:
         mode: str,
     ) -> None:
         consumer_id = self.consumer_id or process_identity("rl-inference")
-        payload_bytes = _directory_payload_bytes(snapshot.step_dir)
+        payload_bytes = _policy_artifact_bytes(snapshot.meta_path)
         _record_received(
             self.events_dir,
             kind="policy_received",
@@ -893,13 +889,16 @@ class FileSystemPolicyReceiver:
         self._record_received(snapshot, wait_seconds=wait_seconds, mode=mode)
 
 
-def _directory_payload_bytes(path: Path) -> int:
-    total = 0
-    for candidate in path.rglob("*"):
-        if not candidate.is_file():
-            continue
-        total += candidate.stat().st_size
-    return total
+def _policy_artifact_bytes(metadata_path: Path) -> int | None:
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    artifact = metadata.get("artifact") if isinstance(metadata, dict) else None
+    value = artifact.get("bytes") if isinstance(artifact, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    return value
 
 
 def _trace_output_dir(events_dir: Path | None) -> Path | None:

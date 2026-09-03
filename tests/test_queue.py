@@ -164,7 +164,10 @@ def test_policy_receiver_records_wait_metrics(tmp_path: Path) -> None:
     config = RLPolicyTransferConfig(poll_interval_seconds=0.001)
     policy_dir = tmp_path / "policies" / "step-000000"
     policy_dir.mkdir(parents=True)
-    (policy_dir / "policy.json").write_text("{}", encoding="utf-8")
+    (policy_dir / "policy.json").write_text(
+        json.dumps({"artifact": {"bytes": len(b"weights")}}),
+        encoding="utf-8",
+    )
     (policy_dir / "adapter").mkdir()
     (policy_dir / "adapter" / "adapter_model.safetensors").write_bytes(b"weights")
     (policy_dir / "STABLE").touch()
@@ -185,7 +188,7 @@ def test_policy_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert events[0].consumer_id == "inference"
     assert events[0].details is not None
     assert events[0].details["mode"] == "wait"
-    assert events[0].details["payload_bytes"] >= len(b"weights")
+    assert events[0].details["payload_bytes"] == len(b"weights")
     assert events[0].details["wait_seconds"] >= 0
     trace = json.loads(
         (tmp_path / "traces" / "step-000000.jsonl").read_text(encoding="utf-8")

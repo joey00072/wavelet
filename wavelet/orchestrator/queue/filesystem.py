@@ -17,7 +17,7 @@ from wavelet.transport.queue import (
     FileSystemRolloutSender as FileSystemRolloutSender,
     FileSystemRolloutReceiver as FileSystemRolloutReceiver,
     FileSystemPolicyReceiver as FileSystemPolicyReceiver,
-    _directory_payload_bytes as _directory_payload_bytes,
+    _policy_artifact_bytes as _policy_artifact_bytes,
     _trace_output_dir as _trace_output_dir,
     publish_adapter_policy_snapshot as publish_adapter_policy_snapshot,
 )
