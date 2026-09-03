@@ -85,6 +85,8 @@ transfer uses the same metadata and readiness concepts, but broadcasts named
 tensors after inference workers enter the update collective.
 Inference loads LoRA adapters directly from the immutable published directory;
 it does not make a second tmpfs copy of every policy.
+Policy receive events reuse the tensor byte count recorded in `policy.json`;
+they do not walk or reread the artifact to reconstruct diagnostic metadata.
 The one-shot `load_inplace` flag is cleared immediately after refresh so vLLM
 does not reread the adapter during later generation scheduler work.
 
