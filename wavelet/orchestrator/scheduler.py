@@ -2275,7 +2275,6 @@ async def _load_policy_and_update_scheduler(
     policy_step: int,
     scheduler,
 ) -> int:
-    scheduler.begin_policy_update()
     try:
         await scheduler.drain_policy_update_requests()
         loaded_step = await _load_policy_async(
