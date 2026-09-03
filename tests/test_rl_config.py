@@ -231,3 +231,10 @@ def test_policy_transport_retains_current_and_previous_by_default() -> None:
 def test_policy_transport_rejects_single_snapshot_retention() -> None:
     with pytest.raises(ValueError, match="greater than or equal to 2"):
         RLConfig(policy_transfer={"keep_last": 1})
+
+
+def test_rollout_transport_keeps_a_bounded_audit_window_by_default() -> None:
+    config = RLConfig()
+
+    assert config.transport.cleanup_consumed is True
+    assert config.transport.keep_last_consumed == 2

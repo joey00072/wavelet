@@ -55,7 +55,6 @@ orchestrator:
 
 transport:
   poll_interval_seconds: 0.05
-  cleanup_consumed: false
 
 eval:
   interval: 2
