@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import ceil
 from typing import Protocol
 
-from wavelet.configs.rl_config import RLEvalEnvConfig, RLConfig
+from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step
 
 
@@ -40,10 +40,7 @@ def required_policy_step(config: RLConfig, rollout_step: int) -> int:
     async_level = config.orchestrator.max_async_level
     async_lag = max(async_level - 1, 0)
     off_policy_steps = config.orchestrator.max_off_policy_steps
-    if async_level > 0 and off_policy_steps > 0:
-        allowed_lag = min(async_lag, off_policy_steps)
-    else:
-        allowed_lag = max(async_lag, off_policy_steps)
+    allowed_lag = min(async_lag, off_policy_steps)
     return max(rollout_step - allowed_lag, 0)
 
 

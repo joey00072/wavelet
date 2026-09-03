@@ -40,6 +40,10 @@ separately:
 3. The next inference step observes the exported policy subject to the
    configured off-policy window.
 
+`max_off_policy_steps` is always a hard freshness ceiling. Setting it to zero
+requires the policy for the current optimizer step even if `max_async_level` is
+larger; async capacity never silently widens the configured freshness window.
+
 Queue directories and stable markers are the synchronization contract. Run
 state and queue events provide observability; process-local memory is never the
 source of truth for a completed batch or policy.
