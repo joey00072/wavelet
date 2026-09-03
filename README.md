@@ -145,7 +145,8 @@ selection-biased by design.
 Fresh schedulers initialize evaluation from an unevaluated state, so
 `eval_base_model: true` records policy step 0 before interval evaluations and
 provides the fixed baseline used by the progress chart. Resumed schedulers use
-the checkpoint step as their evaluation cursor instead of repeating old evals.
+persisted `eval_metrics.jsonl` policy steps as their evaluation cursor. Missing
+eval records remain due instead of being inferred from the checkpoint step.
 Final evaluation reuses an interval result from the same policy rather than
 generating an identical benchmark twice. Before a required final evaluation,
 the persistent scheduler cancels speculative rollout requests that can no

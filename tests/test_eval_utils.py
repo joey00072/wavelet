@@ -91,18 +91,23 @@ def test_every_scheduler_starts_with_base_eval_due() -> None:
     ] == ["aime2024"]
 
 
-def test_resumed_scheduler_does_not_repeat_completed_evals() -> None:
+def test_resumed_scheduler_restores_completed_evals(tmp_path: Path) -> None:
     config = RLConfig(
+        output_dir=tmp_path,
         eval={
             "interval": 100,
             "eval_base_model": True,
             "env": [{"id": "aime", "name": "aime2024"}],
-        }
+        },
+    )
+    (tmp_path / "eval_metrics.jsonl").write_text(
+        '{"progress/policy_step": 500, "eval/aime2024/avg@8": 0.5}\n',
+        encoding="utf-8",
     )
 
     last_eval_steps = _initial_eval_steps(config, start_step=553)
 
-    assert last_eval_steps == {"aime2024": 553}
+    assert last_eval_steps == {"aime2024": 500}
     assert (
         select_due_eval_envs(
             config,
@@ -111,6 +116,17 @@ def test_resumed_scheduler_does_not_repeat_completed_evals() -> None:
         )
         == []
     )
+
+
+def test_resumed_scheduler_does_not_assume_missing_eval_completed(
+    tmp_path: Path,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        eval={"env": [{"id": "aime", "name": "aime2024"}]},
+    )
+
+    assert _initial_eval_steps(config, start_step=553) == {"aime2024": -1}
 
 
 def test_pass_at_k_for_binary_rewards() -> None:
@@ -165,6 +181,25 @@ def test_select_due_eval_envs_updates_each_env_independently() -> None:
 
     assert [env.resolved_name for env in due] == ["alphabet", "reverse"]
     assert last_eval_steps == {"alphabet": 8, "reverse": 8}
+
+
+def test_due_eval_tracks_actual_policy_when_interval_was_skipped() -> None:
+    config = RLConfig(
+        eval={
+            "eval_base_model": False,
+            "env": [{"id": "aime", "name": "aime2024", "interval": 100}],
+        },
+    )
+    last_eval_steps = {"aime2024": 0}
+
+    due = select_due_eval_envs(
+        config,
+        policy_step=101,
+        last_eval_steps=last_eval_steps,
+    )
+
+    assert [env.resolved_name for env in due] == ["aime2024"]
+    assert last_eval_steps == {"aime2024": 101}
 
 
 def test_final_eval_policy_step_uses_last_exported_step() -> None:
