@@ -105,6 +105,9 @@ Process and colocated training require `policy_transfer.export_initial: true`.
 Filesystem policy exports are transient transport artifacts: Wavelet keeps the
 current and previous snapshot by default and requires `keep_last >= 2`. Use
 trainer checkpoints, not policy exports, for durable resume history.
+Consumed rollout queues likewise retain the latest two batches by default.
+Increase `transport.keep_last_consumed` for a larger reward-hacking audit
+window; do not disable cleanup for long runs.
 This publishes policy step 0 before rollout generation and prevents the trainer
 and inference scheduler from waiting on each other at startup.
 

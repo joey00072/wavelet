@@ -389,8 +389,8 @@ class RLTransportConfig(BaseModel):
     queue_dir: Path | None = None
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
-    cleanup_consumed: bool = False
-    keep_last_consumed: int | None = Field(default=None, ge=1)
+    cleanup_consumed: bool = True
+    keep_last_consumed: int = Field(default=2, ge=1)
 
 
 class RLPolicyTransferConfig(BaseModel):
