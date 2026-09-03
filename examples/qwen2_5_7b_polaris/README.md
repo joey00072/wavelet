@@ -33,8 +33,9 @@ uv run python -m wavelet debug preflight \
 uv run python -m wavelet rl @ examples/qwen2_5_7b_polaris/rl_smoke.yaml
 ```
 
-The smoke config writes a checkpoint at step one to validate the complete path
-before the canonical long run documented below. The long run evaluates AIME
+The smoke config uses the same unpacked, no-KL, `5e-5` training semantics and
+writes a checkpoint at step one to validate the complete path before the
+canonical long run documented below. The long run evaluates AIME
 2024 every 100 policy steps and retains only recent policies, checkpoints,
 consumed training batches, evaluation sets, and sampled completions needed for
 reward-hacking inspection.

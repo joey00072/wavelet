@@ -223,6 +223,16 @@ def test_polaris_async_rl_uses_canonical_two_gpu_batch_shape() -> None:
     assert config.max_steps == 100000
 
 
+def test_polaris_smoke_exercises_long_run_training_semantics() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/qwen2_5_7b_polaris/rl_smoke.yaml"))
+    )
+
+    assert config.data.pack_sequences is False
+    assert config.loss.kl_tau == 0.0
+    assert config.optim.lr == pytest.approx(5e-5)
+
+
 def test_moe_reverse_text_rl_starts_from_sft_adapter_on_two_gpus() -> None:
     config = RLConfig.model_validate(
         load_yaml(Path("examples/moe_reverse_text/rl.yaml"))
