@@ -10,7 +10,6 @@ that are expected to run on this host.
 | `reverse_text` | working | 0.6B LoRA RL with explicit GRPO plus SFT config; includes a 2-GPU INT4 QLoRA 4B experiment. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
-| `qwen2_5_7b_math500` | runnable | 7B LoRA GRPO on MATH-500 with strict think/answer tags, diverse group sampling, bounded artifacts, and 100-step evals. |
 | `qwen2_5_7b_polaris` | runnable | 7B LoRA GRPO on filtered Polaris with strict tags, diverse group sampling, a zero-step AIME 2024 baseline, and held-out 100-step evals. |
 | `hendrycks_sanity` | runnable | 1.5B math sanity config. |
 | `wiki_search` | runnable with env deps | Requires `wiki-search` environment setup. |
