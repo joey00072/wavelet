@@ -52,25 +52,30 @@ class RLOrchestrator:
         inference_engine=None,
     ) -> Path:
         attempts = self.config.orchestrator.zero_advantage_max_retries + 1
-        last_scored_records: list[RLExample] = []
+        trainable_records: list[RLExample] = []
         for retry in range(attempts):
             records = self._load_step_records(step=step, retry=retry)
             scored_records = self._generate_and_score(
                 records,
                 inference_engine=inference_engine,
             )
-            trainable_records = self._filter_zero_advantage_records(scored_records)
-            last_scored_records = trainable_records
+            trainable_records = self._append_new_groups(
+                trainable_records,
+                self._filter_zero_advantage_records(scored_records),
+                target_groups=self.config.orchestrator.examples_per_step,
+            )
             if self._has_target_groups(trainable_records):
                 break
         else:
+            accepted_groups = self._group_count(trainable_records)
             raise RuntimeError(
                 "Could not materialize the requested rollout group count after "
-                f"{attempts} generation attempt(s). Increase "
+                f"{attempts} generation attempt(s) (accepted "
+                f"{accepted_groups}). Increase "
                 "orchestrator.zero_advantage_max_retries, relax filtering, or "
                 "check the reward/model output format."
             )
-        return self._write_records(last_scored_records, step=step)
+        return self._write_records(trainable_records, step=step)
 
     def materialize_native_chunk(
         self,
@@ -84,7 +89,7 @@ class RLOrchestrator:
         if self.config.orchestrator.custom_rollout_function is not None:
             raise ValueError("Native rollout chunks require native rollouts.")
         attempts = self.config.orchestrator.zero_advantage_max_retries + 1
-        last_scored_records: list[RLExample] = []
+        trainable_records: list[RLExample] = []
         expected_groups: int | None = None
         for retry in range(attempts):
             records = self._load_native_chunk_records(
@@ -99,21 +104,51 @@ class RLOrchestrator:
                 records,
                 inference_engine=inference_engine,
             )
-            trainable_records = self._filter_zero_advantage_records(scored_records)
-            last_scored_records = trainable_records
+            trainable_records = self._append_new_groups(
+                trainable_records,
+                self._filter_zero_advantage_records(scored_records),
+                target_groups=expected_groups,
+            )
             if self._has_target_groups(
                 trainable_records,
                 target_groups=expected_groups,
             ):
                 break
         else:
+            accepted_groups = self._group_count(trainable_records)
             raise RuntimeError(
                 "Could not materialize the requested native chunk group count after "
-                f"{attempts} generation attempt(s). Increase "
+                f"{attempts} generation attempt(s) (accepted "
+                f"{accepted_groups}). Increase "
                 "orchestrator.zero_advantage_max_retries, relax filtering, or "
                 "check the reward/model output format."
             )
-        return self._write_records(last_scored_records, step=queue_step)
+        return self._write_records(trainable_records, step=queue_step)
+
+    def _append_new_groups(
+        self,
+        accumulated: list[RLExample],
+        candidates: list[RLExample],
+        *,
+        target_groups: int | None,
+    ) -> list[RLExample]:
+        """Collect unique rollout groups across bounded generation attempts."""
+        result = list(accumulated)
+        seen = {self._group_key(record) for record in result}
+        grouped: dict[str, list[RLExample]] = {}
+        for record in candidates:
+            grouped.setdefault(self._group_key(record), []).append(record)
+        for key, group in grouped.items():
+            if key in seen:
+                continue
+            if target_groups is not None and len(seen) >= target_groups:
+                break
+            result.extend(group)
+            seen.add(key)
+        return result
+
+    def _group_count(self, records: list[RLExample]) -> int:
+        return len({self._group_key(record) for record in records})
 
     def _has_target_groups(
         self,
@@ -128,8 +163,7 @@ class RLOrchestrator:
         )
         if target is None:
             return bool(records)
-        group_count = len({self._group_key(record) for record in records})
-        return group_count >= target
+        return self._group_count(records) >= target
 
     def _load_step_records(
         self,
