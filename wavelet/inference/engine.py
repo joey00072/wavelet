@@ -768,6 +768,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "tensor_parallel_size": vllm_config.tensor_parallel_size,
             "gpu_memory_utilization": vllm_config.gpu_memory_utilization,
             "enforce_eager": vllm_config.enforce_eager,
+            "logprobs_mode": "processed_logprobs",
             "enable_lora": self.config.lora is not None,
             "max_loras": 1,
             "max_cpu_loras": 1,
