@@ -626,6 +626,43 @@ def test_verifier_scheduler_uses_explicit_max_inflight_rollouts() -> None:
     assert scheduler.max_inflight_rollouts == 128
 
 
+def test_explicit_rollout_limit_is_hard_with_many_clients() -> None:
+    config = RLConfig(
+        orchestrator={
+            "examples_per_step": 64,
+            "rollouts_per_example": 8,
+            "max_inflight_rollouts": 130,
+        }
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.target_groups = 64
+    scheduler.rollout_count = 8
+    scheduler.clients = [object()] * 256
+
+    assert scheduler.max_inflight_groups == 16
+    assert scheduler.max_inflight_rollouts == 130
+
+
+def test_pending_chunk_limit_is_hard_with_many_clients() -> None:
+    config = RLConfig(
+        orchestrator={
+            "examples_per_step": 64,
+            "rollouts_per_example": 8,
+            "rollout_chunk_examples": 2,
+            "max_pending_rollout_chunks": 2,
+        }
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.target_groups = 64
+    scheduler.rollout_count = 8
+    scheduler.clients = [object()] * 256
+
+    assert scheduler.max_inflight_groups == 4
+    assert scheduler.max_inflight_rollouts == 32
+
+
 def test_verifier_executors_scale_to_high_water_concurrency(
     monkeypatch,
 ) -> None:

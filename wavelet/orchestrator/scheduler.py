@@ -432,17 +432,14 @@ class VerifierRolloutScheduler:
     def max_inflight_groups(self) -> int:
         explicit_rollouts = self.config.orchestrator.max_inflight_rollouts
         if explicit_rollouts is not None:
-            return max(
-                len(self.clients),
-                math.ceil(explicit_rollouts / self.rollout_count),
-            )
+            return max(1, explicit_rollouts // self.rollout_count)
         base_groups = self.target_groups
         pending_chunk_limit = self.config.orchestrator.max_pending_rollout_chunks
         if pending_chunk_limit is not None:
             bounded_groups = (
                 _rollout_chunk_examples(self.config) * pending_chunk_limit
             )
-            return max(len(self.clients), bounded_groups)
+            return bounded_groups
         oversampled_groups = math.ceil(
             base_groups * self.config.orchestrator.oversampling_factor
         )
@@ -453,7 +450,10 @@ class VerifierRolloutScheduler:
 
     @property
     def max_inflight_rollouts(self) -> int:
-        return max(len(self.clients), self.max_inflight_groups * self.rollout_count)
+        explicit_rollouts = self.config.orchestrator.max_inflight_rollouts
+        if explicit_rollouts is not None:
+            return explicit_rollouts
+        return self.max_inflight_groups * self.rollout_count
 
     @property
     def inflight_rollout_count(self) -> int:
