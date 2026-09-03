@@ -884,10 +884,6 @@ def _policy_artifact_bytes(metadata_path: Path) -> int | None:
     return value
 
 
-def _trace_output_dir(events_dir: Path | None) -> Path | None:
-    return events_dir.parent if events_dir is not None else None
-
-
 def publish_adapter_policy_snapshot(
     output_dir: Path,
     config: RLPolicyTransferConfig,

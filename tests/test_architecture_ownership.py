@@ -1,3 +1,5 @@
+import ast
+from collections import Counter
 from pathlib import Path
 
 import wavelet.distributed.world as legacy_world
@@ -42,3 +44,16 @@ def test_canonical_modules_do_not_import_compatibility_paths() -> None:
     for path in canonical_files:
         source = path.read_text(encoding="utf-8")
         assert not any(item in source for item in compatibility_imports), path
+
+
+def test_modules_do_not_shadow_top_level_definitions() -> None:
+    root = Path(__file__).parents[1] / "wavelet"
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        names = [
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
+        ]
+        duplicates = [name for name, count in Counter(names).items() if count > 1]
+        assert not duplicates, f"{path}: {duplicates}"
