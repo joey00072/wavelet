@@ -34,6 +34,22 @@ def test_prompt_logprobs_preserve_exact_zero(token_key: int | str) -> None:
     ) == [0.0]
 
 
+@pytest.mark.parametrize("row_count", [0, 2])
+def test_generation_logprobs_require_exact_row_count(row_count: int) -> None:
+    with pytest.raises(ValueError, match="different number"):
+        extract_vllm_generation_logprobs([{7: -0.1}] * row_count, [7])
+
+
+@pytest.mark.parametrize("row_count", [1, 3])
+def test_prompt_logprobs_require_exact_row_count(row_count: int) -> None:
+    with pytest.raises(ValueError, match="different number"):
+        extract_vllm_prompt_logprobs(
+            [None] * row_count,
+            target_ids=[7],
+            loss_mask=[True],
+        )
+
+
 def test_sampling_payloads_preserve_backend_contracts() -> None:
     sampling = RLSamplingConfig(
         do_sample=False,

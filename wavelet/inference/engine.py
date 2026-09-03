@@ -170,13 +170,13 @@ def extract_vllm_generation_logprobs(
     if logprobs is None:
         raise ValueError("vLLM output did not include token logprobs.")
     rows = list(logprobs)
-    if len(rows) < len(token_ids):
+    if len(rows) != len(token_ids):
         raise ValueError(
-            "vLLM returned fewer logprob rows than generated tokens "
-            f"({len(rows)} < {len(token_ids)})."
+            "vLLM returned a different number of logprob rows and generated "
+            f"tokens ({len(rows)} != {len(token_ids)})."
         )
     values: list[float] = []
-    for token_id, row in zip(token_ids, rows, strict=False):
+    for token_id, row in zip(token_ids, rows, strict=True):
         if isinstance(row, dict):
             candidate = _token_logprob(row, token_id)
             if candidate is None:
@@ -198,10 +198,11 @@ def extract_vllm_prompt_logprobs(
     if prompt_logprobs is None:
         raise ValueError("vLLM scoring output did not include prompt_logprobs.")
     rows = list(prompt_logprobs)
-    if len(rows) < len(target_ids) + 1:
+    expected_rows = len(target_ids) + 1
+    if len(rows) != expected_rows:
         raise ValueError(
-            "vLLM returned fewer prompt logprob rows than scored tokens "
-            f"({len(rows)} < {len(target_ids) + 1})."
+            "vLLM returned a different number of prompt logprob rows and scored "
+            f"tokens ({len(rows)} != {expected_rows})."
         )
     values: list[float] = []
     for index, (token_id, trainable) in enumerate(
