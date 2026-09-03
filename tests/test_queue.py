@@ -41,6 +41,25 @@ def test_queue_public_imports_are_compatible() -> None:
     assert FileSystemPolicyReceiver.__name__ == "FileSystemPolicyReceiver"
 
 
+def test_publish_does_not_mark_batch_stable_when_manifest_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = RLTransportConfig()
+    sender = FileSystemRolloutSender(tmp_path, config)
+    source = _write_source(tmp_path / "source.jsonl", "{}\n")
+
+    def fail_manifest(*_args, **_kwargs) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("wavelet.transport.queue.write_manifest", fail_manifest)
+
+    with pytest.raises(OSError, match="disk full"):
+        sender.publish(source, step=0, optimizer_step=0)
+
+    assert not (tmp_path / "rollouts" / "step-000000" / "STABLE").exists()
+
+
 def test_rollout_receiver_wait_available_advances_past_late_gap(
     tmp_path: Path,
 ) -> None:

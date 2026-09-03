@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wavelet.orchestrator.queue import (
     ClaimRecord,
     ConsumedRecord,
@@ -70,6 +72,34 @@ def test_missing_lifecycle_records_return_none(tmp_path: Path) -> None:
     assert read_manifest(tmp_path) is None
     assert read_claim(tmp_path) is None
     assert read_consumed(tmp_path) is None
+
+
+@pytest.mark.parametrize("operation", ["claim", "consumed"])
+def test_required_lifecycle_write_failures_propagate(
+    operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    batch_path = tmp_path / "rollouts.jsonl"
+    batch_path.write_text("{}\n", encoding="utf-8")
+    batch = RolloutBatch(step=0, path=batch_path, step_dir=tmp_path)
+
+    def fail_write(*_args, **_kwargs) -> None:
+        raise OSError("disk full")
+
+    if operation == "claim":
+        monkeypatch.setattr("wavelet.transport.queue.write_claim", fail_write)
+        with pytest.raises(OSError, match="disk full"):
+            record_rollout_claim(batch, trainer_step_before=0)
+    else:
+        monkeypatch.setattr("wavelet.transport.queue.write_consumed", fail_write)
+        with pytest.raises(OSError, match="disk full"):
+            record_rollout_consumed(
+                batch,
+                trainer_step_before=0,
+                trainer_step_after=1,
+                optimizer_step_completed=True,
+            )
 
 
 def test_event_append_and_tail(tmp_path: Path) -> None:

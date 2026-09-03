@@ -102,6 +102,9 @@ Only the intended distributed rank writes metadata, stable markers, queue
 events, and final directories. Barriers protect visibility across trainer
 ranks; they do not replace stable markers between trainer and inference
 processes.
+Rollout manifests and claim/consumed records are required queue state. Their
+write failures stop the run; only duplicate diagnostic events and traces are
+best-effort.
 
 ## Extension Points
 
