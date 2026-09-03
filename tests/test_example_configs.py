@@ -185,7 +185,7 @@ def test_polaris_recovery_sft_initializes_fresh_lora() -> None:
     assert config.data.batch_size == 8
     assert config.optim.lr == pytest.approx(2e-4)
     assert config.epochs == 3
-    assert config.max_steps == 117
+    assert config.max_steps is None
 
 
 def test_polaris_async_rl_uses_canonical_two_gpu_batch_shape() -> None:
