@@ -194,3 +194,31 @@ def test_pretokenized_tail_truncation_keeps_aligned_logprob_prefix() -> None:
     assert sample["input_ids"] == list(range(8))
     assert sample["inference_logprobs"] == [-1.0] * 8
     assert len(sample["advantages"]) == 8
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("advantage", float("nan"), "advantage.*finite"),
+        ("reward", float("inf"), "reward.*finite"),
+        ("inference_logprobs", [float("-inf")] * 6, "inference_logprobs.*finite"),
+        ("teacher_logprobs", [float("nan")] * 6, "teacher_logprobs.*finite"),
+        ("temperatures", [0.0] * 6, "temperatures.*positive"),
+        ("temperatures", [-1.0] * 6, "temperatures.*positive"),
+    ],
+)
+def test_rl_samples_reject_invalid_numeric_streams(
+    field_name: str,
+    value,
+    message: str,
+) -> None:
+    record = _record(0)
+    setattr(record, field_name, value)
+
+    with pytest.raises(ValueError, match=message):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )

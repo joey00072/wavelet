@@ -897,6 +897,24 @@ class RLConfig(TrainerConfig):
         return self
 
     @model_validator(mode="after")
+    def validate_online_sampling_temperature(self) -> "RLConfig":
+        if (
+            not self.orchestrator.enabled
+            or not self.inference.enabled
+            or self.max_steps == 0
+        ):
+            return self
+
+        sampling = self.inference.sampling
+        if sampling.do_sample and sampling.temperature > 0:
+            return self
+        raise ValueError(
+            "Online RL requires stochastic sampling with a positive temperature "
+            "so behavior log-probabilities can be replayed by the trainer. Use "
+            "do_sample=true and temperature>0, or set max_steps=0 for evaluation."
+        )
+
+    @model_validator(mode="after")
     def validate_initial_policy_for_process_training(self) -> "RLConfig":
         if (
             self.orchestrator.enabled

@@ -173,6 +173,35 @@ def test_eval_only_group_config_allows_deterministic_sampling() -> None:
     assert config.inference.sampling.seed == 123
 
 
+@pytest.mark.parametrize(
+    "sampling",
+    [
+        {"do_sample": False},
+        {"temperature": 0.0},
+    ],
+)
+def test_single_rollout_online_rl_rejects_zero_effective_temperature(
+    sampling,
+) -> None:
+    with pytest.raises(ValueError, match="positive temperature"):
+        RLConfig(
+            algo={"type": "reward"},
+            orchestrator={"rollouts_per_example": 1},
+            inference={"sampling": sampling},
+            max_steps=1,
+        )
+
+
+def test_eval_only_reward_config_allows_greedy_sampling() -> None:
+    config = RLConfig(
+        algo={"type": "reward"},
+        inference={"sampling": {"do_sample": False}},
+        max_steps=0,
+    )
+
+    assert config.inference.sampling.do_sample is False
+
+
 @pytest.mark.parametrize("mode", ["process", "colocate", "colocate_sleep"])
 def test_process_training_requires_initial_policy_export(mode: str) -> None:
     with pytest.raises(ValueError, match="export_initial=true"):
