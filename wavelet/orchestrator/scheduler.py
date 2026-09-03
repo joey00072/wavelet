@@ -51,7 +51,7 @@ from wavelet.orchestrator.envs import (
     _is_usable_training_group as _is_usable_training_group,  # noqa: F401
     _is_complete_training_group as _is_complete_training_group,  # noqa: F401
     _has_trainable_rollout_record as _has_trainable_rollout_record,  # noqa: F401
-    _mark_zero_advantage_records_metric_only as _mark_zero_advantage_records_metric_only,  # noqa: F401
+    _mark_zero_advantage_records_metric_only as _mark_zero_advantage_records_metric_only,  # noqa: E501
     _has_trainable_trajectory as _has_trainable_trajectory,  # noqa: F401
     _patch_env_response_messages as _patch_env_response_messages,  # noqa: F401
     _coerce_vf_message as _coerce_vf_message,  # noqa: F401
@@ -439,7 +439,10 @@ class VerifierRolloutScheduler:
         base_groups = self.target_groups
         pending_chunk_limit = self.config.orchestrator.max_pending_rollout_chunks
         if pending_chunk_limit is not None:
-            base_groups = _rollout_chunk_examples(self.config) * pending_chunk_limit
+            bounded_groups = (
+                _rollout_chunk_examples(self.config) * pending_chunk_limit
+            )
+            return max(len(self.clients), bounded_groups)
         oversampled_groups = math.ceil(
             base_groups * self.config.orchestrator.oversampling_factor
         )

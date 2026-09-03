@@ -147,7 +147,9 @@ def test_custom_verifier_rollout_function_loads_without_env_import() -> None:
     orchestrator = RLOrchestrator(
         RLConfig(
             orchestrator={
-                "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts"
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                )
             }
         )
     )
@@ -583,6 +585,26 @@ def test_verifier_scheduler_rollout_capacity_uses_pending_chunk_limit() -> None:
 
     assert scheduler.max_inflight_groups == 128
     assert scheduler.max_inflight_rollouts == 1024
+
+
+def test_pending_chunk_limit_is_not_expanded_by_oversampling() -> None:
+    config = RLConfig(
+        orchestrator={
+            "examples_per_step": 32,
+            "rollouts_per_example": 8,
+            "rollout_chunk_examples": 8,
+            "max_pending_rollout_chunks": 8,
+            "oversampling_factor": 3.0,
+        }
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.target_groups = 32
+    scheduler.rollout_count = 8
+    scheduler.clients = [object()] * 4
+
+    assert scheduler.max_inflight_groups == 64
+    assert scheduler.max_inflight_rollouts == 512
 
 
 def test_verifier_scheduler_uses_explicit_max_inflight_rollouts() -> None:
