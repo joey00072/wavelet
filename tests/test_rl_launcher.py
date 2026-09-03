@@ -86,16 +86,12 @@ def test_integrated_rollout_publish_records_loaded_policy_step() -> None:
 
 
 @pytest.mark.parametrize("fails", [False, True])
-def test_integrated_launcher_closes_resources(
-    tmp_path, monkeypatch, fails
-) -> None:
+def test_integrated_launcher_closes_resources(tmp_path, monkeypatch, fails) -> None:
     config = RLConfig(output_dir=tmp_path / "run")
     trainer = Mock(step=0, resume_checkpoint_dir=None)
     inference_engine = Mock()
     teardown = AsyncMock()
-    rollout_loop = Mock(
-        side_effect=RuntimeError("rollout failed") if fails else None
-    )
+    rollout_loop = Mock(side_effect=RuntimeError("rollout failed") if fails else None)
     monkeypatch.setattr(runtime, "RLTrainer", Mock(return_value=trainer))
     monkeypatch.setattr(runtime, "FileSystemRolloutReceiver", Mock())
     monkeypatch.setattr(runtime, "FileSystemPolicyReceiver", Mock())
@@ -119,9 +115,7 @@ def test_integrated_launcher_closes_resources(
 
     teardown.assert_awaited_once_with()
     inference_engine.close.assert_called_once_with()
-    trainer.finalize.assert_called_once_with(
-        status="failed" if fails else "completed"
-    )
+    trainer.finalize.assert_called_once_with(status="failed" if fails else "completed")
 
 
 def _argv_value(argv: list[str], option: str) -> str:

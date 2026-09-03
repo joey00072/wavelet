@@ -10,7 +10,7 @@ def load_yaml(path: Path) -> dict[str, Any]:
     if payload is None:
         return {}
     if not isinstance(payload, dict):
-        raise ValueError(f"Expected mapping in config file: {path}")
+        raise TypeError(f"Expected mapping in config file: {path}")
     return payload
 
 

@@ -2302,11 +2302,11 @@ def _initial_eval_steps(
             if not math.isfinite(policy_step) or not float(policy_step).is_integer():
                 continue
             evaluated_step = int(policy_step)
-            for env_name in last_eval_steps:
+            for env_name, last_eval_step in last_eval_steps.items():
                 metric_prefix = f"eval/{env_name}/"
                 if any(str(key).startswith(metric_prefix) for key in metrics):
                     last_eval_steps[env_name] = max(
-                        last_eval_steps[env_name],
+                        last_eval_step,
                         evaluated_step,
                     )
     return last_eval_steps

@@ -493,7 +493,7 @@ def _patch_load_lora_adapter() -> None:
                 lora_request.base_model_name = base_model_name
             try:
                 await self.engine_client.add_lora(lora_request)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - translate vLLM failures to HTTP
                 error_type = "BadRequestError"
                 status_code = HTTPStatus.BAD_REQUEST
                 if "No adapter found" in str(exc):
@@ -728,9 +728,7 @@ async def debug_state(request: Request) -> dict[str, Any]:
         "policy_adapter_name": getattr(request.app.state, "policy_adapter_name", None),
         "policy_adapter_path": getattr(request.app.state, "policy_adapter_path", None),
         "policy_weight_path": getattr(request.app.state, "policy_weight_path", None),
-        "generation_paused": getattr(
-            request.app.state, "generation_paused", False
-        ),
+        "generation_paused": getattr(request.app.state, "generation_paused", False),
         "asleep": getattr(request.app.state, "asleep", False),
     }
     return state

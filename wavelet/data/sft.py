@@ -43,7 +43,7 @@ def _coerce_messages(value: Any, role: str | None) -> list[dict[str, str]]:
         messages: list[dict[str, str]] = []
         for item in value:
             if not isinstance(item, dict):
-                raise ValueError("Message items must be objects.")
+                raise TypeError("Message items must be objects.")
             if "role" not in item and role is None:
                 raise ValueError("Message items must include a role.")
             messages.append(

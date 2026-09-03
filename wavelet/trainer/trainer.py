@@ -232,15 +232,13 @@ class BaseTrainer:
                     timeout=timedelta(minutes=30),
                 )
             else:
-                rendezvous_file = tempfile.NamedTemporaryFile(
-                    prefix="wavelet-dist-",
-                    suffix=".init",
-                    delete=False,
-                )
-                rendezvous_file.close()
+                with tempfile.NamedTemporaryFile(
+                    prefix="wavelet-dist-", suffix=".init", delete=False
+                ) as rendezvous_file:
+                    rendezvous_path = rendezvous_file.name
                 torch.distributed.init_process_group(
                     backend=backend,
-                    init_method=f"file://{rendezvous_file.name}",
+                    init_method=f"file://{rendezvous_path}",
                     rank=0,
                     world_size=1,
                     timeout=timedelta(minutes=30),

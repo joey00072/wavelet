@@ -250,5 +250,5 @@ class RLRewardScorer:
                 and parsed_guess
                 and verify(parsed_expected, parsed_guess)
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - optional parser failures mean no match
             return False

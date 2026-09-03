@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -446,16 +447,16 @@ class RunMonitor:
             return
         import wandb
 
-        init_kwargs = dict(
-            project=self.wandb.project or "wavelet",
-            entity=self.wandb.entity,
-            name=self.wandb.name,
-            group=self.wandb.group,
-            tags=self.wandb.tags,
-            dir=str(self.output_dir),
-            config=run_config,
-            resume="allow" if resumed_from is not None else None,
-        )
+        init_kwargs = {
+            "project": self.wandb.project or "wavelet",
+            "entity": self.wandb.entity,
+            "name": self.wandb.name,
+            "group": self.wandb.group,
+            "tags": self.wandb.tags,
+            "dir": str(self.output_dir),
+            "config": run_config,
+            "resume": "allow" if resumed_from is not None else None,
+        }
         settings_factory = getattr(wandb, "Settings", None)
         if callable(settings_factory):
             init_kwargs["settings"] = settings_factory(
@@ -466,7 +467,7 @@ class RunMonitor:
         except Exception:
             if self.wandb.mode != "online" or not self.wandb.offline_fallback:
                 raise
-            logging.warning(
+            logger.warning(
                 "W&B online initialization failed; falling back to offline W&B "
                 "logging in %s.",
                 self.output_dir,
@@ -590,9 +591,7 @@ def log_eval_metrics(
             optimizer_step=step,
             policy_step=policy_step,
             details={
-                key: value
-                for key, value in metrics.items()
-                if key.startswith("eval/")
+                key: value for key, value in metrics.items() if key.startswith("eval/")
             },
         ),
     )
@@ -870,7 +869,7 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")
         _WANDB_RUN.log({**metrics, "step": step}, step=step)
-    except Exception as exc:  # pragma: no cover - diagnostics must not kill training
+    except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
 
 
@@ -921,8 +920,7 @@ def _grouped_rollout_means(
         total_weight = sum(weight for _, weight in weighted_values)
         if total_weight > 0:
             values.append(
-                sum(value * weight for value, weight in weighted_values)
-                / total_weight
+                sum(value * weight for value, weight in weighted_values) / total_weight
             )
     return values
 
@@ -937,8 +935,7 @@ def _solve_rates(
     for rows in grouped.values():
         reward_sums.append(
             sum(
-                (_float_or_none(row.get("reward")) or 0.0)
-                * max(_sample_count(row), 0)
+                (_float_or_none(row.get("reward")) or 0.0) * max(_sample_count(row), 0)
                 for row in rows
             )
         )
@@ -1105,7 +1102,7 @@ def _numeric(row: dict[str, Any], key: str) -> float | None:
         numeric = float(value)
     except (TypeError, ValueError):
         return None
-    if numeric != numeric:
+    if math.isnan(numeric):
         return None
     return numeric
 

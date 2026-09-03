@@ -188,9 +188,7 @@ def _shift_tokens(
     *,
     temperature: float,
 ) -> TrajectorySample:
-    if not (
-        len(token_ids) == len(loss_mask) == len(logprobs) == len(turn_ids)
-    ):
+    if not (len(token_ids) == len(loss_mask) == len(logprobs) == len(turn_ids)):
         raise ValueError("Token ids, masks, logprobs, and turn ids must align.")
     if len(token_ids) < 2:
         return TrajectorySample([], [], [], [], [], [])

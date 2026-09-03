@@ -130,7 +130,7 @@ class OrchestratorRunState(RolloutStateEventsMixin):
                 detail=detail,
                 limit=limit,
             )
-        except Exception as exc:  # pragma: no cover - health should degrade only
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover
             return {
                 "summary": None,
                 "policy": None,

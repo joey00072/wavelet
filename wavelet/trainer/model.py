@@ -1195,7 +1195,7 @@ def _single_module_lora_adapter_name(module: nn.Module) -> str | None:
     for attr in LORA_STATE_ATTRS:
         container = getattr(module, attr, None)
         if isinstance(container, dict) or hasattr(container, "keys"):
-            names.update(str(name) for name in container.keys())
+            names.update(str(name) for name in container)
     if len(names) > 1:
         raise RuntimeError(
             "Wavelet supports exactly one LoRA adapter per wrapped module; "

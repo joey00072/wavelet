@@ -37,7 +37,7 @@ def _set_nested(mapping: dict[str, Any], dotted_key: str, value: Any) -> None:
             child = {}
             cursor[key] = child
         if not isinstance(child, dict):
-            raise ValueError(f"Cannot override nested key '{dotted_key}'.")
+            raise TypeError(f"Cannot override nested key '{dotted_key}'.")
         cursor = child
     cursor[parts[-1]] = value
 

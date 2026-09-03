@@ -153,9 +153,7 @@ def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:
     assert trace["details"]["trainable"] == 1.0
 
 
-def test_log_eval_metrics_uses_orchestrator_wandb_run(
-    monkeypatch, tmp_path
-) -> None:
+def test_log_eval_metrics_uses_orchestrator_wandb_run(monkeypatch, tmp_path) -> None:
     metrics = {
         "eval/aime/avg@8": 0.25,
         "eval/aime/pass@8": 0.75,

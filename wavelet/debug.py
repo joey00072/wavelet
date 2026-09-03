@@ -1326,7 +1326,7 @@ def _quantile(values: list[float], q: float) -> float:
     if not values:
         return 0.0
     ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * q))))
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * q)))
     return ordered[index]
 
 
@@ -1653,10 +1653,13 @@ def _adapter_path_checks(config: RLConfig) -> list[PreflightCheck]:
 
     required_files = ("adapter_config.json", "adapter_model.safetensors")
     missing_files = [
-        filename for filename in required_files if not (adapter_path / filename).is_file()
+        filename
+        for filename in required_files
+        if not (adapter_path / filename).is_file()
     ]
-    removed_by_clean = config.clean_output_dir and adapter_path.absolute().is_relative_to(
-        config.output_dir.absolute()
+    removed_by_clean = (
+        config.clean_output_dir
+        and adapter_path.absolute().is_relative_to(config.output_dir.absolute())
     )
     valid = adapter_path.is_dir() and not missing_files and not removed_by_clean
     return [
@@ -2027,22 +2030,28 @@ def _trainer_4bit_checks(config: RLConfig) -> list[PreflightCheck]:
                 "qlora_adapter",
                 lora_enabled,
                 "QLoRA adapter training is enabled.",
-                "model.load_in_4bit=true requires a LoRA config; Wavelet does "
-                "not support full-model 4-bit training.",
+                (
+                    "model.load_in_4bit=true requires a LoRA config; Wavelet does "
+                    "not support full-model 4-bit training."
+                ),
             ),
             (
                 "qlora_fsdp",
                 fsdp_disabled,
                 "FSDP is disabled for QLoRA training.",
-                "QLoRA training uses replicated DDP in Wavelet. Disable "
-                "fsdp.enabled for model.load_in_4bit=true.",
+                (
+                    "QLoRA training uses replicated DDP in Wavelet. Disable "
+                    "fsdp.enabled for model.load_in_4bit=true."
+                ),
             ),
             (
                 "qlora_colocate_sleep",
                 movable,
                 "Launcher mode is compatible with QLoRA.",
-                "QLoRA does not support colocate_sleep yet because bitsandbytes "
-                "4-bit modules cannot be moved between CPU and GPU.",
+                (
+                    "QLoRA does not support colocate_sleep yet because bitsandbytes "
+                    "4-bit modules cannot be moved between CPU and GPU."
+                ),
             ),
         )
     ]

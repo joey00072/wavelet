@@ -460,7 +460,7 @@ async def _teardown_cached_verifier_envs() -> None:
             result = teardown()
             if inspect.isawaitable(result):
                 await result
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - finish all teardown attempts
             errors.append(exc)
     try:
         from verifiers.utils.thread_utils import shutdown_executors

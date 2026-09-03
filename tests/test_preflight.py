@@ -280,8 +280,7 @@ def test_checkpoint_output_dir_does_not_replace_run_output_dir(
     assert report["paths"]["output_dir"] == str(run_dir)
     assert report["paths"]["checkpoint_dir"] == str(checkpoint_dir)
     assert any(
-        check["name"] == "checkpoint_parent_writable"
-        and check["status"] == "ok"
+        check["name"] == "checkpoint_parent_writable" and check["status"] == "ok"
         for check in report["checks"]
     )
 

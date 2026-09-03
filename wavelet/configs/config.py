@@ -89,9 +89,12 @@ class TrainingDataConfig(BaseModel):
     def validate_source(self):
         if self.batch_size % self.micro_batch_size != 0:
             raise ValueError("batch_size must be divisible by micro_batch_size")
-        if self.hf_subsets is not None and self.hf_splits is not None:
-            if len(self.hf_subsets) != len(self.hf_splits):
-                raise ValueError("hf_subsets and hf_splits must have the same length")
+        if (
+            self.hf_subsets is not None
+            and self.hf_splits is not None
+            and len(self.hf_subsets) != len(self.hf_splits)
+        ):
+            raise ValueError("hf_subsets and hf_splits must have the same length")
         if self.source == "hf" and self.hf_name is None:
             raise ValueError("hf_name is required when data.source='hf'")
         if self.source == "local" and self.hf_name is not None:
@@ -763,9 +766,12 @@ def _normalize_algorithm_config(value: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(value)
     if "algo" in normalized:
         algo = normalized["algo"]
-        if isinstance(algo, dict) and "type" not in algo:
-            if "file" in algo or "algorithm" in algo:
-                normalized["algo"] = {"type": "custom", **algo}
+        if (
+            isinstance(algo, dict)
+            and "type" not in algo
+            and ("file" in algo or "algorithm" in algo)
+        ):
+            normalized["algo"] = {"type": "custom", **algo}
         return normalized
 
     orchestrator = normalized.get("orchestrator")
