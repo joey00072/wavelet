@@ -20,7 +20,8 @@ agent-readable map of workflows, diagnostics, and repository guidance.
   `uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
   This also validates local training data and required LoRA adapter artifacts.
   The report includes low-precision checks for QLoRA and vLLM quantized
-  inference settings.
+  inference settings. Config loading rejects duplicate YAML keys instead of
+  silently accepting the last value.
 - [Inference diagnostics](docs/inference.skill.md): model serving, policy loading,
   logprobs, and throughput checks
 - [Orchestrator diagnostics](docs/orchestrator.skill.md): scheduling, rollout,
