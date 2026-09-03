@@ -1644,3 +1644,21 @@ def test_verifier_scheduler_rejects_partial_batch_at_retry_limit() -> None:
             target_groups=2,
             rejected_groups=1,
         )
+
+
+def test_policy_update_gate_blocks_new_rollout_submission() -> None:
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler._policy_update_ready = asyncio.Event()
+    scheduler._policy_update_ready.set()
+    scheduled = []
+    scheduler._schedule_next_rollout = lambda: scheduled.append(True) or False
+
+    scheduler.begin_policy_update()
+    scheduler._fill_inflight()
+
+    assert scheduler.policy_update_in_progress is True
+    assert scheduled == []
+
+    scheduler.finish_policy_update()
+
+    assert scheduler.policy_update_in_progress is False

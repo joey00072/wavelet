@@ -414,6 +414,9 @@ class VerifierRolloutScheduler:
         self.cancelled_rollouts_count = 0
         self.rejected_groups_count = 0
         self.last_batch_metrics: dict[str, float] = {}
+        self._policy_update_ready = asyncio.Event()
+        self._policy_update_ready.set()
+        self.policy_update_wait_seconds = 0.0
 
     def set_policy_step(
         self,
@@ -471,6 +474,7 @@ class VerifierRolloutScheduler:
             self.config.orchestrator.zero_advantage_max_retries + 1
         )
         self._sync_ready_group_ages()
+        self.policy_update_wait_seconds = 0.0
 
         try:
             drained_completed, drained_rejected = self._drain_completed_groups_to_ready(
@@ -503,6 +507,7 @@ class VerifierRolloutScheduler:
                     outputs = []
                     accepted_groups = 0
 
+                await self._wait_for_policy_update()
                 self._fill_inflight()
                 done, _ = await asyncio.wait(
                     self.pending,
@@ -604,6 +609,9 @@ class VerifierRolloutScheduler:
         self.last_batch_metrics["generation/data/cursor"] = float(record_cursor)
         self.last_batch_metrics["generation/data/epoch"] = float(
             record_cursor // len(getattr(self, "records", [None]))
+        )
+        self.last_batch_metrics["generation/policy_update_wait_seconds"] = float(
+            getattr(self, "policy_update_wait_seconds", 0.0)
         )
         emit_perf(
             "verifier_scheduler",
@@ -796,6 +804,7 @@ class VerifierRolloutScheduler:
             ]
 
     async def aclose(self) -> None:
+        self.finish_policy_update()
         for task in self.pending:
             task.cancel()
         if self.pending:
@@ -809,9 +818,48 @@ class VerifierRolloutScheduler:
             self.ready_group_off_policy_steps.clear()
 
     def _fill_inflight(self) -> None:
+        if self.policy_update_in_progress:
+            return
         while self.inflight_rollout_count < self.max_inflight_rollouts:
             if not self._schedule_next_rollout():
                 break
+
+    @property
+    def policy_update_in_progress(self) -> bool:
+        event = getattr(self, "_policy_update_ready", None)
+        return event is not None and not event.is_set()
+
+    def begin_policy_update(self) -> None:
+        event = getattr(self, "_policy_update_ready", None)
+        if event is None:
+            event = asyncio.Event()
+            self._policy_update_ready = event
+        event.clear()
+
+    def finish_policy_update(self) -> None:
+        event = getattr(self, "_policy_update_ready", None)
+        if event is not None:
+            event.set()
+
+    async def drain_policy_update_requests(self) -> None:
+        """Wait until every request admitted before the update has completed."""
+        if not self.policy_update_in_progress:
+            raise RuntimeError("Policy request draining requires a paused scheduler.")
+        pending = tuple(getattr(self, "pending", ()))
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _wait_for_policy_update(self) -> None:
+        event = getattr(self, "_policy_update_ready", None)
+        if event is None or event.is_set():
+            return
+        started_at = perf_counter()
+        await event.wait()
+        self.policy_update_wait_seconds = getattr(
+            self,
+            "policy_update_wait_seconds",
+            0.0,
+        ) + (perf_counter() - started_at)
 
     def _schedule_next_rollout(self) -> bool:
         remaining_capacity = self.max_inflight_rollouts - self.inflight_rollout_count
@@ -1817,15 +1865,20 @@ class _VerifierPublisherStrategy:
         )
 
     def _start_background_load(self, policy_step: int) -> None:
-        self.pending_policy_update = asyncio.create_task(
-            _load_policy_and_update_scheduler(
-                self.config,
-                self.inference_engine,
-                self.policy_receiver,
-                policy_step,
-                self.scheduler,
+        self.scheduler.begin_policy_update()
+        try:
+            self.pending_policy_update = asyncio.create_task(
+                _load_policy_and_update_scheduler(
+                    self.config,
+                    self.inference_engine,
+                    self.policy_receiver,
+                    policy_step,
+                    self.scheduler,
+                )
             )
-        )
+        except Exception:
+            self.scheduler.finish_policy_update()
+            raise
         if self.state is not None:
             self.state.update_policy(
                 pending_load=True,
@@ -1840,21 +1893,26 @@ class _VerifierPublisherStrategy:
     ) -> tuple[float, float]:
         started_at = perf_counter()
         previous_policy_step = self.loaded_policy_step
-        self.loaded_policy_step = await _load_policy_async(
-            self.config,
-            self.inference_engine,
-            self.policy_receiver,
-            policy_step,
-        )
-        self.scheduler.set_policy_step(
-            self.loaded_policy_step,
-            model_name=_current_policy_model_name(self.inference_engine),
-        )
-        if (
-            previous_policy_step is not None
-            and self.loaded_policy_step != previous_policy_step
-        ):
-            await self.scheduler.mark_policy_update()
+        self.scheduler.begin_policy_update()
+        try:
+            await self.scheduler.drain_policy_update_requests()
+            self.loaded_policy_step = await _load_policy_async(
+                self.config,
+                self.inference_engine,
+                self.policy_receiver,
+                policy_step,
+            )
+            self.scheduler.set_policy_step(
+                self.loaded_policy_step,
+                model_name=_current_policy_model_name(self.inference_engine),
+            )
+            if (
+                previous_policy_step is not None
+                and self.loaded_policy_step != previous_policy_step
+            ):
+                await self.scheduler.mark_policy_update()
+        finally:
+            self.scheduler.finish_policy_update()
         await self._record_loaded_policy(optimizer_step)
         elapsed = perf_counter() - started_at
         return elapsed, elapsed
@@ -2200,18 +2258,23 @@ async def _load_policy_and_update_scheduler(
     policy_step: int,
     scheduler,
 ) -> int:
-    loaded_step = await _load_policy_async(
-        config,
-        inference_engine,
-        policy_receiver,
-        policy_step,
-    )
-    scheduler.set_policy_step(
-        loaded_step,
-        model_name=_current_policy_model_name(inference_engine),
-    )
-    await scheduler.mark_policy_update()
-    return loaded_step
+    scheduler.begin_policy_update()
+    try:
+        await scheduler.drain_policy_update_requests()
+        loaded_step = await _load_policy_async(
+            config,
+            inference_engine,
+            policy_receiver,
+            policy_step,
+        )
+        scheduler.set_policy_step(
+            loaded_step,
+            model_name=_current_policy_model_name(inference_engine),
+        )
+        await scheduler.mark_policy_update()
+        return loaded_step
+    finally:
+        scheduler.finish_policy_update()
 
 
 def _current_policy_model_name(inference_engine) -> str | None:
