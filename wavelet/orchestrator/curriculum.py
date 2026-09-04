@@ -186,7 +186,7 @@ class DifficultyPoolSampler:
             )
         raw_rewards = state_dict["task_rewards"]
         if not isinstance(raw_rewards, Mapping):
-            raise ValueError("Curriculum task_rewards state must be a mapping.")
+            raise TypeError("Curriculum task_rewards state must be a mapping.")
         task_rewards = {str(key): float(value) for key, value in raw_rewards.items()}
         invalid_keys = set(task_rewards) - set(self.task_keys)
         if invalid_keys or not all(
@@ -326,7 +326,7 @@ class Curriculum:
             sampler_state,
             Mapping,
         ):
-            raise ValueError("Curriculum checkpoint state must contain mappings.")
+            raise TypeError("Curriculum checkpoint state must contain mappings.")
         if set(gate_states) != set(self.gates):
             raise ValueError(
                 "Curriculum checkpoint gates differ from configuration: "
@@ -336,7 +336,7 @@ class Curriculum:
         for name, gate in self.gates.items():
             gate_state = gate_states[name]
             if not isinstance(gate_state, Mapping):
-                raise ValueError(f"Curriculum gate state {name!r} must be a mapping.")
+                raise TypeError(f"Curriculum gate state {name!r} must be a mapping.")
             gate.load_state_dict(gate_state)
 
     def metrics(self) -> dict[str, float]:
