@@ -11,7 +11,6 @@ from time import perf_counter
 
 import torch
 from torch import Tensor
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
@@ -43,7 +42,7 @@ from wavelet.trainer.losses import (
     selective_log_softmax,
     setup_rl_loss_fn,
 )
-from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.model import is_fsdp_model, sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.perf import training_flop_metrics
 from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.types import LossOutput, TrainOutput
@@ -1376,7 +1375,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if (
             self.config.lora is not None
             and self.config.policy_transfer.lightweight_lora
-            and isinstance(self.model, FSDP)
+            and is_fsdp_model(self.model)
         ):
             saved_path = save_lora_adapter_snapshot_from_fsdp(
                 self.model,

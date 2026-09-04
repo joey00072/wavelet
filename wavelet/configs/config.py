@@ -275,6 +275,7 @@ class CheckpointConfig(ConfigModel):
 
 class FSDPConfig(ConfigModel):
     enabled: bool = False
+    impl: Literal["fsdp1", "fsdp2"] = "fsdp1"
     backend: Literal["auto", "gloo", "nccl", "hybrid"] = "auto"
     dp_replicate: int = Field(default=1, ge=1)
     dp_shard: int = -1
@@ -282,6 +283,15 @@ class FSDPConfig(ConfigModel):
     tp: int = Field(default=1, ge=1)
     ep: int = Field(default=1, ge=1)
     cpu_offload: bool = False
+    reshard_after_forward: bool = True
+
+    @model_validator(mode="after")
+    def validate_implementation_options(self) -> "FSDPConfig":
+        if self.impl == "fsdp1" and not self.reshard_after_forward:
+            raise ValueError(
+                "fsdp.reshard_after_forward=false requires fsdp.impl='fsdp2'."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_supported_parallel_dimensions(self) -> "FSDPConfig":

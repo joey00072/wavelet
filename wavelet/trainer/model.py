@@ -21,12 +21,21 @@ from peft import (
 )
 from safetensors.torch import save_file as save_safetensors
 from torch import nn
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+)
 from torch.distributed.fsdp import (
     CPUOffload,
+    CPUOffloadPolicy,
+    FSDPModule,
     FullStateDictConfig,
     MixedPrecision,
+    MixedPrecisionPolicy,
+    OffloadPolicy,
     ShardingStrategy,
     StateDictType,
+    fully_shard,
 )
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
@@ -505,6 +514,14 @@ def maybe_wrap_fsdp(
             "FSDP requires an initialized torch.distributed process group."
         )
 
+    if fsdp_config.impl == "fsdp2":
+        return _wrap_fsdp2(
+            model,
+            model_config=model_config,
+            fsdp_config=fsdp_config,
+            parallel_dims=parallel_dims,
+        )
+
     if parallel_dims is not None:
         if parallel_dims.ep_enabled:
             raise NotImplementedError(
@@ -549,6 +566,63 @@ def maybe_wrap_fsdp(
         device_mesh=device_mesh,
     )
     return cast(PreTrainedModel, wrapped)
+
+
+def _wrap_fsdp2(
+    model: PreTrainedModel,
+    *,
+    model_config: ModelConfig,
+    fsdp_config: FSDPConfig,
+    parallel_dims: ParallelDims | None,
+) -> PreTrainedModel:
+    if parallel_dims is None:
+        raise RuntimeError("FSDP2 requires initialized parallel dimensions.")
+    if parallel_dims.ep_enabled:
+        raise NotImplementedError(
+            "Expert parallel execution is not wired into the model stack yet."
+        )
+    if parallel_dims.cp_enabled:
+        raise NotImplementedError(
+            "Context parallel execution is not wired into the attention stack yet."
+        )
+
+    mesh = parallel_dims.get_mesh("hsdp")
+    mp_policy = _fsdp2_mixed_precision(model_config)
+    offload_policy: OffloadPolicy = (
+        CPUOffloadPolicy(pin_memory=torch.cuda.is_available())
+        if fsdp_config.cpu_offload
+        else OffloadPolicy()
+    )
+    shard_kwargs = {
+        "mesh": mesh,
+        "mp_policy": mp_policy,
+        "offload_policy": offload_policy,
+        "reshard_after_forward": fsdp_config.reshard_after_forward,
+    }
+    layer_classes = _transformer_layer_classes(model)
+    transformer_blocks = [
+        module
+        for module in model.modules()
+        if module is not model and type(module) in layer_classes
+    ]
+    for block in transformer_blocks:
+        fully_shard(block, **shard_kwargs)
+    fully_shard(model, **shard_kwargs)
+    return cast(PreTrainedModel, model)
+
+
+def _fsdp2_mixed_precision(model_config: ModelConfig) -> MixedPrecisionPolicy:
+    dtype = resolve_dtype(model_config.torch_dtype)
+    if not isinstance(dtype, torch.dtype):
+        return MixedPrecisionPolicy()
+    if not torch.cuda.is_available() and dtype is not torch.float32:
+        return MixedPrecisionPolicy()
+    if dtype is torch.float32 and torch.cuda.is_available():
+        return MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+        )
+    return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
 
 
 def maybe_wrap_ddp(
@@ -611,7 +685,7 @@ def export_model_for_save(
     *,
     state_dict_dtype: torch.dtype | None = None,
 ) -> tuple[PreTrainedModel, dict[str, torch.Tensor] | None]:
-    if not isinstance(model, FSDP):
+    if not is_fsdp_model(model):
         unwrapped = unwrap_model(model)
         if state_dict_dtype is None:
             return unwrapped, None
@@ -620,12 +694,28 @@ def export_model_for_save(
             state_dict_dtype,
         )
 
-    config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, config):
-        state_dict = model.state_dict()
+    if isinstance(model, FSDPModule):
+        gathered = get_model_state_dict(
+            model,
+            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+        )
+        state_dict = {
+            key: value
+            for key, value in gathered.items()
+            if isinstance(value, torch.Tensor)
+        }
+    else:
+        config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, config):
+            state_dict = model.state_dict()
     if state_dict_dtype is not None:
         state_dict = _state_dict_to_save_dtype(state_dict, state_dict_dtype)
     return unwrap_model(model), state_dict
+
+
+def is_fsdp_model(model: nn.Module) -> bool:
+    """Return whether the root uses either supported FSDP implementation."""
+    return isinstance(model, (FSDP, FSDPModule))
 
 
 def unwrap_model(model: nn.Module) -> PreTrainedModel:
@@ -957,7 +1047,7 @@ def save_lora_adapter_snapshot(
 
 
 def save_lora_adapter_snapshot_from_fsdp(
-    model: FSDP,
+    model: nn.Module,
     output_dir: Path,
     *,
     is_main_process: bool = True,
@@ -970,11 +1060,26 @@ def save_lora_adapter_snapshot_from_fsdp(
             "FSDP lightweight policy snapshots require a wrapped PeftModel."
         )
 
-    state_dict = _gather_fsdp_lora_state_dict(
-        model,
-        unwrapped,
-        parallel_dims=parallel_dims,
-    )
+    if isinstance(model, FSDPModule):
+        gathered = get_model_state_dict(
+            model,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+                ignore_frozen_params=True,
+            ),
+        )
+        state_dict = {
+            key: value
+            for key, value in gathered.items()
+            if isinstance(value, torch.Tensor)
+        }
+    else:
+        state_dict = _gather_fsdp_lora_state_dict(
+            cast(FSDP, model),
+            unwrapped,
+            parallel_dims=parallel_dims,
+        )
     return save_lora_adapter_snapshot(
         unwrapped,
         output_dir,

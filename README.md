@@ -91,7 +91,10 @@ for the supported choices and their contracts.
 
 Current distributed scope is experimental:
 
-- root FSDP and HSDP-style DP meshes are wired into the trainer bootstrap
+- FSDP1 remains the default; `fsdp.impl: fsdp2` opts into per-transformer-block
+  `fully_shard` plus a root shard, using the existing HSDP mesh. See the
+  [FSDP2 migration guide](docs/fsdp2_migration.md) for the tested boundary and
+  pending meta-device weight-loading work
 - `fsdp.backend: auto` selects `cpu:gloo,cuda:nccl` on CUDA so async
   checkpoints, which require a CPU backend in the default group, work out of
   the box; the explicit `hybrid` setting remains accepted
@@ -428,8 +431,9 @@ Supported optimizers are AdamW, Adam, SGD, stateless SignSGD (`sign_sgd`), and
 the configured 8-bit Adam/AdamW variants; Muon is not accepted because Wavelet
 has no Muon runtime. SignSGD uses the sign of each gradient and applies
 decoupled weight decay without allocating momentum or variance state.
-FSDP1 does not expose a configurable `reshard_after_forward` policy, so that
-key is rejected instead of being accepted without affecting the wrapper.
+FSDP1 does not expose a configurable `reshard_after_forward` policy, so setting
+that key to `false` is rejected instead of being accepted without affecting the
+wrapper. Select `fsdp.impl: fsdp2` to control that policy directly.
 Likewise, `fsdp.cp` and `fsdp.ep` values above 1 are rejected before GPU setup;
 the current model stack only supports data and tensor parallel dimensions.
 SFT sample generation has no trainer implementation, so a `generate` block is

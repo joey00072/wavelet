@@ -103,6 +103,15 @@ def test_unimplemented_fsdp_reshard_setting_is_rejected() -> None:
         RLConfig(fsdp={"reshard_after_forward": False})
 
 
+def test_fsdp2_accepts_no_reshard_after_forward() -> None:
+    config = RLConfig(
+        fsdp={"enabled": True, "impl": "fsdp2", "reshard_after_forward": False}
+    )
+
+    assert config.fsdp.impl == "fsdp2"
+    assert config.fsdp.reshard_after_forward is False
+
+
 @pytest.mark.parametrize("config_cls", [RLConfig, SFTConfig])
 @pytest.mark.parametrize("field", ["cp", "ep"])
 def test_unsupported_parallel_dimensions_are_rejected_before_runtime(

@@ -3,8 +3,10 @@
 Wavelet examples cover the local RL, SFT, verifier, and multi-GPU launch paths
 that are expected to run on this host.
 
-The FSDP examples only include settings honored by Wavelet's current FSDP1
-wrapper; FSDP2-only reshard controls are intentionally omitted.
+The FSDP examples keep the default `fsdp.impl: fsdp1` compatibility path.
+FSDP2 is opt-in; copy an example and set `impl: fsdp2` when following the
+[migration guide](../docs/fsdp2_migration.md). FSDP2-only reshard controls are
+intentionally omitted from the baseline examples.
 Model configs use `matmul_precision: high` by default. Set it to `highest` for
 full FP32 matrix multiplication, including on ROCm where reduced float32
 precision can be unsuitable for large-vocabulary softmax calculations.

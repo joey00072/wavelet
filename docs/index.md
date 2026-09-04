@@ -17,6 +17,8 @@ training or inference runs.
   scheduling, policy artifacts, and extension boundaries.
 - [Data pipeline](data_pipeline.md): source loading, normalization,
   tokenization, RL packing, and collation contracts.
+- [FSDP2 migration](fsdp2_migration.md): opt-in configuration, wrapper and
+  checkpoint design, compatibility boundary, and validation status.
 - [Inference diagnostics](inference.skill.md): isolate model serving, policy
   loading, generation, logprobs, and throughput.
 - [Orchestrator diagnostics](orchestrator.skill.md): inspect scheduling,

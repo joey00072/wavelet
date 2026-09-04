@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 import torch
 from peft import PeftModel
 from torch import Tensor, nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn import Module
 from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -435,6 +434,7 @@ class PolicyExportMixin:
     def _save_filesystem_policy(self, tmp_dir: Path) -> Path:
         from wavelet.trainer.model import (
             export_model_for_save,
+            is_fsdp_model,
             save_lora_adapter_snapshot,
             save_lora_adapter_snapshot_from_fsdp,
             save_model,
@@ -443,7 +443,7 @@ class PolicyExportMixin:
         if (
             self.config.lora is not None
             and self.config.policy_transfer.lightweight_lora
-            and isinstance(self.model, FSDP)
+            and is_fsdp_model(self.model)
         ):
             return save_lora_adapter_snapshot_from_fsdp(
                 self.model,
