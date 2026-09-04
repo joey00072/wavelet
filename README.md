@@ -301,6 +301,8 @@ FSDP1 does not expose a configurable `reshard_after_forward` policy, so that
 key is rejected instead of being accepted without affecting the wrapper.
 Likewise, `fsdp.cp` and `fsdp.ep` values above 1 are rejected before GPU setup;
 the current model stack only supports data and tensor parallel dimensions.
+SFT sample generation has no trainer implementation, so a `generate` block is
+also rejected; use the inference commands after training instead.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

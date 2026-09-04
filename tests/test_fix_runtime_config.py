@@ -94,6 +94,11 @@ def test_unsupported_parallel_dimensions_are_rejected_before_runtime(
         config_cls(fsdp={field: 2})
 
 
+def test_unimplemented_sft_generation_config_is_rejected() -> None:
+    with pytest.raises(ValueError, match="generate"):
+        SFTConfig(generate={"prompt": "test", "max_new_tokens": 8})
+
+
 def test_process_mode_export_interval_must_fit_freshness_window() -> None:
     orchestrator = {"max_async_level": 2, "max_off_policy_steps": 1}
 

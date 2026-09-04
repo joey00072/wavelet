@@ -262,11 +262,6 @@ class MonitorConfig(ConfigModel):
     samples: SampleLogConfig = SampleLogConfig()
 
 
-class GenerateConfig(ConfigModel):
-    prompt: str = "wavelet"
-    max_new_tokens: int = Field(default=24, ge=1)
-
-
 class TrainerConfig(ConfigModel):
     model: ModelConfig = ModelConfig()
     optim: OptimizerConfig = OptimizerConfig()
@@ -341,7 +336,6 @@ class TrainerConfig(ConfigModel):
 class SFTConfig(TrainerConfig):
     data: DataConfig = DataConfig()
     val: SFTValConfig | None = None
-    generate: GenerateConfig = GenerateConfig()
     deployment: SingleNodeDeploymentConfig = SingleNodeDeploymentConfig()
     output_dir: Path = Path("outputs/unsloth_math_sft")
     max_steps: int | None = Field(default=None, ge=1)
