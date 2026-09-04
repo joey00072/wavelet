@@ -191,11 +191,6 @@ class CheckpointConfig(ConfigModel):
     output_dir: Path | None = Field(default=None)
 
 
-class SingleNodeDeploymentConfig(ConfigModel):
-    type: Literal["single_node"] = "single_node"
-    num_gpus: int = Field(default=1, ge=1)
-
-
 class FSDPConfig(ConfigModel):
     enabled: bool = False
     backend: Literal["auto", "gloo", "nccl", "hybrid"] = "auto"
@@ -336,7 +331,6 @@ class TrainerConfig(ConfigModel):
 class SFTConfig(TrainerConfig):
     data: DataConfig = DataConfig()
     val: SFTValConfig | None = None
-    deployment: SingleNodeDeploymentConfig = SingleNodeDeploymentConfig()
     output_dir: Path = Path("outputs/unsloth_math_sft")
     max_steps: int | None = Field(default=None, ge=1)
 

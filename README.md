@@ -51,6 +51,17 @@ SFT configs may include a `val` block with independent data settings,
 finite epoch without gradients and records token-weighted `val/loss`; see
 `examples/reverse_text/sft.yaml` for a configured example.
 
+SFT configs do not self-launch distributed workers. For multi-GPU SFT, launch
+the command explicitly:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=N \
+  -m wavelet sft @ <config>.yaml
+```
+
+The former `deployment` block is rejected because it did not affect process
+launch.
+
 To continue training an existing LoRA, set `model.adapter_path` to its adapter
 directory. Wavelet uses tokenizer artifacts from that directory when present
 and otherwise falls back to the tokenizer named by `model.name`.

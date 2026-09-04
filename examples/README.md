@@ -5,6 +5,13 @@ that are expected to run on this host.
 
 The FSDP examples only include settings honored by Wavelet's current FSDP1
 wrapper; FSDP2-only reshard controls are intentionally omitted.
+SFT YAML files do not select a process count. Launch multi-GPU SFT examples
+with:
+
+```bash
+uv run torchrun --standalone --nproc-per-node=N \
+  -m wavelet sft @ <config>.yaml
+```
 
 | Example | Status | Notes |
 | --- | --- | --- |

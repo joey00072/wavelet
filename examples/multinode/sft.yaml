@@ -46,9 +46,5 @@ monitor:
     name: wavelet-hendrycks-math-sft-single-node
     mode: online
 
-deployment:
-  type: single_node
-  num_gpus: 8
-
 output_dir: outputs/multinode_math_sft
 clean_output_dir: true

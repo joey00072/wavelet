@@ -54,9 +54,5 @@ monitor:
     name: wavelet-qwen3-4b-hard-distill
     mode: online
 
-deployment:
-  type: single_node
-  num_gpus: 2
-
 output_dir: outputs/alphabet_sort_sft_distill_hard
 clean_output_dir: true

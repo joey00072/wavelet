@@ -49,9 +49,5 @@ monitor:
     name: wavelet-reverse-text-0.6b-sft
     mode: online
 
-deployment:
-  type: single_node
-  num_gpus: 1
-
 output_dir: outputs/reverse_text_sft
 clean_output_dir: true

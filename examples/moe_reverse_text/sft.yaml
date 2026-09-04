@@ -63,9 +63,5 @@ monitor:
     name: wavelet-moe-reverse-text-sft
     mode: disabled
 
-deployment:
-  type: single_node
-  num_gpus: 1
-
 output_dir: outputs/moe_reverse_text_sft
 clean_output_dir: true

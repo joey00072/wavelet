@@ -168,7 +168,6 @@ def test_moe_reverse_text_sft_uses_int4_moe_qlora_shape() -> None:
         "down_proj",
     }
     assert config.optim.type == "paged_adamw_8bit"
-    assert config.deployment.num_gpus == 1
     assert config.max_steps == 2
 
 
