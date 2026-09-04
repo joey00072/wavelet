@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import nullcontext
 
 import psutil
@@ -25,6 +25,43 @@ from wavelet.configs.sft import (
     OptimizerConfig,
     SchedulerConfig,
 )
+
+
+class SignSGD(Optimizer):
+    """Stateless sign-gradient descent with decoupled weight decay."""
+
+    def __init__(
+        self,
+        params: Iterable[nn.Parameter],
+        *,
+        lr: float = 1e-3,
+        weight_decay: float = 0.0,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight decay: {weight_decay}")
+        super().__init__(params, {"lr": lr, "weight_decay": weight_decay})
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            weight_decay = float(group["weight_decay"])
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                if param.grad.is_sparse:
+                    raise RuntimeError("SignSGD does not support sparse gradients.")
+                if weight_decay > 0.0:
+                    param.mul_(1.0 - lr * weight_decay)
+                param.add_(param.grad.sign(), alpha=-lr)
+        return loss
 
 
 def setup_optimizer(
@@ -96,6 +133,12 @@ def setup_optimizer(
             momentum=config.momentum,
             nesterov=config.nesterov,
             implementation=config.implementation,
+        )
+    if config.type == "sign_sgd":
+        return SignSGD(
+            params,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
         )
     raise ValueError(f"Unsupported optimizer type: {config.type}")
 

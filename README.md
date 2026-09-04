@@ -317,8 +317,10 @@ iteration begins, and then returns to the static per-batch estimate.
 
 Every config model rejects unknown or misspelled keys, so a typo such as
 `optim.mu` fails during config loading instead of becoming an inert setting.
-Supported optimizers are AdamW, Adam, SGD, and the configured 8-bit Adam/
-AdamW variants; Muon is not accepted because Wavelet has no Muon runtime.
+Supported optimizers are AdamW, Adam, SGD, stateless SignSGD (`sign_sgd`), and
+the configured 8-bit Adam/AdamW variants; Muon is not accepted because Wavelet
+has no Muon runtime. SignSGD uses the sign of each gradient and applies
+decoupled weight decay without allocating momentum or variance state.
 FSDP1 does not expose a configurable `reshard_after_forward` policy, so that
 key is rejected instead of being accepted without affecting the wrapper.
 Likewise, `fsdp.cp` and `fsdp.ep` values above 1 are rejected before GPU setup;

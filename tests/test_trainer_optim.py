@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from wavelet.configs.sft import OptimizerConfig
-from wavelet.trainer.optim import setup_linear_scheduler, setup_optimizer
+from wavelet.trainer.optim import SignSGD, setup_linear_scheduler, setup_optimizer
 
 
 def test_optimizer_rejects_multiple_trainable_lora_adapters() -> None:
@@ -48,6 +48,21 @@ def test_optimizer_accepts_named_parameter_iterator() -> None:
     )
 
     assert len(optimizer.param_groups[0]["params"]) == 2
+
+
+def test_sign_sgd_applies_sign_update_and_decoupled_weight_decay() -> None:
+    parameter = torch.nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
+    parameter.grad = torch.tensor([0.5, -0.25, 0.0])
+
+    optimizer = setup_optimizer(
+        OptimizerConfig(type="sign_sgd", lr=0.1, weight_decay=0.2),
+        [("weight", parameter)],
+    )
+    optimizer.step()
+
+    assert isinstance(optimizer, SignSGD)
+    assert parameter.tolist() == pytest.approx([0.88, -1.86, 2.94])
+    assert not optimizer.state
 
 
 def test_linear_scheduler_decays_when_decay_would_start_before_warmup_ends() -> None:

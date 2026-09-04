@@ -128,6 +128,7 @@ class OptimizerConfig(ConfigModel):
         "adam",
         "adam_8bit",
         "sgd",
+        "sign_sgd",
     ] = "adamw"
     implementation: Literal["for-loop", "foreach", "fused"] = "fused"
     lr: float = Field(default=1e-3, gt=0.0)
