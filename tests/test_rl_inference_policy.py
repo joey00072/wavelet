@@ -165,6 +165,7 @@ def test_checkpoint_resume_can_force_export_between_intervals() -> None:
         local_world_size=1,
         device=torch.device("cpu"),
     )
+    exporter.output_dir = Path("outputs/run")
     exporter._export_nccl_policy = Mock(return_value=Path("policy"))
 
     assert exporter.export_policy(step=7) is None
@@ -303,7 +304,7 @@ def test_background_policy_refresh_closes_submission_gate_immediately(
         def finish_policy_update(self) -> None:
             calls.append("finish")
 
-    async def fake_update(*_args) -> int:
+    async def fake_update(*_args, **_kwargs) -> int:
         calls.append("task")
         return 4
 

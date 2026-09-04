@@ -215,7 +215,7 @@ def _resolve_decay_steps(
     total_steps: int,
     warmup_steps: int,
 ) -> int:
-    if scheduler_config.decay_steps is not None and scheduler_config.decay_steps > 0:
+    if scheduler_config.decay_steps is not None:
         return scheduler_config.decay_steps
     return max(int(total_steps * scheduler_config.decay_ratio) - warmup_steps, 1)
 
@@ -360,6 +360,10 @@ def setup_linear_scheduler(
     effective_total = max(total_steps - 1, 1)
 
     decay_steps = max(min(decay_steps, effective_total), 1)
+    # Decay may not start before warmup ends; clamp so the phase is attached
+    # instead of silently dropped (which would hold the LR at peak forever).
+    if total_steps - warmup_steps > 0:
+        decay_steps = min(decay_steps, total_steps - warmup_steps)
 
     schedulers: list[LRScheduler] = []
     milestones: list[int] = []
@@ -712,11 +716,13 @@ def setup_cosine_scheduler(
     decay_steps = min(
         max(effective_total - warmup_steps, 1), decay_steps or effective_total
     )
+    # The floor must agree with the warmup start and with the other schedulers,
+    # which all express the minimum as min_lr_factor * lr.
     schedulers.append(
         CosineAnnealingLR(
             optimizer,
             T_max=decay_steps,
-            eta_min=min_lr,
+            eta_min=max(min_lr, min_lr_factor * lr),
         )
     )
 
@@ -758,12 +764,17 @@ def setup_sqrt_scheduler(
         )
         milestones.append(warmup_steps)
 
-    decay_span = max(total_steps - warmup_steps - 1, 1)
+    post_warmup_span = max(total_steps - warmup_steps - 1, 1)
+    decay_span = min(decay_steps, post_warmup_span)
+    # Hold the peak LR until the final ``decay_span`` steps, matching the
+    # constant-then-decay phases of the linear scheduler.
+    constant_span = post_warmup_span - decay_span
 
     def _sqrt_factor(step: int) -> float:
-        if step <= 0:
+        decay_step = step - constant_span
+        if decay_step <= 0:
             return 1.0
-        t = min(step / decay_span, 1.0)
+        t = min(decay_step / decay_span, 1.0)
         return min_lr_factor + (1.0 - min_lr_factor) * math.sqrt(max(1.0 - t, 0.0))
 
     schedulers.append(

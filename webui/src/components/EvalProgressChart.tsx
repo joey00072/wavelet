@@ -2,10 +2,10 @@ import { useMemo, useState } from "react";
 
 import type { EvalMetricRow } from "../types";
 
-const METRICS = [
-  { name: "avg@8", color: "#10b981" },
-  { name: "pass@8", color: "#3b82f6" },
-];
+// Metric keys are eval/<env>/avg@{k} and eval/<env>/pass@{k}, where k is the
+// configured rollouts_per_example. pass@k is charted for the same k as avg@k.
+const AVG_METRIC = /^avg@(\d+)$/;
+const METRIC_COLORS = { avg: "#10b981", pass: "#3b82f6" };
 
 type Point = { step: number; value: number };
 type HoveredPoint = Point & { color: string; label: string; x: number; y: number };
@@ -24,21 +24,22 @@ function pointsFor(metrics: EvalMetricRow[], key: string): Point[] {
 export function EvalProgressChart({ metrics }: { metrics: EvalMetricRow[] }) {
   const [hoveredPoint, setHoveredPoint] = useState<HoveredPoint | null>(null);
   const series = useMemo(() => {
-    const definitions = new Map(METRICS.map((metric) => [metric.name, metric]));
-    const keys = new Set(
-      metrics.flatMap((row) =>
-        Object.keys(row).filter((key) => {
-          const parts = key.split("/");
-          return parts.length === 3 && parts[0] === "eval" && definitions.has(parts[2]);
-        }),
-      ),
-    );
-    return [...keys].sort().map((key) => {
+    const allKeys = new Set(metrics.flatMap((row) => Object.keys(row)));
+    const definitions = new Map<string, string>();
+    for (const key of allKeys) {
+      const parts = key.split("/");
+      if (parts.length !== 3 || parts[0] !== "eval") continue;
+      const match = AVG_METRIC.exec(parts[2]);
+      if (match === null) continue;
+      definitions.set(key, METRIC_COLORS.avg);
+      const passKey = `eval/${parts[1]}/pass@${match[1]}`;
+      if (allKeys.has(passKey)) definitions.set(passKey, METRIC_COLORS.pass);
+    }
+    return [...definitions.keys()].sort().map((key) => {
       const [, envName, metricName] = key.split("/");
-      const definition = definitions.get(metricName)!;
       return {
         key,
-        color: definition.color,
+        color: definitions.get(key)!,
         label: `${envName} ${metricName}`,
         points: pointsFor(metrics, key),
       };
@@ -73,7 +74,7 @@ export function EvalProgressChart({ metrics }: { metrics: EvalMetricRow[] }) {
             Evaluation progress
           </h3>
           <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-            Fixed-policy avg@8 and pass@8 from each configured environment
+            Fixed-policy avg@k and pass@k from each configured environment
           </p>
         </div>
         <div className="flex flex-wrap gap-4">

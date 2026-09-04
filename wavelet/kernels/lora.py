@@ -19,6 +19,40 @@ from .utils import (
     matmul_lora,
 )
 
+
+def _transpose_adapters(adapters: tuple, dtype: torch.dtype) -> tuple:
+    """Cast/transpose LoRA weights for backward; None marks an inactive adapter."""
+    return tuple(None if t is None else t.to(dtype).t() for t in adapters)
+
+
+def _lora_adapter_grads(
+    X: Tensor,
+    dY: Tensor,
+    A_t: Tensor | None,
+    B_t: Tensor | None,
+    S: float | None,
+) -> tuple[Tensor | None, Tensor | None]:
+    """Return (dA, dB) in PEFT layout, or (None, None) when no adapter is active."""
+    if A_t is None or B_t is None:
+        return None, None
+    d_A, d_B = torch.empty_like(A_t), torch.empty_like(B_t)
+    d_A.addmm_(X.t(), dY @ B_t.t(), alpha=S, beta=0)
+    d_B.addmm_(A_t.t() @ X.t(), dY, alpha=S, beta=0)
+    return d_A.t(), d_B.t()
+
+
+def _add_lora_input_grad(
+    dX: Tensor,
+    dY: Tensor,
+    A_t: Tensor | None,
+    B_t: Tensor | None,
+    S: float | None,
+) -> None:
+    if A_t is None or B_t is None:
+        return
+    dX.addmm_(dY @ B_t.t(), A_t.t(), alpha=S)
+
+
 # ── LoRA_MLP ─────────────────────────────────────────────────────────────────
 
 
@@ -91,58 +125,51 @@ class LoRA_MLP(torch.autograd.Function):
         ) = ctx.custom_saved_tensors
         gateA, gateB, upA, upB, downA, downB, X, e, g = ctx.saved_tensors
 
-        batch, seq_len, hd = X.shape
+        input_shape = X.shape
         dY = dY.view(-1, dY.shape[-1])
         X = X.view(-1, X.shape[-1])
         e = e.view(-1, e.shape[-1])
         g = g.view(-1, g.shape[-1])
         dtype = X.dtype
 
-        gateA, gateB, upA, upB, downA, downB = (
-            t.to(dtype).t() for t in (gateA, gateB, upA, upB, downA, downB)
+        gateA, gateB, upA, upB, downA, downB = _transpose_adapters(
+            (gateA, gateB, upA, upB, downA, downB), dtype
         )
 
         DW = matmul_lora(dY, downW.t(), downW_quant, downB, downA, downS)
         DW, df, de = _bwd_fn(DW, e, g)  # DW→h, e→df, g→de  (in-place)
         h = DW
 
-        d_downA, d_downB = torch.empty_like(downA), torch.empty_like(downB)
-        d_gateA, d_gateB = torch.empty_like(gateA), torch.empty_like(gateB)
-        d_upA, d_upB = torch.empty_like(upA), torch.empty_like(upB)
-
-        d_downA.addmm_(h.t(), dY @ downB.t(), alpha=downS, beta=0)
-        d_downB.addmm_(downA.t() @ h.t(), dY, alpha=downS, beta=0)
-        d_upA.addmm_(X.t(), df @ upB.t(), alpha=upS, beta=0)
-        d_upB.addmm_(upA.t() @ X.t(), df, alpha=upS, beta=0)
-        d_gateA.addmm_(X.t(), de @ gateB.t(), alpha=gateS, beta=0)
-        d_gateB.addmm_(gateA.t() @ X.t(), de, alpha=gateS, beta=0)
+        d_downA, d_downB = _lora_adapter_grads(h, dY, downA, downB, downS)
+        d_upA, d_upB = _lora_adapter_grads(X, df, upA, upB, upS)
+        d_gateA, d_gateB = _lora_adapter_grads(X, de, gateA, gateB, gateS)
 
         upW_fp = fast_dequantize(upW.t(), upW_quant)
         dX = torch.matmul(df, upW_fp.t(), out=X if ctx.inplace else None)
         del upW_fp
-        dX.addmm_(df @ upB.t(), upA.t(), alpha=upS)
+        _add_lora_input_grad(dX, df, upA, upB, upS)
 
         gateW_fp = fast_dequantize(gateW.t(), gateW_quant)
         dX.addmm_(de, gateW_fp.t())
         del gateW_fp
-        dX.addmm_(de @ gateB.t(), gateA.t(), alpha=gateS)
+        _add_lora_input_grad(dX, de, gateA, gateB, gateS)
 
         return (
-            dX.view(batch, seq_len, hd),
+            dX.view(input_shape),
             None,
             None,
-            d_gateA.t(),
-            d_gateB.t(),
-            None,
-            None,
-            None,
-            d_upA.t(),
-            d_upB.t(),
+            d_gateA,
+            d_gateB,
             None,
             None,
             None,
-            d_downA.t(),
-            d_downB.t(),
+            d_upA,
+            d_upB,
+            None,
+            None,
+            None,
+            d_downA,
+            d_downB,
             None,
             None,
             None,
@@ -209,57 +236,50 @@ class LoRA_QKV(torch.autograd.Function):
         QW, QW_quant, QS, KW, KW_quant, KS, VW, VW_quant, VS = ctx.custom_saved_tensors
         X, QA, QB, KA, KB, VA, VB = ctx.saved_tensors
 
-        batch, seq_len, hd = X.shape
+        input_shape = X.shape
         dQ = dQ.view(-1, dQ.shape[-1])
         dK = dK.reshape(-1, dK.shape[-1])
         dV = dV.view(-1, dV.shape[-1])
         X = X.view(-1, X.shape[-1])
         dtype = X.dtype
 
-        QA, QB, KA, KB, VA, VB = (t.to(dtype).t() for t in (QA, QB, KA, KB, VA, VB))
+        QA, QB, KA, KB, VA, VB = _transpose_adapters((QA, QB, KA, KB, VA, VB), dtype)
 
-        d_QA, d_QB = torch.empty_like(QA), torch.empty_like(QB)
-        d_KA, d_KB = torch.empty_like(KA), torch.empty_like(KB)
-        d_VA, d_VB = torch.empty_like(VA), torch.empty_like(VB)
-
-        d_QA.addmm_(X.t(), dQ @ QB.t(), alpha=QS, beta=0)
-        d_QB.addmm_(QA.t() @ X.t(), dQ, alpha=QS, beta=0)
-        d_KA.addmm_(X.t(), dK @ KB.t(), alpha=KS, beta=0)
-        d_KB.addmm_(KA.t() @ X.t(), dK, alpha=KS, beta=0)
-        d_VA.addmm_(X.t(), dV @ VB.t(), alpha=VS, beta=0)
-        d_VB.addmm_(VA.t() @ X.t(), dV, alpha=VS, beta=0)
+        d_QA, d_QB = _lora_adapter_grads(X, dQ, QA, QB, QS)
+        d_KA, d_KB = _lora_adapter_grads(X, dK, KA, KB, KS)
+        d_VA, d_VB = _lora_adapter_grads(X, dV, VA, VB, VS)
 
         QW_fp = fast_dequantize(QW.t(), QW_quant)
         dX = torch.matmul(dQ, QW_fp.t(), out=X if ctx.inplace else None)
         del QW_fp
-        dX.addmm_(dQ @ QB.t(), QA.t(), alpha=QS)
+        _add_lora_input_grad(dX, dQ, QA, QB, QS)
 
         KW_fp = fast_dequantize(KW.t(), KW_quant)
         dX.addmm_(dK, KW_fp.t())
         del KW_fp
-        dX.addmm_(dK @ KB.t(), KA.t(), alpha=KS)
+        _add_lora_input_grad(dX, dK, KA, KB, KS)
 
         VW_fp = fast_dequantize(VW.t(), VW_quant)
         dX.addmm_(dV, VW_fp.t())
         del VW_fp
-        dX.addmm_(dV @ VB.t(), VA.t(), alpha=VS)
+        _add_lora_input_grad(dX, dV, VA, VB, VS)
 
         return (
-            dX.view(batch, seq_len, hd),
+            dX.view(input_shape),
             None,
             None,
-            d_QA.t(),
-            d_QB.t(),
-            None,
-            None,
-            None,
-            d_KA.t(),
-            d_KB.t(),
+            d_QA,
+            d_QB,
             None,
             None,
             None,
-            d_VA.t(),
-            d_VB.t(),
+            d_KA,
+            d_KB,
+            None,
+            None,
+            None,
+            d_VA,
+            d_VB,
             None,
             None,  # inplace
         )
@@ -285,22 +305,20 @@ class LoRA_W(torch.autograd.Function):
         W, W_quant, S = ctx.custom_saved_tensors
         A, B, X = ctx.saved_tensors
 
-        batch, seq_len, hd = X.shape
+        input_shape = X.shape
         dY = dY.reshape(-1, dY.shape[-1])
         X = X.reshape(-1, X.shape[-1])
         dtype = X.dtype
 
-        A_t, B_t = A.to(dtype).t(), B.to(dtype).t()
-        d_A, d_B = torch.empty_like(A_t), torch.empty_like(B_t)
-        d_A.addmm_(X.t(), dY @ B_t.t(), alpha=S, beta=0)
-        d_B.addmm_(A_t.t() @ X.t(), dY, alpha=S, beta=0)
+        A_t, B_t = _transpose_adapters((A, B), dtype)
+        d_A, d_B = _lora_adapter_grads(X, dY, A_t, B_t, S)
 
         W_fp = fast_dequantize(W.t(), W_quant)
         dX = dY @ W_fp.t()
         del W_fp
-        dX.addmm_(dY @ B_t.t(), A_t.t(), alpha=S)
+        _add_lora_input_grad(dX, dY, A_t, B_t, S)
 
-        return dX.view(batch, seq_len, hd), None, None, d_A.t(), d_B.t(), None
+        return dX.view(input_shape), None, None, d_A, d_B, None
 
 
 # ── apply_* helpers (used as module.forward replacements) ────────────────────

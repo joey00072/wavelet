@@ -215,6 +215,7 @@ def resolve_rollout_schedule(config: RLConfig) -> RolloutSchedule:
 
 import asyncio
 import json
+import logging
 import math
 import random
 from dataclasses import dataclass, field
@@ -227,6 +228,9 @@ from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import (
+    required_policy_step as _required_policy_step,
+)
 from wavelet.orchestrator.schedule import (
     rollout_chunk_examples as _rollout_chunk_examples,
 )
@@ -278,6 +282,25 @@ from wavelet.orchestrator.envs import (
     _verifier_model,
 )
 
+logger = logging.getLogger(__name__)
+
+# A group may re-dispatch at most this many times its rollout count after failed
+# rollouts before the scheduler drops the example and counts it as rejected.
+_MAX_GROUP_RETRIES = 3
+
+
+def _is_policy_step(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _group_policy_step(group_outputs: list[dict[str, Any]]) -> int | None:
+    policy_steps = [
+        output["_wavelet_policy_step"]
+        for output in group_outputs
+        if _is_policy_step(output.get("_wavelet_policy_step"))
+    ]
+    return min(policy_steps) if policy_steps else None
+
 
 @dataclass(slots=True)
 class _PendingVerifierRequest:
@@ -295,6 +318,7 @@ class _VerifierGroupState:
     policy_step: int | None = None
     completed_outputs: list[dict[str, Any]] = field(default_factory=list)
     pinned_client_index: int | None = None
+    failed_rollouts: int = 0
 
 
 @dataclass(slots=True)
@@ -439,6 +463,7 @@ class VerifierRolloutScheduler:
         self.env_name = _env_name(self.env, fallback=env_id)
         self.model = _verifier_model(config)
         self.policy_step: int | None = None
+        self.rollout_step: int | None = None
         self.rollout_count = config.orchestrator.rollouts_per_example or 1
         self.target_groups = config.orchestrator.examples_per_step
         if self.target_groups is None:
@@ -512,8 +537,12 @@ class VerifierRolloutScheduler:
         return sum(info.rollout_count for info in self.pending.values())
 
     async def generate_batch(
-        self, *, target_groups: int | None = None
+        self,
+        *,
+        target_groups: int | None = None,
+        rollout_step: int | None = None,
     ) -> list[RLExample]:
+        """Build one batch for ``rollout_step`` from groups the trainer accepts."""
         started_at = perf_counter()
         self.executor_concurrency = _scale_verifier_executors(
             self.max_inflight_rollouts
@@ -530,8 +559,19 @@ class VerifierRolloutScheduler:
         )
         self._sync_ready_group_ages()
         self.policy_update_wait_seconds = 0.0
+        if rollout_step is not None:
+            self.rollout_step = rollout_step
+            self.cancelled_rollouts_count += self._prune_ready_groups(advance_age=False)
+            self.cancelled_rollouts_count += await self._cancel_stale_requests()
 
         try:
+            # Buffered groups are older than anything completing now; shipping
+            # them first keeps them from expiring unused at the next step.
+            while self.ready_groups and accepted_groups < target_groups:
+                outputs.extend(self.ready_groups.pop(0))
+                if self.ready_group_off_policy_steps:
+                    self.ready_group_off_policy_steps.pop(0)
+                accepted_groups += 1
             drained_completed, drained_rejected = self._drain_completed_groups_to_ready(
                 target_groups=target_groups,
                 outputs=outputs,
@@ -540,12 +580,7 @@ class VerifierRolloutScheduler:
             )
             completed_groups += drained_completed
             rejected_groups += drained_rejected
-            accepted_groups += len(outputs) // self.rollout_count
-            while self.ready_groups and accepted_groups < target_groups:
-                outputs.extend(self.ready_groups.pop(0))
-                if self.ready_group_off_policy_steps:
-                    self.ready_group_off_policy_steps.pop(0)
-                accepted_groups += 1
+            accepted_groups = len(outputs) // self.rollout_count
 
             while True:
                 if accepted_groups >= target_groups:
@@ -657,6 +692,12 @@ class VerifierRolloutScheduler:
         self.last_batch_metrics["generation/executor_concurrency"] = float(
             self.executor_concurrency
         )
+        self.last_batch_metrics["generation/rollouts/cancelled_total"] = float(
+            getattr(self, "cancelled_rollouts_count", 0)
+        )
+        self.last_batch_metrics["generation/groups/rejected_total"] = float(
+            getattr(self, "rejected_groups_count", 0)
+        )
         record_cursor = getattr(self, "record_cursor", 0)
         self.last_batch_metrics["generation/data/cursor"] = float(record_cursor)
         self.last_batch_metrics["generation/data/epoch"] = float(
@@ -727,15 +768,45 @@ class VerifierRolloutScheduler:
             output["_wavelet_policy_step"] = request.policy_step
             output["_wavelet_group_id"] = f"persistent:{request.group_id}"
         missing_rollouts = request.rollout_count - len(group_outputs)
+        if missing_rollouts > 0 and request.policy_step != getattr(
+            self, "policy_step", None
+        ):
+            # The group cannot be completed under one policy any more; it is
+            # cancelled work, so it must not consume the zero-advantage retry
+            # budget or count as a reward-filter rejection.
+            self.groups.pop(request.group_id, None)
+            self._count_cancelled_rollouts(
+                len(group.completed_outputs) + len(group_outputs)
+            )
+            return 0, 0, 0
+        if self._is_stale_policy_step(
+            request.policy_step,
+            age=request.off_policy_steps,
+        ):
+            # The trainer would reject this group for the pending rollout step,
+            # so it is cancelled work rather than a reward-filter rejection.
+            self.groups.pop(request.group_id, None)
+            self.cancelled_rollouts_count += request.rollout_count
+            return 0, 0, 0
         if missing_rollouts > 0:
-            if request.policy_step != getattr(self, "policy_step", None):
+            group.failed_rollouts += missing_rollouts
+            if group.failed_rollouts > _MAX_GROUP_RETRIES * self.rollout_count:
                 self.groups.pop(request.group_id, None)
+                logger.warning(
+                    "Dropping verifier group %s after %s failed rollout(s); the "
+                    "example keeps failing under policy step %s.",
+                    request.group_id,
+                    group.failed_rollouts,
+                    request.policy_step,
+                )
                 return 0, 1, 1
             if self.requires_group_scoring:
+                # Group scoring needs the whole group from one dispatch, so the
+                # partial outputs are discarded before the full re-run.
                 group.completed_outputs.clear()
                 group.rollouts_to_schedule = self.rollout_count
-            else:
-                group.rollouts_to_schedule += missing_rollouts
+                return 0, 0, 0
+            group.rollouts_to_schedule += missing_rollouts
         group.completed_outputs.extend(group_outputs)
         if len(group.completed_outputs) < self.rollout_count:
             return 0, 0, 0
@@ -762,23 +833,49 @@ class VerifierRolloutScheduler:
         self.ready_group_off_policy_steps.append(0)
         return 0, 1, 0
 
-    async def mark_policy_update(self) -> int:
-        max_off_policy_steps = self.config.orchestrator.max_off_policy_steps
-        cancelled_rollouts = self._age_ready_groups(max_off_policy_steps)
-        if not self.pending:
-            self.cancelled_rollouts_count += cancelled_rollouts
-            return cancelled_rollouts
+    def _count_cancelled_rollouts(self, count: int) -> None:
+        self.cancelled_rollouts_count = (
+            getattr(self, "cancelled_rollouts_count", 0) + count
+        )
 
+    async def discard_stale_requests(self, rollout_step: int) -> int:
+        """Cancel work the trainer would reject for ``rollout_step``.
+
+        Called before a policy swap drains in-flight requests, so the swap does
+        not wait on generations that can never be admitted.
+        """
+        self.rollout_step = rollout_step
+        cancelled_rollouts = self._prune_ready_groups(advance_age=False)
+        cancelled_rollouts += await self._cancel_stale_requests()
+        self._count_cancelled_rollouts(cancelled_rollouts)
+        return cancelled_rollouts
+
+    async def mark_policy_update(self) -> int:
+        cancelled_rollouts = self._prune_ready_groups(advance_age=True)
+        for request in self.pending.values():
+            request.off_policy_steps = self._request_policy_lag(request)
+        cancelled_rollouts += await self._cancel_stale_requests()
+        self.cancelled_rollouts_count += cancelled_rollouts
+        return cancelled_rollouts
+
+    async def _cancel_stale_requests(self) -> int:
+        """Cancel in-flight requests whose groups the trainer would reject."""
         stale_group_ids = {
             request.group_id
             for request in self.pending.values()
-            if self._request_policy_lag(request) > max_off_policy_steps
+            if self._is_stale_policy_step(
+                request.policy_step,
+                age=request.off_policy_steps,
+            )
         }
+        if not stale_group_ids:
+            return 0
         tasks_to_cancel = [
             task
             for task, request in self.pending.items()
             if request.group_id in stale_group_ids
         ]
+        cancelled_rollouts = 0
         for task in tasks_to_cancel:
             request = self.pending.pop(task, None)
             self.pending_clients.pop(task, None)
@@ -787,55 +884,63 @@ class VerifierRolloutScheduler:
             task.cancel()
         for group_id in stale_group_ids:
             self.groups.pop(group_id, None)
-
-        for request in self.pending.values():
-            request.off_policy_steps = self._request_policy_lag(request)
-
-        if tasks_to_cancel:
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
-        self.cancelled_rollouts_count += cancelled_rollouts
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         return cancelled_rollouts
 
     def _request_policy_lag(self, request: _PendingVerifierRequest) -> int:
-        current_policy_step = getattr(self, "policy_step", None)
-        if isinstance(current_policy_step, int) and isinstance(
-            request.policy_step, int
-        ):
-            return max(current_policy_step - request.policy_step, 0)
-        return request.off_policy_steps + 1
+        return self._policy_lag(
+            request.policy_step,
+            fallback_age=request.off_policy_steps + 1,
+        )
 
-    def _age_ready_groups(self, max_off_policy_steps: int) -> int:
+    def _policy_lag(self, policy_step: int | None, *, fallback_age: int) -> int:
+        current_policy_step = getattr(self, "policy_step", None)
+        if _is_policy_step(current_policy_step) and _is_policy_step(policy_step):
+            return max(current_policy_step - policy_step, 0)
+        return fallback_age
+
+    def _min_admissible_policy_step(self) -> int | None:
+        """Oldest dispatch policy the trainer accepts for the pending rollout step.
+
+        Mirrors the trainer's manifest check, which is relative to the optimizer
+        step being trained rather than to the policy currently loaded for
+        generation. Before any rollout step is known the loaded policy stands in
+        for the step.
+        """
+        rollout_step = getattr(self, "rollout_step", None)
+        if rollout_step is None:
+            rollout_step = getattr(self, "policy_step", None)
+        if not _is_policy_step(rollout_step):
+            return None
+        return _required_policy_step(self.config, rollout_step)
+
+    def _is_stale_policy_step(self, policy_step: int | None, *, age: int) -> bool:
+        minimum = self._min_admissible_policy_step()
+        if minimum is not None and _is_policy_step(policy_step):
+            return policy_step < minimum
+        return age > self.config.orchestrator.max_off_policy_steps
+
+    def _prune_ready_groups(self, *, advance_age: bool) -> int:
+        """Drop buffered groups the trainer would reject; return dropped rollouts."""
         if not hasattr(self, "ready_groups"):
             self.ready_groups = []
         self._sync_ready_group_ages()
-        if not self.ready_groups:
-            self.ready_group_off_policy_steps.clear()
-            return 0
-
         kept_groups: list[list[dict[str, Any]]] = []
         kept_ages: list[int] = []
         dropped_rollouts = 0
-        for group_outputs, off_policy_steps in zip(
+        for group_outputs, age in zip(
             self.ready_groups,
             self.ready_group_off_policy_steps,
             strict=False,
         ):
-            policy_steps = [
-                output.get("_wavelet_policy_step")
-                for output in group_outputs
-                if isinstance(output.get("_wavelet_policy_step"), int)
-                and not isinstance(output.get("_wavelet_policy_step"), bool)
-            ]
-            current_policy_step = getattr(self, "policy_step", None)
-            if isinstance(current_policy_step, int) and policy_steps:
-                next_age = max(current_policy_step - min(policy_steps), 0)
-            else:
-                next_age = off_policy_steps + 1
-            if next_age > max_off_policy_steps:
+            policy_step = _group_policy_step(group_outputs)
+            if advance_age:
+                age = self._policy_lag(policy_step, fallback_age=age + 1)
+            if self._is_stale_policy_step(policy_step, age=age):
                 dropped_rollouts += len(group_outputs)
                 continue
             kept_groups.append(group_outputs)
-            kept_ages.append(next_age)
+            kept_ages.append(age)
         self.ready_groups = kept_groups
         self.ready_group_off_policy_steps = kept_ages
         return dropped_rollouts
@@ -923,10 +1028,9 @@ class VerifierRolloutScheduler:
             if group.rollouts_to_schedule <= 0:
                 continue
             if group.policy_step != current_policy_step:
+                # Partial groups cannot be finished under a newer policy.
                 self.groups.pop(group_id, None)
-                self.rejected_groups_count = (
-                    getattr(self, "rejected_groups_count", 0) + 1
-                )
+                self._count_cancelled_rollouts(len(group.completed_outputs))
                 continue
             cost = group.rollouts_to_schedule if self.requires_group_scoring else 1
             if cost <= remaining_capacity:
@@ -1032,7 +1136,7 @@ from wavelet.data.rl import RLExample
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.metrics import log_eval_metrics, log_rollout_metrics
 from wavelet.orchestrator.policy_metadata import policy_metadata
-from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.rollouts import RLOrchestrator, _reusable_rollout_batch
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
 )
@@ -1061,9 +1165,10 @@ from wavelet.transport.queue import (
     FileSystemRolloutSender,
     QueueEvent,
     append_event_best_effort,
+    prune_rollout_batches_from,
     publish_adapter_policy_snapshot,
+    resolve_queue_dir,
     utc_now,
-    validate_rollout_manifest,
 )
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
@@ -1094,40 +1199,6 @@ def _preload_rollout_resources(config: RLConfig) -> None:
         config.orchestrator.verifier_env_args,
         _verifier_extra_env_kwargs(config),
     )
-
-
-def _reusable_rollout_batch(
-    config: RLConfig,
-    sender: FileSystemRolloutSender,
-    *,
-    queue_step: int,
-    optimizer_step: int,
-    chunk_index: int | None,
-):
-    batch = sender.stable_batch(queue_step)
-    if batch is None:
-        return None
-    row_count = _count_nonempty_lines(batch.path)
-    validate_rollout_manifest(
-        batch,
-        queue_step=queue_step,
-        optimizer_step=optimizer_step,
-        chunk_index=chunk_index,
-        rows=row_count,
-        minimum_policy_step=_required_policy_step(config, optimizer_step),
-        maximum_policy_step=optimizer_step,
-    )
-    append_event_best_effort(
-        config.output_dir / "events",
-        QueueEvent(
-            time=utc_now(),
-            kind="rollout_reused",
-            queue_step=queue_step,
-            optimizer_step=optimizer_step,
-            details={"path": str(batch.path)},
-        ),
-    )
-    return batch
 
 
 @dataclass(slots=True)
@@ -1169,6 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     config = load_config(RLConfig, argv)
     start_step = _resume_optimizer_step(config)
+    discard_rollout_batches_after_resume(config, start_step=start_step)
     policy_receiver = FileSystemPolicyReceiver(
         config.output_dir,
         config.policy_transfer,
@@ -1206,6 +1278,41 @@ def main(argv: list[str] | None = None) -> int:
         if state is not None:
             state.set_status("completed", phase="completed")
         return result
+
+
+def first_regenerated_queue_step(config: RLConfig, *, start_step: int) -> int:
+    """First queue step a run resumed at ``start_step`` produces itself."""
+    schedule = resolve_rollout_schedule(config)
+    if schedule.publish_mode is PublishMode.STREAMING:
+        return (start_step + 1) * _chunks_per_step(config)
+    return start_step + 1
+
+
+def discard_rollout_batches_after_resume(config: RLConfig, *, start_step: int) -> None:
+    """Drop queue batches the interrupted run generated past the resume point.
+
+    Batches for the resume step itself came from policies the checkpoint also
+    holds, so they stay reusable; later ones may come from policy versions the
+    resumed run re-derives differently.
+    """
+    if start_step <= 0:
+        return
+    removed = prune_rollout_batches_from(
+        resolve_queue_dir(config.output_dir, config.transport),
+        first_step=first_regenerated_queue_step(config, start_step=start_step),
+        materialized_dir=config.output_dir / "rollouts",
+    )
+    if removed:
+        append_event_best_effort(
+            config.output_dir / "events",
+            QueueEvent(
+                time=utc_now(),
+                kind="rollout_discarded_on_resume",
+                queue_step=None,
+                optimizer_step=start_step,
+                details={"removed": [str(path) for path in removed]},
+            ),
+        )
 
 
 @dataclass
@@ -1270,6 +1377,7 @@ class _SchedulerStateMachine:
             policy_step=policy_step,
             rollout_step=self._rollout_step(self.next_step_to_submit),
             last_eval_steps=self.last_eval_steps,
+            inference_engine=self.inference_engine,
         )
 
     def _rollout_step(self, queue_step: int) -> int:
@@ -1868,7 +1976,7 @@ class _VerifierPublisherStrategy:
         if self.pending_policy_update is None:
             if must_load:
                 return await self._load_now(policy_step, optimizer_step)
-            self._start_background_load(policy_step)
+            self._start_background_load(policy_step, rollout_step=optimizer_step)
             return 0.0, 0.0
         if not must_load:
             return 0.0, 0.0
@@ -1892,7 +2000,12 @@ class _VerifierPublisherStrategy:
             load_policy="async",
         )
 
-    def _start_background_load(self, policy_step: int) -> None:
+    def _start_background_load(
+        self,
+        policy_step: int,
+        *,
+        rollout_step: int | None = None,
+    ) -> None:
         self.scheduler.begin_policy_update()
         try:
             self.pending_policy_update = asyncio.create_task(
@@ -1902,6 +2015,7 @@ class _VerifierPublisherStrategy:
                     self.policy_receiver,
                     policy_step,
                     self.scheduler,
+                    rollout_step=rollout_step,
                 )
             )
         except Exception:
@@ -1923,6 +2037,7 @@ class _VerifierPublisherStrategy:
         previous_policy_step = self.loaded_policy_step
         self.scheduler.begin_policy_update()
         try:
+            await _discard_stale_requests(self.scheduler, optimizer_step)
             await self.scheduler.drain_policy_update_requests()
             self.loaded_policy_step = await _load_policy_async(
                 self.config,
@@ -1983,6 +2098,7 @@ class _VerifierPublisherStrategy:
             policy_step=self.loaded_policy_step,
             rollout_step=optimizer_step,
             last_eval_steps=self.last_eval_steps,
+            inference_engine=self.inference_engine,
         )
 
     async def publish_chunk(
@@ -2012,7 +2128,10 @@ class _VerifierPublisherStrategy:
         generate_started_at = perf_counter()
         chunk_index = queue_step % self.chunks_per_step
         chunk_groups = _rollout_groups_for_chunk(self.config, chunk_index)
-        records = await self.scheduler.generate_batch(target_groups=chunk_groups)
+        records = await self.scheduler.generate_batch(
+            target_groups=chunk_groups,
+            rollout_step=optimizer_step,
+        )
         generate_seconds = perf_counter() - generate_started_at
         rollout_policy_step = _rollout_records_policy_step(
             records,
@@ -2172,6 +2291,7 @@ class _VerifierPublisherStrategy:
             policy_step=self.loaded_policy_step,
             rollout_step=target_step,
             envs=envs,
+            inference_engine=self.inference_engine,
         )
         _sleep_for_colocated_sleep(self.config, self.inference_engine)
 
@@ -2328,14 +2448,25 @@ async def _load_policy_async(
     return step
 
 
+async def _discard_stale_requests(scheduler, rollout_step: int | None) -> None:
+    if rollout_step is None:
+        return
+    discard = getattr(scheduler, "discard_stale_requests", None)
+    if callable(discard):
+        await discard(rollout_step)
+
+
 async def _load_policy_and_update_scheduler(
     config: RLConfig,
     inference_engine,
     policy_receiver: FileSystemPolicyReceiver,
     policy_step: int,
     scheduler,
+    *,
+    rollout_step: int | None = None,
 ) -> int:
     try:
+        await _discard_stale_requests(scheduler, rollout_step)
         await scheduler.drain_policy_update_requests()
         loaded_step = await _load_policy_async(
             config,
@@ -2565,6 +2696,7 @@ def _run_final_evals(
         policy_step=loaded_policy_step,
         rollout_step=target_step,
         envs=envs,
+        inference_engine=inference_engine,
     )
     _sleep_for_colocated_sleep(config, inference_engine)
     return loaded_policy_step
@@ -2607,6 +2739,7 @@ def _maybe_run_evals(
     policy_step: int,
     rollout_step: int,
     last_eval_steps: dict[str, int],
+    inference_engine: object | None = None,
 ) -> None:
     envs = select_due_eval_envs(
         config,
@@ -2619,6 +2752,7 @@ def _maybe_run_evals(
         policy_step=policy_step,
         rollout_step=rollout_step,
         envs=envs,
+        inference_engine=inference_engine,
     )
 
 
@@ -2629,6 +2763,7 @@ async def _maybe_run_evals_async(
     policy_step: int,
     rollout_step: int,
     last_eval_steps: dict[str, int],
+    inference_engine: object | None = None,
 ) -> None:
     envs = select_due_eval_envs(
         config,
@@ -2641,6 +2776,7 @@ async def _maybe_run_evals_async(
         policy_step=policy_step,
         rollout_step=rollout_step,
         envs=envs,
+        inference_engine=inference_engine,
     )
 
 
@@ -2651,7 +2787,9 @@ def _run_evals(
     policy_step: int,
     rollout_step: int,
     envs,
+    inference_engine: object | None = None,
 ) -> None:
+    """Evaluate the loaded policy; the engine selects the served model name."""
     if not envs:
         return
     _validate_eval_supported(config)
@@ -2664,6 +2802,7 @@ def _run_evals(
             env,
             step=rollout_step,
             policy_step=policy_step,
+            inference_engine=inference_engine,
         )
         log_eval_metrics(
             config,
@@ -2681,6 +2820,7 @@ async def _run_evals_async(
     policy_step: int,
     rollout_step: int,
     envs,
+    inference_engine: object | None = None,
 ) -> None:
     if not envs:
         return
@@ -2694,6 +2834,7 @@ async def _run_evals_async(
             env,
             step=rollout_step,
             policy_step=policy_step,
+            inference_engine=inference_engine,
         )
         log_eval_metrics(
             config,

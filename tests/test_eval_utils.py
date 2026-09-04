@@ -516,3 +516,99 @@ def test_eval_rollouts_preserve_failed_attempts_and_example_identity() -> None:
         "error": "generation failed",
         "completion": [],
     }
+
+
+def test_eval_rollouts_treat_verifier_caught_errors_as_failed_attempts() -> None:
+    vf = SimpleNamespace(RolloutInput=lambda **kwargs: kwargs)
+    env = SimpleNamespace(
+        run_rollout=AsyncMock(
+            side_effect=[
+                {"reward": 1.0, "completion": ["ok"], "error": None},
+                {"reward": 0.0, "completion": [], "error": RuntimeError("boom")},
+            ]
+        )
+    )
+
+    outputs = asyncio.run(
+        _run_eval_examples(
+            vf,
+            env,
+            [{"question": "q", "example_id": "a"}],
+            clients=[object()],
+            model="model",
+            sampling_args={},
+            rollouts_per_example=2,
+            max_retries=0,
+        )
+    )
+    metrics = _eval_metrics(
+        "alphabet",
+        outputs,
+        total_rollouts=2,
+        elapsed_seconds=1.0,
+        rollouts_per_example=2,
+    )
+
+    assert outputs[0]["reward"] == 1.0
+    assert "reward" not in outputs[1]
+    assert outputs[1]["error"] == "boom"
+    assert metrics["eval/alphabet/failed_rollouts"] == pytest.approx(0.5)
+    assert metrics["eval/alphabet/avg@2"] == pytest.approx(0.5)
+    assert metrics["eval/alphabet/pass@1"] == pytest.approx(0.5)
+    assert metrics["eval/alphabet/effective/avg@2"] == pytest.approx(1.0)
+    assert metrics["eval/alphabet/effective/pass@1"] == pytest.approx(1.0)
+
+
+def test_eval_rollouts_offset_fixed_seed_per_rollout() -> None:
+    vf = SimpleNamespace(RolloutInput=lambda **kwargs: kwargs)
+    run_rollout = AsyncMock(return_value={"reward": 1.0, "completion": ["ok"]})
+    env = SimpleNamespace(run_rollout=run_rollout)
+    sampling_args = {"seed": 7, "extra_body": {"cache_salt": "3"}}
+
+    asyncio.run(
+        _run_eval_examples(
+            vf,
+            env,
+            [{"question": "q"}, {"question": "r"}],
+            clients=[object()],
+            model="model",
+            sampling_args=sampling_args,
+            rollouts_per_example=3,
+            max_retries=0,
+        )
+    )
+
+    seeds = [
+        call.kwargs["sampling_args"]["seed"] for call in run_rollout.await_args_list
+    ]
+    assert seeds == [7, 8, 9, 7, 8, 9]
+    assert all(
+        call.kwargs["sampling_args"]["extra_body"] == {"cache_salt": "3"}
+        for call in run_rollout.await_args_list
+    )
+    assert sampling_args == {"seed": 7, "extra_body": {"cache_salt": "3"}}
+
+
+def test_eval_rollouts_leave_unseeded_sampling_args_untouched() -> None:
+    vf = SimpleNamespace(RolloutInput=lambda **kwargs: kwargs)
+    run_rollout = AsyncMock(return_value={"reward": 1.0, "completion": ["ok"]})
+    env = SimpleNamespace(run_rollout=run_rollout)
+    sampling_args = {"temperature": 1.0}
+
+    asyncio.run(
+        _run_eval_examples(
+            vf,
+            env,
+            [{"question": "q"}],
+            clients=[object()],
+            model="model",
+            sampling_args=sampling_args,
+            rollouts_per_example=2,
+            max_retries=0,
+        )
+    )
+
+    assert all(
+        call.kwargs["sampling_args"] == {"temperature": 1.0}
+        for call in run_rollout.await_args_list
+    )

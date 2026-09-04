@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import sys
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -21,6 +22,16 @@ def _load_environment_module() -> ModuleType:
 
 
 ENV = _load_environment_module()
+
+
+def _slow_pool_job(value: int) -> int:
+    time.sleep(0.2)
+    return value
+
+
+def _fake_clock(*readings: float) -> object:
+    values = iter(readings)
+    return lambda: next(values)
 
 
 def test_training_and_eval_datasets_are_pinned() -> None:
@@ -173,4 +184,60 @@ def test_resilient_math_rubric_scores_the_strict_tagged_answer() -> None:
     )
 
     assert reward == 1.0
+    asyncio.run(rubric.teardown())
+
+
+def test_resilient_math_rubric_keeps_pool_for_slow_but_completed_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vf = pytest.importorskip("verifiers")
+
+    async def fast_correct_answer(*args: object, **kwargs: object) -> float:
+        del args, kwargs
+        return 1.0
+
+    monkeypatch.setattr(vf.MathRubric, "correct_answer", fast_correct_answer)
+    rubric = ENV.build_resilient_math_rubric(
+        vf,
+        parser=vf.Parser(extract_fn=ENV.extract_tagged_answer),
+        max_workers=2,
+        timeout_seconds=5.0,
+    )
+    rubric.HARD_TIMEOUT_SECONDS = 1.0
+    # Queue wait on a busy pool: 95% of the hard timeout, but no timeout hit.
+    monkeypatch.setattr(ENV, "perf_counter", _fake_clock(0.0, 0.95))
+    original_executor = rubric.executor
+
+    reward = asyncio.run(rubric.correct_answer(None, [], answer="1"))
+
+    assert reward == 1.0
+    assert rubric.executor is original_executor
+    asyncio.run(rubric.teardown())
+
+
+def test_resilient_math_rubric_replacement_keeps_in_flight_verifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vf = pytest.importorskip("verifiers")
+
+    async def timed_out_correct_answer(*args: object, **kwargs: object) -> float:
+        del args, kwargs
+        return 0.0
+
+    monkeypatch.setattr(vf.MathRubric, "correct_answer", timed_out_correct_answer)
+    rubric = ENV.build_resilient_math_rubric(
+        vf,
+        parser=vf.Parser(extract_fn=ENV.extract_tagged_answer),
+        max_workers=2,
+        timeout_seconds=5.0,
+    )
+    rubric.HARD_TIMEOUT_SECONDS = 1.0
+    monkeypatch.setattr(ENV, "perf_counter", _fake_clock(0.0, 1.5))
+    original_executor = rubric.executor
+    in_flight = original_executor.submit(_slow_pool_job, 7)
+
+    asyncio.run(rubric.correct_answer(None, [], answer="1"))
+
+    assert rubric.executor is not original_executor
+    assert in_flight.result(timeout=10) == 7
     asyncio.run(rubric.teardown())

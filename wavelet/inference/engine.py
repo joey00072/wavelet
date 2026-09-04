@@ -255,11 +255,12 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
         if (
-            self._uses_openai_rollouts()
-            and self.config.lora is None
+            self.config.lora is None
             and self.config.policy_transfer.type == "nccl"
             and step > 0
         ):
+            # The trainer blocks on this marker before broadcasting; a custom
+            # rollout function still needs the weights delivered.
             (policy_dir / NCCL_READY_MARKER).touch()
         payload: dict[str, Any] = {"policy_dir": str(policy_dir), "step": step}
         if self._uses_openai_rollouts() and self.config.lora is not None:
@@ -461,32 +462,16 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 "OpenAI rollout response did not include completion token ids. "
                 "Ensure the vLLM server supports return_token_ids."
             )
-        completion_logprobs = self._openai_completion_logprobs(choice, completion_ids)
-        sample = _shift_completion_sample(
+        return _pretokenized_rollout_record(
+            record,
+            completion_text=completion_text,
             prompt_ids=prompt_ids,
             completion_ids=completion_ids,
-            completion_logprobs=completion_logprobs,
+            completion_logprobs=self._openai_completion_logprobs(
+                choice,
+                completion_ids,
+            ),
             temperature=self.config.inference.sampling.temperature,
-        )
-        trainable_indexes = [
-            index for index, trainable in enumerate(sample["loss_mask"]) if trainable
-        ]
-        if not trainable_indexes:
-            raise RuntimeError("OpenAI rollout response produced no trainable tokens.")
-        return replace(
-            record,
-            completion=[{"role": "assistant", "content": completion_text}],
-            target_completion=record.target_completion or record.completion,
-            input_ids=sample["input_ids"],
-            target_ids=sample["target_ids"],
-            loss_mask=sample["loss_mask"],
-            inference_logprobs=[
-                float(sample["inference_logprobs"][index])
-                for index in trainable_indexes
-            ],
-            temperatures=[
-                float(sample["temperatures"][index]) for index in trainable_indexes
-            ],
         )
 
     def _openai_completion_logprobs(
@@ -601,6 +586,43 @@ def _shift_completion_sample(
         "inference_logprobs": full_logprobs[1:],
         "temperatures": full_temperatures[1:],
     }
+
+
+def _pretokenized_rollout_record(
+    record: RLExample,
+    *,
+    completion_text: str,
+    prompt_ids: list[int],
+    completion_ids: list[int],
+    completion_logprobs: list[float],
+    temperature: float,
+) -> RLExample:
+    """Attach the sampled token ids and logprobs so the trainer skips retokenizing."""
+    sample = _shift_completion_sample(
+        prompt_ids=prompt_ids,
+        completion_ids=completion_ids,
+        completion_logprobs=completion_logprobs,
+        temperature=temperature,
+    )
+    trainable_indexes = [
+        index for index, trainable in enumerate(sample["loss_mask"]) if trainable
+    ]
+    if not trainable_indexes:
+        raise RuntimeError("Rollout produced no trainable tokens.")
+    return replace(
+        record,
+        completion=[{"role": "assistant", "content": completion_text}],
+        target_completion=record.target_completion or record.completion,
+        input_ids=sample["input_ids"],
+        target_ids=sample["target_ids"],
+        loss_mask=sample["loss_mask"],
+        inference_logprobs=[
+            float(sample["inference_logprobs"][index]) for index in trainable_indexes
+        ],
+        temperatures=[
+            float(sample["temperatures"][index]) for index in trainable_indexes
+        ],
+    )
 
 
 import gc
@@ -793,37 +815,53 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 use_tqdm=False,
                 lora_request=lora_request,
             )
-        self._mark_lora_loaded()
 
+        use_generation_logprobs = self.config.inference.vllm.use_generation_logprobs
+        temperature = max(self.config.inference.sampling.temperature, 1e-6)
         generated_records: list[RLExample] = []
-        generation_token_ids: list[list[int]] = []
-        generation_logprobs: list[object] = []
-        for record, request_output in zip(records, request_outputs, strict=True):
+        for record, prompt, request_output in zip(
+            records,
+            prompts,
+            request_outputs,
+            strict=True,
+        ):
             for output in request_output.outputs:
+                completion_text = output.text.strip()
+                if not use_generation_logprobs:
+                    generated_records.append(
+                        replace(
+                            record,
+                            completion=[
+                                {"role": "assistant", "content": completion_text}
+                            ],
+                            target_completion=(
+                                record.target_completion or record.completion
+                            ),
+                        )
+                    )
+                    continue
+                # Train on the exact sampled token ids and their sampled
+                # logprobs; retokenizing the decoded text can disagree with them.
+                completion_ids = [
+                    int(token_id)
+                    for token_id in (getattr(output, "token_ids", None) or [])
+                ]
                 generated_records.append(
-                    replace(
+                    _pretokenized_rollout_record(
                         record,
-                        completion=[
-                            {
-                                "role": "assistant",
-                                "content": output.text.strip(),
-                            }
-                        ],
-                        target_completion=record.target_completion or record.completion,
+                        completion_text=completion_text,
+                        prompt_ids=prompt["prompt_token_ids"],
+                        completion_ids=completion_ids,
+                        completion_logprobs=extract_vllm_generation_logprobs(
+                            getattr(output, "logprobs", None),
+                            completion_ids,
+                        ),
+                        temperature=temperature,
                     )
                 )
-                generation_token_ids.append(
-                    [
-                        int(token_id)
-                        for token_id in (getattr(output, "token_ids", None) or [])
-                    ]
-                )
-                generation_logprobs.append(getattr(output, "logprobs", None))
-        return self._attach_generation_or_prompt_logprobs(
-            generated_records,
-            generation_token_ids=generation_token_ids,
-            generation_logprobs=generation_logprobs,
-        )
+        if not use_generation_logprobs:
+            return self._attach_prompt_logprobs(generated_records)
+        return generated_records
 
     def openai_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         request = _OpenAIBatchRequest(payload=payload, done=threading.Event())
@@ -905,6 +943,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=payload.get("tools"),
+                        **(payload.get("chat_template_kwargs") or {}),
                     )
                 )
             else:
@@ -915,7 +954,13 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 sampling_kwargs,
             )
             prompt_id_rows.append(prompt_ids)
-            prompts.append({"prompt_token_ids": prompt_ids})
+            prompt: dict[str, Any] = {"prompt_token_ids": prompt_ids}
+            cache_salt = payload.get("cache_salt")
+            if cache_salt is not None:
+                # Prefix-cache blocks are keyed by salt, so requests for
+                # different policy steps never share cached KV.
+                prompt["cache_salt"] = str(cache_salt)
+            prompts.append(prompt)
             sampling_params.append(sampling_params_type(**sampling_kwargs))
 
         prefill_tokens = sum(len(row) for row in prompt_id_rows)
@@ -927,7 +972,6 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 use_tqdm=False,
                 lora_request=lora_request,
             )
-        self._mark_lora_loaded()
         results: list[dict[str, Any]] = []
         completion_tokens = 0
         for payload, prompt_ids, request_output in zip(
@@ -945,11 +989,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 completion_ids,
                 getattr(output, "logprobs", None),
             )
-            finish_reason = (
-                "length"
-                if getattr(output, "finish_reason", None) == "length"
-                else "stop"
-            )
+            finish_reason = getattr(output, "finish_reason", None) or "stop"
             results.append(
                 {
                     "id": f"wavelet-{self.policy_step or 0}",
@@ -1038,6 +1078,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                     tokenize=True,
                     add_generation_prompt=payload.get("add_generation_prompt", True),
                     tools=payload.get("tools"),
+                    **(payload.get("chat_template_kwargs") or {}),
                 )
             )
         seconds = perf_counter() - started_at
@@ -1104,6 +1145,23 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
 
         adapter_id = self.config.policy_transfer.adapter_id
         adapter_name = self.config.policy_transfer.adapter_name
+        # The worker LoRA cache is keyed by adapter id, so a new snapshot under
+        # the same id is only picked up when the load is forced in place.
+        reload_request = LoRARequest(
+            adapter_name,
+            adapter_id,
+            str(adapter_dir),
+            load_inplace=True,
+        )
+        with self._generate_lock:
+            self.llm.llm_engine.add_lora(reload_request)
+            # The adapter id is stable across snapshots, so prefix-cache blocks
+            # computed with the previous weights would otherwise be reused.
+            reset_prefix_cache = getattr(
+                self.llm.llm_engine, "reset_prefix_cache", None
+            )
+            if callable(reset_prefix_cache):
+                reset_prefix_cache()
         self._lora_request = LoRARequest(
             adapter_name,
             adapter_id,
@@ -1111,72 +1169,18 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             load_inplace=False,
         )
 
-    def _attach_generation_or_prompt_logprobs(
-        self,
-        records: list[RLExample],
-        *,
-        generation_token_ids: list[list[int]],
-        generation_logprobs: list[object],
-    ) -> list[RLExample]:
-        if not self.config.inference.vllm.use_generation_logprobs:
-            return self._attach_prompt_logprobs(records)
-
-        effective_temperature = max(
-            self.config.inference.sampling.temperature,
-            1e-6,
-        )
-        annotated: list[RLExample | None] = [None] * len(records)
-        fallback_records: list[RLExample] = []
-        fallback_indexes: list[int] = []
-        for index, record in enumerate(records):
-            sample = self._build_record_sample(record)
-            trainable_ids = [
-                int(token_id)
-                for token_id, trainable in zip(
-                    sample["target_ids"],
-                    sample["loss_mask"],
-                    strict=True,
-                )
-                if trainable
-            ]
-            token_ids = generation_token_ids[index]
-            logprobs = generation_logprobs[index]
-            if (
-                logprobs is not None
-                and len(token_ids) >= len(trainable_ids)
-                and token_ids[: len(trainable_ids)] == trainable_ids
-            ):
-                try:
-                    inference_logprobs = extract_vllm_generation_logprobs(
-                        logprobs,
-                        trainable_ids,
-                    )
-                except (TypeError, ValueError):
-                    pass
-                else:
-                    annotated[index] = replace(
-                        record,
-                        inference_logprobs=inference_logprobs,
-                        temperatures=[effective_temperature] * len(inference_logprobs),
-                    )
-                    continue
-            fallback_indexes.append(index)
-            fallback_records.append(record)
-
-        if fallback_records:
-            fallback_annotated = self._attach_prompt_logprobs(fallback_records)
-            for index, record in zip(
-                fallback_indexes,
-                fallback_annotated,
-                strict=True,
-            ):
-                annotated[index] = record
-
-        return [record for record in annotated if record is not None]
-
     def _attach_prompt_logprobs(self, records: list[RLExample]) -> list[RLExample]:
         if self.llm is None or self.tokenizer is None:
             raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        # vLLM prompt logprobs are always computed on unscaled logits, so they
+        # can only be labeled truthfully when sampling ran at temperature 1.
+        temperature = self.config.inference.sampling.temperature
+        if temperature != 1.0:
+            raise ValueError(
+                "vLLM prompt logprobs are computed at temperature 1.0 but "
+                f"inference.sampling.temperature={temperature}. Enable "
+                "inference.vllm.use_generation_logprobs or sample at 1.0."
+            )
         if not records:
             return records
 
@@ -1196,12 +1200,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 use_tqdm=False,
                 lora_request=lora_request,
             )
-        self._mark_lora_loaded()
 
-        effective_temperature = max(
-            self.config.inference.sampling.temperature,
-            1e-6,
-        )
         annotated: list[RLExample] = []
         for record, sample, output in zip(
             records,
@@ -1218,7 +1217,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 replace(
                     record,
                     inference_logprobs=inference_logprobs,
-                    temperatures=[effective_temperature] * len(inference_logprobs),
+                    temperatures=[temperature] * len(inference_logprobs),
                 )
             )
         return annotated
@@ -1245,21 +1244,4 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             temperature=0.0,
             max_tokens=1,
             prompt_logprobs=1,
-        )
-
-    def _mark_lora_loaded(self) -> None:
-        if self._lora_request is None:
-            return
-        if not getattr(self._lora_request, "load_inplace", False):
-            return
-        try:
-            from vllm.lora.request import LoRARequest
-        except ImportError as exc:
-            raise ImportError("vLLM LoRARequest import failed.") from exc
-
-        self._lora_request = LoRARequest(
-            self._lora_request.lora_name,
-            self._lora_request.lora_int_id,
-            str(self._lora_request.lora_path),
-            load_inplace=False,
         )

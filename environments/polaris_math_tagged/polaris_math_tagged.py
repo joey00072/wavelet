@@ -164,14 +164,19 @@ def build_resilient_math_rubric(
                 return
 
             unregister_executor(self.executor_name)
-            processes = list(
-                (getattr(failed_executor, "_processes", None) or {}).values()
-            )
-            for process in processes:
-                process.kill()
-            for process in processes:
-                process.join(timeout=5)
-            failed_executor.shutdown(wait=False, cancel_futures=True)
+            broken = bool(getattr(failed_executor, "_broken", False))
+            if broken:
+                # Nothing in a broken pool can complete; reap the workers.
+                processes = list(
+                    (getattr(failed_executor, "_processes", None) or {}).values()
+                )
+                for process in processes:
+                    process.kill()
+                for process in processes:
+                    process.join(timeout=5)
+            # Let queued verifications on the old pool finish instead of
+            # cancelling them, which would score every in-flight rollout 0.0.
+            failed_executor.shutdown(wait=False, cancel_futures=broken)
 
             self.executor = ProcessPoolExecutor(max_workers=1)
             register_executor(
@@ -183,7 +188,8 @@ def build_resilient_math_rubric(
                 ),
             )
             self.logger.warning(
-                "Replaced math verification process pool after a hard timeout."
+                "Replaced math verification process pool after %s.",
+                "a broken worker" if broken else "a hard timeout",
             )
 
         async def correct_answer(self, *args: Any, **kwargs: Any) -> float:
@@ -191,7 +197,12 @@ def build_resilient_math_rubric(
             started_at = perf_counter()
             reward = await super().correct_answer(*args, **kwargs)
             elapsed = perf_counter() - started_at
-            if elapsed >= self.HARD_TIMEOUT_SECONDS * 0.9:
+            # MathRubric swallows its asyncio.wait_for timeout and returns 0.0,
+            # so the hard timeout can only be observed through elapsed time.
+            # Slow-but-completed calls (queue wait under load) must not
+            # discard a healthy pool.
+            timed_out = elapsed >= self.HARD_TIMEOUT_SECONDS
+            if timed_out or getattr(executor, "_broken", False):
                 self._replace_executor(executor)
             return reward
 

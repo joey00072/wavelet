@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine, _OpenAIBatchRequest
@@ -89,18 +89,16 @@ def test_vllm_policy_load_reuses_stable_lora_request(monkeypatch) -> None:
         lora={"rank": 4, "target_modules": ["q_proj"]},
     )
     engine = VLLMPolicyInferenceEngine(config)
-    engine.llm = object()
+    engine.llm = SimpleNamespace(
+        llm_engine=SimpleNamespace(add_lora=lambda _request: True),
+    )
 
     engine._load_adapter_policy(Path("snapshot/adapter"), step=7)
 
     assert engine._lora_request.lora_name == "policy"
     assert engine._lora_request.lora_int_id == 10
     assert engine._lora_request.lora_path == "snapshot/adapter"
-
-    engine._mark_lora_loaded()
-
-    assert engine._lora_request.lora_name == "policy"
-    assert engine._lora_request.lora_int_id == 10
+    assert engine._lora_request.load_inplace is False
 
 
 def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:

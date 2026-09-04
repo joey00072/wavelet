@@ -3,7 +3,15 @@ from __future__ import annotations
 import pytest
 
 from wavelet.configs.rl_config import RLDataConfig
-from wavelet.data.rl_dataset import PackedRLDataset, RLExample, prepare_rl_sample
+from wavelet.data.rl import (
+    PackedRLDataset,
+    RLExample,
+    _coerce_advantages,
+    _coerce_optional_sequence,
+    prepare_rl_sample,
+    setup_rl_dataloader,
+)
+from wavelet.trainer.debug import build_debug_tokenizer
 
 
 def _record(index: int, *, length: int = 6) -> RLExample:
@@ -222,3 +230,105 @@ def test_rl_samples_reject_invalid_numeric_streams(
             data_config=RLDataConfig(seq_len=8),
             seq_len=8,
         )
+
+
+def test_packed_rl_dataset_pads_bins_to_whole_micro_batches() -> None:
+    config = RLDataConfig(pack_sequences=True, seq_len=8, micro_batch_size=2)
+    dataset = PackedRLDataset(
+        records=[_record(index) for index in range(5)],
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config,
+    )
+    micro_batches = 3
+
+    assert dataset.micro_batch_count() == micro_batches * config.micro_batch_size
+    bins = dataset._bins_for_epoch(0)
+    pad_bins = [sample for sample in bins if sum(sample["loss_mask"]) == 0]
+    assert len(pad_bins) == 1
+    assert pad_bins[0]["sample_count"] == 0
+
+    loader = setup_rl_dataloader(dataset, config, pad_token_id=0)
+    epoch_batches = []
+    for index, batch in enumerate(loader):
+        if index == micro_batches:
+            break
+        epoch_batches.append(batch)
+
+    trained_rows = [
+        tuple(row[mask].tolist())
+        for batch in epoch_batches
+        for row, mask in zip(batch["input_ids"], batch["loss_mask"].bool())
+        if mask.any()
+    ]
+    assert len(trained_rows) == 5
+    assert len(set(trained_rows)) == 5
+    trained_tokens = sum(int(batch["loss_mask"].sum()) for batch in epoch_batches)
+    assert trained_tokens == 30
+    assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(30.0)
+    assert dataset.epoch == 1
+
+
+def test_token_streams_longer_than_trainable_tokens_are_rejected() -> None:
+    with pytest.raises(ValueError, match="inference_logprobs is longer.*4 > 3"):
+        _coerce_optional_sequence(
+            [-1.0] * 4,
+            num_trainable_tokens=3,
+            field_name="inference_logprobs",
+        )
+    with pytest.raises(ValueError, match="advantage is longer.*4 > 3"):
+        _coerce_advantages(
+            [1.0] * 4,
+            fallback_reward=None,
+            num_trainable_tokens=3,
+        )
+
+    assert _coerce_optional_sequence(
+        [-1.0, -2.0, -3.0, -4.0],
+        num_trainable_tokens=3,
+        field_name="inference_logprobs",
+        truncated=True,
+    ) == [-1.0, -2.0, -3.0]
+
+
+def test_retokenized_logprobs_must_match_trainable_tokens_exactly() -> None:
+    tokenizer = build_debug_tokenizer(model_max_length=256)
+    record = RLExample(
+        prompt=[{"role": "user", "content": "hi"}],
+        completion=[{"role": "assistant", "content": "ok"}],
+        advantage=1.0,
+        reward=1.0,
+        inference_logprobs=[-1.0] * 3,
+    )
+    sample = prepare_rl_sample(
+        record, tokenizer, data_config=RLDataConfig(seq_len=64), seq_len=64
+    )
+    assert sample is not None
+    assert sample["inference_logprobs"] == [-1.0] * 3
+
+    record.inference_logprobs = [-1.0] * 4
+    with pytest.raises(ValueError, match="inference_logprobs is longer"):
+        prepare_rl_sample(
+            record, tokenizer, data_config=RLDataConfig(seq_len=64), seq_len=64
+        )
+
+
+def test_retokenized_seq_len_truncation_keeps_logprob_prefix() -> None:
+    tokenizer = build_debug_tokenizer(model_max_length=256)
+    record = RLExample(
+        prompt=[{"role": "user", "content": "hi"}],
+        completion=[{"role": "assistant", "content": "a" * 20}],
+        advantage=1.0,
+        reward=1.0,
+        inference_logprobs=[-float(index) for index in range(21)],
+    )
+
+    sample = prepare_rl_sample(
+        record, tokenizer, data_config=RLDataConfig(seq_len=16), seq_len=16
+    )
+
+    assert sample is not None
+    assert len(sample["input_ids"]) == 16
+    trainable = sum(sample["loss_mask"])
+    assert 0 < trainable < 21
+    assert sample["inference_logprobs"] == [-float(index) for index in range(trainable)]

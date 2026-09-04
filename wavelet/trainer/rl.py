@@ -277,6 +277,11 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def _after_resume(self) -> None:
         self._accumulated_micro_batches = 0
         self._dynamic_loss_scale_local = 0.0
+        # StatefulDataLoader applies restored dataset state only when the next
+        # iterator is created, so the dataset cursor still describes step 0 here.
+        # Use measured token counts for the first resumed optimizer step; the
+        # static estimate is recomputed from the moved cursor after that step.
+        self._optimizer_batch_loss_scale = None
 
     def _validate_resume_state(self, state: TrainerState) -> None:
         if state.step < 0 or state.micro_step < state.step:

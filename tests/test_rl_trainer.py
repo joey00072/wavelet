@@ -7,7 +7,12 @@ import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import ModelConfig
-from wavelet.data.rl_dataset import RLDataset, RLExample
+from wavelet.data.rl_dataset import (
+    PackedRLDataset,
+    RLDataset,
+    RLExample,
+    setup_rl_dataloader,
+)
 from wavelet.distributed.world import World
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.ckpt import TrainerState
@@ -525,3 +530,95 @@ def test_qlora_ddp_does_not_move_quantized_model(monkeypatch) -> None:
     assert wrapped is model
     assert calls["model"] is model
     assert calls["kwargs"] == {"device_ids": [1], "output_device": 1}
+
+
+def _rl_example(trainable_tokens: int) -> RLExample:
+    return RLExample(
+        prompt=[],
+        completion=[],
+        advantage=1.0,
+        reward=1.0,
+        input_ids=list(range(trainable_tokens)),
+        target_ids=list(range(1, trainable_tokens + 1)),
+        loss_mask=[True] * trainable_tokens,
+        inference_logprobs=[-1.0] * trainable_tokens,
+        temperatures=[1.0] * trainable_tokens,
+    )
+
+
+def _cpu_world() -> World:
+    return World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+
+
+def test_after_resume_uses_measured_scale_until_dataloader_state_applies() -> None:
+    config = RLConfig(data={"batch_size": 2, "micro_batch_size": 1, "seq_len": 8})
+    records = [_rl_example(2), _rl_example(2), _rl_example(4), _rl_example(4)]
+
+    def _trainer() -> RLTrainer:
+        trainer = RLTrainer(config)
+        trainer.world = _cpu_world()
+        trainer.accumulation_steps = 2
+        trainer.dataset = RLDataset(
+            records=list(records),
+            tokenizer=None,  # type: ignore[arg-type]
+            seq_len=8,
+            data_config=config.data,
+        )
+        trainer.dataloader = setup_rl_dataloader(
+            trainer.dataset, config.data, pad_token_id=0
+        )
+        return trainer
+
+    saved = _trainer()
+    saved._optimizer_batch_loss_scale = saved._estimate_optimizer_batch_loss_scale()
+    assert saved._optimizer_batch_loss_scale == 4.0
+    iterator = iter(saved.dataloader)
+    next(iterator)
+    next(iterator)
+    state = saved.dataloader.state_dict()
+
+    resumed = _trainer()
+    resumed._optimizer_batch_loss_scale = resumed._estimate_optimizer_batch_loss_scale()
+    resumed.dataloader.load_state_dict(state)
+    # StatefulDataLoader defers dataset state until the next iterator exists,
+    # so a static estimate taken here would describe the step-0 batch (4 tokens)
+    # even though the next optimizer batch holds 8.
+    assert resumed.dataset.step == 0
+    resumed._after_resume()
+    assert resumed._optimizer_batch_loss_scale is None
+
+    resumed_iterator = iter(resumed.dataloader)
+    first = next(resumed_iterator)
+    second = next(resumed_iterator)
+    assert int(first["loss_mask"].sum()) + int(second["loss_mask"].sum()) == 8
+    # After the first resumed optimizer step the cursor has moved and the static
+    # estimate describes the following batch again.
+    assert resumed._estimate_optimizer_batch_loss_scale() == 4.0
+
+
+def test_packed_micro_batch_count_covers_whole_epoch_without_spillover() -> None:
+    config = RLConfig(
+        data={
+            "batch_size": 2,
+            "micro_batch_size": 2,
+            "seq_len": 8,
+            "pack_sequences": True,
+        }
+    )
+    trainer = RLTrainer(config)
+    trainer.world = _cpu_world()
+    trainer.dataset = PackedRLDataset(
+        records=[_rl_example(6) for _ in range(5)],
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config.data,
+    )
+
+    assert trainer._packed_dataloader_batch_count() == 3
+    assert trainer.dataset.micro_batch_count() == 6

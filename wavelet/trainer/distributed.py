@@ -17,8 +17,10 @@ DEFAULT_DEVICE_TYPE = _get_available_device_type() or "cuda"
 def _mesh_device_type() -> str:
     if not dist.is_available() or not dist.is_initialized():
         return DEFAULT_DEVICE_TYPE
-    backend = dist.get_backend()
-    if backend == "nccl":
+    backend = str(dist.get_backend()).lower()
+    # Hybrid backends report "cpu:gloo,cuda:nccl"; any NCCL/CUDA component
+    # means the model and mesh live on CUDA.
+    if "nccl" in backend or "cuda" in backend:
         return "cuda"
     return "cpu"
 

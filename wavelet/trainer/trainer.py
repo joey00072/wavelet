@@ -1,13 +1,14 @@
-# ruff: noqa: F811
-
 from __future__ import annotations
 
 import contextlib
 import gc
 import logging
+import math
 import os
 import random
+import sys
 import tempfile
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,8 +34,14 @@ from wavelet.trainer.distributed import (
 )
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.types import LossOutput, TrainOutput
+from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import RunMonitor
-from wavelet.utils.pathing import resolve_resume_checkpoint
+from wavelet.utils.pathing import (
+    get_config_dir,
+    resolve_resume_checkpoint,
+    validate_output_dir,
+)
+from wavelet.utils.serialization import dump_yaml
 
 if TYPE_CHECKING:
     from wavelet.configs.rl_config import RLConfig
@@ -269,7 +276,9 @@ class BaseTrainer:
         fsdp_config = getattr(self.config, "fsdp", None)
         configured_backend = getattr(fsdp_config, "backend", "auto")
         if configured_backend == "auto":
-            return "nccl" if torch.cuda.is_available() else "gloo"
+            # torch.distributed.checkpoint.async_save requires a CPU backend in
+            # the default group, so CUDA runs use the hybrid backend by default.
+            return "cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo"
         if configured_backend == "hybrid":
             if torch.cuda.is_available():
                 return "cpu:gloo,cuda:nccl"
@@ -479,7 +488,9 @@ class BaseTrainer:
     def _model_parallel_size(self) -> int:
         if self.parallel_dims is None:
             return 1
-        return self.parallel_dims.cp * self.parallel_dims.tp * self.parallel_dims.ep
+        # EP reuses dp_shard/cp ranks for expert sharding, so it does not reduce
+        # the number of data-parallel ranks.
+        return self.parallel_dims.cp * self.parallel_dims.tp
 
     def _rank_in_pipeline_stage(self) -> int:
         if self.world is None:
@@ -557,7 +568,38 @@ class BaseTrainer:
     def _compute_total_steps(self) -> int:
         if self.config.max_steps is not None:
             return self.config.max_steps
-        return self.config.epochs * 1000
+        record_count = self._dataset_record_count()
+        if record_count is None:
+            raise ValueError(
+                "max_steps is required when the dataset cannot report its record "
+                "count; epochs alone cannot bound this run."
+            )
+        if self._dataset_is_packed():
+            raise ValueError(
+                "max_steps is required for packed datasets: packing changes the "
+                "number of optimizer steps per epoch, so epochs alone cannot bound "
+                "this run."
+            )
+        return max(
+            math.ceil(record_count * self.config.epochs / self.config.data.batch_size),
+            1,
+        )
+
+    def _dataset_record_count(self) -> int | None:
+        dataset = self.dataset
+        if dataset is None:
+            return None
+        records = getattr(dataset, "records", None)
+        if records is None:
+            records = getattr(getattr(dataset, "base", None), "records", None)
+        if records is None:
+            return None
+        return len(records)
+
+    def _dataset_is_packed(self) -> bool:
+        return bool(getattr(self.config.data, "pack_sequences", False)) or (
+            getattr(self.config.data, "pack_function", None) == "cat"
+        )
 
     def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if self.world is None:
@@ -766,7 +808,8 @@ class SFTTrainer(BaseTrainer):
         total_loss = logits.new_zeros(())
         valid = (flat_labels != -100).sum()
         if valid == 0:
-            return LossOutput(loss=total_loss)
+            # Keep the zero attached to the graph so backward() still works.
+            return LossOutput(loss=logits.sum() * 0.0)
 
         for start in range(0, B * L, chunk):
             end = min(start + chunk, B * L)
@@ -783,21 +826,6 @@ class SFTTrainer(BaseTrainer):
             loss=loss,
             metrics={"nll": loss.detach(), "tokens/train": valid.detach()},
         )
-
-
-import os
-import sys
-import time
-
-from wavelet.configs.sft import SFTConfig
-from wavelet.trainer.trainer import SFTTrainer
-from wavelet.utils.config import load_config
-from wavelet.utils.pathing import (
-    get_config_dir,
-    resolve_resume_checkpoint,
-    validate_output_dir,
-)
-from wavelet.utils.serialization import dump_yaml
 
 
 def _distributed_local_rank() -> int | None:
@@ -825,11 +853,16 @@ def main(argv: list[str] | None = None) -> int:
     local_rank = _distributed_local_rank()
     config_path = get_config_dir(config.output_dir) / "sft.yaml"
     if local_rank in {None, 0}:
+        data_paths = (
+            list(config.data.path)
+            if isinstance(config.data.path, list)
+            else [config.data.path]
+        )
         validate_output_dir(
             config.output_dir,
             resuming=resuming,
             clean=config.clean_output_dir,
-            protected_paths=(config.model.adapter_path,),
+            protected_paths=(config.model.adapter_path, *data_paths),
         )
         if resuming:
             assert config.ckpt is not None

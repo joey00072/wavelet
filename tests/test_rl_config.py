@@ -21,11 +21,21 @@ def test_sampling_max_tokens_maps_to_max_completion_tokens() -> None:
     assert config.inference.sampling.max_completion_tokens == 17
 
 
-def test_legacy_length_penalty_string_maps_to_config() -> None:
-    config = RLConfig(orchestrator={"length_penalty": "tokens"})
+def test_legacy_length_penalty_string_maps_to_algorithm() -> None:
+    config = RLConfig(
+        orchestrator={"advantage_mode": "group_reward", "length_penalty": "tokens"}
+    )
 
-    assert isinstance(config.orchestrator.length_penalty, TokensLengthPenaltyConfig)
-    assert config.orchestrator.length_penalty.completion_weight == 1.0
+    assert isinstance(config.algo, GRPOAlgorithmConfig)
+    assert isinstance(config.algo.length_penalty, TokensLengthPenaltyConfig)
+    assert config.algo.length_penalty.completion_weight == 1.0
+    assert "length_penalty" not in config.orchestrator.model_dump()
+
+
+def test_legacy_length_penalty_without_group_reward_is_rejected() -> None:
+    # Previously accepted and then silently ignored: nothing read the field.
+    with pytest.raises(ValueError, match="orchestrator.length_penalty"):
+        RLConfig(orchestrator={"length_penalty": "tokens"})
 
 
 def test_legacy_rl_aliases_map_silently() -> None:
@@ -52,13 +62,13 @@ def test_legacy_group_reward_maps_to_grpo_algorithm() -> None:
     assert config.algo.length_penalty is not None
 
 
-def test_explicit_algorithm_config_takes_precedence() -> None:
-    config = RLConfig(
-        algo={"type": "max_rl"},
-        orchestrator={"advantage_mode": "group_reward"},
-    )
-
-    assert config.algo.type == "max_rl"
+def test_explicit_algorithm_config_rejects_legacy_advantage_keys() -> None:
+    # Previously the explicit algo won and the legacy key was silently dropped.
+    with pytest.raises(ValueError, match="orchestrator.advantage_mode"):
+        RLConfig(
+            algo={"type": "max_rl"},
+            orchestrator={"advantage_mode": "group_reward"},
+        )
 
 
 def test_algorithm_normalization_does_not_mutate_input() -> None:

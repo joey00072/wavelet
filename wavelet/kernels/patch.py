@@ -15,6 +15,7 @@ closure and patch_fused_qkv calls self.o_proj(x) which hits it.
 from __future__ import annotations
 
 import logging
+from types import MethodType
 from typing import TYPE_CHECKING
 
 import torch
@@ -38,6 +39,14 @@ def _find_mlp_class(model: PreTrainedModel) -> type | None:
         ):
             return type(module)
     return None
+
+
+def _is_fusable_lora_linear(proj: object) -> bool:
+    """True for a bias-free PEFT LoRA linear the fused kernels can replace."""
+    if proj is None or not hasattr(proj, "lora_A"):
+        return False
+    base_layer = getattr(proj, "base_layer", proj)
+    return getattr(base_layer, "bias", None) is None
 
 
 def _iter_decoder_layers(model: PreTrainedModel):
@@ -71,9 +80,25 @@ def patch_fused_mlp(model: PreTrainedModel) -> bool:
         logger.warning("patch_fused_mlp: no SwiGLU MLP found in model, skipping")
         return False
 
-    mlp_cls.forward = apply_lora_mlp_swiglu
-    logger.info(f"patch_fused_mlp: patched {mlp_cls.__name__}.forward → LoRA_MLP")
-    return True
+    patched = 0
+    for mlp in model.modules():
+        if not isinstance(mlp, mlp_cls):
+            continue
+        if not all(
+            _is_fusable_lora_linear(getattr(mlp, name, None))
+            for name in ("gate_proj", "up_proj", "down_proj")
+        ):
+            continue
+        mlp.forward = MethodType(apply_lora_mlp_swiglu, mlp)
+        patched += 1
+
+    if patched:
+        logger.info(
+            f"patch_fused_mlp: patched {patched} {mlp_cls.__name__} modules → LoRA_MLP"
+        )
+    else:
+        logger.warning("patch_fused_mlp: no eligible LoRA MLP modules found")
+    return patched > 0
 
 
 # ── QKV fusion (Qwen3) ────────────────────────────────────────────────────────
@@ -116,13 +141,15 @@ def patch_fused_qkv(model: PreTrainedModel) -> bool:
         **kwargs,
     ):
         if not hasattr(self, "_wavelet_qkv_patched"):
+            # The upstream signature takes cache_position through **kwargs only.
+            if cache_position is not None:
+                kwargs["cache_position"] = cache_position
             return _original_forward(
                 self,
                 hidden_states,
                 position_embeddings,
                 attention_mask,
                 past_key_values,
-                cache_position,
                 **kwargs,
             )
 
@@ -173,38 +200,31 @@ def patch_fused_qkv(model: PreTrainedModel) -> bool:
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
-    Qwen3Attention.forward = _fused_forward
-
     patched = 0
     for layer in _iter_decoder_layers(model):
         attn = getattr(layer, "self_attn", None)
         if attn is None or not isinstance(attn, Qwen3Attention):
             continue
-        q_proj = getattr(attn, "q_proj", None)
-        k_proj = getattr(attn, "k_proj", None)
-        v_proj = getattr(attn, "v_proj", None)
-        if not (q_proj and k_proj and v_proj):
-            continue
-        if not (
-            hasattr(q_proj, "lora_A")
-            and hasattr(k_proj, "lora_A")
-            and hasattr(v_proj, "lora_A")
-            and getattr(getattr(q_proj, "base_layer", q_proj), "bias", None) is None
-            and getattr(getattr(k_proj, "base_layer", k_proj), "bias", None) is None
-            and getattr(getattr(v_proj, "base_layer", v_proj), "bias", None) is None
+        if not all(
+            _is_fusable_lora_linear(getattr(attn, name, None))
+            for name in ("q_proj", "k_proj", "v_proj")
         ):
             continue
         attn.apply_qkv = apply_lora_qkv
         attn._wavelet_qkv_patched = True
         patched += 1
 
-    if patched:
-        logger.info(
-            f"patch_fused_qkv: patched {patched} Qwen3Attention layers (QKV fused)"
-        )
-    else:
+    if not patched:
         logger.warning("patch_fused_qkv: no eligible Qwen3Attention layers found")
-    return patched > 0
+        return False
+
+    # Only swap the class forward once eligible layers exist; a no-op patch
+    # would still reroute every Qwen3Attention instance in the process.
+    if not getattr(Qwen3Attention, "_wavelet_qkv_class_patched", False):
+        Qwen3Attention.forward = _fused_forward
+        Qwen3Attention._wavelet_qkv_class_patched = True
+    logger.info(f"patch_fused_qkv: patched {patched} Qwen3Attention layers (QKV fused)")
+    return True
 
 
 # ── O-proj fusion (standalone) ────────────────────────────────────────────────
@@ -228,12 +248,7 @@ def patch_fused_o(model: PreTrainedModel) -> bool:
         if attn is None:
             continue
         o_proj = getattr(attn, "o_proj", None)
-        if o_proj is None:
-            continue
-        if not (
-            hasattr(o_proj, "lora_A")
-            and getattr(getattr(o_proj, "base_layer", o_proj), "bias", None) is None
-        ):
+        if not _is_fusable_lora_linear(o_proj):
             continue
 
         def _make_forward(proj):

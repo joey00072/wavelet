@@ -74,6 +74,7 @@ def evaluate_env(
     *,
     step: int,
     policy_step: int,
+    inference_engine: Any | None = None,
 ) -> dict[str, float]:
     return asyncio.run(
         _evaluate_env_async(
@@ -81,6 +82,7 @@ def evaluate_env(
             env_config,
             step=step,
             policy_step=policy_step,
+            inference_engine=inference_engine,
         )
     )
 
@@ -91,12 +93,14 @@ async def evaluate_env_async(
     *,
     step: int,
     policy_step: int,
+    inference_engine: Any | None = None,
 ) -> dict[str, float]:
     return await _evaluate_env_async(
         orchestrator,
         env_config,
         step=step,
         policy_step=policy_step,
+        inference_engine=inference_engine,
     )
 
 
@@ -106,7 +110,9 @@ async def _evaluate_env_async(
     *,
     step: int,
     policy_step: int,
+    inference_engine: Any | None = None,
 ) -> dict[str, float]:
+    """Evaluate the served policy; ``inference_engine`` names the routed model."""
     vf = _load_verifiers("evals")
 
     config = orchestrator.config
@@ -130,7 +136,7 @@ async def _evaluate_env_async(
         env,
         examples,
         clients=clients,
-        model=config.orchestrator.verifier_model or config.model.name,
+        model=_verifier_model(config, inference_engine),
         sampling_args=_sampling_args_with_cache_salt(
             env_config.sampling.to_sampling_args(),
             cache_salt=str(policy_step),
@@ -175,7 +181,7 @@ async def _run_eval_examples(
     example_ids: list[str] = []
     for example_index, example in enumerate(examples):
         client = clients[example_index % len(clients)]
-        for _ in range(rollouts_per_example):
+        for rollout_index in range(rollouts_per_example):
             example_ids.append(
                 str(example.get("example_id", example.get("id", example_index)))
             )
@@ -184,7 +190,9 @@ async def _run_eval_examples(
                     vf.RolloutInput(**example),
                     client=client,
                     model=model,
-                    sampling_args=sampling_args,
+                    sampling_args=_eval_rollout_sampling_args(
+                        sampling_args, rollout_index=rollout_index
+                    ),
                     max_retries=max_retries,
                     state_columns=["trajectory", "sampling_args"],
                 )
@@ -214,8 +222,25 @@ async def _run_eval_examples(
             )
             continue
         output.setdefault("example_id", example_id)
+        error = output.get("error")
+        if error is not None:
+            _raise_if_external_rate_limit(error)
+            output["error"] = _truncate_error(str(error))
+            output.pop("reward", None)
         outputs.append(output)
     return outputs
+
+
+def _eval_rollout_sampling_args(
+    sampling_args: dict[str, Any],
+    *,
+    rollout_index: int,
+) -> dict[str, Any]:
+    """Offset a fixed eval seed per rollout so avg@k/pass@k sample distinct completions."""
+    seed = sampling_args.get("seed")
+    if seed is None or rollout_index == 0:
+        return sampling_args
+    return {**sampling_args, "seed": int(seed) + rollout_index}
 
 
 def _eval_metrics(

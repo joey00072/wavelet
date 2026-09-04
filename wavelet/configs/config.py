@@ -4,34 +4,43 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class ActivationOffloadingConfig(BaseModel):
+class ConfigModel(BaseModel):
+    """Base for every config model: unknown or misspelled keys are errors."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ActivationOffloadingConfig(ConfigModel):
     pin_memory: bool = True
     use_streams: bool = True
     max_fwd_stash_size: int = Field(default=5, ge=1)
 
 
-class LoRAConfig(BaseModel):
+DEFAULT_LORA_TARGET_MODULES = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "experts",
+    "fc1_latent_proj",
+    "fc2_latent_proj",
+]
+
+
+class LoRAConfig(ConfigModel):
     rank: int = Field(default=16, ge=1)
     alpha: float = Field(default=32.0, ge=0.0)
     dropout: float = Field(default=0.0, ge=0.0, le=1.0)
     target_modules: list[str] = Field(
-        default_factory=lambda: [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-            "experts",
-            "fc1_latent_proj",
-            "fc2_latent_proj",
-        ]
+        default_factory=lambda: list(DEFAULT_LORA_TARGET_MODULES)
     )
     modules_to_save: list[str] = Field(default_factory=list)
 
 
-class ModelConfig(BaseModel):
+class ModelConfig(ConfigModel):
     name: str = "Qwen/Qwen3-0.6B"
     adapter_path: Path | None = None
     chat_template: str | None = None
@@ -50,14 +59,14 @@ class ModelConfig(BaseModel):
     smart_gc: bool = False  # sqrt-N gradient checkpointing with CPU offload
 
 
-class LossMaskConfig(BaseModel):
+class LossMaskConfig(ConfigModel):
     system: bool = False
     user: bool = False
     assistant: bool = True
     tool: bool = False
 
 
-class TrainingDataConfig(BaseModel):
+class TrainingDataConfig(ConfigModel):
     source: Literal["local", "hf", "fake"] = "local"
     path: Path | list[Path] = Path("outputs/data.jsonl")
     hf_name: str | None = None
@@ -120,13 +129,13 @@ class DataConfig(TrainingDataConfig):
         return self
 
 
-class SFTValConfig(BaseModel):
+class SFTValConfig(ConfigModel):
     interval: int = Field(default=50, ge=1)
     eval_on_start: bool = False
     data: DataConfig
 
 
-class OptimizerConfig(BaseModel):
+class OptimizerConfig(ConfigModel):
     type: Literal[
         "adamw",
         "adamw_8bit",
@@ -156,22 +165,26 @@ class OptimizerConfig(BaseModel):
             return normalized
         if not isinstance(raw_betas, (list, tuple)) or len(raw_betas) != 2:
             raise ValueError("optim.betas must be a 2-item list like [0.9, 0.999]")
-        normalized.setdefault("betas1", raw_betas[0])
-        normalized.setdefault("betas2", raw_betas[1])
+        for name, beta in (("betas1", raw_betas[0]), ("betas2", raw_betas[1])):
+            if name in normalized and normalized[name] != beta:
+                raise ValueError(
+                    f"optim.betas and optim.{name} disagree; set only one of them."
+                )
+            normalized[name] = beta
         return normalized
 
 
-class SchedulerConfig(BaseModel):
+class SchedulerConfig(ConfigModel):
     type: Literal["constant", "linear", "cosine", "sqrt"] = "constant"
     warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     warmup_steps: int | None = Field(default=None, ge=0)
-    decay_steps: int | None = Field(default=None, ge=0)
+    decay_steps: int | None = Field(default=None, ge=1)
     min_lr: float = Field(default=0.0, ge=0.0)
     min_lr_factor: float | None = Field(default=None, ge=0.0, le=1.0)
     decay_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
-class CheckpointConfig(BaseModel):
+class CheckpointConfig(ConfigModel):
     interval: int | None = Field(default=None, ge=1)
     # Counts optimizer steps, not micro-steps.
     resume_step: int | None = None
@@ -180,12 +193,12 @@ class CheckpointConfig(BaseModel):
     output_dir: Path | None = Field(default=None)
 
 
-class SingleNodeDeploymentConfig(BaseModel):
+class SingleNodeDeploymentConfig(ConfigModel):
     type: Literal["single_node"] = "single_node"
     num_gpus: int = Field(default=1, ge=1)
 
 
-class FSDPConfig(BaseModel):
+class FSDPConfig(ConfigModel):
     enabled: bool = False
     backend: Literal["auto", "gloo", "nccl", "hybrid"] = "auto"
     dp_replicate: int = Field(default=1, ge=1)
@@ -197,14 +210,14 @@ class FSDPConfig(BaseModel):
     reshard_after_forward: bool = True
 
 
-class LogConfig(BaseModel):
+class LogConfig(ConfigModel):
     level: str = "info"
     log_every: int = Field(default=1, ge=1)
     json_console: bool = False
     json_file: bool = True
 
 
-class WandbConfig(BaseModel):
+class WandbConfig(ConfigModel):
     enabled: bool = False
     project: str | None = None
     entity: str | None = None
@@ -216,7 +229,7 @@ class WandbConfig(BaseModel):
     offline_fallback: bool = True
 
 
-class SampleLogConfig(BaseModel):
+class SampleLogConfig(ConfigModel):
     enabled: bool = False
     interval: int = Field(default=10, ge=1)
     sample_ratio: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -224,7 +237,7 @@ class SampleLogConfig(BaseModel):
     keep_last: int = Field(default=256, ge=1)
 
 
-class MonitorConfig(BaseModel):
+class MonitorConfig(ConfigModel):
     enabled: bool = True
     write_events: bool = True
     write_metrics_jsonl: bool = True
@@ -237,12 +250,12 @@ class MonitorConfig(BaseModel):
     samples: SampleLogConfig = SampleLogConfig()
 
 
-class GenerateConfig(BaseModel):
+class GenerateConfig(ConfigModel):
     prompt: str = "wavelet"
     max_new_tokens: int = Field(default=24, ge=1)
 
 
-class TrainerConfig(BaseModel):
+class TrainerConfig(ConfigModel):
     model: ModelConfig = ModelConfig()
     optim: OptimizerConfig = OptimizerConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
@@ -269,6 +282,22 @@ class TrainerConfig(BaseModel):
         return self.output_dir
 
     @model_validator(mode="after")
+    def validate_fused_lora_kernels(self):
+        fused = [
+            name
+            for name in ("fused_lora_mlp", "fused_lora_qkv", "fused_lora_o")
+            if getattr(self.model, name)
+        ]
+        if not fused or self.lora is None:
+            return self
+        if self.lora.dropout > 0.0:
+            raise ValueError(
+                f"model.{fused[0]} does not apply lora.dropout; set lora.dropout=0 "
+                "or disable the fused LoRA kernels."
+            )
+        return self
+
+    @model_validator(mode="after")
     def validate_checkpoint_config(self):
         if self.ckpt is None:
             return self
@@ -276,6 +305,24 @@ class TrainerConfig(BaseModel):
             raise ValueError("ckpt.resume_step must be >= -1")
         if self.ckpt.mode != "disabled" and self.ckpt.interval is None:
             raise ValueError("ckpt.interval is required when checkpointing is enabled")
+        if self.ckpt.mode == "disabled":
+            # Compare values, not model_fields_set: role configs are re-loaded
+            # from a full dump where every field counts as explicitly set.
+            explicit = [
+                f"ckpt.{name}"
+                for name, value in (
+                    ("interval", self.ckpt.interval),
+                    ("output_dir", self.ckpt.output_dir),
+                )
+                if value is not None
+            ]
+            if explicit:
+                fields = ", ".join(explicit)
+                raise ValueError(
+                    f"{fields} set while ckpt.mode='disabled' would never write "
+                    "checkpoints; set ckpt.mode to 'async' or "
+                    "'async_with_pinned_mem', or remove these settings."
+                )
         return self
 
 
@@ -332,8 +379,15 @@ def _normalize_legacy_sampling_fields(value: object) -> object:
     if not isinstance(value, dict):
         return value
     normalized = dict(value)
-    if "max_tokens" in normalized and "max_completion_tokens" not in normalized:
-        normalized["max_completion_tokens"] = normalized.pop("max_tokens")
+    if "max_tokens" in normalized:
+        legacy = normalized.pop("max_tokens")
+        current = normalized.get("max_completion_tokens", legacy)
+        if current != legacy:
+            raise ValueError(
+                "sampling.max_tokens and sampling.max_completion_tokens disagree; "
+                "set only max_completion_tokens."
+            )
+        normalized["max_completion_tokens"] = legacy
     return normalized
 
 
@@ -348,23 +402,45 @@ class RLDataConfig(TrainingDataConfig):
     temperature_column: str = "temperature"
     metadata_column: str = "metadata"
 
+    @model_validator(mode="after")
+    def validate_pad_to_multiple_of(self) -> "RLDataConfig":
+        if self.seq_len % self.pad_to_multiple_of != 0:
+            raise ValueError(
+                "RL data.pad_to_multiple_of must divide data.seq_len; otherwise "
+                "padded packed rows exceed the configured sequence length."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_num_workers(self) -> "RLDataConfig":
+        if self.num_workers > 1:
+            raise ValueError(
+                "RL data.num_workers must be 0 or 1: rollout rows are pretokenized, "
+                "and multiple dataloader workers split rows and packed bins "
+                "differently from the per-rank micro-batch count the trainer "
+                "expects."
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_columns(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
-        if (
-            "reference_logprobs_column" in normalized
-            and "inference_logprobs_column" not in normalized
-        ):
-            normalized["inference_logprobs_column"] = normalized.pop(
-                "reference_logprobs_column"
-            )
+        if "reference_logprobs_column" in normalized:
+            legacy = normalized.pop("reference_logprobs_column")
+            current = normalized.get("inference_logprobs_column", legacy)
+            if current != legacy:
+                raise ValueError(
+                    "data.reference_logprobs_column and data.inference_logprobs_column "
+                    "disagree; set only inference_logprobs_column."
+                )
+            normalized["inference_logprobs_column"] = legacy
         return normalized
 
 
-class RLLossConfig(BaseModel):
+class RLLossConfig(ConfigModel):
     type: Literal["dppo"] = "dppo"
     dppo_mask_high: float = Field(default=0.20, ge=0.0)
     dppo_mask_low: float = Field(default=0.20, ge=0.0)
@@ -384,7 +460,7 @@ class RLLossConfig(BaseModel):
         return normalized
 
 
-class RLTransportConfig(BaseModel):
+class RLTransportConfig(ConfigModel):
     type: Literal["filesystem"] = "filesystem"
     rollout_filename: str = "rollouts.jsonl"
     queue_dir: Path | None = None
@@ -394,7 +470,7 @@ class RLTransportConfig(BaseModel):
     keep_last_consumed: int = Field(default=2, ge=1)
 
 
-class RLPolicyTransferConfig(BaseModel):
+class RLPolicyTransferConfig(ConfigModel):
     type: Literal["filesystem", "nccl"] = "filesystem"
     policy_dir: Path | None = None
     adapter_name: str = "policy"
@@ -415,7 +491,7 @@ class RLPolicyTransferConfig(BaseModel):
     nccl_rank_offset: int = Field(default=1, ge=1)
 
 
-class RLSamplingConfig(BaseModel):
+class RLSamplingConfig(ConfigModel):
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=-1, ge=-1)
@@ -435,7 +511,7 @@ class RLSamplingConfig(BaseModel):
         return _normalize_legacy_sampling_fields(value)
 
 
-class RLEvalSamplingConfig(BaseModel):
+class RLEvalSamplingConfig(ConfigModel):
     temperature: float | None = Field(default=None, ge=0.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=-1)
@@ -476,7 +552,7 @@ class RLEvalSamplingConfig(BaseModel):
         return args
 
 
-class RLEvalEnvConfig(BaseModel):
+class RLEvalEnvConfig(ConfigModel):
     id: str
     name: str | None = None
     args: dict[str, Any] = Field(default_factory=dict)
@@ -491,7 +567,7 @@ class RLEvalEnvConfig(BaseModel):
         return self.name or self.id.split("@", 1)[0]
 
 
-class RLEvalConfig(BaseModel):
+class RLEvalConfig(ConfigModel):
     env: list[RLEvalEnvConfig] = Field(default_factory=list)
     sampling: RLEvalSamplingConfig = RLEvalSamplingConfig()
     num_examples: int = -1
@@ -527,7 +603,7 @@ class RLEvalConfig(BaseModel):
         return self
 
 
-class RLVLLMConfig(BaseModel):
+class RLVLLMConfig(ConfigModel):
     server_backend: Literal["offline", "openai"] = "openai"
     gpu_memory_utilization: float = Field(default=0.35, gt=0.0, le=1.0)
     max_model_len: int | None = Field(default=None, ge=8)
@@ -551,15 +627,30 @@ class RLVLLMConfig(BaseModel):
     openai_batch_max_size: int | None = Field(default=None, ge=1)
 
 
-class RLVLLMHTTPConfig(BaseModel):
+class RLVLLMHTTPConfig(ConfigModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
     ports: list[int] | None = None
     request_timeout_seconds: float = Field(default=300.0, gt=0.0)
     startup_timeout_seconds: float = Field(default=300.0, gt=0.0)
 
+    @model_validator(mode="after")
+    def validate_unique_ports(self) -> "RLVLLMHTTPConfig":
+        if self.ports is None:
+            return self
+        if not self.ports:
+            raise ValueError("inference.http.ports must list at least one port.")
+        for port in self.ports:
+            if not 1 <= port <= 65535:
+                raise ValueError(f"inference.http.ports entry {port} is out of range.")
+        if len(set(self.ports)) != len(self.ports):
+            raise ValueError(
+                "inference.http.ports must be unique; replicas cannot share a port."
+            )
+        return self
 
-class RLInferenceConfig(BaseModel):
+
+class RLInferenceConfig(ConfigModel):
     enabled: bool = True
     mode: Literal["passthrough", "vllm_http"] = "vllm_http"
     default_temperature: float = Field(default=1.0, gt=0.0)
@@ -568,7 +659,7 @@ class RLInferenceConfig(BaseModel):
     http: RLVLLMHTTPConfig = RLVLLMHTTPConfig()
 
 
-class RLRewardConfig(BaseModel):
+class RLRewardConfig(ConfigModel):
     mode: Literal[
         "passthrough",
         "reference_match",
@@ -610,7 +701,7 @@ class RLRewardConfig(BaseModel):
         return self
 
 
-class RLStateServerConfig(BaseModel):
+class RLStateServerConfig(ConfigModel):
     enabled: bool = False
     host: str = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65535)
@@ -621,8 +712,8 @@ class RLStateServerConfig(BaseModel):
     max_events: int = Field(default=2000, ge=100)
 
 
-class _StrictConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class _StrictConfig(ConfigModel):
+    pass
 
 
 class TokensLengthPenaltyConfig(_StrictConfig):
@@ -690,7 +781,7 @@ RLAlgorithmConfig = Annotated[
 ]
 
 
-class RLOrchestratorConfig(BaseModel):
+class RLOrchestratorConfig(ConfigModel):
     enabled: bool = True
     custom_rollout_function: str | None = None
     verifier_env_id: str | None = None
@@ -707,9 +798,6 @@ class RLOrchestratorConfig(BaseModel):
     verifier_max_total_completion_tokens: int = -1
     materialize_path: Path | None = None
     overwrite: bool = True
-    advantage_mode: Literal["passthrough", "reward", "group_reward"] = "passthrough"
-    normalize_group_advantages: bool = False
-    advantage_epsilon: float = Field(default=1e-6, gt=0.0)
     examples_per_step: int | None = Field(default=None, ge=1)
     rollouts_per_example: int | None = Field(default=None, ge=1)
     oversampling_factor: float = Field(default=1.0, ge=1.0)
@@ -720,20 +808,7 @@ class RLOrchestratorConfig(BaseModel):
     max_async_level: int = Field(default=0, ge=0)
     max_off_policy_steps: int = Field(default=0, ge=0)
     max_pending_rollout_chunks: int | None = Field(default=None, ge=1)
-    length_penalty: LengthPenaltyConfig | None = None
     state_server: RLStateServerConfig = RLStateServerConfig()
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_legacy_orchestrator_fields(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            return value
-        normalized = dict(value)
-        if "length_penalty" in normalized:
-            normalized["length_penalty"] = _normalize_length_penalty(
-                normalized["length_penalty"]
-            )
-        return normalized
 
     @model_validator(mode="after")
     def validate_max_inflight_rollouts(self) -> "RLOrchestratorConfig":
@@ -747,7 +822,7 @@ class RLOrchestratorConfig(BaseModel):
         return self
 
 
-class RLLauncherConfig(BaseModel):
+class RLLauncherConfig(ConfigModel):
     mode: Literal["integrated", "process", "colocate", "colocate_sleep"] = "integrated"
     backend: Literal["local", "ray"] = "local"
     trainer_cuda_visible_devices: str | list[str] | None = None
@@ -762,10 +837,41 @@ class RLLauncherConfig(BaseModel):
     colocate_memory_wait_margin: float = Field(default=0.05, ge=0.0, le=0.5)
 
 
+_LEGACY_ADVANTAGE_KEYS = (
+    "advantage_mode",
+    "normalize_group_advantages",
+    "advantage_epsilon",
+    "length_penalty",
+)
+
+
 def _normalize_algorithm_config(value: dict[str, Any]) -> dict[str, Any]:
-    """Infer file-backed algorithms and translate legacy advantage settings."""
+    """Infer file-backed algorithms and translate legacy advantage settings.
+
+    Legacy ``orchestrator.advantage_mode`` settings are moved into ``algo`` so
+    the resolved config carries them in exactly one place. Combining them with
+    an explicit ``algo`` block, or passing GRPO-only settings without
+    ``advantage_mode: group_reward``, is rejected instead of silently ignored.
+    """
     normalized = dict(value)
+    orchestrator = normalized.get("orchestrator")
+    legacy: dict[str, Any] = {}
+    if isinstance(orchestrator, dict):
+        orchestrator = dict(orchestrator)
+        legacy = {
+            key: orchestrator.pop(key)
+            for key in _LEGACY_ADVANTAGE_KEYS
+            if key in orchestrator
+        }
+        normalized["orchestrator"] = orchestrator
+    legacy_fields = ", ".join(f"orchestrator.{key}" for key in legacy)
+
     if "algo" in normalized:
+        if legacy:
+            raise ValueError(
+                f"{legacy_fields} cannot be combined with an explicit algo block; "
+                "move the advantage settings into algo."
+            )
         algo = normalized["algo"]
         if (
             isinstance(algo, dict)
@@ -775,21 +881,27 @@ def _normalize_algorithm_config(value: dict[str, Any]) -> dict[str, Any]:
             normalized["algo"] = {"type": "custom", **algo}
         return normalized
 
-    orchestrator = normalized.get("orchestrator")
-    if not isinstance(orchestrator, dict):
+    if not legacy:
         return normalized
-    mode = orchestrator.get("advantage_mode")
-    if mode is None:
-        return normalized
+    mode = legacy.get("advantage_mode")
+    grpo_fields = ", ".join(
+        f"orchestrator.{key}" for key in legacy if key != "advantage_mode"
+    )
+    if mode != "group_reward" and grpo_fields:
+        raise ValueError(
+            f"{grpo_fields} only apply with orchestrator.advantage_mode="
+            "'group_reward'; use algo.type='grpo' with normalize_advantages, "
+            "epsilon, and length_penalty instead."
+        )
     if mode != "group_reward":
         normalized["algo"] = {"type": mode}
         return normalized
 
     normalized["algo"] = {
         "type": "grpo",
-        "normalize_advantages": orchestrator.get("normalize_group_advantages", False),
-        "epsilon": orchestrator.get("advantage_epsilon", 1e-6),
-        "length_penalty": _normalize_length_penalty(orchestrator.get("length_penalty")),
+        "normalize_advantages": legacy.get("normalize_group_advantages", False),
+        "epsilon": legacy.get("advantage_epsilon", 1e-6),
+        "length_penalty": _normalize_length_penalty(legacy.get("length_penalty")),
     }
     return normalized
 
@@ -814,20 +926,6 @@ class RLConfig(TrainerConfig):
         if not isinstance(value, dict):
             return value
         return _normalize_algorithm_config(value)
-
-    @model_validator(mode="after")
-    def validate_rollout_modes(self) -> "RLConfig":
-        if (
-            self.inference.mode == "vllm_http"
-            and "mode" in self.inference.model_fields_set
-            and self.reward.mode == "passthrough"
-            and self.orchestrator.custom_rollout_function is None
-        ):
-            raise ValueError(
-                "reward.mode must score generated completions when inference.mode "
-                "generates rollouts."
-            )
-        return self
 
     @model_validator(mode="after")
     def validate_train_sampling_replay(self) -> "RLConfig":
@@ -923,6 +1021,33 @@ class RLConfig(TrainerConfig):
             "so behavior log-probabilities can be replayed by the trainer. Use "
             "do_sample=true and temperature>0, or set max_steps=0 for evaluation."
         )
+
+    @model_validator(mode="after")
+    def validate_export_interval_within_freshness_window(self) -> "RLConfig":
+        # Integrated runs pick the newest export at or below the trainer step in
+        # process, so only the process-style schedulers can wait on an export.
+        if (
+            not self.orchestrator.enabled
+            or not self.inference.enabled
+            or self.launcher.mode == "integrated"
+            or self.max_steps == 0
+        ):
+            return self
+        async_lag = max(self.orchestrator.max_async_level - 1, 0)
+        allowed_lag = min(async_lag, self.orchestrator.max_off_policy_steps)
+        interval = self.policy_transfer.export_every_steps
+        if interval > allowed_lag + 1:
+            raise ValueError(
+                f"policy_transfer.export_every_steps={interval} leaves rollout "
+                f"steps without an admissible policy: with max_async_level="
+                f"{self.orchestrator.max_async_level} and max_off_policy_steps="
+                f"{self.orchestrator.max_off_policy_steps} each rollout step may "
+                f"use policies from the last {allowed_lag + 1} step(s), so the "
+                "orchestrator would wait for an export the trainer cannot produce "
+                "until it receives those rollouts. Set export_every_steps to at "
+                f"most {allowed_lag + 1} or widen the off-policy window."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_initial_policy_for_process_training(self) -> "RLConfig":

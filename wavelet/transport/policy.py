@@ -164,6 +164,15 @@ def update_info_for_model(model: nn.Module, *, packed: bool = False) -> dict[str
     return update_info_for_named_tensors(model.state_dict().items(), packed=packed)
 
 
+def nccl_world_size(inference_world_size: int) -> int:
+    """Return the NCCL group size: every inference rank plus the one trainer rank.
+
+    Replicas receive different rank offsets, so the group size must be derived
+    from the total inference rank count rather than from a replica's offset.
+    """
+    return inference_world_size + 1
+
+
 @dataclass(slots=True)
 class NCCLWeightBroadcaster:
     host: str
@@ -289,7 +298,7 @@ class NCCLWeightUpdateWorker(Worker):
         if local_rank is None:
             local_rank = torch.cuda.current_device()
         rank = rank_offset + int(local_rank)
-        world_size = rank_offset + inference_world_size
+        world_size = nccl_world_size(inference_world_size)
 
         process_group = process_group_type.create(
             host=host,
@@ -373,16 +382,20 @@ class PolicyExportMixin:
         export_step = self.step if step is None else step
         if not force and not self.should_export_policy(export_step):
             return None
-        if self.config.policy_transfer.type == "nccl":
-            return self._export_nccl_policy(export_step)
-
         policy_dir = resolve_policy_dir(self.output_dir, self.config.policy_transfer)
-        step_dir = get_policy_step_dir(policy_dir, export_step)
         if force:
+            # A resumed run must not leave newer snapshots from the crashed run
+            # visible; inference would otherwise load a policy the trainer never
+            # produced (and, for NCCL, wait on a handshake nobody completes).
             if self.world.is_main:
                 prune_policy_snapshots_beyond(policy_dir, step=export_step)
             if self.world.world_size > 1:
                 barrier(self.world)
+        if self.config.policy_transfer.type == "nccl":
+            return self._export_nccl_policy(export_step)
+
+        step_dir = get_policy_step_dir(policy_dir, export_step)
+        if force:
             expected_kind = (
                 "adapter"
                 if self.config.lora is not None
@@ -402,6 +415,8 @@ class PolicyExportMixin:
             )
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
         self._prepare_export_directory(tmp_dir, step_dir)
+        if self.world.world_size > 1:
+            barrier(self.world)
         saved_path = self._save_filesystem_policy(tmp_dir)
         if self.world.is_main:
             self._write_policy_metadata(
@@ -645,9 +660,8 @@ class PolicyExportMixin:
             host=self.config.policy_transfer.nccl_host,
             port=self.config.policy_transfer.nccl_port,
             rank=0,
-            world_size=(
+            world_size=nccl_world_size(
                 self.config.policy_transfer.nccl_inference_world_size
-                + self.config.policy_transfer.nccl_rank_offset
             ),
             device=device,
             timeout_seconds=self.config.policy_transfer.nccl_timeout_seconds,

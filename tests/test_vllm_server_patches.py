@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from http import HTTPStatus
 from logging import CRITICAL
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 from vllm.entrypoints.openai import api_server
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
+from vllm.exceptions import VLLMValidationError
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import (
     LRUCacheWorkerLoRAManager,
@@ -27,30 +29,35 @@ def test_load_lora_patch_still_addresses_upstream_request_replacement() -> None:
     assert "lora_request.lora_path = request.lora_path" not in source
 
 
+class _NoopLock:
+    async def __aenter__(self) -> None:
+        return None
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+
+def _serving_models(existing: LoRARequest, add_lora) -> SimpleNamespace:
+    return SimpleNamespace(
+        lora_resolver_lock={existing.lora_name: _NoopLock()},
+        lora_requests={existing.lora_name: existing},
+        lora_id_counter=SimpleNamespace(inc=lambda _amount: 2),
+        engine_client=SimpleNamespace(add_lora=add_lora),
+        is_base_model=lambda _name: False,
+    )
+
+
 @pytest.mark.anyio
-async def test_load_lora_patch_preserves_request_identity_on_path_update(
+async def test_load_lora_patch_reuses_adapter_id_and_publishes_fresh_request(
     monkeypatch,
 ) -> None:
-    class _Lock:
-        async def __aenter__(self) -> None:
-            return None
-
-        async def __aexit__(self, *_args) -> None:
-            return None
-
     existing = LoRARequest("policy", 1, "/old")
     added: list[LoRARequest] = []
 
     async def add_lora(request: LoRARequest) -> None:
         added.append(request)
 
-    serving = SimpleNamespace(
-        lora_resolver_lock={"policy": _Lock()},
-        lora_requests={"policy": existing},
-        lora_id_counter=SimpleNamespace(inc=lambda _amount: 2),
-        engine_client=SimpleNamespace(add_lora=add_lora),
-        is_base_model=lambda _name: False,
-    )
+    serving = _serving_models(existing, add_lora)
     monkeypatch.setattr(
         OpenAIServingModels,
         "load_lora_adapter",
@@ -68,10 +75,65 @@ async def test_load_lora_patch_preserves_request_identity_on_path_update(
     )
 
     assert result == "Success: LoRA adapter 'policy' added successfully."
-    assert added == [existing]
+    published = serving.lora_requests["policy"]
+    assert added == [published]
+    assert published is not existing
+    assert published.lora_int_id == 1
+    assert published.lora_path == "/new"
+    assert published.load_inplace is True
+    assert existing.lora_path == "/old"
+    assert existing.load_inplace is False
+
+
+@pytest.mark.anyio
+async def test_load_lora_patch_keeps_registered_request_when_engine_rejects_path(
+    monkeypatch,
+) -> None:
+    existing = LoRARequest("policy", 1, "/old")
+
+    async def add_lora(request: LoRARequest) -> None:
+        raise ValueError(f"No adapter found for {request.lora_path}")
+
+    serving = _serving_models(existing, add_lora)
+    monkeypatch.setattr(
+        OpenAIServingModels,
+        "load_lora_adapter",
+        OpenAIServingModels.load_lora_adapter,
+    )
+    server._patch_load_lora_adapter()
+
+    result = await OpenAIServingModels.load_lora_adapter(
+        serving,
+        LoadLoRAAdapterRequest(
+            lora_name="policy",
+            lora_path="/missing",
+            load_inplace=True,
+        ),
+    )
+
+    assert result.error.code == HTTPStatus.NOT_FOUND
+    assert result.error.type == "NotFoundError"
     assert serving.lora_requests["policy"] is existing
-    assert existing.lora_path == "/new"
-    assert existing.load_inplace is True
+    assert existing.lora_path == "/old"
+    assert existing.load_inplace is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "This model's maximum context length is 4096 tokens. However, your "
+            "prompt contains at least 5000 input tokens."
+        ),
+        "The decoder prompt is too long: request has 5000 input tokens.",
+    ],
+)
+def test_prompt_tokens_from_validation_error_parses_token_count(
+    message: str,
+) -> None:
+    error = VLLMValidationError(message)
+
+    assert server._prompt_tokens_from_validation_error(error) == 5000
 
 
 def test_lru_patch_still_addresses_path_changes_without_load_inplace() -> None:

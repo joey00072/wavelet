@@ -299,6 +299,7 @@ class RunMonitor:
         self.events_file = output_dir / "events.jsonl"
         self.heartbeat_file = output_dir / "heartbeat.json"
         self.run_metadata_file = output_dir / "run_metadata.json"
+        self.wandb_run_id_file = output_dir / "wandb_run_id.txt"
         self._wandb_run: Any | None = None
         self._wandb_samples_table: Any | None = None
         self._wandb_samples_columns: list[str] = []
@@ -357,7 +358,9 @@ class RunMonitor:
         if self._wandb_run is not None:
             wandb_metrics = {k: v for k, v in row.items() if k != "timestamp"}
             wandb_metrics.update(self._wandb_alias_metrics(row))
-            self._wandb_run.log(wandb_metrics, step=step)
+            # ``step`` is the declared step metric; an explicit ``step=`` would
+            # make W&B drop rows logged for an earlier step (async eval results).
+            self._wandb_run.log(wandb_metrics)
 
         self._write_heartbeat(status="running", step=step, metrics=row)
 
@@ -405,7 +408,7 @@ class RunMonitor:
             self._wandb_samples_table.add_data(
                 *[step if column == "step" else sample[column] for column in columns]
             )
-        self._wandb_run.log({"samples": self._wandb_samples_table}, step=step)
+        self._wandb_run.log({"samples": self._wandb_samples_table, "step": step})
 
     def _append_sample_history(self, rows: list[dict[str, Any]]) -> None:
         if self._sample_rows_since_compaction is None:
@@ -524,6 +527,9 @@ class RunMonitor:
             return
         import wandb
 
+        previous_run_id = (
+            self._read_wandb_run_id() if resumed_from is not None else None
+        )
         init_kwargs = {
             "project": self.wandb.project or "wavelet",
             "entity": self.wandb.entity,
@@ -532,7 +538,9 @@ class RunMonitor:
             "tags": self.wandb.tags,
             "dir": str(self.output_dir),
             "config": run_config,
-            "resume": "allow" if resumed_from is not None else None,
+            # Without the previous id, ``resume="allow"`` starts a fresh run.
+            "id": previous_run_id,
+            "resume": "allow" if previous_run_id is not None else None,
         }
         settings_factory = getattr(wandb, "Settings", None)
         if callable(settings_factory):
@@ -553,6 +561,18 @@ class RunMonitor:
             self._wandb_run = wandb.init(mode="offline", **init_kwargs)
         self._wandb_run.define_metric("step")
         self._wandb_run.define_metric("*", step_metric="step")
+        self._write_wandb_run_id(getattr(self._wandb_run, "id", None))
+
+    def _read_wandb_run_id(self) -> str | None:
+        if not self.wandb_run_id_file.exists():
+            return None
+        run_id = self.wandb_run_id_file.read_text(encoding="utf-8").strip()
+        return run_id or None
+
+    def _write_wandb_run_id(self, run_id: object) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            return
+        self.wandb_run_id_file.write_text(run_id, encoding="utf-8")
 
     @staticmethod
     def _wandb_alias_metrics(row: dict[str, Any]) -> dict[str, Any]:
@@ -945,7 +965,7 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
             )
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")
-        _WANDB_RUN.log({**metrics, "step": step}, step=step)
+        _WANDB_RUN.log({**metrics, "step": step})
     except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
 

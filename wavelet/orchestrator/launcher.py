@@ -77,6 +77,7 @@ def _run_role_subprocess(
     cuda_visible_devices: str | None,
     torchrun_nproc_per_node: int = 1,
 ) -> int:
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     with Path(log_path).open("a", encoding="utf-8") as log_file:
         command_args = _role_command(
             command,
@@ -91,7 +92,40 @@ def _run_role_subprocess(
             env=_role_env(cuda_visible_devices),
             start_new_session=True,
         )
+        return _wait_for_role_process(process)
+
+
+def _wait_for_role_process(
+    process: subprocess.Popen,
+    *,
+    timeout_seconds: float = _TERMINATE_TIMEOUT_SECONDS,
+) -> int:
+    """Wait for a role subprocess, tearing down its process group on cancel.
+
+    The child runs in its own session, so a cancelled Ray task (which surfaces
+    as ``KeyboardInterrupt`` in the worker) or ``SystemExit`` must forward the
+    shutdown explicitly; otherwise the role keeps running as an orphan.
+    """
+    try:
         return int(process.wait())
+    except (KeyboardInterrupt, SystemExit):
+        _terminate_process_group(process, timeout_seconds=timeout_seconds)
+        raise
+
+
+def _terminate_process_group(
+    process: subprocess.Popen,
+    *,
+    timeout_seconds: float = _TERMINATE_TIMEOUT_SECONDS,
+) -> None:
+    if process.poll() is not None:
+        return
+    _signal_process_group(process, signal.SIGTERM)
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _signal_process_group(process, signal.SIGKILL)
+        process.wait()
 
 
 def _start_local_role(
@@ -127,14 +161,7 @@ class LocalRoleHandle:
         return None if code is None else int(code)
 
     def terminate(self, *, timeout_seconds: float = _TERMINATE_TIMEOUT_SECONDS) -> None:
-        if self.process.poll() is not None:
-            return
-        _signal_process_group(self.process, signal.SIGTERM)
-        try:
-            self.process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _signal_process_group(self.process, signal.SIGKILL)
-            self.process.wait()
+        _terminate_process_group(self.process, timeout_seconds=timeout_seconds)
 
     def close(self) -> None:
         self.log_file.close()
@@ -153,9 +180,13 @@ class RayRoleHandle:
             return None
         return int(self.ray.get(self.ref))
 
-    def terminate(self, *, timeout_seconds: float = 10.0) -> None:
-        del timeout_seconds
-        self.ray.cancel(self.ref, force=True)
+    def terminate(self, *, timeout_seconds: float = _TERMINATE_TIMEOUT_SECONDS) -> None:
+        # A non-forced cancel interrupts the worker task so it can tear down the
+        # role's process group; force-killing the worker would orphan the child.
+        self.ray.cancel(self.ref, force=False)
+        ready, _pending = self.ray.wait([self.ref], timeout=timeout_seconds)
+        if not ready:
+            self.ray.cancel(self.ref, force=True)
 
     def close(self) -> None:
         return None

@@ -801,7 +801,10 @@ def test_http_openai_nccl_load_policy_signals_ready(tmp_path: Path) -> None:
 
 def test_launcher_derives_nccl_inference_world_size() -> None:
     config = RLConfig(
-        inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},
+        inference={
+            "mode": "vllm_http",
+            "vllm": {"server_backend": "openai", "tensor_parallel_size": 2},
+        },
         lora=None,
         reward={"mode": "reference_match"},
         policy_transfer={"type": "nccl"},

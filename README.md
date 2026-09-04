@@ -50,7 +50,10 @@ To continue training an existing LoRA, set `model.adapter_path` to its adapter
 directory. Wavelet uses tokenizer artifacts from that directory when present
 and otherwise falls back to the tokenizer named by `model.name`.
 Keep that adapter outside a new run's `output_dir` when `clean_output_dir: true`;
-preflight rejects layouts where cleanup would delete the input adapter.
+preflight rejects layouts where cleanup would delete the input adapter, and the
+launchers likewise refuse to delete the configured `data.path` inputs or an
+`output_dir` that resolves to the filesystem root, the home directory, or the
+current working directory and its parents.
 
 Run the RL example:
 
@@ -65,7 +68,9 @@ for the supported choices and their contracts.
 Current distributed scope is experimental:
 
 - root FSDP and HSDP-style DP meshes are wired into the trainer bootstrap
-- hybrid backend config is accepted
+- `fsdp.backend: auto` selects `cpu:gloo,cuda:nccl` on CUDA so async
+  checkpoints, which require a CPU backend in the default group, work out of
+  the box; the explicit `hybrid` setting remains accepted
 - QLoRA config is accepted for LoRA adapter training with replicated DDP;
   preflight rejects unsupported full-model 4-bit, FSDP, tensor-parallel, and
   `colocate_sleep` combinations
@@ -89,7 +94,10 @@ The RL stack is now split into minimal but scalable pieces:
 
 Role logs append under `<output_dir>/logs/`, so a resume attempt preserves the
 trace from the process that produced its checkpoint. Ray-backed launchers
-disconnect from Ray during teardown after their role handles are closed.
+create that log directory on the worker node and disconnect from Ray during
+teardown after their role handles are closed. A `SIGTERM` sent to `wavelet rl`
+(systemd, SLURM, `timeout`) tears down the role processes exactly like Ctrl-C
+instead of orphaning GPU workers.
 
 The transport is intentionally simple and durable: each batch is written under
 `<output_dir>/rollouts/step-000000/rollouts.jsonl` with an atomic stable marker.
@@ -123,7 +131,14 @@ scheduler restart from the resolved checkpoint optimizer step; streaming modes
 convert that step to the corresponding queue-chunk offset. Completed runs wait
 for a pending async checkpoint to become stable before process teardown. A
 restored trainer also forces one policy export at the checkpoint step, even when
-that step is between normal export intervals.
+that step is between normal export intervals, and removes newer snapshots left by
+the interrupted run for both filesystem and NCCL transports. The resumed
+orchestrator likewise discards rollout queue batches (and materialized files)
+beyond the checkpoint step, because the interrupted run generated them with
+policy versions the resumed run re-derives differently; batches for the resume
+step itself stay reusable. Async checkpoints
+finish copying the live tensors to their staging buffer before the trainer
+returns to the next optimizer step; only the upload continues in the background.
 Set `ckpt.output_dir` to place large checkpoint step directories on a separate
 volume without moving logs, rollouts, policies, or other run state out of the
 top-level `output_dir`. Resume and preflight resolve the same checkpoint volume.
@@ -245,10 +260,51 @@ and extra trajectory branches do not count as additional rollouts.
 
 Evaluation `avg@k` and `pass@k` metrics count every requested generation;
 failed or missing-reward attempts count as incorrect instead of disappearing from
-the denominator. Corresponding `eval/<env>/effective/...` metrics describe only
-successful verifier responses, and `failed_rollouts` reports the failure rate.
+the denominator. Rollouts whose verifier recorded an internal error are failed
+attempts too, even though verifiers reports them with a zero reward.
+Corresponding `eval/<env>/effective/...` metrics describe only successful
+verifier responses, and `failed_rollouts` reports the failure rate. A fixed
+`eval.sampling.seed` is offset per rollout (`seed + rollout_index`) so the k
+generations of one example stay distinct. Evaluations always query the served
+policy model name, so LoRA runs evaluate the trained adapter rather than the
+base model.
 The orchestrator writes these fixed-policy metrics to `eval_metrics.jsonl` and
-its W&B run at the matching optimizer step.
+its W&B run at the matching optimizer step. W&B rows use the logged `step`
+field as their step metric rather than an explicit monotonic step, so async
+evaluation results for an earlier optimizer step are not discarded, and a
+resumed run continues the previous W&B run through the id persisted in
+`<output_dir>/wandb_run_id.txt`.
 Standalone trainers use the same resolved step count for optimization and the
 learning-rate scheduler; in particular, RL `max_steps: 0` remains evaluation-only
-instead of falling back to an implicit training run.
+instead of falling back to an implicit training run. Without `max_steps`,
+`epochs` derives the step count from the dataset record count and the global
+`data.batch_size`; packed datasets and fake data change the rows per epoch and
+therefore require an explicit `max_steps`.
+An explicit `scheduler.decay_steps` (at least 1) is clamped so decay begins when
+warmup ends rather than being dropped, the `sqrt` schedule holds the peak until
+its final `decay_steps`, and the `cosine` floor honors `min_lr_factor` like the
+other schedules. A resumed RL trainer measures the token count of its first
+optimizer step directly, because restored dataloader state only applies once
+iteration begins, and then returns to the static per-batch estimate.
+
+Every config model rejects unknown or misspelled keys, so a typo such as
+`rollouts_per_examples` or `learning_rate` is an error rather than a silently
+ignored setting. Several further misconfigurations fail fast instead of
+degrading silently: `ckpt`
+settings such as `interval` together with the default `mode: disabled`, fused
+LoRA kernels combined with `lora.dropout > 0`, RL `data.num_workers > 1`, RL
+`data.pad_to_multiple_of` values that do not divide `data.seq_len`, duplicate
+`inference.http.ports`, legacy aliases such as `optim.betas` that disagree with
+their canonical fields, a process-mode `policy_transfer.export_every_steps`
+larger than the freshness window (`min(max_async_level - 1,
+max_off_policy_steps) + 1`, which would leave the rollout scheduler waiting for
+an export the trainer cannot produce), and
+`reward.mode: passthrough` for rollouts that vLLM generates without a custom
+rollout function, and `launcher.mode: process` device groups where the trainer
+and an inference replica, or two replicas, are pinned to the same CUDA device
+(both rejected by `wavelet rl` at launch and reported by preflight; colocate
+modes share devices by design).
+With `policy_transfer.type: nccl`, each inference replica must expose exactly
+`tensor_parallel_size * data_parallel_size` CUDA devices, because only vLLM
+workers join the weight-broadcast group; the group size is the inference rank
+count plus the trainer, independent of each replica's rank offset.

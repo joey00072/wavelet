@@ -61,6 +61,7 @@ class WaveletCheckpointFunction(torch.autograd.Function):
         ctx.preserve_rng_state = preserve_rng_state
 
         ctx.fwd_cpu_state = torch.get_rng_state()
+        ctx.autocast_states = _capture_autocast_states()
         ctx.had_cuda_in_fwd = torch.cuda._initialized
         if ctx.had_cuda_in_fwd:
             ctx.fwd_gpu_devices, ctx.fwd_gpu_states = _get_device_states(*args)
@@ -162,9 +163,41 @@ def _recompute_checkpoint_outputs(ctx, inputs: list) -> tuple[tuple, object]:
             else value
             for index, value in enumerate(inputs)
         )
-        with torch.enable_grad():
+        with torch.enable_grad(), _autocast_contexts(ctx.autocast_states):
             outputs = ctx.run_function(*detached)
     return detached, outputs
+
+
+_AUTOCAST_DEVICE_TYPES = ("cuda", "cpu")
+
+
+def _capture_autocast_states() -> dict[str, tuple[bool, torch.dtype]]:
+    return {
+        device_type: (
+            torch.is_autocast_enabled(device_type),
+            torch.get_autocast_dtype(device_type),
+        )
+        for device_type in _AUTOCAST_DEVICE_TYPES
+    }
+
+
+class _autocast_contexts:
+    """Re-enter the forward's autocast state for every device type."""
+
+    def __init__(self, states: dict[str, tuple[bool, torch.dtype]]) -> None:
+        self._contexts = [
+            torch.autocast(device_type=device_type, dtype=dtype, enabled=enabled)
+            for device_type, (enabled, dtype) in states.items()
+            if enabled
+        ]
+
+    def __enter__(self) -> None:
+        for context in self._contexts:
+            context.__enter__()
+
+    def __exit__(self, *exc_info: object) -> None:
+        for context in reversed(self._contexts):
+            context.__exit__(*exc_info)
 
 
 # ── patch / unpatch ───────────────────────────────────────────────────────────

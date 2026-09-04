@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import random
 from collections.abc import Iterator
@@ -24,6 +25,8 @@ from wavelet.data.sft import (
     load_data_payloads,
     normalize_record,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RLSample(TypedDict):
@@ -218,20 +221,28 @@ def pack_samples(
     seq_len: int,
     pad_to_multiple_of: int,
 ) -> list[RLSample]:
-    """Pack samples with first-fit decreasing bin packing."""
+    """Pack samples with first-fit decreasing bin packing.
+
+    Samples only share a bin when they carry the same optional streams;
+    merging a row without ``inference_logprobs`` into a bin would otherwise
+    drop the sampled logprobs of every other row in that bin.
+    """
     sorted_samples = sorted(samples, key=lambda sample: -len(sample["input_ids"]))
     bins: list[list[RLSample]] = []
     bin_lengths: list[int] = []
+    bin_streams: list[tuple[bool, bool]] = []
     for sample in sorted_samples:
         sample_len = len(sample["input_ids"])
+        streams = ("inference_logprobs" in sample, "teacher_logprobs" in sample)
         for index, current_len in enumerate(bin_lengths):
-            if current_len + sample_len <= seq_len:
+            if bin_streams[index] == streams and current_len + sample_len <= seq_len:
                 bins[index].append(sample)
                 bin_lengths[index] += sample_len
                 break
         else:
             bins.append([sample])
             bin_lengths.append(sample_len)
+            bin_streams.append(streams)
     return [
         _merge_samples(items, pad_to_multiple_of=pad_to_multiple_of) for items in bins
     ]
@@ -241,11 +252,18 @@ def pad_bins_for_distribution(
     bins: list[RLSample],
     *,
     data_world_size: int,
+    micro_batch_size: int = 1,
 ) -> list[RLSample]:
-    """Add zero-loss bins so every data rank receives the same bin count."""
-    if data_world_size <= 1 or not bins:
+    """Add zero-loss bins so every data rank receives the same bin count.
+
+    Bins are padded to a multiple of ``data_world_size * micro_batch_size`` so
+    each rank's epoch also splits into whole micro-batches; otherwise the final
+    micro-batch would be filled with bins from the next epoch.
+    """
+    multiple = max(data_world_size, 1) * max(micro_batch_size, 1)
+    if multiple <= 1 or not bins:
         return bins
-    pad_count = (-len(bins)) % data_world_size
+    pad_count = (-len(bins)) % multiple
     if pad_count == 0:
         return bins
     return [*bins, *(_zero_loss_copy(bins[0]) for _ in range(pad_count))]
@@ -547,12 +565,46 @@ def count_nonempty_jsonl_rows(
     return rows
 
 
+def _check_trainable_stream_length(
+    value: list[float],
+    *,
+    num_trainable_tokens: int,
+    field_name: str,
+    truncated: bool,
+) -> None:
+    """Require token-level streams to align with the trainable tokens.
+
+    A longer stream is only acceptable when the sample was cut at ``seq_len``;
+    otherwise the retokenized completion no longer matches the source stream and
+    a silent prefix would pair each token with the wrong value.
+    """
+    if len(value) < num_trainable_tokens:
+        raise ValueError(
+            f"{field_name} is shorter than the number of trainable tokens "
+            f"({len(value)} < {num_trainable_tokens})."
+        )
+    if len(value) > num_trainable_tokens and not truncated:
+        raise ValueError(
+            f"{field_name} is longer than the number of trainable tokens "
+            f"({len(value)} > {num_trainable_tokens}); the tokenized completion "
+            "does not align with the source stream."
+        )
+
+
 def _coerce_advantages(
     value: float | list[float] | None,
     *,
     fallback_reward: float | None,
     num_trainable_tokens: int,
+    truncated: bool = False,
 ) -> list[float]:
+    if isinstance(value, list):
+        _check_trainable_stream_length(
+            value,
+            num_trainable_tokens=num_trainable_tokens,
+            field_name="advantage",
+            truncated=truncated,
+        )
     if num_trainable_tokens == 0:
         return []
     if value is None:
@@ -560,12 +612,6 @@ def _coerce_advantages(
             raise ValueError("Each RL row must provide either advantage or reward.")
         return [float(fallback_reward)] * num_trainable_tokens
     if isinstance(value, list):
-        if len(value) < num_trainable_tokens:
-            raise ValueError(
-                "Token-level advantages are shorter than the number of trainable "
-                "tokens "
-                f"({len(value)} < {num_trainable_tokens})."
-            )
         return [float(item) for item in value[:num_trainable_tokens]]
     return [float(value)] * num_trainable_tokens
 
@@ -576,17 +622,19 @@ def _coerce_optional_sequence(
     num_trainable_tokens: int,
     field_name: str,
     default: float | None = None,
+    truncated: bool = False,
 ) -> list[float] | None:
     if value is None:
         if default is None:
             return None
         return [default] * num_trainable_tokens
     if isinstance(value, list):
-        if len(value) < num_trainable_tokens:
-            raise ValueError(
-                f"{field_name} is shorter than the number of trainable tokens "
-                f"({len(value)} < {num_trainable_tokens})."
-            )
+        _check_trainable_stream_length(
+            value,
+            num_trainable_tokens=num_trainable_tokens,
+            field_name=field_name,
+            truncated=truncated,
+        )
         return [float(item) for item in value[:num_trainable_tokens]]
     return [float(value)] * num_trainable_tokens
 
@@ -658,7 +706,15 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
             metadata.get("_wavelet_dummy_rollout")
             or metadata.get("_wavelet_filtered_rollout")
         ):
-            return None
+            # Skipping the row would pull the next epoch's row into this batch
+            # (duplicating rollouts), and retokenizing would pair the sampled
+            # logprobs with different tokens. Keep it as a zero-loss row.
+            logger.warning(
+                "Pretokenized RL row keeps no trainable tokens within seq_len=%s "
+                "(source length %s); training on it as a zero-loss row.",
+                seq_len,
+                len(record.input_ids),
+            )
     return {
         "input_ids": input_ids,
         "position_ids": list(range(len(input_ids))),
@@ -709,26 +765,35 @@ def prepare_rl_sample(
         return None
 
     num_trainable_tokens = sum(base_sample["loss_mask"])
+    # Samples cut at seq_len legitimately keep only a prefix of each stream.
+    if record.input_ids is not None:
+        truncated = len(record.input_ids) > seq_len
+    else:
+        truncated = len(base_sample["input_ids"]) >= seq_len
     advantages = _coerce_advantages(
         record.advantage,
         fallback_reward=record.reward,
         num_trainable_tokens=num_trainable_tokens,
+        truncated=truncated,
     )
     inference_logprobs = _coerce_optional_sequence(
         record.inference_logprobs,
         num_trainable_tokens=num_trainable_tokens,
         field_name="inference_logprobs",
+        truncated=truncated,
     )
     teacher_logprobs = _coerce_optional_sequence(
         record.teacher_logprobs,
         num_trainable_tokens=num_trainable_tokens,
         field_name="teacher_logprobs",
+        truncated=truncated,
     )
     temperatures = _coerce_optional_sequence(
         record.temperatures,
         num_trainable_tokens=num_trainable_tokens,
         field_name="temperature",
         default=1.0,
+        truncated=truncated,
     )
     assert temperatures is not None
 
@@ -914,7 +979,8 @@ class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]
         global_bins = self._global_bins_for_epoch(epoch)
         data_rank, data_world_size = self._effective_data_partition()
         bins = global_bins[data_rank::data_world_size]
-        self._epoch_bins[epoch] = bins
+        # Earlier epochs are never revisited; dropping them bounds memory.
+        self._epoch_bins = {epoch: bins}
         return bins
 
     def _global_bins_for_epoch(self, epoch: int) -> list[RLSample]:
@@ -946,8 +1012,9 @@ class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]
         packed = pad_bins_for_distribution(
             packed,
             data_world_size=data_world_size,
+            micro_batch_size=self.data_config.micro_batch_size,
         )
-        self._epoch_global_bins[epoch] = packed
+        self._epoch_global_bins = {epoch: packed}
         return packed
 
 
@@ -980,7 +1047,7 @@ class FakeRLDataset(IterableDataset[RLSample]):
         while True:
             self.step += 1
             self.epoch = self.step // max(self.vocab_size, 1)
-            rng = random.Random(self.seed + self.step)
+            rng = random.Random(f"{self.seed}:{self.step}")
             sample_len = self.seq_len
             if self.length_mode == "variable":
                 sample_len = rng.randint(max(2, self.seq_len // 4), self.seq_len)

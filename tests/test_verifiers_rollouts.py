@@ -1315,7 +1315,7 @@ def test_verifier_scheduler_reschedules_failed_single_rollout() -> None:
     assert scheduler.groups == {}
 
 
-def test_verifier_scheduler_drops_incomplete_group_after_policy_change() -> None:
+def test_verifier_scheduler_cancels_incomplete_group_after_policy_change() -> None:
     config = RLConfig(
         orchestrator={
             "examples_per_step": 1,
@@ -1354,8 +1354,11 @@ def test_verifier_scheduler_drops_incomplete_group_after_policy_change() -> None
             accepted_groups=0,
         )
 
-    assert asyncio.run(run()) == (0, 1, 1)
+    # The swap made the group unfinishable; it is cancelled work, not a
+    # reward-filter rejection, so it must not consume the retry budget.
+    assert asyncio.run(run()) == (0, 0, 0)
     assert scheduler.groups == {}
+    assert scheduler.cancelled_rollouts_count == 0
 
 
 def test_verifier_scheduler_cancels_stale_off_policy_groups() -> None:

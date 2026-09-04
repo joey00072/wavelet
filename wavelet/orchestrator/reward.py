@@ -38,7 +38,7 @@ def _compact_answer_text(value: str) -> str:
     text = re.sub(r"\\boxed\{([^{}]+)\}", r"\1", text)
     text = re.sub(r"\\(?:text|mathrm)\{([^{}]+)\}", r"\1", text)
     text = text.replace("$", "")
-    text = text.replace(",", "")
+    text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
     text = re.sub(r"\s+", "", text)
     return text.strip(" .,:;")
 
@@ -139,8 +139,8 @@ class RLRewardScorer:
         return re.compile(
             rf"{re.escape(self.config.reasoning_end)}.*?"
             rf"{re.escape(self.config.solution_start)}(.+?){solution_end}"
-            rf"[\s]{{0,}}$",
-            flags=re.MULTILINE | re.DOTALL,
+            rf"[\s]{{0,}}\Z",
+            flags=re.DOTALL,
         )
 
     def _extract_math_solution(self, response: str) -> str | None:
@@ -151,7 +151,7 @@ class RLRewardScorer:
         if tagged_solution is not None:
             return tagged_solution
         answer_match = re.search(
-            r"(?:answer|solution|therefore|so)[^\n:=]*[:=]?\s*([^\n]+)$",
+            r"\b(?:answer|solution|therefore|so)\b[^\n]*?(?:[:=]|\bis\b)\s*([^\n]+)$",
             response.strip(),
             flags=re.IGNORECASE,
         )

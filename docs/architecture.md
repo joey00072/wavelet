@@ -43,6 +43,27 @@ separately:
 `max_off_policy_steps` is always a hard freshness ceiling. Setting it to zero
 requires the policy for the current optimizer step even if `max_async_level` is
 larger; async capacity never silently widens the configured freshness window.
+The trainer enforces this through `required_policy_step(rollout_step)`, and the
+persistent verifier scheduler admits, ages, and cancels groups against that same
+threshold for the rollout step it is building rather than against the policy it
+currently has loaded. A group can therefore never be published with a policy
+step the trainer would reject. Groups whose rollouts keep failing are retried a
+bounded number of times and then dropped as rejected instead of spinning forever.
+Groups interrupted by a policy swap are counted as cancelled work rather than
+reward-filter rejections, so they never consume the zero-advantage retry budget.
+Buffered ready groups ship before freshly completed ones, so older admissible
+groups are not starved until they expire.
+
+Process-style launchers additionally require every freshness window to contain
+an export: `policy_transfer.export_every_steps` may not exceed the admissible lag
+plus one, otherwise the scheduler would wait for a policy the trainer cannot
+produce until it receives the very rollouts the scheduler is waiting to build.
+
+The integrated launcher follows the same contract: it only pipelines rollout
+generation for step `S+1` on policy `S` when the freshness window admits a lag of
+one, waits only for policy steps the trainer actually exports (respecting
+`policy_transfer.export_every_steps`), labels an engine that has not loaded any
+policy as step 0, and reuses an existing stable rollout batch on resume.
 
 Queue directories and stable markers are the synchronization contract. Run
 state and queue events provide observability; process-local memory is never the
@@ -87,21 +108,35 @@ Inference loads LoRA adapters directly from the immutable published directory;
 it does not make a second tmpfs copy of every policy.
 Policy receive events reuse the tensor byte count recorded in `policy.json`;
 they do not walk or reread the artifact to reconstruct diagnostic metadata.
-Checkpoint resume removes policy versions beyond the restored step and reuses
-an exact complete snapshot when present. Ordinary exports never overwrite a
-stable policy directory.
-The one-shot `load_inplace` flag is cleared immediately after refresh so vLLM
-does not reread the adapter during later generation scheduler work.
+Checkpoint resume removes policy versions beyond the restored step for both
+filesystem and NCCL transports, discards rollout queue batches whose optimizer
+step lies beyond the restored step (a manifest carries only a policy step, so a
+stale batch from the old run's identically numbered policy would otherwise
+validate), and reuses an exact complete snapshot when present. Ordinary exports never overwrite a stable policy directory, and every
+rank waits for the main rank to reset the export directory before writing.
+Every adapter snapshot is loaded with a one-shot in-place request so vLLM's
+adapter cache, which is keyed by adapter id, swaps in the new weights; the
+request kept for generation has the flag cleared so vLLM does not reread the
+adapter during later scheduler work. The HTTP server registers a refreshed
+adapter request only after vLLM accepted the load, so a failed load leaves the
+previous adapter serving.
 
 HTTP policy refreshes are transactions across all inference replicas. The
-rollout scheduler first blocks new submissions and drains requests already
-admitted. LoRA adapters then use vLLM's in-place load directly; a second server
+rollout scheduler first blocks new submissions, cancels in-flight requests whose
+policy can no longer be admitted for the upcoming rollout step, and drains the
+requests that remain. LoRA adapters then use vLLM's in-place load directly; a second server
 pause would only repeat the scheduler drain. Full-model and collective updates
 pause generation without clearing the version-salted prefix cache, update every
-replica, and resume even when loading fails. Never replace adapter or model
-weights while a request is decoding.
+replica, and resume even when loading fails. The offline engine, whose adapter
+id is stable across snapshots, resets the prefix cache after each in-place
+adapter reload and forwards the client's `cache_salt`. Never replace adapter or
+model weights while a request is decoding.
 
-Only the intended distributed rank writes metadata, stable markers, queue
+Lightweight LoRA exports from FSDP gather adapter shards over the `dp_shard_cp`
+group, so every HSDP replica reconstructs the full adapter without duplicate
+shards, and the snapshot includes `lora.modules_to_save` copies alongside the
+LoRA tensors. Only the intended distributed rank writes metadata, stable
+markers, queue
 events, and final directories. Barriers protect visibility across trainer
 ranks; they do not replace stable markers between trainer and inference
 processes.

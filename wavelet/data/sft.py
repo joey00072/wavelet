@@ -46,11 +46,13 @@ def _coerce_messages(value: Any, role: str | None) -> list[dict[str, str]]:
                 raise TypeError("Message items must be objects.")
             if "role" not in item and role is None:
                 raise ValueError("Message items must include a role.")
+            content = item.get("content")
             messages.append(
                 {
                     **item,
                     "role": str(item.get("role", role)),
-                    "content": str(item["content"]),
+                    # Tool-call assistant messages commonly carry ``content: null``.
+                    "content": "" if content is None else str(content),
                 }
             )
         return messages
@@ -411,6 +413,9 @@ def _build_loss_mask_fast(
         return None
 
     messages = record.prompt + record.completion
+    # Per-turn step_loss_mask overrides are only honored by the incremental path.
+    if any(not message.get("step_loss_mask", 1) for message in messages):
+        return None
     kwargs: dict[str, Any] = {
         "tokenize": True,
         "return_dict": True,
@@ -462,10 +467,10 @@ def _build_loss_mask(
             and messages[index + 1]["role"] == "tool"
         ):
             continue
+        # Rendering the generation prompt keeps the next assistant header out of
+        # the trainable span regardless of which role precedes it.
         add_generation_prompt = (
-            message["role"] in {"user", "tool"}
-            and index + 1 < len(messages)
-            and messages[index + 1]["role"] == "assistant"
+            index + 1 < len(messages) and messages[index + 1]["role"] == "assistant"
         )
         current_ids = _apply_chat_template(
             tokenizer,
@@ -498,7 +503,24 @@ def _build_loss_mask(
         # or filtering bad turns in multi-turn data.
         role_mask = _should_mask(message["role"], loss_mask_config)
         turn_mask = bool(message.get("step_loss_mask", 1)) and role_mask
-        loss_mask.extend([turn_mask] * (len(current_ids) - prev_len))
+        header_start = len(current_ids)
+        if turn_mask and add_generation_prompt:
+            # The trailing generation prompt is the next turn's header, so it
+            # must not be trained as part of this assistant message.
+            content_ids = _apply_chat_template(
+                tokenizer,
+                messages[: index + 1],
+                add_generation_prompt=False,
+                tools=record.tools,
+                chat_template_kwargs=record.chat_template_kwargs,
+            )
+            if (
+                prev_len <= len(content_ids)
+                and content_ids == current_ids[: len(content_ids)]
+            ):
+                header_start = len(content_ids)
+        loss_mask.extend([turn_mask] * (header_start - prev_len))
+        loss_mask.extend([False] * (len(current_ids) - header_start))
         prev_ids = current_ids
         prev_len = len(current_ids)
     return prev_ids, loss_mask

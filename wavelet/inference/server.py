@@ -444,9 +444,9 @@ def _prompt_tokens_from_validation_error(error: VLLMValidationError) -> int | No
     value = getattr(error, "value", None)
     if isinstance(value, int):
         return value
-    match = re.search(r"prompt contains at least (\\d+) input tokens", str(error))
+    match = re.search(r"prompt contains at least (\d+) input tokens", str(error))
     if match is None:
-        match = re.search(r"request has (\\d+) input tokens", str(error))
+        match = re.search(r"request has (\d+) input tokens", str(error))
     if match is None:
         return None
     return int(match.group(1))
@@ -476,19 +476,22 @@ def _patch_load_lora_adapter() -> None:
     ) -> ErrorResponse | str:
         lora_name = request.lora_name
         async with self.lora_resolver_lock[lora_name]:
-            if lora_name in self.lora_requests:
-                lora_request = self.lora_requests[lora_name]
-                lora_request.lora_path = request.lora_path
-            else:
-                from vllm.lora.request import LoRARequest
+            from vllm.lora.request import LoRARequest
 
-                lora_request = LoRARequest(
-                    lora_name=lora_name,
-                    lora_int_id=self.lora_id_counter.inc(1),
-                    lora_path=request.lora_path,
-                    load_inplace=request.load_inplace,
-                )
-            lora_request.load_inplace = request.load_inplace
+            # Keep the adapter id stable across snapshots so the worker cache
+            # swaps weights in place, but only publish the new request after
+            # the engine accepted it; a failed load must not poison generation.
+            existing = self.lora_requests.get(lora_name)
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=(
+                    existing.lora_int_id
+                    if existing is not None
+                    else self.lora_id_counter.inc(1)
+                ),
+                lora_path=request.lora_path,
+                load_inplace=request.load_inplace,
+            )
             if base_model_name is not None and self.is_base_model(base_model_name):
                 lora_request.base_model_name = base_model_name
             try:
@@ -631,24 +634,6 @@ def _patch_noisy_tool_parser_errors() -> None:
         return
 
     hermes_tool_parser.logger.setLevel(CRITICAL)
-
-
-def _replace_active_adapter_inplace(adapter_manager: Any, lora: Any) -> bool:
-    try:
-        index = adapter_manager.lora_index_to_id.index(lora.id)
-    except ValueError:
-        return False
-
-    adapter_manager._create_merged_loras_inplace(lora)
-    adapter_manager._registered_adapters[lora.id] = lora
-    adapter_manager._active_adapters[lora.id] = None
-    for module_name, module in adapter_manager.modules.items():
-        module_lora = adapter_manager._get_lora_layer_weights(lora, module_name)
-        if not module_lora:
-            module.reset_lora(index)
-            continue
-        module.set_lora(index, module_lora.lora_a, module_lora.lora_b)
-    return True
 
 
 def _patch_skip_lora_module_warnings() -> None:

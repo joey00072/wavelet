@@ -14,6 +14,7 @@ from wavelet.data.rl import (
 )
 from wavelet.inference.diagnostics import inference_debug_state
 from wavelet.inference.engine import VLLMPolicyInferenceEngine
+from wavelet.transport.policy import nccl_world_size
 from wavelet.utils.config import load_config
 
 
@@ -73,9 +74,8 @@ def _lifespan(config: RLConfig, engine: Any):
                     "master_address": config.policy_transfer.nccl_host,
                     "master_port": config.policy_transfer.nccl_port,
                     "rank_offset": config.policy_transfer.nccl_rank_offset,
-                    "world_size": (
+                    "world_size": nccl_world_size(
                         config.policy_transfer.nccl_inference_world_size
-                        + config.policy_transfer.nccl_rank_offset
                     ),
                 }
             )

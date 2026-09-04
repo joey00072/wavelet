@@ -21,6 +21,9 @@ from wavelet.data.rl import RLExample, load_rl_records
 from wavelet.orchestrator.algorithms import build_algorithm
 from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
 from wavelet.orchestrator.placement import (
+    device_group_conflict_error as _device_group_conflict_error,
+)
+from wavelet.orchestrator.placement import (
     device_group_size as _device_group_size,
 )
 from wavelet.orchestrator.placement import (
@@ -28,6 +31,9 @@ from wavelet.orchestrator.placement import (
 )
 from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
+)
+from wavelet.orchestrator.placement import (
+    rollout_reward_mode_error as _rollout_reward_mode_error,
 )
 from wavelet.orchestrator.placement import (
     trainer_device_group,
@@ -1751,13 +1757,15 @@ def _existing_parent(path: Path) -> Path:
 def _launcher_checks(config: RLConfig) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    invalid = config.launcher.mode == "process" and world_size > 1
+    # Mirrors the runtime guard: every non-integrated mode spawns its own roles.
+    invalid = config.launcher.mode != "integrated" and world_size > 1
     checks.append(
         PreflightCheck(
             "torchrun_launcher",
             "error" if invalid else "ok",
             (
-                "Do not run 'wavelet rl' process launcher under torchrun."
+                f"Do not run 'wavelet rl' launcher.mode={config.launcher.mode!r} "
+                "under torchrun."
                 if invalid
                 else "Launcher mode is compatible with the current WORLD_SIZE."
             ),
@@ -1765,8 +1773,41 @@ def _launcher_checks(config: RLConfig) -> list[PreflightCheck]:
         )
     )
 
+    checks.append(_rollout_reward_mode_check(config))
     checks.extend(_device_group_checks(config))
     return checks
+
+
+def _rollout_reward_mode_check(config: RLConfig) -> PreflightCheck:
+    error = _rollout_reward_mode_error(config)
+    return PreflightCheck(
+        "rollout_reward_mode",
+        "ok" if error is None else "error",
+        error or "reward.mode is compatible with the rollout source.",
+        {"inference_mode": config.inference.mode, "reward_mode": config.reward.mode},
+    )
+
+
+def _trainer_process_count_check(
+    config: RLConfig,
+    trainer_group: str | None,
+) -> PreflightCheck | None:
+    if config.launcher.trainer_cuda_visible_devices is None or trainer_group is None:
+        return None
+    device_count = len([d for d in trainer_group.split(",") if d.strip()])
+    processes = config.launcher.trainer_num_processes
+    if device_count == processes:
+        return None
+    return PreflightCheck(
+        "trainer_num_processes",
+        "error",
+        (
+            f"launcher.trainer_num_processes={processes} does not match the "
+            f"{device_count} pinned trainer device(s) in "
+            f"launcher.trainer_cuda_visible_devices={trainer_group!r}."
+        ),
+        {"cuda_visible_devices": trainer_group, "trainer_num_processes": processes},
+    )
 
 
 def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
@@ -1791,6 +1832,18 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
         device_count = _device_group_size(config, group)
         required = _required_inference_devices(config)
         status: CheckStatus = "ok" if device_count >= required else "warning"
+        fallback = (
+            f"Inference replica {index} has {device_count} visible "
+            f"device(s); configured vLLM needs {required}."
+        )
+        if config.policy_transfer.type == "nccl" and device_count != required:
+            # Only TP x DP vLLM workers join the NCCL group; extra visible
+            # devices would leave the trainer waiting for ranks that never join.
+            status = "error"
+            fallback += (
+                " NCCL policy transfer requires exactly tensor_parallel_size x "
+                "data_parallel_size visible devices per replica."
+            )
         checks.append(
             PreflightCheck(
                 name=f"inference_devices_{index}",
@@ -1800,10 +1853,7 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
                         f"Inference replica {index}",
                         group,
                         gpu_indices,
-                        fallback=(
-                            f"Inference replica {index} has {device_count} visible "
-                            f"device(s); configured vLLM needs {required}."
-                        ),
+                        fallback=fallback,
                     )
                 ),
                 details={"cuda_visible_devices": group, "required_devices": required},
@@ -1855,6 +1905,18 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
             details={"cuda_visible_devices": trainer_group},
         )
     )
+    process_count_check = _trainer_process_count_check(config, trainer_group)
+    if process_count_check is not None:
+        checks.append(process_count_check)
+    conflict = _device_group_conflict_error(config)
+    if conflict is not None:
+        checks.append(
+            PreflightCheck(
+                name="device_group_overlap",
+                status="error",
+                message=conflict,
+            )
+        )
     return checks
 
 

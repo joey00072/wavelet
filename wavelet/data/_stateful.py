@@ -21,6 +21,7 @@ class StatefulDatasetMixin(Generic[RecordT]):
     num_samples: defaultdict[str, int]
     num_tokens: defaultdict[str, int]
     skipped: int
+    _order_cache: tuple[int, list[int]] | None
 
     def _initialize_iteration_state(self) -> None:
         self.step = 0
@@ -28,6 +29,7 @@ class StatefulDatasetMixin(Generic[RecordT]):
         self.num_samples = defaultdict(int)
         self.num_tokens = defaultdict(int)
         self.skipped = 0
+        self._order_cache = None
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -58,9 +60,15 @@ class StatefulDatasetMixin(Generic[RecordT]):
         self.num_tokens[source_name] += token_count
 
     def _order_for_epoch(self, epoch: int) -> list[int]:
+        # Shuffling is O(N); cache the current epoch so per-sample lookups stay
+        # O(1). The cache is derived state and is intentionally not checkpointed.
+        cached = getattr(self, "_order_cache", None)
+        if cached is not None and cached[0] == epoch:
+            return cached[1]
         order = list(range(len(self.records)))
         if self.shuffle:
             random.Random(self.seed + epoch).shuffle(order)
+        self._order_cache = (epoch, order)
         return order
 
     def _local_record_indexes(self) -> Iterator[int]:

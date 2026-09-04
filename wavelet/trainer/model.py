@@ -39,6 +39,7 @@ from transformers import (
 )
 from transformers.utils import logging as transformers_logging
 
+from wavelet.configs.config import DEFAULT_LORA_TARGET_MODULES
 from wavelet.configs.sft import FSDPConfig, LoRAConfig, ModelConfig
 from wavelet.trainer.debug import (
     DEBUG_LORA_TARGET_MODULES,
@@ -632,18 +633,6 @@ def _fsdp_sharding_strategy(
     return ShardingStrategy.NO_SHARD
 
 
-DEFAULT_LORA_TARGET_MODULES = [
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-    "gate_proj",
-    "up_proj",
-    "down_proj",
-    "experts",
-]
-
-
 LORA_STATE_ATTRS = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
 
 
@@ -671,7 +660,7 @@ def apply_lora(
     target_modules = _resolve_lora_target_modules(model, config)
     peft_config = PeftLoraConfig(
         r=config.rank,
-        lora_alpha=int(config.alpha),
+        lora_alpha=config.alpha,
         lora_dropout=config.dropout,
         target_modules=target_modules,
         modules_to_save=config.modules_to_save or None,
@@ -1060,8 +1049,43 @@ def _lora_parameter_shapes(model: PeftModel) -> dict[str, tuple[int, ...]]:
                     shape = (child.out_features, child.in_features)
                 else:
                     shape = tuple(weight.shape)
-                shapes[f"{module_name}.{attr}.{adapter_name}.weight"] = shape
+                # ``lora_embedding_*`` containers hold parameters directly, so
+                # their state-dict keys carry no ``.weight`` suffix.
+                suffix = "" if isinstance(child, nn.Parameter) else ".weight"
+                shapes[f"{module_name}.{attr}.{adapter_name}{suffix}"] = shape
+        saved_copies = getattr(module, "modules_to_save", None)
+        if isinstance(saved_copies, nn.ModuleDict) and active_adapter_name in (
+            saved_copies
+        ):
+            # ``lora.modules_to_save`` trains full copies (e.g. lm_head) that
+            # the adapter snapshot must ship alongside the LoRA tensors.
+            for param_name, param in saved_copies[
+                active_adapter_name
+            ].named_parameters():
+                key = (
+                    f"{module_name}.modules_to_save.{active_adapter_name}.{param_name}"
+                )
+                shapes[key] = _unsharded_parameter_shape(
+                    saved_copies[active_adapter_name], param_name, param
+                )
     return shapes
+
+
+def _unsharded_parameter_shape(
+    module: nn.Module, param_name: str, param: nn.Parameter
+) -> tuple[int, ...]:
+    owner = module
+    attr = param_name
+    if "." in param_name:
+        owner_path, attr = param_name.rsplit(".", 1)
+        owner = module.get_submodule(owner_path)
+    if isinstance(owner, nn.Linear) and attr == "weight":
+        return (owner.out_features, owner.in_features)
+    if isinstance(owner, nn.Linear) and attr == "bias":
+        return (owner.out_features,)
+    if isinstance(owner, nn.Embedding) and attr == "weight":
+        return (owner.num_embeddings, owner.embedding_dim)
+    return tuple(param.shape)
 
 
 def _gather_fsdp_lora_state_dict(
@@ -1077,9 +1101,14 @@ def _gather_fsdp_lora_state_dict(
             .cpu()
             .contiguous()
             for name, value in model.named_parameters()
-            if "lora_" in name
-            and value.numel() > 0
-            and _lora_state_key_matches_adapter(name, adapter_name)
+            if value.numel() > 0
+            and (
+                (
+                    "lora_" in name
+                    and _lora_state_key_matches_adapter(name, adapter_name)
+                )
+                or f".modules_to_save.{adapter_name}." in name
+            )
         }
 
     expected_shapes = _lora_parameter_shapes(unwrapped)
@@ -1090,7 +1119,10 @@ def _gather_fsdp_lora_state_dict(
         and value.numel() > 0
     }
 
-    group = _mesh_process_group(parallel_dims, "hsdp")
+    # Each HSDP replica holds a complete copy of the sharded adapter, so the
+    # gather runs over the shard group only; the 2-D hsdp mesh has no single
+    # process group and would also concatenate duplicate replica shards.
+    group = _mesh_process_group(parallel_dims, "dp_shard_cp")
     group_rank = _distributed_group_rank(group)
     group_world_size = torch.distributed.get_world_size(group=group)
     gathered: list[dict[str, torch.Tensor] | None] | None
@@ -1153,7 +1185,7 @@ def _mesh_process_group(
         return None
     if name == "tp" and not parallel_dims.tp_enabled:
         return None
-    if name == "hsdp" and not parallel_dims.fsdp_enabled:
+    if name == "dp_shard_cp" and not parallel_dims.fsdp_enabled:
         return None
     return parallel_dims.get_mesh(name).get_group()
 

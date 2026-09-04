@@ -21,7 +21,15 @@ from wavelet.orchestrator.algorithms import (
     uses_group_advantages,
 )
 from wavelet.orchestrator.reward import RLRewardScorer
-from wavelet.transport.queue import FileSystemRolloutSender, RolloutBatch
+from wavelet.orchestrator.schedule import required_policy_step
+from wavelet.transport.queue import (
+    FileSystemRolloutSender,
+    QueueEvent,
+    RolloutBatch,
+    append_event_best_effort,
+    utc_now,
+    validate_rollout_manifest,
+)
 
 CustomRolloutFunction = Callable[
     ["RLOrchestrator", list[RLExample], object | None],
@@ -284,11 +292,21 @@ class RLOrchestrator:
         inference_engine=None,
         policy_step: int | None = None,
     ) -> RolloutBatch:
+        """Publish the rollout batch for ``step``, reusing a valid stable batch."""
+        sender = FileSystemRolloutSender(self.config.output_dir, self.config.transport)
+        existing = _reusable_rollout_batch(
+            self.config,
+            sender,
+            queue_step=step,
+            optimizer_step=step,
+            chunk_index=None,
+        )
+        if existing is not None:
+            return existing
         materialized_path = self.materialize(
             step=step,
             inference_engine=inference_engine,
         )
-        sender = FileSystemRolloutSender(self.config.output_dir, self.config.transport)
         return sender.publish(
             materialized_path,
             step=step,
@@ -508,3 +526,38 @@ class RLOrchestrator:
 def _count_nonempty_lines(path: Path) -> int:
     with path.open("r", encoding="utf-8") as handle:
         return sum(1 for line in handle if line.strip())
+
+
+def _reusable_rollout_batch(
+    config: RLConfig,
+    sender: FileSystemRolloutSender,
+    *,
+    queue_step: int,
+    optimizer_step: int,
+    chunk_index: int | None,
+) -> RolloutBatch | None:
+    """Return the stable batch for ``queue_step`` if the trainer would accept it."""
+    batch = sender.stable_batch(queue_step)
+    if batch is None:
+        return None
+    row_count = _count_nonempty_lines(batch.path)
+    validate_rollout_manifest(
+        batch,
+        queue_step=queue_step,
+        optimizer_step=optimizer_step,
+        chunk_index=chunk_index,
+        rows=row_count,
+        minimum_policy_step=required_policy_step(config, optimizer_step),
+        maximum_policy_step=optimizer_step,
+    )
+    append_event_best_effort(
+        config.output_dir / "events",
+        QueueEvent(
+            time=utc_now(),
+            kind="rollout_reused",
+            queue_step=queue_step,
+            optimizer_step=optimizer_step,
+            details={"path": str(batch.path)},
+        ),
+    )
+    return batch

@@ -272,8 +272,12 @@ normalized at the configuration boundary:
 - `group_reward` becomes `algo.type: grpo`.
 
 Legacy GRPO normalization, epsilon, and length-penalty fields are carried into
-the named configuration. New configs should use `algo`. If both forms are
-present, the explicit `algo` block takes precedence.
+the named configuration and removed from `orchestrator`, so the resolved config
+holds them in exactly one place. New configs should use `algo`. Mixing the two
+forms is rejected: legacy keys next to an explicit `algo` block raise an error
+instead of being silently dropped, and `normalize_group_advantages`,
+`advantage_epsilon`, or `length_penalty` without `advantage_mode: group_reward`
+raise as well because nothing would read them.
 
 ## Inspect the Resolved Configuration
 

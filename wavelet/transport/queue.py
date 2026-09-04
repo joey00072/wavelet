@@ -309,6 +309,41 @@ def prune_consumed_rollout_batches(
     return removed
 
 
+def prune_rollout_batches_from(
+    queue_dir: Path,
+    *,
+    first_step: int,
+    materialized_dir: Path | None = None,
+) -> list[Path]:
+    """Remove queue batches at or beyond ``first_step`` left by an abandoned run.
+
+    A resumed run regenerates those steps with its own policy versions; the
+    manifest records only a policy step, so a stale batch produced by the old
+    run's identically numbered (but different) policy would otherwise validate.
+    """
+    removed: list[Path] = []
+    if queue_dir.exists():
+        for candidate in queue_dir.iterdir():
+            if not candidate.is_dir():
+                continue
+            step = parse_step(candidate)
+            if step is not None and step >= first_step:
+                shutil.rmtree(candidate)
+                removed.append(candidate)
+    for directory in {queue_dir, materialized_dir or queue_dir}:
+        if not directory.exists():
+            continue
+        for candidate in directory.glob("materialized-step-*.jsonl"):
+            try:
+                step = int(candidate.stem.removeprefix("materialized-step-"))
+            except ValueError:
+                continue
+            if step >= first_step:
+                candidate.unlink()
+                removed.append(candidate)
+    return sorted(removed)
+
+
 def record_rollout_claim(
     batch: RolloutBatch,
     *,

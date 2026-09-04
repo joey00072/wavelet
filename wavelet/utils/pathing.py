@@ -92,6 +92,25 @@ def existing_run_state_entries(output_dir: Path) -> list[str]:
     return entries
 
 
+def _reject_unsafe_cleanup_root(output_root: Path) -> None:
+    """Refuse to recursively delete directories that are clearly not run dirs."""
+    cwd = Path.cwd().absolute()
+    home = Path.home().absolute()
+    reasons: list[str] = []
+    if output_root == Path(output_root.anchor):
+        reasons.append("the filesystem root")
+    if output_root == home:
+        reasons.append("the home directory")
+    if cwd == output_root or cwd.is_relative_to(output_root):
+        reasons.append("the current working directory or one of its parents")
+    if reasons:
+        raise ValueError(
+            f"clean_output_dir=true refuses to delete '{output_root}' because it is "
+            + " and ".join(reasons)
+            + ". Point output_dir at a dedicated run directory."
+        )
+
+
 def validate_output_dir(
     output_dir: Path,
     *,
@@ -108,6 +127,7 @@ def validate_output_dir(
         return
     if clean:
         output_root = output_dir.absolute()
+        _reject_unsafe_cleanup_root(output_root)
         endangered = [
             path
             for path in protected_paths

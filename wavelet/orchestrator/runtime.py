@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import sys
 import time
 import urllib.request
@@ -22,20 +23,35 @@ from wavelet.orchestrator.launcher import (
     wait_for_roles,
 )
 from wavelet.orchestrator.placement import (
-    device_group_size as _device_group_size,
-)
-from wavelet.orchestrator.placement import (
     device_groups as _as_device_groups,
 )
 from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
 )
 from wavelet.orchestrator.placement import (
+    nccl_inference_ranks as _nccl_inference_ranks,
+)
+from wavelet.orchestrator.placement import (
     trainer_device_group as _trainer_device_group,
 )
+from wavelet.orchestrator.placement import (
+    validate_device_groups as _validate_device_groups,
+)
+from wavelet.orchestrator.placement import (
+    validate_rollout_reward_mode as _validate_rollout_reward_mode,
+)
 from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import (
+    latest_exported_policy_step_at_or_before as _latest_exported_policy_step,
+)
+from wavelet.orchestrator.schedule import (
+    required_policy_step as _required_policy_step,
+)
 from wavelet.orchestrator.schedule import target_steps as _target_steps
-from wavelet.orchestrator.scheduler import IntegratedRolloutScheduler
+from wavelet.orchestrator.scheduler import (
+    IntegratedRolloutScheduler,
+    discard_rollout_batches_after_resume,
+)
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.transport.queue import (
     FileSystemPolicyReceiver,
@@ -60,6 +76,12 @@ class StepTimes:
     load_data: float = 0.0
     train_until: float = 0.0
     export_policy: float = 0.0
+
+
+def _data_paths(path: Path | list[Path] | None) -> list[Path]:
+    if path is None:
+        return []
+    return list(path) if isinstance(path, list) else [path]
 
 
 def _write_subconfigs(config: RLConfig, trainer_config: RLConfig | None = None) -> None:
@@ -109,7 +131,7 @@ def _config_with_nccl_inference_world_size(
         inference_replicas,
     )
     inference_world_size = sum(
-        _device_group_size(config, cuda_visible_devices)
+        _nccl_inference_ranks(config, cuda_visible_devices)
         for cuda_visible_devices in inference_devices
     )
     return config.model_copy(
@@ -178,6 +200,22 @@ def _rollout_client_config(config: RLConfig, *, ports: list[int]) -> RLConfig:
     )
 
 
+def _policy_step_for_trainer_step(
+    config: RLConfig,
+    policy_receiver: FileSystemPolicyReceiver,
+    *,
+    step: int,
+) -> int | None:
+    """Resolve the newest policy the trainer has exported at or before ``step``.
+
+    The trainer only exports every ``export_every_steps`` (plus forced exports
+    on resume), so waiting for the exact trainer step would block forever.
+    """
+    if step in policy_receiver.available_steps():
+        return step
+    return _latest_exported_policy_step(config, step)
+
+
 def _load_policy_for_step(
     config: RLConfig,
     policy_receiver: FileSystemPolicyReceiver,
@@ -185,12 +223,24 @@ def _load_policy_for_step(
     *,
     step: int,
 ) -> float:
-    if step <= 0 and not config.policy_transfer.export_initial:
+    policy_step = _policy_step_for_trainer_step(config, policy_receiver, step=step)
+    if policy_step is None:
+        return 0.0
+    if getattr(inference_engine, "policy_step", None) == policy_step:
         return 0.0
     started_at = perf_counter()
-    policy = policy_receiver.wait_for_step(step)
+    policy = policy_receiver.wait_for_step(policy_step)
     inference_engine.load_policy(policy.step_dir, step=policy.step)
     return perf_counter() - started_at
+
+
+def _pipelined_rollouts(config: RLConfig) -> bool:
+    """Whether rollouts for step S+1 may be generated on policy S.
+
+    The pipelined loop always produces lag-1 rollouts, so it is only valid when
+    the trainer's freshness contract admits a one-step-old policy.
+    """
+    return _required_policy_step(config, 1) < 1
 
 
 def _publish_rollout_timed(
@@ -200,10 +250,15 @@ def _publish_rollout_timed(
     inference_engine,
 ) -> tuple[RolloutBatch, float]:
     started_at = perf_counter()
+    policy_step = getattr(inference_engine, "policy_step", None)
+    if policy_step is None:
+        # No policy has been loaded yet, so the engine serves the base weights,
+        # which are policy step 0.
+        policy_step = 0
     batch = orchestrator.publish(
         step=step,
         inference_engine=inference_engine,
-        policy_step=getattr(inference_engine, "policy_step", None),
+        policy_step=policy_step,
     )
     return batch, perf_counter() - started_at
 
@@ -389,7 +444,10 @@ def _role_specs(
             replica_rank_offset = None
             if config.policy_transfer.type == "nccl":
                 replica_rank_offset = nccl_rank_offset
-                nccl_rank_offset += _device_group_size(config, cuda_visible_devices)
+                nccl_rank_offset += _nccl_inference_ranks(
+                    config,
+                    cuda_visible_devices,
+                )
             replica_config = _inference_replica_config(
                 config,
                 port=port,
@@ -467,6 +525,7 @@ def _run_process_launcher(config: RLConfig) -> int:
 
     launcher = create_role_launcher(config)
     handles = []
+    previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
         service_roles = [role for role in roles if role.service]
         job_roles = [role for role in roles if not role.service]
@@ -487,8 +546,15 @@ def _run_process_launcher(config: RLConfig) -> int:
             close_handles(handles)
         finally:
             launcher.close()
+            signal.signal(signal.SIGTERM, previous_sigterm)
     print(f"Published rollout batches under {config.output_dir / 'rollouts'}")
     return 0
+
+
+def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
+    # Role processes run in their own sessions, so a SIGTERM to the launcher
+    # (systemd, SLURM, ``timeout``) would otherwise orphan every GPU process.
+    raise KeyboardInterrupt(f"received signal {signum}")
 
 
 def _wait_for_vllm_http_server(
@@ -564,6 +630,8 @@ def _run_integrated_launcher(config: RLConfig) -> int:
         _write_subconfigs(config, trainer_config)
         trainer = RLTrainer(trainer_config)
         trainer.setup()
+        if trainer.resume_checkpoint_dir is not None:
+            discard_rollout_batches_after_resume(config, start_step=trainer.step)
         receiver = FileSystemRolloutReceiver(
             config.output_dir,
             config.transport,
@@ -585,10 +653,7 @@ def _run_integrated_launcher(config: RLConfig) -> int:
                 step=trainer.step,
                 force=trainer.resume_checkpoint_dir is not None,
             )
-            pipelined = (
-                config.orchestrator.max_async_level > 0
-                and config.orchestrator.max_off_policy_steps > 0
-            )
+            pipelined = _pipelined_rollouts(config)
             _run_rollout_loop(
                 config,
                 trainer=trainer,
@@ -625,12 +690,14 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
 
     config = load_config(RLConfig, argv)
+    _validate_rollout_reward_mode(config)
+    _validate_device_groups(config)
     resuming = config.ckpt is not None and config.ckpt.resume_step is not None
     validate_output_dir(
         config.output_dir,
         resuming=resuming,
         clean=config.clean_output_dir,
-        protected_paths=(config.model.adapter_path,),
+        protected_paths=(config.model.adapter_path, *_data_paths(config.data.path)),
     )
     if resuming:
         assert config.ckpt is not None

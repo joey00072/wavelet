@@ -24,7 +24,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from wavelet.configs.sft import CheckpointConfig
-from wavelet.trainer.distributed import World, barrier
+from wavelet.trainer.distributed import World, barrier, distributed_uses_cuda
 from wavelet.utils.pathing import (
     STABLE_CHECKPOINT_MARKER,
     get_checkpoint_dir,
@@ -149,6 +149,7 @@ class CheckpointManager:
                 response=response,
                 stager=stager,
             )
+            self._wait_for_staging(response)
             return True
 
         if self.config.mode == "async_with_pinned_mem":
@@ -167,6 +168,7 @@ class CheckpointManager:
                 response=response,
                 stager=stager,
             )
+            self._wait_for_staging(response)
             return True
 
         dcp.save(
@@ -236,7 +238,7 @@ class CheckpointManager:
         if pending is None:
             return
 
-        if not block and not self._is_response_done(pending.response):
+        if not block and not self._all_ranks_done(pending.response):
             return
 
         try:
@@ -331,6 +333,26 @@ class CheckpointManager:
             return response.done()
         return response.upload_completion.done()
 
+    def _all_ranks_done(
+        self,
+        response: AsyncSaveResponse | Future[Any],
+    ) -> bool:
+        """Agree across ranks whether the async save finished.
+
+        Finalization runs a barrier, so every rank must take the same branch;
+        a rank that observes its own upload as done may not assume the others
+        have finished too.
+        """
+        done = self._is_response_done(response)
+        if not torch.distributed.is_initialized():
+            return done
+        device = torch.device("cpu")
+        if distributed_uses_cuda() and self.world.device.type == "cuda":
+            device = self.world.device
+        flag = torch.tensor(int(done), dtype=torch.int64, device=device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+        return bool(flag.item())
+
     def _wait_for_response(
         self,
         response: AsyncSaveResponse | Future[Any],
@@ -340,6 +362,18 @@ class CheckpointManager:
             return
         response.staging_completion.result()
         response.upload_completion.result()
+
+    @staticmethod
+    def _wait_for_staging(response: AsyncSaveResponse | Future[Any]) -> None:
+        """Block until the live tensors have been copied to the staging buffer.
+
+        The upload keeps running in the background, but the next optimizer step
+        may not mutate parameters or optimizer state while staging still reads
+        them.
+        """
+        if isinstance(response, Future):
+            return
+        response.staging_completion.result()
 
     def _build_async_stager(self, *, use_pinned_memory: bool) -> DefaultStager:
         accelerator_available = bool(torch.accelerator.is_available())

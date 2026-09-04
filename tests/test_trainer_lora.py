@@ -338,7 +338,7 @@ def test_hf_tp_lora_prepare_reduces_rowwise_lora_output(monkeypatch) -> None:
     assert torch.equal(reduced_output, base_output + 1)
 
 
-def test_fsdp_lora_gather_uses_hsdp_mesh_group(monkeypatch) -> None:
+def test_fsdp_lora_gather_uses_shard_mesh_group(monkeypatch) -> None:
     hsdp_group = object()
     calls: dict[str, object] = {}
 
@@ -351,7 +351,9 @@ def test_fsdp_lora_gather_uses_hsdp_mesh_group(monkeypatch) -> None:
         fsdp_enabled = True
 
         def get_mesh(self, name: str):
-            assert name == "hsdp"
+            # Gathering over the shard group keeps HSDP replicas from
+            # contributing duplicate shards (and the 2-D hsdp mesh has no group).
+            assert name == "dp_shard_cp"
             return FakeMesh()
 
     class FakeModule:
