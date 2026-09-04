@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 from functools import partial
 from pathlib import Path
+from time import perf_counter
 from typing import Any, cast
 
 import torch
 import torch.distributed
+from huggingface_hub import snapshot_download
 from peft import LoraConfig as PeftLoraConfig
 from peft import (
     PeftModel,
@@ -55,6 +57,25 @@ from wavelet.trainer.debug import (
 from wavelet.trainer.distributed import ParallelDims, World
 
 logger = logging.getLogger(__name__)
+
+
+def pre_download_model(model_name: str) -> Path | None:
+    """Populate the Hugging Face cache once before launcher roles start."""
+    local_path = Path(model_name)
+    if model_name == DEBUG_MODEL_NAME or local_path.exists():
+        logger.info("Model %s is local; skipping pre-download.", model_name)
+        return local_path if local_path.exists() else None
+
+    started_at = perf_counter()
+    logger.info("Pre-downloading model %s.", model_name)
+    downloaded = Path(snapshot_download(repo_id=model_name, repo_type="model"))
+    logger.info(
+        "Pre-downloaded model %s to %s in %.2fs.",
+        model_name,
+        downloaded,
+        perf_counter() - started_at,
+    )
+    return downloaded
 
 
 def resolve_dtype(name: str) -> torch.dtype | str:

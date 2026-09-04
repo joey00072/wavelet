@@ -374,6 +374,9 @@ Online process-mode RL roles use W&B shared mode with that same run id: the
 trainer is the primary writer and the orchestrator is the final writer, so
 training, rollout, and evaluation metrics land in one run. Offline and disabled
 W&B modes keep their existing local behavior and do not enable shared mode.
+Before process-mode roles start, the launcher downloads remote model artifacts
+once into the shared Hugging Face cache; local paths and the built-in debug
+model skip this step.
 Metrics logged without an optimizer step use W&B wall time as their chart axis.
 Online primary writers also create a versioned `overview` workspace with curated
 training, evaluation, stability, wall-time inference, performance, and resource panels; set

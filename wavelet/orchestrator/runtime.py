@@ -59,6 +59,7 @@ from wavelet.orchestrator.scheduler import (
     IntegratedRolloutScheduler,
     discard_rollout_batches_after_resume,
 )
+from wavelet.trainer.model import pre_download_model
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.transport.queue import (
     FileSystemPolicyReceiver,
@@ -579,6 +580,8 @@ def _run_process_launcher(
             "'wavelet rl-inference' once and 'torchrun -m wavelet rl-trainer' for "
             "the trainer ranks."
         )
+
+    pre_download_model(config.model.name)
 
     inference_replicas = config.launcher.inference_num_replicas
     config = _config_with_nccl_inference_world_size(

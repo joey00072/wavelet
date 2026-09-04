@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -10,6 +11,7 @@ from torch.utils.checkpoint import CheckpointPolicy
 
 from wavelet.configs.sft import ActivationCheckpointingConfig, ModelConfig
 from wavelet.trainer import model as model_utils
+from wavelet.trainer.debug import DEBUG_MODEL_NAME
 from wavelet.trainer.model import setup_tokenizer
 
 
@@ -18,6 +20,26 @@ class _Tokenizer:
     eos_token = "<eos>"
     chat_template = "original"
     padding_side = "right"
+
+
+def test_pre_download_model_populates_hugging_face_cache(monkeypatch, tmp_path) -> None:
+    downloaded = tmp_path / "hub" / "snapshot"
+    snapshot_download = Mock(return_value=str(downloaded))
+    monkeypatch.setattr(model_utils, "snapshot_download", snapshot_download)
+
+    result = model_utils.pre_download_model("org/model")
+
+    assert result == downloaded
+    snapshot_download.assert_called_once_with(repo_id="org/model", repo_type="model")
+
+
+def test_pre_download_model_skips_local_and_debug_models(monkeypatch, tmp_path) -> None:
+    snapshot_download = Mock()
+    monkeypatch.setattr(model_utils, "snapshot_download", snapshot_download)
+
+    assert model_utils.pre_download_model(str(tmp_path)) == tmp_path
+    assert model_utils.pre_download_model(DEBUG_MODEL_NAME) is None
+    snapshot_download.assert_not_called()
 
 
 def test_setup_tokenizer_falls_back_from_adapter_to_base_model(
