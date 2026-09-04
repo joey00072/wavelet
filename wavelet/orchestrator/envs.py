@@ -1212,6 +1212,9 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
         policy_step = output.get("_wavelet_policy_step")
         if isinstance(policy_step, int) and not isinstance(policy_step, bool):
             metadata["policy_step"] = policy_step
+        policy_end_step = output.get("_wavelet_policy_end_step")
+        if isinstance(policy_end_step, int) and not isinstance(policy_end_step, bool):
+            metadata["policy_end_step"] = policy_end_step
         records.append(
             RLExample(
                 prompt=_mask_prompt_history(first_step.get("prompt") or []),

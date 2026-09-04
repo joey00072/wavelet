@@ -315,6 +315,7 @@ class _PendingVerifierRequest:
     rollout_count: int
     off_policy_steps: int = 0
     policy_step: int | None = None
+    completed_policy_step: int | None = None
 
 
 @dataclass(slots=True)
@@ -434,6 +435,7 @@ def generate_rollouts(
     if isinstance(policy_step, int) and not isinstance(policy_step, bool):
         for output in outputs:
             output["_wavelet_policy_step"] = policy_step
+            output["_wavelet_policy_end_step"] = policy_step
     rollout_seconds = perf_counter() - rollout_started_at
     convert_started_at = perf_counter()
     records = [record for output in outputs for record in _records_from_output(output)]
@@ -793,8 +795,12 @@ class VerifierRolloutScheduler:
             return 0, 0, 0
 
         group_outputs = _completed_group_outputs(task)
+        completed_policy_step = request.completed_policy_step
+        if not _is_policy_step(completed_policy_step):
+            completed_policy_step = request.policy_step
         for output in group_outputs:
             output["_wavelet_policy_step"] = request.policy_step
+            output["_wavelet_policy_end_step"] = completed_policy_step
             output["_wavelet_group_id"] = f"persistent:{request.group_id}"
         missing_rollouts = request.rollout_count - len(group_outputs)
         if missing_rollouts > 0 and request.policy_step != getattr(
@@ -1136,6 +1142,15 @@ class VerifierRolloutScheduler:
             policy_step=group.policy_step,
         )
         self.pending_clients[task] = client_index
+        task.add_done_callback(self._record_request_completion)
+
+    def _record_request_completion(
+        self,
+        task: asyncio.Task[list[dict[str, Any]]],
+    ) -> None:
+        request = self.pending.get(task)
+        if request is not None and request.completed_policy_step is None:
+            request.completed_policy_step = self.policy_step
 
     def _next_record(self) -> RLExample:
         epoch, offset = divmod(self.record_cursor, len(self.records))

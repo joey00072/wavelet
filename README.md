@@ -230,6 +230,9 @@ refunds that admission so steady-state replacements remain immediate. Set
 rate limit for sandbox-backed environments. The rate limit is supported only
 by `wavelet.orchestrator.verifiers:generate_rollouts`, and cancelled work does
 not refund admission into an immediate refill wave.
+Rollout metrics decompose `off_policy/mean` and `off_policy/max` into
+`off_policy/in_flight/*` (policy updates while generation was running) and
+`off_policy/in_queue/*` (additional lag before the rollout was published).
 Long-running process schedulers emit a one-line policy, queue, and in-flight
 status every `orchestrator.pipeline_status_interval_seconds` (30 seconds by
 default).

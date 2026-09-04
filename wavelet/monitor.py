@@ -182,6 +182,18 @@ def series_stats(
     return metrics
 
 
+def policy_staleness(
+    *,
+    policy_start_step: int,
+    policy_end_step: int,
+    training_step: int,
+) -> tuple[int, int, int]:
+    """Return total, generation-time, and queued policy lag for one rollout."""
+    total = max(0, training_step - policy_start_step)
+    in_flight = min(total, max(0, policy_end_step - policy_start_step))
+    return total, in_flight, total - in_flight
+
+
 def summary_stats(values: Iterable[float]) -> dict[str, float | int | None]:
     """Summarize values using the diagnostic JSON response shape."""
     items = list(values)
@@ -891,6 +903,7 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         metrics["policy/lag"] = float(inputs.step - inputs.policy_step)
     if inputs.chunk_index is not None:
         metrics["progress/chunk_index"] = float(inputs.chunk_index)
+    metrics.update(_off_policy_metrics(rows, training_step=inputs.step))
 
     for name, value_fn, include_min in (
         (
@@ -944,6 +957,42 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         )
 
     return metrics
+
+
+def _off_policy_metrics(
+    rows: list[dict[str, Any]],
+    *,
+    training_step: int,
+) -> dict[str, float]:
+    values: list[tuple[int, int, int]] = []
+    for row in rows:
+        if _sample_count(row) <= 0:
+            continue
+        metadata = _metadata(row)
+        policy_start = metadata.get("policy_step")
+        if not isinstance(policy_start, int) or isinstance(policy_start, bool):
+            continue
+        policy_end = metadata.get("policy_end_step", policy_start)
+        if not isinstance(policy_end, int) or isinstance(policy_end, bool):
+            policy_end = policy_start
+        values.append(
+            policy_staleness(
+                policy_start_step=policy_start,
+                policy_end_step=policy_end,
+                training_step=training_step,
+            )
+        )
+    if not values:
+        return {}
+    totals, in_flight, in_queue = zip(*values, strict=True)
+    return {
+        "off_policy/mean": float(mean(totals)),
+        "off_policy/max": float(max(totals)),
+        "off_policy/in_flight/mean": float(mean(in_flight)),
+        "off_policy/in_flight/max": float(max(in_flight)),
+        "off_policy/in_queue/mean": float(mean(in_queue)),
+        "off_policy/in_queue/max": float(max(in_queue)),
+    }
 
 
 def _add_environment_metrics(

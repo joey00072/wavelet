@@ -15,6 +15,7 @@ from wavelet.orchestrator.metrics import (
     RolloutMetricInputs,
     log_eval_metrics,
     log_rollout_metrics,
+    policy_staleness,
     rollout_metrics,
 )
 
@@ -104,6 +105,56 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
     assert metrics["fate/all/with_inference_logprobs"] == 1
     assert metrics["fate/all/with_teacher_logprobs"] == 1
     assert metrics["fate/reverse-text/filtered_rate"] == pytest.approx(0.25)
+
+
+def test_policy_staleness_splits_generation_and_queue_lag() -> None:
+    assert policy_staleness(
+        policy_start_step=2,
+        policy_end_step=4,
+        training_step=5,
+    ) == (3, 2, 1)
+    assert policy_staleness(
+        policy_start_step=7,
+        policy_end_step=6,
+        training_step=5,
+    ) == (0, 0, 0)
+
+
+def test_rollout_metrics_report_off_policy_components_once_per_rollout() -> None:
+    rows = [
+        {
+            "metadata": {
+                "policy_step": 2,
+                "policy_end_step": 4,
+                "_wavelet_rollout_count": 1,
+            }
+        },
+        {
+            "metadata": {
+                "policy_step": 3,
+                "policy_end_step": 3,
+                "_wavelet_rollout_count": 1,
+            }
+        },
+        {
+            "metadata": {
+                "policy_step": 0,
+                "policy_end_step": 5,
+                "_wavelet_rollout_count": 0,
+            }
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=1, step=5)
+    )
+
+    assert metrics["off_policy/mean"] == 2.5
+    assert metrics["off_policy/max"] == 3.0
+    assert metrics["off_policy/in_flight/mean"] == 1.0
+    assert metrics["off_policy/in_flight/max"] == 2.0
+    assert metrics["off_policy/in_queue/mean"] == 1.5
+    assert metrics["off_policy/in_queue/max"] == 2.0
 
 
 def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:

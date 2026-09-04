@@ -126,13 +126,38 @@ def test_verifier_record_preserves_actual_generation_policy_step() -> None:
         "reward": 1.0,
         "advantage": 1.0,
         "_wavelet_policy_step": 3,
+        "_wavelet_policy_end_step": 4,
         "trajectory": _trainable_trajectory(),
     }
 
     record = _records_from_output(output)[0]
 
     assert record.metadata["policy_step"] == 3
+    assert record.metadata["policy_end_step"] == 4
     assert _rollout_records_policy_step([record], fallback=9) == 3
+
+
+def test_verifier_scheduler_snapshots_policy_when_request_completes() -> None:
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.policy_step = 4
+
+    async def run() -> _PendingVerifierRequest:
+        task = asyncio.create_task(asyncio.sleep(0, result=[]))
+        request = _PendingVerifierRequest(
+            group_id=1,
+            client_index=0,
+            rollout_count=1,
+            policy_step=2,
+        )
+        scheduler.pending = {task: request}
+        task.add_done_callback(scheduler._record_request_completion)
+        await task
+        await asyncio.sleep(0)
+        return request
+
+    request = asyncio.run(run())
+
+    assert request.completed_policy_step == 4
 
 
 def test_rollout_batch_policy_step_uses_oldest_actual_policy() -> None:
