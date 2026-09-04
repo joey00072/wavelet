@@ -158,6 +158,9 @@ Filesystem policy exports use a temporary directory followed by an atomic
 rename and stable marker. Metadata is written beside the model or adapter. NCCL
 transfer uses the same metadata and readiness concepts, but broadcasts named
 tensors after inference workers enter the update collective.
+Full-model filesystem refreshes use vLLM's layerwise reload lifecycle, so each
+layer is processed and copied into its existing kernel storage as its checkpoint
+weights arrive instead of materializing a second processed model at once.
 Inference loads LoRA adapters directly from the immutable published directory;
 it does not make a second tmpfs copy of every policy.
 Policy receive events reuse the tensor byte count recorded in `policy.json`;

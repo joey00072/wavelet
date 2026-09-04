@@ -16,7 +16,12 @@ import torch
 from peft import PeftModel
 from torch import Tensor, nn
 from torch.nn import Module
+from vllm.config import set_current_vllm_config
 from vllm.model_executor.model_loader import DefaultModelLoader, get_model_loader
+from vllm.model_executor.model_loader.reload import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+)
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 from wavelet.orchestrator.policy_metadata import (
@@ -267,10 +272,11 @@ class FileSystemWeightUpdateWorker(Worker):
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
         weights_iterator = model_loader._get_weights_iterator(local_source)
-        model.load_weights(weights_iterator)  # type: ignore[arg-type]
-
         device = next(model.parameters()).device
-        process_weights_after_loading(model, self.model_runner.model_config, device)
+        with torch.device(device), set_current_vllm_config(self.vllm_config):
+            initialize_layerwise_reload(model)
+            model.load_weights(weights_iterator)  # type: ignore[arg-type]
+            finalize_layerwise_reload(model, self.model_runner.model_config)
 
 
 class NCCLWeightUpdateWorker(Worker):
