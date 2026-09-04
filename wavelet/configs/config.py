@@ -588,6 +588,40 @@ class RLEvalConfig(ConfigModel):
         return self
 
 
+_MANAGED_VLLM_ARGS = frozenset(
+    {
+        "chat_template",
+        "data_parallel_rpc_port",
+        "data_parallel_size",
+        "data_parallel_size_local",
+        "dtype",
+        "enable_auto_tool_choice",
+        "enable_log_requests",
+        "enable_lora",
+        "enable_sleep_mode",
+        "enforce_eager",
+        "fully_sharded_loras",
+        "generation_config",
+        "gpu_memory_utilization",
+        "host",
+        "load_format",
+        "logprobs_mode",
+        "max_cpu_loras",
+        "max_lora_rank",
+        "max_loras",
+        "max_model_len",
+        "model",
+        "port",
+        "quantization",
+        "reasoning_parser",
+        "tensor_parallel_size",
+        "tool_call_parser",
+        "trust_remote_code",
+        "worker_extension_cls",
+    }
+)
+
+
 class RLVLLMConfig(ConfigModel):
     server_backend: Literal["offline", "openai"] = "openai"
     gpu_memory_utilization: float = Field(default=0.35, gt=0.0, le=1.0)
@@ -610,6 +644,30 @@ class RLVLLMConfig(ConfigModel):
     openai_batch_min_size: int = Field(default=1, ge=1)
     openai_batch_max_wait_seconds: float = Field(default=0.01, ge=0.0)
     openai_batch_max_size: int | None = Field(default=None, ge=1)
+    extra_args: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_extra_args(self) -> "RLVLLMConfig":
+        normalized_keys: set[str] = set()
+        for key in self.extra_args:
+            normalized = key.replace("-", "_")
+            if not normalized.isidentifier():
+                raise ValueError(
+                    "inference.vllm.extra_args keys must be vLLM argument names; "
+                    f"got {key!r}."
+                )
+            if normalized in _MANAGED_VLLM_ARGS:
+                raise ValueError(
+                    "inference.vllm.extra_args cannot override Wavelet-managed "
+                    f"argument {key!r}; configure its Wavelet field instead."
+                )
+            if normalized in normalized_keys:
+                raise ValueError(
+                    "inference.vllm.extra_args contains duplicate normalized key "
+                    f"{normalized!r}."
+                )
+            normalized_keys.add(normalized)
+        return self
 
 
 class RLVLLMHTTPConfig(ConfigModel):

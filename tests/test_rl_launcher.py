@@ -489,6 +489,42 @@ def test_inference_server_passes_quantized_load_args() -> None:
     assert _argv_value(argv, "--load-format") == "bitsandbytes"
 
 
+def test_inference_server_passes_explicit_extra_vllm_args() -> None:
+    config = RLConfig(
+        inference={
+            "vllm": {
+                "extra_args": {
+                    "max_num_seqs": 64,
+                    "compilation-config": {"cudagraph_mode": "NONE"},
+                    "enable_prefix_caching": True,
+                    "async_scheduling": False,
+                }
+            }
+        }
+    )
+
+    argv = _serve_argv(config)
+
+    assert _argv_value(argv, "--max-num-seqs") == "64"
+    assert _argv_value(argv, "--compilation-config") == ('{"cudagraph_mode":"NONE"}')
+    assert "--enable-prefix-caching" in argv
+    assert "--no-async-scheduling" in argv
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["model", "port", "tensor_parallel_size", "enable-lora", "logprobs_mode"],
+)
+def test_inference_server_rejects_managed_extra_vllm_args(key: str) -> None:
+    with pytest.raises(ValueError, match="Wavelet-managed"):
+        RLConfig(inference={"vllm": {"extra_args": {key: "override"}}})
+
+
+def test_vllm_passthrough_remains_explicit() -> None:
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        RLConfig(inference={"vllm": {"max_num_seqs": 64}})
+
+
 def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
     config = RLConfig(
         inference={"mode": "vllm_http", "vllm": {"server_backend": "openai"}},

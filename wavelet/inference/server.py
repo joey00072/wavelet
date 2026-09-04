@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -1097,12 +1098,27 @@ def _append_lora_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--fully-sharded-loras")
 
 
+def _append_extra_serve_args(argv: list[str], config: RLConfig) -> None:
+    for key, value in sorted(config.inference.vllm.extra_args.items()):
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            argv.append(flag if value else f"--no-{flag.removeprefix('--')}")
+            continue
+        rendered = (
+            json.dumps(value, separators=(",", ":"))
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        argv.extend([flag, rendered])
+
+
 def _serve_argv(config: RLConfig) -> list[str]:
     """Build vLLM server arguments without initializing the GPU platform."""
     argv = _base_serve_argv(config)
     _append_optional_serve_args(argv, config)
     _append_parser_serve_args(argv, config)
     _append_lora_serve_args(argv, config)
+    _append_extra_serve_args(argv, config)
     worker_extension_cls = (
         "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
         if config.policy_transfer.type == "nccl"

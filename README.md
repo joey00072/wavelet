@@ -327,6 +327,11 @@ SFT packing accepts only the implemented `pad` and `cat` modes; the former
 Activation offloading uses the trainer's single CUDA stream; the unsupported
 `use_streams` and `max_fwd_stash_size` controls are rejected rather than
 silently ignored. Its `pin_memory` setting remains configurable.
+Additional vLLM server options belong in `inference.vllm.extra_args`. Keys may
+use snake case or kebab case; structured values are JSON-encoded and boolean
+values become `--flag`/`--no-flag`. Wavelet rejects collisions with arguments
+it manages, such as `model`, `port`, `tensor_parallel_size`, `enable_lora`, and
+`logprobs_mode`.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`
