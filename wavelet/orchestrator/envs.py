@@ -221,6 +221,7 @@ async def _evaluate_env_async(
         ),
         rollouts_per_example=env_config.rollouts_per_example,
         max_retries=env_config.max_retries,
+        max_inflight_rollouts=config.eval.max_inflight_rollouts,
     )
     elapsed = perf_counter() - started_at
     env_name = env_config.resolved_name
@@ -253,20 +254,29 @@ async def _run_eval_examples(
     sampling_args: dict[str, Any],
     rollouts_per_example: int,
     max_retries: int,
+    max_inflight_rollouts: int | None = None,
 ) -> list[dict[str, Any]]:
-    _scale_verifier_executors(len(examples) * rollouts_per_example)
-    tasks = []
-    example_ids: list[str] = []
-    for example_index, example in enumerate(examples):
-        client = clients[example_index % len(clients)]
-        for rollout_index in range(rollouts_per_example):
-            example_ids.append(
-                str(example.get("example_id", example.get("id", example_index)))
-            )
-            tasks.append(
-                env.run_rollout(
+    rollout_count = len(examples) * rollouts_per_example
+    executor_count = (
+        rollout_count
+        if max_inflight_rollouts is None
+        else min(rollout_count, max_inflight_rollouts)
+    )
+    _scale_verifier_executors(executor_count)
+    results: list[Any] = [None] * rollout_count
+    next_index = 0
+
+    async def run_worker() -> None:
+        nonlocal next_index
+        while next_index < rollout_count:
+            result_index = next_index
+            next_index += 1
+            example_index, rollout_index = divmod(result_index, rollouts_per_example)
+            example = examples[example_index]
+            try:
+                results[result_index] = await env.run_rollout(
                     vf.RolloutInput(**example),
-                    client=client,
+                    client=clients[example_index % len(clients)],
                     model=model,
                     sampling_args=_eval_rollout_sampling_args(
                         sampling_args, rollout_index=rollout_index
@@ -274,10 +284,15 @@ async def _run_eval_examples(
                     max_retries=max_retries,
                     state_columns=["trajectory", "sampling_args"],
                 )
-            )
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception as exc:  # noqa: BLE001
+                results[result_index] = exc
+
+    await asyncio.gather(*(run_worker() for _ in range(executor_count)))
     outputs: list[dict[str, Any]] = []
-    for example_id, result in zip(example_ids, results, strict=True):
+    for result_index, result in enumerate(results):
+        example_index = result_index // rollouts_per_example
+        example = examples[example_index]
+        example_id = str(example.get("example_id", example.get("id", example_index)))
         if isinstance(result, Exception):
             _raise_if_external_rate_limit(result)
             outputs.append(

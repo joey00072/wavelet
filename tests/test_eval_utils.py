@@ -153,6 +153,7 @@ def test_eval_config_inherits_group_defaults() -> None:
     assert env.num_examples == 16
     assert env.rollouts_per_example == 4
     assert env.resolved_name == "alphabet"
+    assert config.max_inflight_rollouts == 64
 
 
 def test_select_due_eval_envs_updates_each_env_independently() -> None:
@@ -620,3 +621,34 @@ def test_eval_rollouts_leave_unseeded_sampling_args_untouched() -> None:
         call.kwargs["sampling_args"] == {"temperature": 1.0}
         for call in run_rollout.await_args_list
     )
+
+
+def test_eval_rollouts_bound_inflight_requests() -> None:
+    vf = SimpleNamespace(RolloutInput=lambda **kwargs: kwargs)
+    active = 0
+    peak = 0
+
+    async def run_rollout(*_args, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return {"reward": 1.0, "completion": ["ok"]}
+
+    outputs = asyncio.run(
+        _run_eval_examples(
+            vf,
+            SimpleNamespace(run_rollout=run_rollout),
+            [{"question": str(index)} for index in range(4)],
+            clients=[object()],
+            model="model",
+            sampling_args={},
+            rollouts_per_example=2,
+            max_retries=0,
+            max_inflight_rollouts=3,
+        )
+    )
+
+    assert len(outputs) == 8
+    assert peak == 3

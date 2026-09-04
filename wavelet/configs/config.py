@@ -731,6 +731,7 @@ class RLEvalConfig(ConfigModel):
     rollouts_per_example: int = Field(default=1, ge=1)
     interval: int = Field(default=100, ge=1)
     max_retries: int = Field(default=0, ge=0)
+    max_inflight_rollouts: int = Field(default=64, ge=1)
     eval_base_model: bool = True
     final_eval: bool = True
     keep_last_rollout_sets: int = Field(default=2, ge=1)

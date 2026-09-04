@@ -344,8 +344,9 @@ def test_eval_requests_route_to_the_served_policy_model(
             return SimpleNamespace(to_list=list)
 
     async def run_examples(vf, env, examples, *, model, **kwargs):  # type: ignore[no-untyped-def]
-        del vf, env, examples, kwargs
+        del vf, env, examples
         captured["model"] = model
+        captured["max_inflight_rollouts"] = kwargs["max_inflight_rollouts"]
         return []
 
     monkeypatch.setattr(verifier_envs, "_load_verifiers", lambda feature: object())
@@ -361,7 +362,7 @@ def test_eval_requests_route_to_the_served_policy_model(
     config = RLConfig(
         output_dir=tmp_path / "run",
         lora={"rank": 4},
-        eval={"env": [{"id": "math-env"}]},
+        eval={"env": [{"id": "math-env"}], "max_inflight_rollouts": 7},
     )
     orchestrator = SimpleNamespace(config=config)
     engine = SimpleNamespace(policy_model_name="policy-adapter")
@@ -377,6 +378,7 @@ def test_eval_requests_route_to_the_served_policy_model(
     )
 
     assert captured["model"] == "policy-adapter"
+    assert captured["max_inflight_rollouts"] == 7
     assert metrics["progress/policy_step"] == 4.0
 
     asyncio.run(

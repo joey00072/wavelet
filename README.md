@@ -367,6 +367,9 @@ field as their step metric rather than an explicit monotonic step, so async
 evaluation results for an earlier optimizer step are not discarded, and a
 resumed run continues the previous W&B run through the id persisted in
 `<output_dir>/wandb_run_id.txt`.
+Evaluation rollout requests are bounded by `eval.max_inflight_rollouts`
+(default `64`) so a large evaluation set does not enqueue every generation at
+once.
 Online process-mode RL roles use W&B shared mode with that same run id: the
 trainer is the primary writer and the orchestrator is the final writer, so
 training, rollout, and evaluation metrics land in one run. Offline and disabled

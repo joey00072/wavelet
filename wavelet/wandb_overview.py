@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
@@ -12,6 +13,7 @@ import wandb_workspaces.workspaces as ws
 from wandb_workspaces.workspaces.internal import execute_graphql
 
 OVERVIEW_NAME = "overview"
+logger = logging.getLogger(__name__)
 _COLUMNS = 4
 _ROWS = 6
 
@@ -225,7 +227,8 @@ def ensure_overview_view(
             existing = ws.Workspace.from_url(
                 f"https://wandb.ai/{entity}/{project}?nw={slug}"
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not inspect W&B overview %s: %s", internal_name, exc)
             continue
         if _view_signature(existing.sections) == target:
             return None
