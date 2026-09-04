@@ -370,6 +370,11 @@ optimizer-step range as a Chrome trace. The default path is
 `<output_dir>/profiler/trace-<start>-<end>.json`; distributed runs add a rank
 suffix so workers never overwrite one another. Set `profiler.trace_path` to
 override the file location, and open the result in Perfetto or Chrome tracing.
+Enable `memory_profiler` on a CUDA trainer to record allocator history and write
+PyTorch memory-viz snapshots under `<output_dir>/memory/step-N/rank-N.pickle`.
+`memory_profiler.interval` controls the optimizer-step cadence and
+`max_entries` bounds retained allocator events; `output_dir` overrides the
+snapshot root. Enabling this profiler on a CPU-only runtime fails immediately.
 Standalone trainers use the same resolved step count for optimization and the
 learning-rate scheduler; in particular, RL `max_steps: 0` remains evaluation-only
 instead of falling back to an implicit training run. Without `max_steps`,

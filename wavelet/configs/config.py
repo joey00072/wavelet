@@ -248,6 +248,12 @@ class ProfilerConfig(ConfigModel):
         return self
 
 
+class MemoryProfilerConfig(ConfigModel):
+    interval: int = Field(default=1, ge=1)
+    max_entries: int = Field(default=100_000, ge=1)
+    output_dir: Path | None = None
+
+
 class CheckpointConfig(ConfigModel):
     interval: int | None = Field(default=None, ge=1)
     # Counts optimizer steps, not micro-steps.
@@ -339,6 +345,7 @@ class TrainerConfig(ConfigModel):
     scheduler: SchedulerConfig = SchedulerConfig()
     gc: GCConfig | None = GCConfig()
     profiler: ProfilerConfig | None = None
+    memory_profiler: MemoryProfilerConfig | None = None
     max_grad_norm: float = Field(default=1.0, ge=0.0)
     loss_impl: Literal["liger", "torch", "liger_fused"] = "torch"
     ckpt: CheckpointConfig | None = None

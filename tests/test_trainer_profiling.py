@@ -8,7 +8,7 @@ import torch
 
 from wavelet.configs.config import TrainerConfig
 from wavelet.trainer.distributed import World
-from wavelet.trainer.profiling import StepProfiler
+from wavelet.trainer.profiling import CudaMemoryProfiler, StepProfiler
 from wavelet.trainer.trainer import BaseTrainer
 
 
@@ -74,3 +74,77 @@ def test_distributed_trainer_uses_rank_specific_trace_path(
         profile_memory=True,
     )
     profiler.before_step.assert_called_once_with(2)
+
+
+def test_cuda_memory_profiler_writes_rank_local_snapshots(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    record_history = Mock()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda.memory, "_record_memory_history", record_history)
+    monkeypatch.setattr(
+        torch.cuda.memory,
+        "_snapshot",
+        Mock(return_value={"segments": ["snapshot"]}),
+    )
+    profiler = CudaMemoryProfiler(
+        tmp_path,
+        rank=2,
+        interval=3,
+        max_entries=123,
+    )
+
+    assert profiler.step(2) is None
+    snapshot_path = profiler.step(3)
+    profiler.close()
+
+    assert snapshot_path == tmp_path / "step-3" / "rank-2.pickle"
+    assert snapshot_path is not None and snapshot_path.exists()
+    record_history.assert_any_call(max_entries=123)
+    record_history.assert_called_with(enabled=None)
+
+
+def test_cuda_memory_profiler_requires_cuda(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    with pytest.raises(RuntimeError, match="requires a CUDA device"):
+        CudaMemoryProfiler(
+            tmp_path,
+            rank=0,
+            interval=1,
+            max_entries=100,
+        )
+
+
+def test_trainer_uses_default_memory_snapshot_root(tmp_path, monkeypatch) -> None:
+    trainer = BaseTrainer(
+        TrainerConfig(
+            output_dir=tmp_path,
+            memory_profiler={"interval": 4, "max_entries": 321},
+        )
+    )
+    trainer.world = World(
+        rank=1,
+        local_rank=1,
+        world_size=2,
+        local_world_size=2,
+        device=torch.device("cuda", 1),
+    )
+    memory_profiler = Mock()
+    create_profiler = Mock(return_value=memory_profiler)
+    monkeypatch.setattr(
+        "wavelet.trainer.trainer.CudaMemoryProfiler",
+        create_profiler,
+    )
+
+    trainer._ensure_memory_profiler()
+    trainer._maybe_dump_memory_snapshot(4)
+
+    create_profiler.assert_called_once_with(
+        tmp_path / "memory",
+        rank=1,
+        interval=4,
+        max_entries=321,
+    )
+    memory_profiler.step.assert_called_once_with(4)

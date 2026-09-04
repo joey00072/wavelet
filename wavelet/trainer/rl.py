@@ -577,6 +577,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def finalize(self, *, status: str = "completed") -> None:
         self._close_policy_transport()
         self._close_step_profiler()
+        self._close_memory_profiler()
         if self.monitor is None or self._run_closed:
             self._close_garbage_collector()
             return

@@ -1,8 +1,49 @@
 from __future__ import annotations
 
+import logging
+import pickle
 from pathlib import Path
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+class CudaMemoryProfiler:
+    """Record allocator history and dump rank-local snapshots on a fixed cadence."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        *,
+        rank: int,
+        interval: int,
+        max_entries: int,
+    ) -> None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA memory profiling requires a CUDA device.")
+        self.output_dir = Path(output_dir)
+        self.rank = rank
+        self.interval = interval
+        self._closed = False
+        torch.cuda.memory._record_memory_history(max_entries=max_entries)
+
+    def step(self, step: int) -> Path | None:
+        if self._closed or step <= 0 or step % self.interval != 0:
+            return None
+        snapshot_dir = self.output_dir / f"step-{step}"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / f"rank-{self.rank}.pickle"
+        with snapshot_path.open("wb") as handle:
+            pickle.dump(torch.cuda.memory._snapshot(), handle)
+        logger.info("Wrote CUDA memory snapshot to %s", snapshot_path)
+        return snapshot_path
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 class StepProfiler:

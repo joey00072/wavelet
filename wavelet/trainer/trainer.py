@@ -35,7 +35,7 @@ from wavelet.trainer.distributed import (
 )
 from wavelet.trainer.garbage_collection import DeterministicGarbageCollector
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
-from wavelet.trainer.profiling import StepProfiler
+from wavelet.trainer.profiling import CudaMemoryProfiler, StepProfiler
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import RunMonitor, setup_config_logger
@@ -139,6 +139,7 @@ class BaseTrainer:
         self.total_samples = 0
         self._garbage_collector: DeterministicGarbageCollector | None = None
         self._step_profiler: StepProfiler | None = None
+        self._memory_profiler: CudaMemoryProfiler | None = None
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -265,6 +266,7 @@ class BaseTrainer:
             raise RuntimeError("Trainer run has already been finalized.")
         assert self.model is not None
         assert self.world is not None
+        self._ensure_memory_profiler()
         self._ensure_garbage_collector()
         self.model.train()
         progress = tqdm(
@@ -283,6 +285,7 @@ class BaseTrainer:
                         continue
                     self._after_optimizer_step()
                     self._maybe_collect_garbage()
+                    self._maybe_dump_memory_snapshot(self.step)
                     self._maybe_finish_step_profiler(self.step)
                     self._log_train_output(output, progress)
                     self._maybe_checkpoint()
@@ -318,6 +321,7 @@ class BaseTrainer:
         if self.monitor is None:
             raise RuntimeError("Monitor not set up. Call setup() first.")
         self._close_step_profiler()
+        self._close_memory_profiler()
         try:
             self.monitor.finish(status=status, step=self.step)
             self._run_closed = True
@@ -373,6 +377,29 @@ class BaseTrainer:
             return
         self._step_profiler.close()
         self._step_profiler = None
+
+    def _ensure_memory_profiler(self) -> None:
+        config = self.config.memory_profiler
+        if config is None or self._memory_profiler is not None:
+            return
+        if self.world is None:
+            raise RuntimeError("World must be set up before memory profiling")
+        self._memory_profiler = CudaMemoryProfiler(
+            config.output_dir or (self.output_dir / "memory"),
+            rank=self.world.rank,
+            interval=config.interval,
+            max_entries=config.max_entries,
+        )
+
+    def _maybe_dump_memory_snapshot(self, step: int) -> None:
+        if self._memory_profiler is not None:
+            self._memory_profiler.step(step)
+
+    def _close_memory_profiler(self) -> None:
+        if self._memory_profiler is None:
+            return
+        self._memory_profiler.close()
+        self._memory_profiler = None
 
     def _setup_distributed(self) -> None:
         fsdp_config = getattr(self.config, "fsdp", None)
