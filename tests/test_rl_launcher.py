@@ -577,6 +577,29 @@ def test_inference_server_passes_quantized_load_args() -> None:
     assert _argv_value(argv, "--load-format") == "bitsandbytes"
 
 
+def test_inference_server_enables_fp32_projection_and_router_by_default() -> None:
+    argv = _serve_argv(RLConfig())
+
+    assert _argv_value(argv, "--additional-config") == '{"fp32_lm_head":true}'
+    assert _argv_value(argv, "--hf-overrides") == ('{"moe_router_dtype":"float32"}')
+
+
+def test_inference_server_allows_disabling_fp32_inference_controls() -> None:
+    config = RLConfig(
+        inference={
+            "vllm": {
+                "enable_fp32_lm_head": False,
+                "enable_fp32_router_logits": False,
+            }
+        }
+    )
+
+    argv = _serve_argv(config)
+
+    assert "--additional-config" not in argv
+    assert "--hf-overrides" not in argv
+
+
 def test_inference_server_passes_explicit_extra_vllm_args() -> None:
     config = RLConfig(
         inference={
@@ -601,7 +624,15 @@ def test_inference_server_passes_explicit_extra_vllm_args() -> None:
 
 @pytest.mark.parametrize(
     "key",
-    ["model", "port", "tensor_parallel_size", "enable-lora", "logprobs_mode"],
+    [
+        "model",
+        "port",
+        "tensor_parallel_size",
+        "enable-lora",
+        "logprobs_mode",
+        "additional_config",
+        "hf-overrides",
+    ],
 )
 def test_inference_server_rejects_managed_extra_vllm_args(key: str) -> None:
     with pytest.raises(ValueError, match="Wavelet-managed"):

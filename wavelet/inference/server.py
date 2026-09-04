@@ -1189,6 +1189,20 @@ def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--trust-remote-code")
     if config.model.chat_template is not None:
         argv.extend(["--chat-template", config.model.chat_template])
+    if vllm_config.enable_fp32_lm_head:
+        argv.extend(
+            [
+                "--additional-config",
+                json.dumps({"fp32_lm_head": True}, separators=(",", ":")),
+            ]
+        )
+    if vllm_config.enable_fp32_router_logits:
+        argv.extend(
+            [
+                "--hf-overrides",
+                json.dumps({"moe_router_dtype": "float32"}, separators=(",", ":")),
+            ]
+        )
 
 
 def _append_parser_serve_args(argv: list[str], config: RLConfig) -> None:

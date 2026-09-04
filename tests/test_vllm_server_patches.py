@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.entrypoints.openai import api_server
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
@@ -18,6 +19,7 @@ from vllm.lora.worker_manager import (
 )
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.inference import patches as inference_patches
 from wavelet.inference import server
 
 
@@ -174,6 +176,25 @@ def test_tool_parser_patch_silences_upstream_parser_logger(monkeypatch) -> None:
     server._patch_noisy_tool_parser_errors()
 
     assert hermes_tool_parser.logger.level == CRITICAL
+
+
+def test_fp32_lm_head_helper_uses_fp32_matmul_output(monkeypatch) -> None:
+    hidden_states = torch.ones((1, 2, 3), dtype=torch.bfloat16)
+    weight = torch.ones((4, 3), dtype=torch.bfloat16)
+    bias = torch.arange(4, dtype=torch.bfloat16)
+    calls: list[torch.dtype | None] = []
+
+    def mm(left, right, *, out_dtype=None):  # type: ignore[no-untyped-def]
+        calls.append(out_dtype)
+        return left.float() @ right.float()
+
+    monkeypatch.setattr(torch, "mm", mm)
+
+    logits = inference_patches._fp32_lm_head_logits(hidden_states, weight, bias)
+
+    assert calls == [torch.float32]
+    assert logits.shape == (1, 2, 4)
+    assert logits.dtype == torch.float32
 
 
 def test_build_app_patch_is_required_for_wavelet_router_and_state() -> None:

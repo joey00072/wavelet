@@ -796,6 +796,7 @@ _MANAGED_VLLM_ARGS = frozenset(
         "fully_sharded_loras",
         "generation_config",
         "gpu_memory_utilization",
+        "hf_overrides",
         "host",
         "load_format",
         "logprobs_mode",
@@ -804,6 +805,7 @@ _MANAGED_VLLM_ARGS = frozenset(
         "max_loras",
         "max_model_len",
         "model",
+        "additional_config",
         "port",
         "quantization",
         "reasoning_parser",
@@ -832,6 +834,14 @@ class RLVLLMConfig(ConfigModel):
     dtype: Literal["auto", "float32", "float16", "bfloat16"] | None = None
     tool_call_parser: str | None = "auto"
     reasoning_parser: str | None = "auto"
+    enable_fp32_lm_head: bool = Field(
+        default=True,
+        description="Accumulate and emit the inference LM-head projection in fp32.",
+    )
+    enable_fp32_router_logits: bool = Field(
+        default=True,
+        description="Request fp32 MoE router logits through Hugging Face overrides.",
+    )
     use_generation_logprobs: bool = True
     openai_batch_wait_seconds: float = Field(default=0.01, ge=0.0)
     openai_batch_min_size: int = Field(default=1, ge=1)

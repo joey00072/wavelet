@@ -574,6 +574,12 @@ it manages, such as `model`, `port`, `tensor_parallel_size`, `enable_lora`, and
 `inference.vllm.enforce_eager` defaults to `false`, allowing vLLM to use its
 hybrid eager/CUDA-graph execution path. Set it to `true` for deployments whose
 GPU-memory constraints or model behavior require eager-only execution.
+Inference enables fp32 LM-head output and fp32 MoE-router logits by default to
+avoid rounding away precision before token scoring and expert selection. Set
+`inference.vllm.enable_fp32_lm_head` or
+`inference.vllm.enable_fp32_router_logits` to `false` to opt out; their managed
+`additional_config` and `hf_overrides` arguments cannot also be supplied through
+`extra_args`.
 Process launches can add environment variables globally or per role:
 
 ```yaml
