@@ -194,6 +194,10 @@ with expressions such as `uv run pytest -m integration` or
 `uv run pytest -m "not gpu and not slow"`; tests marked `gpu` must also guard
 themselves when CUDA is unavailable.
 
+Pull requests and pushes to `master` run the same Ruff checks plus the complete
+`not gpu` pytest selection from the locked `uv` environment. GPU-only coverage
+remains an explicit release or hardware-runner check.
+
 Track project size when a change adds or removes meaningful surface area:
 
 ```bash
