@@ -8,6 +8,8 @@ from wavelet.data.rl import (
     RLExample,
     _coerce_advantages,
     _coerce_optional_sequence,
+    collate_rl_batch,
+    component_normalization_counts,
     prepare_rl_sample,
     setup_rl_dataloader,
 )
@@ -332,3 +334,46 @@ def test_retokenized_seq_len_truncation_keeps_logprob_prefix() -> None:
     trainable = sum(sample["loss_mask"])
     assert 0 < trainable < 21
     assert sample["inference_logprobs"] == [-float(index) for index in range(trainable)]
+
+
+def test_ce_only_sample_preserves_component_weights_through_collation() -> None:
+    record = _record(0, length=4)
+    record.advantage = None
+    record.reward = None
+    record.inference_logprobs = None
+    record.ce_weight = [0.0, 2.0, 1.0, 0.0]
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sample["advantages"] == [0.0] * 4
+    assert sample["rl_weights"] == [0.0] * 4
+    assert sample["ce_weights"] == [0.0, 2.0, 1.0, 0.0]
+    assert component_normalization_counts(sample) == {
+        "rl": 0,
+        "ce": 2,
+        "ref_kl": 0,
+    }
+
+    batch = collate_rl_batch([sample], pad_token_id=0)
+    assert batch["rl_weights"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
+    assert batch["ce_weights"].tolist() == [[0.0, 2.0, 1.0, 0.0]]
+    assert batch["ref_kl_weights"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
+
+
+def test_component_weight_streams_must_align_with_source_tokens() -> None:
+    record = _record(0, length=4)
+    record.ref_kl_weight = [1.0, 1.0]
+
+    with pytest.raises(ValueError, match="ref_kl_weight.*2 != 4"):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )

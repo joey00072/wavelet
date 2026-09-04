@@ -259,6 +259,31 @@ def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch() -> None:
     assert trainer._estimate_optimizer_batch_loss_scale() == 64.0
 
 
+def test_optimizer_batch_scales_count_each_loss_component_independently() -> None:
+    config = RLConfig(data={"batch_size": 2, "micro_batch_size": 1, "seq_len": 8})
+    records = [_rl_example(2), _rl_example(2)]
+    records[0].ce_weight = [1.0, 0.0]
+    records[0].ref_kl_weight = [1.0, 1.0]
+    records[0].teacher_logprobs = [-0.5, -0.5]
+    records[1].ce_weight = [2.0, 3.0]
+
+    trainer = RLTrainer(config)
+    trainer.world = _cpu_world()
+    trainer.accumulation_steps = 2
+    trainer.dataset = RLDataset(
+        records=records,
+        tokenizer=None,  # type: ignore[arg-type]
+        seq_len=8,
+        data_config=config.data,
+    )
+
+    assert trainer._estimate_optimizer_batch_loss_scales() == {
+        "rl": 4.0,
+        "ce": 3.0,
+        "ref_kl": 2.0,
+    }
+
+
 def test_loss_scale_uses_global_token_mean_for_averaged_dp_gradients(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -298,7 +323,8 @@ def test_loss_scale_uses_global_token_mean_for_averaged_dp_gradients(
     ) -> None:
         assert op == torch.distributed.ReduceOp.SUM
         assert group is dp_group
-        tensor.add_(8.0)
+        assert tensor.tolist() == [4.0, 0.0, 0.0]
+        tensor.add_(torch.tensor([8.0, 6.0, 2.0]))
 
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 

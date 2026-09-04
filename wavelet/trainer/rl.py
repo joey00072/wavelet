@@ -36,10 +36,12 @@ from wavelet.orchestrator.schedule import (
 from wavelet.trainer.ckpt import TrainerState
 from wavelet.trainer.distributed import barrier
 from wavelet.trainer.losses import (
+    component_normalization_unit_counts,
     compute_entropy,
     compute_loss,
     normalization_unit_count,
     selective_log_softmax,
+    setup_rl_loss_fn,
 )
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.trainer import BaseTrainer
@@ -239,10 +241,12 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._train_loss_accum: list[float] = []
         self._train_metric_accum: list[dict[str, float]] = []
         self._optimizer_batch_loss_scale: float | None = None
+        self._optimizer_batch_loss_scales: dict[str, float] | None = None
         self._gradient_accumulation_loss_scale: float | None = None
         self._dynamic_loss_scale_local = 0.0
         self._loaded_micro_batch_count = 0
         self._run_closed = False
+        self._rl_loss_fn = setup_rl_loss_fn(config.loss)
         self._init_policy_transport()
 
     def _setup_data(self) -> None:
@@ -269,7 +273,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         )
         if isinstance(self.dataset, PackedRLDataset):
             self.accumulation_steps = self._packed_dataloader_batch_count()
-        self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
+        self._set_optimizer_batch_loss_scales(
+            self._estimate_optimizer_batch_loss_scales()
+        )
 
     def _validate_ready(self) -> None:
         super()._validate_ready()
@@ -283,6 +289,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         # Use measured token counts for the first resumed optimizer step; the
         # static estimate is recomputed from the moved cursor after that step.
         self._optimizer_batch_loss_scale = None
+        self._optimizer_batch_loss_scales = None
 
     def _validate_resume_state(self, state: TrainerState) -> None:
         if state.step < 0 or state.micro_step < state.step:
@@ -586,7 +593,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         from wavelet.trainer.model import unwrap_model
 
         missing_references = any(
-            record.inference_logprobs is None for record in self.dataset.records
+            record.inference_logprobs is None
+            and (
+                record.advantage is not None
+                or record.reward is not None
+                or record.ref_kl_weight is not None
+            )
+            for record in self.dataset.records
         )
         if not missing_references:
             return
@@ -612,29 +625,48 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
     def _estimate_optimizer_batch_loss_scale(self) -> float | None:
+        scales = self._estimate_optimizer_batch_loss_scales()
+        return None if scales is None else scales["rl"]
+
+    def _estimate_optimizer_batch_loss_scales(self) -> dict[str, float] | None:
         if self.config.data.num_workers != 0:
             return None
         if not isinstance(self.dataset, (RLDataset, PackedRLDataset)):
             return None
-        records = self.dataset.records
-        if any(
-            record.advantage is None and record.reward is None for record in records
-        ):
-            return None
         local_optimizer_batch_size = (
             self.accumulation_steps * self.config.data.micro_batch_size
         )
-        local_loss_scale = self.dataset.loss_scale_for_next_local_batch(
+        local_loss_scales = self.dataset.loss_scales_for_next_local_batch(
             local_optimizer_batch_size,
-            normalization=self.config.loss.normalization,
+            rl_normalization=self.config.loss.normalization,
         )
-        return self._average_data_parallel_loss_scale(local_loss_scale)
+        return self._average_data_parallel_loss_scales(local_loss_scales)
+
+    def _set_optimizer_batch_loss_scales(
+        self,
+        scales: dict[str, float] | None,
+    ) -> None:
+        self._optimizer_batch_loss_scales = scales
+        self._optimizer_batch_loss_scale = None if scales is None else scales["rl"]
 
     def _average_data_parallel_loss_scale(self, local_loss_scale: float) -> float:
         """Return the denominator compatible with averaged DP gradients."""
+        return self._average_data_parallel_loss_scales(
+            {"rl": local_loss_scale, "ce": 0.0, "ref_kl": 0.0}
+        )["rl"]
+
+    def _average_data_parallel_loss_scales(
+        self,
+        local_loss_scales: dict[str, float | int],
+    ) -> dict[str, float]:
+        """Return per-component denominators for averaged DP gradients."""
+        components = ("rl", "ce", "ref_kl")
         _, data_world_size = self._data_partition()
         if data_world_size == 1:
-            return max(float(local_loss_scale), 1.0)
+            return {
+                component: max(float(local_loss_scales[component]), 1.0)
+                for component in components
+            }
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed RL loss normalization requires an initialized "
@@ -646,21 +678,28 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 "before RL loss normalization."
             )
 
-        loss_scale = torch.tensor(
-            float(local_loss_scale),
+        loss_scales = torch.tensor(
+            [float(local_loss_scales[component]) for component in components],
             dtype=torch.float64,
             device=self.world.device,
         )
         dp_group = self.parallel_dims.get_mesh("dp").get_group()
         torch.distributed.all_reduce(
-            loss_scale,
+            loss_scales,
             op=torch.distributed.ReduceOp.SUM,
             group=dp_group,
         )
         # DDP and FSDP average gradients across the same data-parallel ranks.
         # Dividing each local loss by the average token count therefore yields
         # a global sum divided by the global token count after gradient sync.
-        return max(float(loss_scale.item()) / data_world_size, 1.0)
+        return {
+            component: max(float(scale) / data_world_size, 1.0)
+            for component, scale in zip(
+                components,
+                loss_scales.tolist(),
+                strict=True,
+            )
+        }
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
@@ -675,6 +714,39 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             mask_dtype = _torch_dtype_from_name(self.config.model.torch_dtype)
             if mask_dtype is not None:
                 attention_mask = attention_mask.to(dtype=mask_dtype)
+
+        rl_weights, ce_weights, ref_kl_weights = self._component_weights(batch)
+        has_auxiliary_component = bool(
+            (ce_weights != 0).any() or (ref_kl_weights != 0).any()
+        )
+        if has_auxiliary_component and self._optimizer_batch_loss_scales is None:
+            local_scales = component_normalization_unit_counts(
+                batch["loss_mask"],
+                rl_weights=rl_weights,
+                ce_weights=ce_weights,
+                ref_kl_weights=ref_kl_weights,
+                rl_normalization=self.config.loss.normalization,
+                position_ids=batch["position_ids"],
+            )
+            remaining_local_samples = (
+                self.accumulation_steps - 1
+            ) * self.config.data.micro_batch_size
+            if remaining_local_samples > 0:
+                if self.config.data.num_workers != 0 or not isinstance(
+                    self.dataset, (RLDataset, PackedRLDataset)
+                ):
+                    raise ValueError(
+                        "CE/ref-KL loss components with data.num_workers=1 require "
+                        "data.batch_size to equal the global micro-batch size."
+                    )
+                remaining_scales = self.dataset.loss_scales_for_next_local_batch(
+                    remaining_local_samples,
+                    rl_normalization=self.config.loss.normalization,
+                )
+                for component in local_scales:
+                    local_scales[component] += int(remaining_scales[component])
+            estimated_scales = self._average_data_parallel_loss_scales(local_scales)
+            self._set_optimizer_batch_loss_scales(estimated_scales)
 
         with self.act_offload_ctx:
             loss_output = self._forward_rl_loss(batch, attention_mask)
@@ -721,6 +793,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if not batch["loss_mask"].bool().any():
             loss = trainer_logprobs.sum() * 0.0
             return LossOutput(loss=loss, metrics=self._zero_loss_metrics(loss))
+        rl_weights, ce_weights, ref_kl_weights = self._component_weights(batch)
         output = compute_loss(
             trainer_logprobs,
             self._inference_logprobs(batch, attention_mask),
@@ -734,9 +807,26 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 else 1.0
             ),
             position_ids=batch["position_ids"],
+            rl_weights=rl_weights,
+            ce_weights=ce_weights,
+            ref_kl_weights=ref_kl_weights,
+            component_loss_scales=self._optimizer_batch_loss_scales,
+            rl_loss_fn=self._rl_loss_fn,
         )
         output.metrics.update(self._entropy_metrics(entropy, batch["loss_mask"]))
         return output
+
+    @staticmethod
+    def _component_weights(batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
+        loss_mask = batch["loss_mask"]
+        return (
+            batch.get("rl_weights", loss_mask.to(dtype=torch.float32)),
+            batch.get("ce_weights", torch.zeros_like(loss_mask, dtype=torch.float32)),
+            batch.get(
+                "ref_kl_weights",
+                torch.zeros_like(loss_mask, dtype=torch.float32),
+            ),
+        )
 
     def _backward_rl_loss(self, loss: Tensor) -> None:
         with self._maybe_no_sync():
@@ -805,7 +895,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         metrics.update(self._standard_metric_aliases(metrics))
         metrics = self._sync_metrics(metrics)
         metrics = self._finalize_synced_metrics(metrics)
-        self._optimizer_batch_loss_scale = self._estimate_optimizer_batch_loss_scale()
+        self._set_optimizer_batch_loss_scales(
+            self._estimate_optimizer_batch_loss_scales()
+        )
         self._gradient_accumulation_loss_scale = None
         return metrics
 
@@ -833,7 +925,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     ) -> Tensor:
         inference_logprobs = batch["inference_logprobs"].clone()
         has_inference = batch["has_inference_logprobs"].bool()
-        if has_inference.all():
+        rl_weights, _, ref_kl_weights = self._component_weights(batch)
+        needs_inference = (rl_weights != 0).any(dim=1) | (ref_kl_weights != 0).any(
+            dim=1
+        )
+        missing_required = ~has_inference & needs_inference
+        if not missing_required.any():
+            inference_logprobs[~has_inference] = 0.0
             return inference_logprobs
 
         from wavelet.trainer.model import unwrap_model
@@ -853,7 +951,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         finally:
             if training:
                 self.model.train()
-        inference_logprobs[~has_inference] = computed_inference[~has_inference]
+        inference_logprobs[missing_required] = computed_inference[missing_required]
         return inference_logprobs
 
     def _model_logprobs(
@@ -930,11 +1028,19 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         return contextlib.nullcontext()
 
     def _teacher_logprobs(self, batch: dict[str, Tensor]) -> Tensor | None:
-        if not batch["has_teacher_logprobs"].bool().any():
-            return None
-        if not batch["has_teacher_logprobs"].bool().all():
+        has_teacher = batch["has_teacher_logprobs"].bool()
+        _, _, ref_kl_weights = self._component_weights(batch)
+        needs_teacher = (ref_kl_weights != 0).any(dim=1)
+        if (~has_teacher & needs_teacher).any():
             raise ValueError(
-                "teacher_logprobs must be provided for either all samples in a batch or none."
+                "teacher_logprobs are required for samples with nonzero ref_kl_weight."
+            )
+        if not has_teacher.any():
+            return None
+        if self.config.loss.teacher_tau > 0.0 and not has_teacher.all():
+            raise ValueError(
+                "teacher_logprobs must be provided for all samples when "
+                "loss.teacher_tau is nonzero."
             )
         return batch["teacher_logprobs"]
 
@@ -1523,11 +1629,25 @@ def _configure_streaming_accumulation(
             + loaded_micro_batches * max(remaining_chunks + 1, 2)
         )
 
+    records = getattr(trainer.dataset, "records", ())
+    has_auxiliary_components = any(
+        record.ce_weight is not None or record.ref_kl_weight is not None
+        for record in records
+    )
+    if has_auxiliary_components:
+        if chunks_per_step != 1:
+            raise ValueError(
+                "CE/ref-KL components require non-streaming rollout publication "
+                "when an optimizer step spans multiple chunks."
+            )
+        trainer._gradient_accumulation_loss_scale = None
+        return
+
     if accumulator.accumulated_loss_scale > 0.0:
-        trainer._optimizer_batch_loss_scale = 1.0
+        trainer._set_optimizer_batch_loss_scales({"rl": 1.0, "ce": 1.0, "ref_kl": 1.0})
         trainer._gradient_accumulation_loss_scale = accumulator.accumulated_loss_scale
     else:
-        trainer._optimizer_batch_loss_scale = None
+        trainer._set_optimizer_batch_loss_scales(None)
         trainer._gradient_accumulation_loss_scale = None
 
 

@@ -449,6 +449,8 @@ class RLDataConfig(TrainingDataConfig):
     inference_logprobs_column: str = "inference_logprobs"
     teacher_logprobs_column: str = "teacher_logprobs"
     temperature_column: str = "temperature"
+    ce_weight_column: str = "ce_weight"
+    ref_kl_weight_column: str = "ref_kl_weight"
     metadata_column: str = "metadata"
 
     @model_validator(mode="after")
@@ -490,7 +492,9 @@ class RLDataConfig(TrainingDataConfig):
 
 
 class RLLossConfig(ConfigModel):
-    type: Literal["dppo"] = "dppo"
+    type: Literal["dppo", "custom"] = "dppo"
+    import_path: str | None = None
+    kwargs: dict[str, Any] = Field(default_factory=dict)
     dppo_mask_high: float = Field(default=0.20, ge=0.0)
     dppo_mask_low: float = Field(default=0.20, ge=0.0)
     kl_tau: float = Field(default=1e-3, ge=0.0)
@@ -506,7 +510,34 @@ class RLLossConfig(ConfigModel):
         normalized = dict(value)
         if "advantage_scale" in normalized and "adv_tau" not in normalized:
             normalized["adv_tau"] = normalized.pop("advantage_scale")
+        if normalized.get("type") == "custom":
+            dppo_fields = {
+                "dppo_mask_high",
+                "dppo_mask_low",
+                "kl_tau",
+                "adv_tau",
+                "teacher_tau",
+            }
+            conflicts = sorted(dppo_fields & normalized.keys())
+            if conflicts:
+                raise ValueError(
+                    "DPPO-only loss fields cannot be set for a custom loss: "
+                    f"{', '.join(conflicts)}. Pass custom arguments through kwargs."
+                )
         return normalized
+
+    @model_validator(mode="after")
+    def validate_custom_loss(self) -> "RLLossConfig":
+        if self.type == "custom":
+            if self.import_path is None or not self.import_path.strip():
+                raise ValueError("Custom RL loss requires a non-empty import_path.")
+            return self
+        if self.import_path is not None or self.kwargs:
+            raise ValueError(
+                "loss.import_path and loss.kwargs are only valid when loss.type="
+                "'custom'."
+            )
+        return self
 
 
 class RLTransportConfig(ConfigModel):

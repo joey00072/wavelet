@@ -17,6 +17,8 @@ def test_rollout_record_round_trip_preserves_training_fields():
         inference_logprobs=[-0.2],
         teacher_logprobs=[-0.1],
         temperatures=[1.0],
+        ce_weight=[0.25],
+        ref_kl_weight=[0.75],
         tools=[{"type": "function"}],
         chat_template_kwargs={"reasoning": True},
         metadata={"group_key": "group"},

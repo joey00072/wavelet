@@ -13,6 +13,7 @@ from wavelet.configs.config import DEFAULT_LORA_TARGET_MODULES
 from wavelet.configs.rl_config import (
     GRPOAlgorithmConfig,
     RLConfig,
+    RLLossConfig,
     TokensLengthPenaltyConfig,
 )
 from wavelet.configs.sft import LoRAConfig, SFTConfig
@@ -31,6 +32,26 @@ def test_rl_data_rejects_multiple_dataloader_workers() -> None:
 
     with pytest.raises(ValueError, match="num_workers"):
         RLConfig(data={"num_workers": 2})
+
+
+def test_custom_rl_loss_requires_import_path_and_owns_kwargs() -> None:
+    custom = RLLossConfig(
+        type="custom",
+        import_path="package.module.loss",
+        kwargs={"scale": 2.0},
+    )
+    assert custom.import_path == "package.module.loss"
+
+    with pytest.raises(ValueError, match="import_path"):
+        RLLossConfig(type="custom")
+    with pytest.raises(ValueError, match="only valid"):
+        RLLossConfig(type="dppo", kwargs={"scale": 2.0})
+    with pytest.raises(ValueError, match="DPPO-only"):
+        RLLossConfig(
+            type="custom",
+            import_path="package.module.loss",
+            kl_tau=0.5,
+        )
 
 
 # ── legacy advantage keys ─────────────────────────────────────────────────────

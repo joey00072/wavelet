@@ -114,6 +114,15 @@ supported; see the [data pipeline guide](data_pipeline.md). Serialized
 `RLExample` payloads are the boundary between rollout generation, HTTP
 inference, queues, diagnostics, and training.
 
+`wavelet.trainer.losses` owns the component loss contract. Its default RL
+component preserves DPPO, while CE and reference-KL components are selected by
+per-token streams on `RLExample`. Each component is divided by its own global
+token count (the RL component may retain sequence normalization), using one
+batched data-parallel reduction for all component counts. Custom RL functions
+are imported from `loss.import_path`; they receive `LossInputs`, including the
+already-derived component mask and optional token weights, and return
+`LossOutput`.
+
 ## Policy Artifacts
 
 `wavelet.transport.policy` owns filesystem and NCCL policy transfer, while

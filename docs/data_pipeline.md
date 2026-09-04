@@ -41,9 +41,12 @@ RL records use `RLExample` from `wavelet.data.rl`. The stages are:
    streams with the full token sequence.
 
 Token-level streams (`advantage` lists, `inference_logprobs`, `teacher_logprobs`,
-`temperature` lists) must match the trainable token count exactly; a longer
-stream is only accepted when the sample was cut at `seq_len`, in which case the
-aligned prefix is kept. RL `data.num_workers` is limited to 0 or 1 because rows
+`temperature`, `ce_weight`, and `ref_kl_weight` lists) must match the trainable
+token count exactly; a longer stream is only accepted when the sample was cut at
+`seq_len`, in which case the aligned prefix is kept. A row without an advantage
+or reward may still train CE or reference KL; its RL component is disabled.
+Nonzero `ref_kl_weight` values require aligned `teacher_logprobs`. RL
+`data.num_workers` is limited to 0 or 1 because rows
 are pretokenized and extra workers would split rows and packed bins differently
 from the per-rank micro-batch count the trainer expects. SFT messages with
 `content: null` are treated as empty strings, and a per-message
@@ -59,8 +62,10 @@ records, tokenization, collation, and datasets.
 
 A pre-tokenized row must provide `input_ids`, `target_ids`, and `loss_mask` with
 matching lengths. Token-level `advantage`, `inference_logprobs`,
-`teacher_logprobs`, and `temperature` values align only with `true` entries in
-`loss_mask`; they do not include values for masked tokens.
+`teacher_logprobs`, `temperature`, `ce_weight`, and `ref_kl_weight` values align
+only with `true` entries in `loss_mask`; they do not include values for masked
+tokens. Zero component weights remove a token from both that component's loss
+and denominator; nonzero weights scale its loss while counting the token once.
 
 Pretokenized rows are never retokenized from their chat messages, because the
 sampled `inference_logprobs` belong to the original token stream. A row whose

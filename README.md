@@ -235,9 +235,18 @@ trainer ranks finish reading them; retained consumed queue batches remain the
 auditable rollout source.
 
 RL loss normalization is optimizer-batch exact for variable-length examples.
-When dataloader workers prevent deterministic look-ahead, the trainer sums raw
-microbatch losses and applies the measured global token or sequence denominator
-once at the optimizer boundary.
+DPPO (`rl`), cross entropy (`ce`), and reference-policy KL (`ref_kl`) each use
+their own global denominator, so adding sparsely weighted CE or distillation
+tokens does not dilute another component. Rollout rows opt into the auxiliary
+components with trainable-token-aligned `ce_weight` and `ref_kl_weight` streams;
+`ref_kl` also requires `teacher_logprobs`. `loss.type: custom` imports a custom
+RL component through `loss.import_path` and forwards `loss.kwargs`.
+When dataloader workers prevent deterministic look-ahead, the RL-only trainer
+sums raw microbatch losses and applies the measured global token or sequence
+denominator once at the optimizer boundary. Auxiliary components with one data
+worker require a single microbatch per optimizer step. Multi-chunk streaming
+steps remain RL-only because their final auxiliary denominators are not known
+when the first chunk is backpropagated.
 If any distributed rank observes a non-finite loss, all ranks abort before
 backward and accumulated gradients are cleared; the trainer never silently
 skips a microbatch into a later optimizer update.

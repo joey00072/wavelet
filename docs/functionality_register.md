@@ -14,7 +14,7 @@ run in the ordinary test suite.
 | Rewards and advantage algorithms | `uv run pytest tests/test_reward.py tests/test_algorithms.py` |
 | Agent trajectory token provenance | `uv run pytest tests/test_agent_trajectory.py` |
 | RL records, packing, and tokenization | `uv run pytest tests/test_rl_dataset.py tests/test_tokenization_alignment.py` |
-| DPPO loss and trainer stepping | `uv run pytest tests/test_rl_loss.py tests/test_rl_trainer.py` |
+| Component RL/CE/ref-KL losses and trainer stepping | `uv run pytest tests/test_rl_loss.py tests/test_rl_trainer.py` |
 | LoRA, policy metadata, and policy loading | `uv run pytest tests/test_trainer_lora.py tests/test_policy_metadata.py tests/test_rl_inference_policy.py` |
 | HTTP, offline, and native inference | `uv run pytest tests/test_http_inference.py tests/test_native_inference_server.py tests/test_vllm_batching.py` |
 | Diagnostics, metrics, monitoring, state server | `uv run pytest tests/test_monitor.py tests/test_monitoring.py tests/test_inference_diagnostics.py tests/test_orchestrator_diagnostics.py tests/test_trainer_diagnostics.py tests/test_orchestrator_metrics.py tests/test_state_server.py` |

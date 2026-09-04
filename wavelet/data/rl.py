@@ -27,6 +27,7 @@ from wavelet.data.sft import (
 )
 
 logger = logging.getLogger(__name__)
+LOSS_COMPONENTS = ("rl", "ce", "ref_kl")
 
 
 class RLSample(TypedDict):
@@ -37,6 +38,9 @@ class RLSample(TypedDict):
     target_ids: list[int]
     loss_mask: list[bool]
     advantages: list[float]
+    rl_weights: NotRequired[list[float]]
+    ce_weights: NotRequired[list[float]]
+    ref_kl_weights: NotRequired[list[float]]
     inference_logprobs: NotRequired[list[float]]
     teacher_logprobs: NotRequired[list[float]]
     temperatures: list[float]
@@ -54,6 +58,9 @@ class RLBatch(TypedDict):
     labels: Tensor
     loss_mask: Tensor
     advantages: Tensor
+    rl_weights: Tensor
+    ce_weights: Tensor
+    ref_kl_weights: Tensor
     rewards: Tensor
     has_inference_logprobs: Tensor
     inference_logprobs: Tensor
@@ -78,6 +85,8 @@ class RLExample:
     inference_logprobs: list[float] | None = None
     teacher_logprobs: list[float] | None = None
     temperatures: float | list[float] | None = None
+    ce_weight: float | list[float] | None = None
+    ref_kl_weight: float | list[float] | None = None
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
@@ -103,6 +112,8 @@ def rl_example_from_payload(payload: dict[str, Any]) -> RLExample:
         inference_logprobs=payload.get("inference_logprobs"),
         teacher_logprobs=payload.get("teacher_logprobs"),
         temperatures=payload.get("temperatures"),
+        ce_weight=payload.get("ce_weight"),
+        ref_kl_weight=payload.get("ref_kl_weight"),
         tools=payload.get("tools"),
         chat_template_kwargs=payload.get("chat_template_kwargs"),
         metadata=payload.get("metadata"),
@@ -139,6 +150,8 @@ def serialize_rl_record(
         config.advantage_column: record.advantage,
         config.reward_column: record.reward,
         config.temperature_column: record.temperatures,
+        config.ce_weight_column: record.ce_weight,
+        config.ref_kl_weight_column: record.ref_kl_weight,
     }
     optional = {
         "input_ids": record.input_ids,
@@ -184,18 +197,23 @@ def deserialize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLEx
         inference_logprobs=payload.get(config.inference_logprobs_column),
         teacher_logprobs=payload.get(config.teacher_logprobs_column),
         temperatures=temperatures,
+        ce_weight=payload.get(config.ce_weight_column),
+        ref_kl_weight=payload.get(config.ref_kl_weight_column),
         metadata=metadata,
     )
 
 
 def trainable_token_count(sample: RLSample) -> int:
     """Return the number of tokens that contribute to the RL loss."""
-    return sum(bool(value) for value in sample["loss_mask"])
+    weights = sample.get("rl_weights")
+    if weights is None:
+        return sum(bool(value) for value in sample["loss_mask"])
+    return sum(weight != 0.0 for weight in weights)
 
 
 def trainable_sequence_count(sample: RLSample) -> int:
     """Return the number of packed sequences that contribute to the RL loss."""
-    loss_mask = sample["loss_mask"]
+    loss_mask = _component_mask(sample, "rl")
     if not any(bool(value) for value in loss_mask):
         return 0
 
@@ -213,6 +231,41 @@ def trainable_sequence_count(sample: RLSample) -> int:
         any(bool(value) for value in loss_mask[start:end])
         for start, end in zip(starts, ends, strict=True)
     )
+
+
+def _component_mask(sample: RLSample, component: str) -> list[bool]:
+    loss_mask = sample["loss_mask"]
+    stream_name = f"{component}_weights"
+    weights = sample.get(stream_name)  # type: ignore[literal-required]
+    if weights is None:
+        return list(loss_mask) if component == "rl" else [False] * len(loss_mask)
+
+    expanded: list[bool] = []
+    trainable_index = 0
+    for trainable in loss_mask:
+        if not trainable:
+            expanded.append(False)
+            continue
+        expanded.append(weights[trainable_index] != 0.0)
+        trainable_index += 1
+    return expanded
+
+
+def component_normalization_counts(
+    sample: RLSample,
+    *,
+    rl_normalization: str = "token",
+) -> dict[str, int]:
+    """Count each loss component's normalization units in one sample."""
+    return {
+        "rl": (
+            trainable_sequence_count(sample)
+            if rl_normalization == "sequence"
+            else trainable_token_count(sample)
+        ),
+        "ce": sum(_component_mask(sample, "ce")),
+        "ref_kl": sum(_component_mask(sample, "ref_kl")),
+    }
 
 
 def pack_samples(
@@ -279,6 +332,9 @@ def _merge_samples(
     position_ids: list[int] = []
     loss_mask: list[bool] = []
     advantages: list[float] = []
+    rl_weights: list[float] = []
+    ce_weights: list[float] = []
+    ref_kl_weights: list[float] = []
     inference_logprobs: list[float] = []
     teacher_logprobs: list[float] = []
     temperatures: list[float] = []
@@ -288,6 +344,8 @@ def _merge_samples(
     sample_count = sum(int(sample.get("sample_count", 1)) for sample in samples)
     has_inference = all("inference_logprobs" in sample for sample in samples)
     has_teacher = all("teacher_logprobs" in sample for sample in samples)
+    has_ce = any("ce_weights" in sample for sample in samples)
+    has_ref_kl = any("ref_kl_weights" in sample for sample in samples)
 
     for sample in samples:
         input_ids.extend(sample["input_ids"])
@@ -295,6 +353,14 @@ def _merge_samples(
         position_ids.extend(sample["position_ids"])
         loss_mask.extend(sample["loss_mask"])
         advantages.extend(sample["advantages"])
+        trainable_tokens = sum(sample["loss_mask"])
+        rl_weights.extend(sample.get("rl_weights", [1.0] * trainable_tokens))
+        if has_ce:
+            ce_weights.extend(sample.get("ce_weights", [0.0] * trainable_tokens))
+        if has_ref_kl:
+            ref_kl_weights.extend(
+                sample.get("ref_kl_weights", [0.0] * trainable_tokens)
+            )
         temperatures.extend(sample["temperatures"])
         if has_inference:
             inference_logprobs.extend(sample["inference_logprobs"])
@@ -314,6 +380,7 @@ def _merge_samples(
         "target_ids": target_ids,
         "loss_mask": loss_mask,
         "advantages": advantages,
+        "rl_weights": rl_weights,
         "temperatures": temperatures,
         "reward": sum(rewards) / len(rewards) if rewards else None,
         "sample_count": sample_count,
@@ -322,6 +389,10 @@ def _merge_samples(
         packed["inference_logprobs"] = inference_logprobs
     if has_teacher:
         packed["teacher_logprobs"] = teacher_logprobs
+    if has_ce:
+        packed["ce_weights"] = ce_weights
+    if has_ref_kl:
+        packed["ref_kl_weights"] = ref_kl_weights
     return packed
 
 
@@ -351,6 +422,7 @@ def _zero_loss_copy(source: RLSample) -> RLSample:
         "target_ids": list(source["target_ids"]),
         "loss_mask": [False] * len(source["loss_mask"]),
         "advantages": [],
+        "rl_weights": [],
         "temperatures": [],
         "reward": None,
         "sample_count": 0,
@@ -359,6 +431,10 @@ def _zero_loss_copy(source: RLSample) -> RLSample:
         dummy["inference_logprobs"] = []
     if "teacher_logprobs" in source:
         dummy["teacher_logprobs"] = []
+    if "ce_weights" in source:
+        dummy["ce_weights"] = []
+    if "ref_kl_weights" in source:
+        dummy["ref_kl_weights"] = []
     return dummy
 
 
@@ -429,6 +505,9 @@ def collate_rl_batch(
         "labels": [],
         "loss_mask": [],
         "advantages": [],
+        "rl_weights": [],
+        "ce_weights": [],
+        "ref_kl_weights": [],
         "rewards": [],
         "has_inference_logprobs": [],
         "inference_logprobs": [],
@@ -458,6 +537,9 @@ def _append_sample(
     trainable_tokens = sum(loss_mask)
     inference_logprobs = item.get("inference_logprobs")
     teacher_logprobs = item.get("teacher_logprobs")
+    rl_weights = item.get("rl_weights")
+    ce_weights = item.get("ce_weights")
+    ref_kl_weights = item.get("ref_kl_weights")
 
     _validate_trainable_values(
         item["advantages"],
@@ -479,6 +561,16 @@ def _append_sample(
         field_name="teacher_logprobs",
         trainable_tokens=trainable_tokens,
     )
+    for field_name, values in (
+        ("rl_weights", rl_weights),
+        ("ce_weights", ce_weights),
+        ("ref_kl_weights", ref_kl_weights),
+    ):
+        _validate_trainable_values(
+            values,
+            field_name=field_name,
+            trainable_tokens=trainable_tokens,
+        )
 
     expanded_advantages = _expand_trainable_values(
         item["advantages"], mask=loss_mask, default=0.0
@@ -491,6 +583,15 @@ def _append_sample(
     )
     expanded_temperatures = _expand_trainable_values(
         item["temperatures"], mask=loss_mask, default=1.0
+    )
+    expanded_rl_weights = _expand_trainable_values(
+        rl_weights, mask=loss_mask, default=1.0
+    )
+    expanded_ce_weights = _expand_trainable_values(
+        ce_weights, mask=loss_mask, default=0.0
+    )
+    expanded_ref_kl_weights = _expand_trainable_values(
+        ref_kl_weights, mask=loss_mask, default=0.0
     )
     labels = [
         target_id if trainable else IGNORE_INDEX
@@ -523,6 +624,15 @@ def _append_sample(
     )
     output["advantages"].append(
         torch.tensor(expanded_advantages + [0.0] * padding, dtype=torch.float32)
+    )
+    output["rl_weights"].append(
+        torch.tensor(expanded_rl_weights + [0.0] * padding, dtype=torch.float32)
+    )
+    output["ce_weights"].append(
+        torch.tensor(expanded_ce_weights + [0.0] * padding, dtype=torch.float32)
+    )
+    output["ref_kl_weights"].append(
+        torch.tensor(expanded_ref_kl_weights + [0.0] * padding, dtype=torch.float32)
     )
     output["rewards"].append(
         torch.tensor(
@@ -597,6 +707,7 @@ def _coerce_advantages(
     fallback_reward: float | None,
     num_trainable_tokens: int,
     truncated: bool = False,
+    allow_missing: bool = False,
 ) -> list[float]:
     if isinstance(value, list):
         _check_trainable_stream_length(
@@ -609,6 +720,8 @@ def _coerce_advantages(
         return []
     if value is None:
         if fallback_reward is None:
+            if allow_missing:
+                return [0.0] * num_trainable_tokens
             raise ValueError("Each RL row must provide either advantage or reward.")
         return [float(fallback_reward)] * num_trainable_tokens
     if isinstance(value, list):
@@ -685,6 +798,8 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
         ("inference_logprobs", record.inference_logprobs),
         ("teacher_logprobs", record.teacher_logprobs),
         ("temperatures", record.temperatures),
+        ("ce_weight", record.ce_weight),
+        ("ref_kl_weight", record.ref_kl_weight),
     ):
         if isinstance(values, list) and len(values) != source_trainable_tokens:
             raise ValueError(
@@ -721,17 +836,13 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
         "target_ids": target_ids,
         "loss_mask": loss_mask,
         "advantages": [],
+        "rl_weights": [],
         "temperatures": [],
         "reward": record.reward,
     }
 
 
-def prepare_rl_sample(
-    record: RLExample,
-    tokenizer: PreTrainedTokenizerBase,
-    data_config: RLDataConfig,
-    seq_len: int,
-) -> RLSample | None:
+def _validate_rl_record_streams(record: RLExample) -> tuple[bool, bool, bool]:
     _validate_numeric_stream(record.advantage, field_name="advantage")
     _validate_numeric_stream(record.reward, field_name="reward")
     _validate_numeric_stream(
@@ -746,6 +857,30 @@ def prepare_rl_sample(
         record.temperatures,
         field_name="temperatures",
         strictly_positive=True,
+    )
+    _validate_numeric_stream(record.ce_weight, field_name="ce_weight")
+    _validate_numeric_stream(record.ref_kl_weight, field_name="ref_kl_weight")
+    components = (
+        record.advantage is not None or record.reward is not None,
+        record.ce_weight is not None,
+        record.ref_kl_weight is not None,
+    )
+    if not any(components):
+        raise ValueError(
+            "Each RL row must configure at least one of advantage/reward, "
+            "ce_weight, or ref_kl_weight."
+        )
+    return components
+
+
+def prepare_rl_sample(
+    record: RLExample,
+    tokenizer: PreTrainedTokenizerBase,
+    data_config: RLDataConfig,
+    seq_len: int,
+) -> RLSample | None:
+    has_rl_component, has_ce_component, has_ref_kl_component = (
+        _validate_rl_record_streams(record)
     )
     base_sample: Sample | RLSample | None = _pretokenized_sample(record, seq_len)
     if base_sample is None:
@@ -775,6 +910,7 @@ def prepare_rl_sample(
         fallback_reward=record.reward,
         num_trainable_tokens=num_trainable_tokens,
         truncated=truncated,
+        allow_missing=has_ce_component or has_ref_kl_component,
     )
     inference_logprobs = _coerce_optional_sequence(
         record.inference_logprobs,
@@ -796,6 +932,18 @@ def prepare_rl_sample(
         truncated=truncated,
     )
     assert temperatures is not None
+    ce_weights = _coerce_optional_sequence(
+        record.ce_weight,
+        num_trainable_tokens=num_trainable_tokens,
+        field_name="ce_weight",
+        truncated=truncated,
+    )
+    ref_kl_weights = _coerce_optional_sequence(
+        record.ref_kl_weight,
+        num_trainable_tokens=num_trainable_tokens,
+        field_name="ref_kl_weight",
+        truncated=truncated,
+    )
 
     sample: RLSample = {
         "input_ids": base_sample["input_ids"],
@@ -803,6 +951,7 @@ def prepare_rl_sample(
         "target_ids": base_sample["target_ids"],
         "loss_mask": base_sample["loss_mask"],
         "advantages": advantages,
+        "rl_weights": [float(has_rl_component)] * num_trainable_tokens,
         "temperatures": temperatures,
         "reward": record.reward,
     }
@@ -815,6 +964,10 @@ def prepare_rl_sample(
         sample["inference_logprobs"] = inference_logprobs
     if teacher_logprobs is not None:
         sample["teacher_logprobs"] = teacher_logprobs
+    if ce_weights is not None:
+        sample["ce_weights"] = ce_weights
+    if ref_kl_weights is not None:
+        sample["ref_kl_weights"] = ref_kl_weights
     return sample
 
 
@@ -853,12 +1006,24 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
         normalization: str = "token",
     ) -> int:
         """Count trainable units for the next local optimizer batch."""
+        return self.loss_scales_for_next_local_batch(
+            local_batch_size,
+            rl_normalization=normalization,
+        )["rl"]
+
+    def loss_scales_for_next_local_batch(
+        self,
+        local_batch_size: int,
+        *,
+        rl_normalization: str = "token",
+    ) -> dict[str, int]:
+        """Count component units for the next local optimizer batch."""
         if local_batch_size <= 0:
-            return 0
+            return dict.fromkeys(LOSS_COMPONENTS, 0)
 
         num_examples = len(self.records)
         data_rank, data_world_size = self._effective_data_partition()
-        total = 0
+        totals = dict.fromkeys(LOSS_COMPONENTS, 0)
         collected = 0
         offset = 0
         while collected < local_batch_size:
@@ -878,12 +1043,14 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
             )
             if sample is None:
                 continue
-            if normalization == "sequence":
-                total += trainable_sequence_count(sample)
-            else:
-                total += trainable_token_count(sample)
+            counts = component_normalization_counts(
+                sample,
+                rl_normalization=rl_normalization,
+            )
+            for component in LOSS_COMPONENTS:
+                totals[component] += counts[component]
             collected += 1
-        return total
+        return totals
 
     def __iter__(self) -> Iterator[RLSample]:
         for record_index in self._local_record_indexes():
@@ -944,13 +1111,44 @@ class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]
         *,
         normalization: str = "token",
     ) -> float:
-        counter = (
-            trainable_sequence_count
-            if normalization == "sequence"
-            else trainable_token_count
-        )
-        total = sum(counter(sample) for sample in self._bins_for_epoch(self.epoch))
-        return float(total)
+        return self.loss_scales_for_next_local_batch(
+            self.micro_batch_count(),
+            rl_normalization=normalization,
+        )["rl"]
+
+    def loss_scales_for_next_local_batch(
+        self,
+        local_batch_size: int,
+        *,
+        rl_normalization: str = "token",
+    ) -> dict[str, float]:
+        totals = dict.fromkeys(LOSS_COMPONENTS, 0.0)
+        if local_batch_size <= 0:
+            return totals
+
+        samples: list[RLSample] = []
+        epoch = self.epoch
+        next_bin_index = max(self._next_bin_index, 0)
+        while len(samples) < local_batch_size:
+            bins = self._bins_for_epoch(epoch)
+            if not bins:
+                break
+            remaining = bins[next_bin_index:]
+            take = min(local_batch_size - len(samples), len(remaining))
+            samples.extend(remaining[:take])
+            if len(samples) >= local_batch_size:
+                break
+            epoch += 1
+            next_bin_index = 0
+
+        for sample in samples:
+            counts = component_normalization_counts(
+                sample,
+                rl_normalization=rl_normalization,
+            )
+            for component in LOSS_COMPONENTS:
+                totals[component] += counts[component]
+        return totals
 
     def __iter__(self) -> Iterator[RLSample]:
         while True:
@@ -1091,10 +1289,14 @@ def setup_rl_dataset(
             seed=config.seed + data_rank,
         )
     records = load_rl_records(config)
-    has_rl_targets = all(
-        record.advantage is not None or record.reward is not None for record in records
+    has_training_targets = all(
+        record.advantage is not None
+        or record.reward is not None
+        or record.ce_weight is not None
+        or record.ref_kl_weight is not None
+        for record in records
     )
-    if config.pack_sequences and has_rl_targets:
+    if config.pack_sequences and has_training_targets:
         return PackedRLDataset(
             records=records,
             tokenizer=tokenizer,

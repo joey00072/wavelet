@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import importlib
 import logging
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import torch
 from torch import Tensor, nn
@@ -20,6 +21,10 @@ class LossInputs:
     teacher_logprobs: Tensor | None
     advantages: Tensor
     loss_mask: Tensor
+    loss_weights: Tensor | None = None
+
+
+LossFn = Callable[[LossInputs], LossOutput]
 
 
 def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
@@ -91,7 +96,10 @@ def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput
 
     pg_loss = keep_mask * scaled_advantages * importance_ratio
     kl_loss = loss_mask * log_importance_ratio.square()
-    loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
+    per_token_loss = -pg_loss + loss_config.kl_tau * kl_loss
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+    loss = per_token_loss.sum()
 
     metrics = {
         "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),
@@ -107,6 +115,85 @@ def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)
     return LossOutput(loss=loss, metrics=metrics)
+
+
+def ce_loss_fn(inputs: LossInputs) -> LossOutput:
+    """Return weighted next-token cross entropy for one sequence."""
+    per_token_loss = -inputs.trainer_logprobs
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+    return LossOutput(
+        loss=per_token_loss[inputs.loss_mask].sum(),
+        metrics={"ce/nll": _safe_mean(-inputs.trainer_logprobs, inputs.loss_mask)},
+    )
+
+
+def ref_kl_loss_fn(inputs: LossInputs) -> LossOutput:
+    """Return weighted reverse-KL policy loss with a one-sided trust region."""
+    if inputs.teacher_logprobs is None:
+        raise ValueError(
+            "ref_kl loss requires teacher_logprobs for every weighted token."
+        )
+
+    log_ratio = inputs.trainer_logprobs - inputs.inference_logprobs
+    importance_ratio = torch.exp(log_ratio)
+    mismatch_kl = importance_ratio - log_ratio - 1
+    probability_delta = torch.exp(inputs.trainer_logprobs) - torch.exp(
+        inputs.inference_logprobs
+    )
+    invalid = probability_delta < -0.2
+    keep_mask = inputs.loss_mask & ~invalid
+    teacher_kl = inputs.teacher_logprobs - inputs.trainer_logprobs
+    policy_loss = -(keep_mask * teacher_kl.detach() * importance_ratio)
+    regularizer = inputs.loss_mask * log_ratio.square()
+    per_token_loss = policy_loss + 1e-3 * regularizer
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+    return LossOutput(
+        loss=per_token_loss.sum(),
+        metrics={
+            "ref_kl/masked_mismatch_kl": _safe_mean(
+                mismatch_kl, inputs.loss_mask & invalid
+            ),
+            "ref_kl/unmasked_mismatch_kl": _safe_mean(mismatch_kl, keep_mask),
+            "ref_kl/is_masked": _safe_mean(invalid.float(), inputs.loss_mask),
+            "ref_kl": _safe_mean(teacher_kl, inputs.loss_mask),
+        },
+    )
+
+
+def _import_loss_fn(import_path: str) -> Callable[..., LossOutput]:
+    module_name, separator, attribute = import_path.rpartition(".")
+    if not separator:
+        raise ValueError(
+            "Custom loss import_path must include a module and attribute name."
+        )
+    module = importlib.import_module(module_name)
+    loss_fn = getattr(module, attribute)
+    if not callable(loss_fn):
+        raise TypeError(f"Custom loss object {import_path!r} is not callable.")
+    return loss_fn
+
+
+def setup_rl_loss_fn(loss_config: RLLossConfig) -> LossFn:
+    """Resolve the configured per-sequence RL component loss."""
+    if loss_config.type == "custom":
+        assert loss_config.import_path is not None
+        custom_fn = _import_loss_fn(loss_config.import_path)
+        kwargs = dict(loss_config.kwargs)
+
+        def custom_loss(inputs: LossInputs) -> LossOutput:
+            output = custom_fn(inputs, **kwargs)
+            if not isinstance(output, LossOutput):
+                raise TypeError("Custom RL loss must return LossOutput.")
+            return output
+
+        return custom_loss
+
+    def dppo_loss(inputs: LossInputs) -> LossOutput:
+        return default_loss_fn(inputs, loss_config)
+
+    return dppo_loss
 
 
 def _sequence_spans(position_ids: Tensor, seq_len: int) -> list[tuple[int, int]]:
@@ -149,39 +236,21 @@ def normalization_unit_count(
 
 
 def _iter_trainable_spans(
-    trainer_logprobs: Tensor,
-    inference_logprobs: Tensor,
-    teacher_logprobs: Tensor | None,
-    advantages: Tensor,
     loss_mask: Tensor,
     position_ids: Tensor | None,
-) -> Iterator[tuple[LossInputs, Tensor]]:
-    seq_len = trainer_logprobs.shape[1]
+) -> Iterator[tuple[int, int, int]]:
+    seq_len = loss_mask.shape[1]
     spans_by_row = (
-        [[(0, seq_len)] for _ in range(trainer_logprobs.shape[0])]
+        [[(0, seq_len)] for _ in range(loss_mask.shape[0])]
         if position_ids is None
         else [_sequence_spans(row, seq_len) for row in position_ids]
     )
     for row_index, spans in enumerate(spans_by_row):
         for start, end in spans:
             span_mask = loss_mask[row_index, start:end]
-            trainable_tokens = span_mask.sum()
-            if int(trainable_tokens.item()) == 0:
+            if not bool(span_mask.any()):
                 continue
-            yield (
-                LossInputs(
-                    trainer_logprobs=trainer_logprobs[row_index, start:end],
-                    inference_logprobs=inference_logprobs[row_index, start:end],
-                    teacher_logprobs=(
-                        None
-                        if teacher_logprobs is None
-                        else teacher_logprobs[row_index, start:end]
-                    ),
-                    advantages=advantages[row_index, start:end],
-                    loss_mask=span_mask,
-                ),
-                trainable_tokens,
-            )
+            yield row_index, start, end
 
 
 def _resolve_loss_scale(
@@ -201,6 +270,38 @@ def _resolve_loss_scale(
     return max(float(loss_scale), 1.0)
 
 
+def component_normalization_unit_counts(
+    loss_mask: Tensor,
+    *,
+    rl_weights: Tensor | None = None,
+    ce_weights: Tensor | None = None,
+    ref_kl_weights: Tensor | None = None,
+    rl_normalization: str = "token",
+    position_ids: Tensor | None = None,
+) -> dict[str, int]:
+    """Count local normalization units for each configured loss component."""
+    rl_mask = loss_mask if rl_weights is None else loss_mask & (rl_weights != 0)
+    ce_mask = (
+        torch.zeros_like(loss_mask)
+        if ce_weights is None
+        else loss_mask & (ce_weights != 0)
+    )
+    ref_kl_mask = (
+        torch.zeros_like(loss_mask)
+        if ref_kl_weights is None
+        else loss_mask & (ref_kl_weights != 0)
+    )
+    return {
+        "rl": normalization_unit_count(
+            rl_mask,
+            normalization=rl_normalization,
+            position_ids=position_ids,
+        ),
+        "ce": int(ce_mask.sum().item()),
+        "ref_kl": int(ref_kl_mask.sum().item()),
+    }
+
+
 def _aggregate_loss_metrics(
     metric_values: dict[str, list[Tensor]],
 ) -> dict[str, Tensor]:
@@ -217,6 +318,92 @@ def _aggregate_loss_metrics(
     return metrics
 
 
+def _accumulate_loss_output(
+    component: str,
+    output: LossOutput,
+    component_losses: dict[str, Tensor],
+    metric_values: dict[str, list[Tensor]],
+    *,
+    divisor: Tensor | int = 1,
+) -> None:
+    component_losses[component] = component_losses[component] + output.loss / divisor
+    for key, value in output.metrics.items():
+        metric_values.setdefault(key, []).append(value)
+
+
+def _accumulate_span_components(
+    *,
+    row_index: int,
+    start: int,
+    end: int,
+    trainer_logprobs: Tensor,
+    inference_logprobs: Tensor,
+    teacher_logprobs: Tensor | None,
+    advantages: Tensor,
+    loss_mask: Tensor,
+    rl_weights: Tensor | None,
+    ce_weights: Tensor | None,
+    ref_kl_weights: Tensor | None,
+    rl_loss_fn: LossFn,
+    rl_normalization: str,
+    component_losses: dict[str, Tensor],
+    metric_values: dict[str, list[Tensor]],
+) -> None:
+    span_mask = loss_mask[row_index, start:end]
+    common: dict[str, Any] = {
+        "trainer_logprobs": trainer_logprobs[row_index, start:end],
+        "inference_logprobs": inference_logprobs[row_index, start:end],
+        "teacher_logprobs": (
+            None if teacher_logprobs is None else teacher_logprobs[row_index, start:end]
+        ),
+        "advantages": advantages[row_index, start:end],
+    }
+
+    span_rl_weights = None if rl_weights is None else rl_weights[row_index, start:end]
+    rl_mask = (
+        span_mask if span_rl_weights is None else span_mask & (span_rl_weights != 0)
+    )
+    if bool(rl_mask.any()):
+        divisor = (
+            torch.clamp_min(rl_mask.sum(), 1) if rl_normalization == "sequence" else 1
+        )
+        _accumulate_loss_output(
+            "rl",
+            rl_loss_fn(
+                LossInputs(
+                    **common,
+                    loss_mask=rl_mask,
+                    loss_weights=span_rl_weights,
+                )
+            ),
+            component_losses,
+            metric_values,
+            divisor=divisor,
+        )
+
+    for component, weights, loss_fn in (
+        ("ce", ce_weights, ce_loss_fn),
+        ("ref_kl", ref_kl_weights, ref_kl_loss_fn),
+    ):
+        if weights is None:
+            continue
+        span_weights = weights[row_index, start:end]
+        component_mask = span_mask & (span_weights != 0)
+        if bool(component_mask.any()):
+            _accumulate_loss_output(
+                component,
+                loss_fn(
+                    LossInputs(
+                        **common,
+                        loss_mask=component_mask,
+                        loss_weights=span_weights,
+                    )
+                ),
+                component_losses,
+                metric_values,
+            )
+
+
 def compute_loss(
     trainer_logprobs: Tensor,
     inference_logprobs: Tensor,
@@ -227,39 +414,64 @@ def compute_loss(
     *,
     loss_scale: float | Tensor | None = None,
     position_ids: Tensor | None = None,
+    rl_weights: Tensor | None = None,
+    ce_weights: Tensor | None = None,
+    ref_kl_weights: Tensor | None = None,
+    component_loss_scales: dict[str, float | Tensor] | None = None,
+    rl_loss_fn: LossFn | None = None,
 ) -> LossOutput:
-    total_loss: Tensor | None = None
+    component_losses = {
+        "rl": trainer_logprobs.sum() * 0.0,
+        "ce": trainer_logprobs.sum() * 0.0,
+        "ref_kl": trainer_logprobs.sum() * 0.0,
+    }
     metric_values: dict[str, list[Tensor]] = {}
-    sequence_count = 0
-
-    spans = _iter_trainable_spans(
-        trainer_logprobs,
-        inference_logprobs,
-        teacher_logprobs,
-        advantages,
+    component_counts = component_normalization_unit_counts(
         loss_mask,
-        position_ids,
+        rl_weights=rl_weights,
+        ce_weights=ce_weights,
+        ref_kl_weights=ref_kl_weights,
+        rl_normalization=loss_config.normalization,
+        position_ids=position_ids,
     )
-    for span_inputs, trainable_tokens in spans:
-        outputs = default_loss_fn(span_inputs, loss_config)
-        span_loss = outputs.loss
-        if loss_config.normalization == "sequence":
-            span_loss = span_loss / torch.clamp_min(trainable_tokens, 1)
-            sequence_count += 1
-        total_loss = span_loss if total_loss is None else total_loss + span_loss
-        for key, value in outputs.metrics.items():
-            metric_values.setdefault(key, []).append(value)
+    configured_rl_loss = rl_loss_fn or setup_rl_loss_fn(loss_config)
 
-    if total_loss is None:
-        total_loss = trainer_logprobs.sum() * 0.0
-    scale = _resolve_loss_scale(
-        loss_scale,
-        normalization=loss_config.normalization,
-        sequence_count=sequence_count,
-        loss_mask=loss_mask,
-        device=total_loss.device,
-    )
-    scaled_loss = total_loss / scale
+    for row_index, start, end in _iter_trainable_spans(loss_mask, position_ids):
+        _accumulate_span_components(
+            row_index=row_index,
+            start=start,
+            end=end,
+            trainer_logprobs=trainer_logprobs,
+            inference_logprobs=inference_logprobs,
+            teacher_logprobs=teacher_logprobs,
+            advantages=advantages,
+            loss_mask=loss_mask,
+            rl_weights=rl_weights,
+            ce_weights=ce_weights,
+            ref_kl_weights=ref_kl_weights,
+            rl_loss_fn=configured_rl_loss,
+            rl_normalization=loss_config.normalization,
+            component_losses=component_losses,
+            metric_values=metric_values,
+        )
+
+    scales = dict(component_loss_scales or {})
+    if "rl" not in scales and loss_scale is not None:
+        scales["rl"] = loss_scale
+    scaled_loss = trainer_logprobs.sum() * 0.0
+    for component, component_loss in component_losses.items():
+        requested_scale = scales.get(component)
+        if requested_scale is None:
+            scale: float | Tensor = max(float(component_counts[component]), 1.0)
+        else:
+            scale = _resolve_loss_scale(
+                requested_scale,
+                normalization="token",
+                sequence_count=component_counts[component],
+                loss_mask=loss_mask,
+                device=component_loss.device,
+            )
+        scaled_loss = scaled_loss + component_loss / scale
     return LossOutput(
         loss=scaled_loss,
         metrics=_aggregate_loss_metrics(metric_values),
