@@ -259,6 +259,7 @@ class TrainerConfig(ConfigModel):
     epochs: int = Field(default=1, ge=1)
     max_steps: int | None = Field(default=None, ge=0)
     seed: int = 0
+    dist_timeout_seconds: int = Field(default=1800, ge=1)
     activation_offloading: ActivationOffloadingConfig | None = None
 
     @property

@@ -302,7 +302,7 @@ class BaseTrainer:
                 torch.distributed.init_process_group(
                     backend=backend,
                     init_method="env://",
-                    timeout=timedelta(minutes=30),
+                    timeout=timedelta(seconds=self.config.dist_timeout_seconds),
                 )
             else:
                 with tempfile.NamedTemporaryFile(
@@ -314,7 +314,7 @@ class BaseTrainer:
                     init_method=f"file://{rendezvous_path}",
                     rank=0,
                     world_size=1,
-                    timeout=timedelta(minutes=30),
+                    timeout=timedelta(seconds=self.config.dist_timeout_seconds),
                 )
 
         if torch.distributed.is_initialized():

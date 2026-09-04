@@ -27,6 +27,9 @@ behavior belong to the subsystem it invokes. Shared rollout scheduling lives in
 and trainer behavior in `wavelet.trainer.trainer` and `wavelet.trainer.rl`.
 Historical module paths are retained as thin compatibility aliases where user
 code may still import them.
+Trainer process-group initialization uses `dist_timeout_seconds` from the SFT
+or RL config. It defaults to 1800 seconds and can be increased for slow or
+multi-node rendezvous without changing code.
 
 ## RL Process Flow
 

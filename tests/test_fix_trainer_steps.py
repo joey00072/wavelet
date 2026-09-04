@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -163,6 +164,26 @@ def test_auto_backend_uses_hybrid_group_on_cuda(monkeypatch) -> None:
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert trainer._distributed_backend() == "gloo"
+
+
+def test_distributed_setup_uses_configured_timeout(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    trainer = SFTTrainer(SFTConfig(dist_timeout_seconds=17))
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        dist, "init_process_group", lambda **kwargs: calls.append(kwargs)
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    trainer._setup_distributed()
+
+    assert calls[0]["timeout"] == timedelta(seconds=17)
+
+
+def test_distributed_timeout_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="dist_timeout_seconds"):
+        SFTConfig(dist_timeout_seconds=0)
 
 
 # ── learning-rate schedules ───────────────────────────────────────────────────
