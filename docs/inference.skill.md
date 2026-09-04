@@ -62,6 +62,9 @@ uv run python -m wavelet debug inference smoke @ path/to/rl.yaml --policy-dir pa
 The vLLM servers expose these debug endpoints:
 
 - `GET /health`: basic liveness, loaded policy step, and sleep state.
+- `GET /liveness`: end-to-end worker liveness. The API process runs a no-op
+  RPC on every vLLM worker and returns HTTP 503 if
+  `inference.http.liveness_timeout_seconds` elapses.
 - `GET /debug/state`: resolved inference config plus runtime policy state.
 - `POST /score`: fixed-token prefill scoring for OPD/OPSD distillation. Supply
   `model` and `token_ids`; the response contains aligned `prompt_logprobs`.

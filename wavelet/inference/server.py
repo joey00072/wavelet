@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -703,6 +704,24 @@ async def health(request: Request) -> dict[str, Any]:
         "policy_step": getattr(request.app.state, "policy_step", None),
         "asleep": getattr(request.app.state, "asleep", False),
     }
+
+
+@router.get("/liveness", response_model=None)
+async def liveness(request: Request) -> dict[str, str] | JSONResponse:
+    """Check that every vLLM worker can service a no-op RPC."""
+    if _CONFIG is None:
+        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    try:
+        await asyncio.wait_for(
+            _engine_client(request).collective_rpc("liveness_probe"),
+            timeout=_CONFIG.inference.http.liveness_timeout_seconds,
+        )
+    except TimeoutError:
+        return JSONResponse(
+            {"status": "engine_unresponsive"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    return {"status": "ok"}
 
 
 @router.get("/debug/state")

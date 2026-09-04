@@ -771,6 +771,7 @@ class RLVLLMHTTPConfig(ConfigModel):
     ports: list[int] | None = None
     request_timeout_seconds: float = Field(default=300.0, gt=0.0)
     startup_timeout_seconds: float = Field(default=300.0, gt=0.0)
+    liveness_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
     @model_validator(mode="after")
     def validate_unique_ports(self) -> "RLVLLMHTTPConfig":

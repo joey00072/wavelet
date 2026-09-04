@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -11,6 +13,7 @@ import pytest
 import wavelet.orchestrator.envs as verifier_envs
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl_dataset import RLExample
+from wavelet.inference import server as inference_server
 from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
 from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine
@@ -222,9 +225,35 @@ def test_wait_for_vllm_http_server_checks_model_listing(monkeypatch) -> None:
     _wait_for_vllm_http_server(config)
 
     assert urls == [
-        "http://127.0.0.1:8000/health",
+        "http://127.0.0.1:8000/liveness",
         "http://127.0.0.1:8000/v1/models",
     ]
+
+
+def test_vllm_liveness_route_probes_workers(monkeypatch) -> None:
+    engine = SimpleNamespace(collective_rpc=AsyncMock(return_value=[None]))
+    monkeypatch.setattr(inference_server, "_CONFIG", RLConfig())
+    monkeypatch.setattr(inference_server, "_engine_client", lambda _request: engine)
+
+    response = asyncio.run(inference_server.liveness(SimpleNamespace()))
+
+    assert response == {"status": "ok"}
+    engine.collective_rpc.assert_awaited_once_with("liveness_probe")
+
+
+def test_vllm_liveness_route_times_out_unresponsive_workers(monkeypatch) -> None:
+    async def never_responds(_method: str) -> None:
+        await asyncio.Future()
+
+    engine = SimpleNamespace(collective_rpc=Mock(side_effect=never_responds))
+    config = RLConfig(inference={"http": {"liveness_timeout_seconds": 0.001}})
+    monkeypatch.setattr(inference_server, "_CONFIG", config)
+    monkeypatch.setattr(inference_server, "_engine_client", lambda _request: engine)
+
+    response = asyncio.run(inference_server.liveness(SimpleNamespace()))
+
+    assert response.status_code == 503
+    assert response.body == b'{"status":"engine_unresponsive"}'
 
 
 def test_streaming_chunk_resume_uses_chunk_index_space() -> None:

@@ -357,9 +357,11 @@ Policy load, pause, and resume calls retry transient connection failures and
 HTTP 5xx responses up to three times with exponential backoff. Control calls
 use a 300-second per-attempt timeout, while policy loads use 720 seconds; a
 successful response acknowledging the wrong policy step fails immediately.
-Inference startup checks both `/health` and `/v1/models`; a healthy server that
-does not list the configured base model or policy adapter fails before rollout
-work begins.
+Inference startup checks worker RPC liveness at `/liveness` and then
+`/v1/models`; a responsive API process with stuck model workers, or a server
+that does not list the configured base model or policy adapter, fails before
+rollout work begins. The worker RPC timeout is configurable with
+`inference.http.liveness_timeout_seconds`.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

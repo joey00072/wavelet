@@ -571,7 +571,7 @@ def _wait_for_vllm_http_server(
 ) -> None:
     port = config.inference.http.port if port is None else port
     base_url = f"http://{config.inference.http.host}:{port}"
-    health_url = f"{base_url}/health"
+    liveness_url = f"{base_url}/liveness"
     models_url = f"{base_url}/v1/models"
     deadline = time.monotonic() + config.inference.http.startup_timeout_seconds
     last_error: Exception | None = None
@@ -580,11 +580,11 @@ def _wait_for_vllm_http_server(
             code = handle.poll()
             if code is not None:
                 raise RuntimeError(
-                    f"vLLM HTTP server exited with code {code} before {health_url} "
+                    f"vLLM HTTP server exited with code {code} before {liveness_url} "
                     f"became healthy. Check '{handle.log_path}'."
                 )
         try:
-            with urllib.request.urlopen(health_url, timeout=5.0):
+            with urllib.request.urlopen(liveness_url, timeout=5.0):
                 pass
             with urllib.request.urlopen(models_url, timeout=5.0) as response:
                 models = json.loads(response.read().decode("utf-8"))
@@ -598,7 +598,7 @@ def _wait_for_vllm_http_server(
             last_error = exc
             time.sleep(config.launcher.poll_interval_seconds)
     raise TimeoutError(
-        f"Timed out waiting for vLLM HTTP server at {health_url}"
+        f"Timed out waiting for vLLM workers at {liveness_url}"
     ) from last_error
 
 
