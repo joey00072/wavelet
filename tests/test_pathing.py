@@ -40,6 +40,25 @@ def test_launch_attempts_preserve_configs_commands_and_logs(tmp_path: Path) -> N
     assert get_config_dir(output_dir).resolve() == second.config_dir.resolve()
 
 
+def test_launch_artifacts_copy_each_composed_config(tmp_path: Path) -> None:
+    first_source = tmp_path / "base.yaml"
+    second_source = tmp_path / "overlay.yaml"
+    first_source.write_text("max_steps: 3\n", encoding="utf-8")
+    second_source.write_text("launcher:\n  mode: process\n", encoding="utf-8")
+    attempt = create_launch_attempt(tmp_path / "run")
+
+    write_launch_artifacts(
+        attempt,
+        command="rl",
+        argv=["@", str(first_source), f"@{second_source}"],
+    )
+
+    assert (attempt.config_attempt_dir / "rl_1.yaml").read_text() == ("max_steps: 3\n")
+    assert (attempt.config_attempt_dir / "rl_2.yaml").read_text() == (
+        "launcher:\n  mode: process\n"
+    )
+
+
 def test_validate_output_dir_allows_empty_directory(tmp_path: Path) -> None:
     output_dir = tmp_path / "run"
     output_dir.mkdir()

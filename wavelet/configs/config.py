@@ -316,9 +316,18 @@ class TrainerConfig(ConfigModel):
     log: LogConfig = LogConfig()
     monitor: MonitorConfig = MonitorConfig()
     fsdp: FSDPConfig = FSDPConfig()
-    output_dir: Path = Path("outputs/train")
-    clean_output_dir: bool = False
-    dry_run: bool = False
+    output_dir: Path = Field(
+        default=Path("outputs/train"),
+        description="Directory for checkpoints, metrics, logs, and run state.",
+    )
+    clean_output_dir: bool = Field(
+        default=False,
+        description="Remove existing run state before starting a new run.",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Validate and resolve configuration without training.",
+    )
     epochs: int = Field(default=1, ge=1)
     max_steps: int | None = Field(default=None, ge=0)
     seed: int = 0
@@ -380,7 +389,10 @@ class TrainerConfig(ConfigModel):
 class SFTConfig(TrainerConfig):
     data: DataConfig = DataConfig()
     val: SFTValConfig | None = None
-    output_dir: Path = Path("outputs/unsloth_math_sft")
+    output_dir: Path = Field(
+        default=Path("outputs/unsloth_math_sft"),
+        description="Directory for SFT checkpoints, metrics, logs, and run state.",
+    )
     max_steps: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
@@ -1155,7 +1167,10 @@ class RLConfig(TrainerConfig):
     transport: RLTransportConfig = RLTransportConfig()
     policy_transfer: RLPolicyTransferConfig = RLPolicyTransferConfig()
     launcher: RLLauncherConfig = RLLauncherConfig()
-    output_dir: Path = Path("outputs/unsloth_math_rl")
+    output_dir: Path = Field(
+        default=Path("outputs/unsloth_math_rl"),
+        description="Directory for RL artifacts and per-launch attempt history.",
+    )
     max_steps: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="before")

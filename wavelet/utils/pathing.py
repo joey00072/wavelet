@@ -68,12 +68,18 @@ def create_launch_attempt(output_dir: Path) -> LaunchAttemptPaths:
 
 def launch_config_paths(argv: list[str]) -> list[Path]:
     """Return root config files referenced by the supported CLI syntax."""
-    if "@" in argv:
-        index = argv.index("@")
-        return [Path(argv[index + 1])] if index + 1 < len(argv) else []
-    if argv and argv[0].startswith("@") and len(argv[0]) > 1:
-        return [Path(argv[0][1:])]
-    return []
+    paths: list[Path] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "@" and index + 1 < len(argv):
+            paths.append(Path(argv[index + 1]))
+            index += 2
+            continue
+        if token.startswith("@") and len(token) > 1:
+            paths.append(Path(token[1:]))
+        index += 1
+    return paths
 
 
 def write_launch_artifacts(
@@ -88,11 +94,13 @@ def write_launch_artifacts(
         f"{command_line}\n",
         encoding="utf-8",
     )
-    for source in launch_config_paths(argv):
+    sources = launch_config_paths(argv)
+    for index, source in enumerate(sources, start=1):
         if not source.is_file():
             continue
         suffix = source.suffix or ".yaml"
-        destination = attempt.config_attempt_dir / f"{command}{suffix}"
+        stem = command if len(sources) == 1 else f"{command}_{index}"
+        destination = attempt.config_attempt_dir / f"{stem}{suffix}"
         if source.resolve() != destination.resolve():
             shutil.copyfile(source, destination)
 

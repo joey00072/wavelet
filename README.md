@@ -8,6 +8,11 @@ Minimal post-training scaffolding for SFT and RL experiments.
 
 After `uv sync`, run the installed CLI as `uv run wavelet <command>`. The
 module form, `uv run python -m wavelet <command>`, remains supported.
+Pass multiple `@ config.yaml` arguments to compose configs from left to right,
+then use dotted overrides such as `--inference.sampling.top-p 0.9`. Override
+names accept kebab-case, and boolean fields accept bare `--flag` and
+`--no-flag` forms. Run a config-backed command with `--help` to list its nested
+fields, types, defaults, and available field descriptions.
 
 ## Documentation
 
