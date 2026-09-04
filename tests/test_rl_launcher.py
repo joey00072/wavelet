@@ -34,6 +34,7 @@ from wavelet.orchestrator.runtime import (
     _role_specs,
     _rollout_client_config,
     _run_integrated_launcher,
+    _shared_wandb_environment,
     _sleep_vllm_http_servers,
     _trainer_device_group,
     _wait_for_vllm_http_server,
@@ -649,6 +650,61 @@ def test_process_roles_receive_common_and_specific_environment(tmp_path: Path) -
     assert roles[0].env_vars == {"SHARED": "inference", "ROLE": "server"}
     assert roles[1].env_vars == {"SHARED": "common", "ROLE": "trainer"}
     assert roles[2].env_vars == {"SHARED": "common", "ROLE": "orchestrator"}
+
+
+def test_process_roles_share_one_online_wandb_run(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    config = RLConfig(
+        output_dir=tmp_path,
+        launcher={"mode": "process"},
+        monitor={"wandb": {"enabled": True, "mode": "online"}},
+    )
+    shared_env = _shared_wandb_environment(config)
+
+    roles = _role_specs(
+        config,
+        trainer_config_path=tmp_path / "trainer.yaml",
+        inference_config_path=tmp_path / "inference.yaml",
+        inference_ports=[8100],
+        wandb_shared_env=shared_env,
+    )
+
+    trainer = next(role for role in roles if role.name == "trainer")
+    orchestrator = next(role for role in roles if role.name == "inference")
+    inference_server = next(role for role in roles if role.name == "inference_server_0")
+    assert trainer.env_vars["WANDB_RUN_ID"] == orchestrator.env_vars["WANDB_RUN_ID"]
+    assert trainer.env_vars["WANDB_SHARED_LABEL"] == "trainer"
+    assert trainer.env_vars["WANDB_SHARED_PRIMARY"] == "trainer"
+    assert orchestrator.env_vars["WANDB_SHARED_LABEL"] == "orchestrator"
+    assert orchestrator.env_vars["WANDB_SHARED_FINISHER"] == "orchestrator"
+    assert "WANDB_RUN_ID" not in inference_server.env_vars
+    assert (tmp_path / "wandb_run_id.txt").read_text() == shared_env["WANDB_RUN_ID"]
+
+
+def test_shared_wandb_is_disabled_for_offline_runs(tmp_path: Path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        monitor={"wandb": {"enabled": True, "mode": "offline"}},
+    )
+
+    assert _shared_wandb_environment(config) == {}
+    assert not (tmp_path / "wandb_run_id.txt").exists()
+
+
+def test_shared_wandb_reuses_persisted_run_id_when_resuming(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    monkeypatch.delenv("WANDB_RUN_ID", raising=False)
+    (tmp_path / "wandb_run_id.txt").write_text("existing-run", encoding="utf-8")
+    config = RLConfig(
+        output_dir=tmp_path,
+        launcher={"mode": "process"},
+        ckpt={"resume_step": 3},
+        monitor={"wandb": {"enabled": True, "mode": "online"}},
+    )
+
+    assert _shared_wandb_environment(config)["WANDB_RUN_ID"] == "existing-run"
 
 
 def test_launcher_environment_values_are_redacted_from_serialized_config() -> None:

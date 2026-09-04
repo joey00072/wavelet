@@ -555,9 +555,14 @@ class RunMonitor:
             return
         import wandb
 
-        previous_run_id = (
-            self._read_wandb_run_id() if resumed_from is not None else None
+        shared_kwargs = _shared_wandb_init_kwargs(
+            wandb,
+            configured_mode=self.wandb.mode,
+            init_timeout_seconds=self.wandb.init_timeout_seconds,
         )
+        previous_run_id = None
+        if shared_kwargs is None and resumed_from is not None:
+            previous_run_id = self._read_wandb_run_id()
         init_kwargs = {
             "project": self.wandb.project or "wavelet",
             "entity": self.wandb.entity,
@@ -570,13 +575,18 @@ class RunMonitor:
             "id": previous_run_id,
             "resume": "allow" if previous_run_id is not None else None,
         }
+        if shared_kwargs is not None:
+            init_kwargs.update(shared_kwargs)
         settings_factory = getattr(wandb, "Settings", None)
-        if callable(settings_factory):
+        if callable(settings_factory) and shared_kwargs is None:
             init_kwargs["settings"] = settings_factory(
                 init_timeout=self.wandb.init_timeout_seconds
             )
         try:
-            self._wandb_run = wandb.init(mode=self.wandb.mode, **init_kwargs)
+            if shared_kwargs is None:
+                self._wandb_run = wandb.init(mode=self.wandb.mode, **init_kwargs)
+            else:
+                self._wandb_run = wandb.init(**init_kwargs)
         except Exception:
             if self.wandb.mode != "online" or not self.wandb.offline_fallback:
                 raise
@@ -586,10 +596,21 @@ class RunMonitor:
                 self.output_dir,
                 exc_info=True,
             )
-            self._wandb_run = wandb.init(mode="offline", **init_kwargs)
+            fallback_kwargs = dict(init_kwargs)
+            fallback_kwargs.update({"id": None, "resume": None})
+            if callable(settings_factory):
+                fallback_kwargs["settings"] = settings_factory(
+                    init_timeout=self.wandb.init_timeout_seconds
+                )
+            self._wandb_run = wandb.init(mode="offline", **fallback_kwargs)
         self._wandb_run.define_metric("step")
         self._wandb_run.define_metric("*", step_metric="step")
-        self._write_wandb_run_id(getattr(self._wandb_run, "id", None))
+        canonical_run_id = (
+            os.environ.get("WANDB_RUN_ID")
+            if shared_kwargs is not None
+            else getattr(self._wandb_run, "id", None)
+        )
+        self._write_wandb_run_id(canonical_run_id)
 
     def _read_wandb_run_id(self) -> str | None:
         if not self.wandb_run_id_file.exists():
@@ -743,6 +764,41 @@ def setup_config_logger(name: str, config: RLConfig | SFTConfig) -> logging.Logg
         json_file=config.log.json_file,
         output_dir=config.output_dir,
     )
+
+
+def _shared_wandb_init_kwargs(
+    wandb: Any,
+    *,
+    configured_mode: str,
+    init_timeout_seconds: float,
+) -> dict[str, Any] | None:
+    env_mode = os.environ.get("WANDB_MODE")
+    if (
+        os.environ.get("WANDB_SHARED_MODE") != "1"
+        or configured_mode != "online"
+        or env_mode in {"disabled", "offline"}
+    ):
+        return None
+    run_id = os.environ.get("WANDB_RUN_ID", "").strip()
+    if not run_id:
+        raise ValueError("WANDB_SHARED_MODE=1 requires WANDB_RUN_ID")
+    label = os.environ.get("WANDB_SHARED_LABEL")
+    primary_label = os.environ.get("WANDB_SHARED_PRIMARY", "orchestrator")
+    finisher_label = os.environ.get("WANDB_SHARED_FINISHER", primary_label)
+    settings_factory = getattr(wandb, "Settings", None)
+    if not callable(settings_factory):
+        raise TypeError("Installed W&B SDK does not support shared mode settings")
+    return {
+        "id": run_id,
+        "resume": "allow",
+        "settings": settings_factory(
+            mode="shared",
+            init_timeout=init_timeout_seconds,
+            x_label=label,
+            x_primary=label == primary_label,
+            x_update_finish_state=label == finisher_label,
+        ),
+    }
 
 
 _WANDB_RUN = None
@@ -1157,22 +1213,51 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
         return
     try:
         if _WANDB_RUN is None:
-            run_name = wandb_config.name
-            _WANDB_RUN = wandb.init(
-                project=wandb_config.project or "wavelet",
-                entity=wandb_config.entity,
-                name=f"{run_name}-orchestrator" if run_name else None,
-                group=wandb_config.group or run_name,
-                tags=wandb_config.tags,
-                mode=wandb_config.mode,
-                dir=str(config.output_dir),
-                config=redact(config.model_dump(mode="json")),
-            )
+            active_run = getattr(wandb, "run", None)
+            if active_run is not None:
+                _WANDB_RUN = active_run
+            else:
+                shared_kwargs = _shared_wandb_init_kwargs(
+                    wandb,
+                    configured_mode=wandb_config.mode,
+                    init_timeout_seconds=wandb_config.init_timeout_seconds,
+                )
+                run_name = wandb_config.name
+                init_kwargs = {
+                    "project": wandb_config.project or "wavelet",
+                    "entity": wandb_config.entity,
+                    "name": (
+                        run_name
+                        if shared_kwargs is not None
+                        else f"{run_name}-orchestrator"
+                        if run_name
+                        else None
+                    ),
+                    "group": wandb_config.group or run_name,
+                    "tags": wandb_config.tags,
+                    "dir": str(config.output_dir),
+                    "config": redact(config.model_dump(mode="json")),
+                }
+                if shared_kwargs is None:
+                    init_kwargs["mode"] = wandb_config.mode
+                else:
+                    init_kwargs.update(shared_kwargs)
+                _WANDB_RUN = wandb.init(**init_kwargs)
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")
         _WANDB_RUN.log({**metrics, "step": step})
     except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
+
+
+def finish_orchestrator_wandb() -> None:
+    global _WANDB_RUN
+    if _WANDB_RUN is None:
+        return
+    try:
+        _WANDB_RUN.finish()
+    finally:
+        _WANDB_RUN = None
 
 
 def _group_by_example(

@@ -292,6 +292,48 @@ def test_wandb_resume_reuses_persisted_run_id(monkeypatch, tmp_path: Path) -> No
     assert captured[1]["resume"] == "allow"
 
 
+def test_wandb_monitor_joins_shared_online_run(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+    settings: dict[str, object] = {}
+
+    def fake_init(**kwargs):
+        captured.update(kwargs)
+        return _FakeRun()
+
+    def fake_settings(**kwargs):
+        settings.update(kwargs)
+        return kwargs
+
+    monkeypatch.delenv("WANDB_MODE", raising=False)
+    monkeypatch.setenv("WANDB_SHARED_MODE", "1")
+    monkeypatch.setenv("WANDB_RUN_ID", "shared-123")
+    monkeypatch.setenv("WANDB_SHARED_LABEL", "trainer")
+    monkeypatch.setenv("WANDB_SHARED_PRIMARY", "trainer")
+    monkeypatch.setenv("WANDB_SHARED_FINISHER", "orchestrator")
+    monkeypatch.setitem(
+        sys.modules,
+        "wandb",
+        types.SimpleNamespace(init=fake_init, Settings=fake_settings),
+    )
+    monitor = RunMonitor(
+        tmp_path,
+        log_cuda_memory=False,
+        log_disk_usage=False,
+        wandb=WandbConfig(enabled=True, project="wavelet-tests", mode="online"),
+    )
+
+    monitor.start_run(run_config={})
+
+    assert captured["id"] == "shared-123"
+    assert captured["resume"] == "allow"
+    assert "mode" not in captured
+    assert settings["mode"] == "shared"
+    assert settings["x_label"] == "trainer"
+    assert settings["x_primary"] is True
+    assert settings["x_update_finish_state"] is False
+    assert (tmp_path / "wandb_run_id.txt").read_text() == "shared-123"
+
+
 # ── unknown keys and device placement ─────────────────────────────────────────
 
 

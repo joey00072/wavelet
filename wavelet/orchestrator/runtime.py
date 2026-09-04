@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import signal
 import sys
 import time
@@ -451,9 +452,25 @@ def _role_specs(
     inference_config_path: Path,
     inference_ports: list[int],
     config_dir: Path | None = None,
+    wandb_shared_env: dict[str, str] | None = None,
 ) -> list[RoleSpec]:
     inference_replicas = len(inference_ports)
     eval_only = _target_steps(config) == 0
+    wandb_shared_env = wandb_shared_env or {}
+    primary_label = "orchestrator" if eval_only else "trainer"
+
+    def role_env(role: str, label: str) -> dict[str, str]:
+        env = config.launcher.env_vars.for_role(role)
+        if not wandb_shared_env:
+            return env
+        return {
+            **env,
+            **wandb_shared_env,
+            "WANDB_SHARED_LABEL": label,
+            "WANDB_SHARED_PRIMARY": primary_label,
+            "WANDB_SHARED_FINISHER": "orchestrator",
+        }
+
     roles: list[RoleSpec] = []
     if config.inference.mode == "vllm_http":
         inference_devices = _as_device_groups(
@@ -506,7 +523,7 @@ def _role_specs(
                 log_name="rl_trainer",
                 cuda_visible_devices=_trainer_device_group(config),
                 torchrun_nproc_per_node=config.launcher.trainer_num_processes,
-                env_vars=config.launcher.env_vars.for_role("trainer"),
+                env_vars=role_env("trainer", "trainer"),
             )
         )
     roles.append(
@@ -516,10 +533,39 @@ def _role_specs(
             config_path=inference_config_path,
             log_name="rl_inference",
             cuda_visible_devices=None,
-            env_vars=config.launcher.env_vars.for_role("orchestrator"),
+            env_vars=role_env("orchestrator", "orchestrator"),
         )
     )
     return roles
+
+
+def _shared_wandb_environment(config: RLConfig) -> dict[str, str]:
+    wandb = config.monitor.wandb
+    env_mode = os.environ.get("WANDB_MODE")
+    if (
+        not wandb.enabled
+        or wandb.mode != "online"
+        or env_mode in {"disabled", "offline"}
+    ):
+        return {}
+    run_id_file = config.output_dir / "wandb_run_id.txt"
+    run_id = os.environ.get("WANDB_RUN_ID", "").strip()
+    checkpoint = config.ckpt
+    if (
+        not run_id
+        and checkpoint is not None
+        and checkpoint.is_resuming
+        and run_id_file.exists()
+    ):
+        run_id = run_id_file.read_text(encoding="utf-8").strip()
+    if not run_id:
+        run_id = secrets.token_hex(4)
+    run_id_file.parent.mkdir(parents=True, exist_ok=True)
+    run_id_file.write_text(run_id, encoding="utf-8")
+    return {
+        "WANDB_SHARED_MODE": "1",
+        "WANDB_RUN_ID": run_id,
+    }
 
 
 def _run_process_launcher(
@@ -549,12 +595,14 @@ def _run_process_launcher(
     trainer_config_path = config_dir / "rl_trainer.yaml"
     inference_config_path = config_dir / "rl_inference.yaml"
     dump_yaml(inference_config_path, _role_config_payload(rollout_config))
+    wandb_shared_env = _shared_wandb_environment(config)
     roles = _role_specs(
         config,
         trainer_config_path=trainer_config_path,
         inference_config_path=inference_config_path,
         inference_ports=inference_ports,
         config_dir=config_dir,
+        wandb_shared_env=wandb_shared_env,
     )
 
     launcher = create_role_launcher(

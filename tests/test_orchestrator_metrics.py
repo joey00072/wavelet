@@ -318,6 +318,17 @@ def test_orchestrator_wandb_config_redacts_secrets(monkeypatch, tmp_path) -> Non
     }
 
 
+def test_finish_orchestrator_wandb_finishes_once(monkeypatch) -> None:
+    run = Mock()
+    monkeypatch.setattr(monitor_module, "_WANDB_RUN", run)
+
+    monitor_module.finish_orchestrator_wandb()
+    monitor_module.finish_orchestrator_wandb()
+
+    run.finish.assert_called_once_with()
+    assert monitor_module._WANDB_RUN is None
+
+
 def test_rollout_metrics_include_non_overlapping_generation_metrics() -> None:
     metrics = rollout_metrics(
         RolloutMetricInputs(

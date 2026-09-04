@@ -354,6 +354,10 @@ field as their step metric rather than an explicit monotonic step, so async
 evaluation results for an earlier optimizer step are not discarded, and a
 resumed run continues the previous W&B run through the id persisted in
 `<output_dir>/wandb_run_id.txt`.
+Online process-mode RL roles use W&B shared mode with that same run id: the
+trainer is the primary writer and the orchestrator is the final writer, so
+training, rollout, and evaluation metrics land in one run. Offline and disabled
+W&B modes keep their existing local behavior and do not enable shared mode.
 Training metrics that become NaN or infinite are stored as `null` in local
 JSONL logs and omitted from W&B rows; the monitor warns once for each affected
 metric key.

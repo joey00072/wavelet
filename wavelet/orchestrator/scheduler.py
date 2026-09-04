@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
-from wavelet.monitor import setup_config_logger
+from wavelet.monitor import finish_orchestrator_wandb, setup_config_logger
 from wavelet.orchestrator.envs import (
     _algorithm_record_from_output as _algorithm_record_from_output,
 )
@@ -1333,19 +1333,22 @@ def main(argv: list[str] | None = None) -> int:
     orchestrator = RLOrchestrator(config)
     target_step = _target_steps(config)
     _preload_rollout_resources(config)
-    with maybe_state_server(config, target_step=target_step) as state:
-        if state is not None:
-            state.set_status("running", phase="inference")
-        result = RolloutScheduler(
-            config=config,
-            orchestrator=orchestrator,
-            inference_engine=inference_engine,
-            policy_receiver=policy_receiver,
-            state=state,
-        ).run(target_step=target_step, start_step=start_step)
-        if state is not None:
-            state.set_status("completed", phase="completed")
-        return result
+    try:
+        with maybe_state_server(config, target_step=target_step) as state:
+            if state is not None:
+                state.set_status("running", phase="inference")
+            result = RolloutScheduler(
+                config=config,
+                orchestrator=orchestrator,
+                inference_engine=inference_engine,
+                policy_receiver=policy_receiver,
+                state=state,
+            ).run(target_step=target_step, start_step=start_step)
+            if state is not None:
+                state.set_status("completed", phase="completed")
+            return result
+    finally:
+        finish_orchestrator_wandb()
 
 
 def first_regenerated_queue_step(config: RLConfig, *, start_step: int) -> int:
