@@ -1,0 +1,34 @@
+name: GPU Tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: GPU tests
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 60
+    env:
+      WANDB_MODE: disabled
+      UV_LINK_MODE: copy
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked dependencies
+        run: uv sync --extra dev --locked
+      - name: Check GPU availability
+        run: nvidia-smi
+      - name: Run GPU tests
+        run: uv run pytest tests -m gpu

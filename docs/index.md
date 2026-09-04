@@ -194,9 +194,18 @@ with expressions such as `uv run pytest -m integration` or
 `uv run pytest -m "not gpu and not slow"`; tests marked `gpu` must also guard
 themselves when CUDA is unavailable.
 
-Pull requests and pushes to `master` run the same Ruff checks plus the complete
-`not gpu` pytest selection from the locked `uv` environment. GPU-only coverage
-remains an explicit release or hardware-runner check.
+The CPU integration suite includes a real reverse-text SFT subprocess followed
+by checkpoint resume. It verifies continuous step/token progress, a lower final
+training loss, and a stable post-resume checkpoint:
+
+```bash
+uv run pytest tests/integration/test_reverse_text_sft.py -q
+```
+
+Pull requests and pushes to `master` run the same Ruff checks plus separate CPU
+unit and integration jobs from the locked `uv` environment. The manual GPU
+workflow targets a self-hosted runner carrying the `linux` and `gpu` labels;
+GPU-only coverage remains an explicit release or hardware-runner check.
 
 Track project size when a change adds or removes meaningful surface area:
 
