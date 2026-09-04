@@ -17,12 +17,12 @@ wrapper; FSDP2-only reshard controls are intentionally omitted.
 | `hendrycks_sanity` | runnable | 1.5B math sanity config. |
 | `wiki_search` | runnable with env deps | Requires `wiki-search` environment setup. |
 | `wordle` | runnable after external env install | Requires the Wordle environment installed outside `uv sync`. |
-| `qwen30b_math` | adapted | Single-node prototype of a larger multi-node config. |
-| `qwen30b_swe` | adapted | Requires SWE environment and reduced sequence length for this host. |
+| `qwen30b_math` | adapted | Single-node prototype constrained to supported DP/TP dimensions. |
+| `qwen30b_swe` | adapted | Requires SWE environment; CP/EP remain disabled. |
 | `multinode` | adapted | Single-node prototype of a multi-node example. |
-| `intellect_3_1` | config only | Production-scale multi-node/MoE workload using AdamW. |
-| `minimax_m2_5_swe` | config only | Production-scale multi-node/MoE workload. |
-| `glm5_pd_disag` | config only | Production-scale disaggregated/MoE workload. |
+| `intellect_3_1` | config only | Large-model workload using AdamW; CP/EP remain disabled. |
+| `minimax_m2_5_swe` | config only | Large-model workload; CP/EP remain disabled. |
+| `glm5_pd_disag` | config only | Disaggregated/MoE workload with EP disabled. |
 
 Use the shared verifier data helper for environment-backed RL examples:
 

@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.sft import WandbConfig
+from wavelet.configs.sft import SFTConfig, WandbConfig
 from wavelet.orchestrator import launcher as launcher_module
 from wavelet.orchestrator.runtime import (
     _raise_keyboard_interrupt,
@@ -83,6 +83,15 @@ def test_unimplemented_muon_optimizer_config_is_rejected(
 def test_unimplemented_fsdp_reshard_setting_is_rejected() -> None:
     with pytest.raises(ValueError, match="reshard_after_forward"):
         RLConfig(fsdp={"reshard_after_forward": False})
+
+
+@pytest.mark.parametrize("config_cls", [RLConfig, SFTConfig])
+@pytest.mark.parametrize("field", ["cp", "ep"])
+def test_unsupported_parallel_dimensions_are_rejected_before_runtime(
+    config_cls: type[RLConfig | SFTConfig], field: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"fsdp\.{field}=2"):
+        config_cls(fsdp={field: 2})
 
 
 def test_process_mode_export_interval_must_fit_freshness_window() -> None:

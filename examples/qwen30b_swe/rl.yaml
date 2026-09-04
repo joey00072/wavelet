@@ -74,8 +74,9 @@ fsdp:
   backend: nccl
   dp_replicate: 1
   dp_shard: -1
-  cp: 2
-  ep: 8
+  # Context and expert parallelism are not implemented in the current model stack.
+  cp: 1
+  ep: 1
 
 optim:
   type: adamw

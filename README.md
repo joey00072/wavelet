@@ -78,7 +78,8 @@ Current distributed scope is experimental:
   beside the policy artifact for later parity checks
 - tensor-parallel model loading/saving now works for full-model paths when the
   selected architecture exposes a `transformers` TP plan
-- EP and CP are still not wired into the model kernels or attention stack
+- EP and CP degrees above 1 are rejected during config loading because they are
+  not yet wired into the model kernels or attention stack
 - LoRA adapter export from TP-sharded models is not implemented yet
 
 ## RL Framework Shape
@@ -293,6 +294,8 @@ Supported optimizers are AdamW, Adam, SGD, and the configured 8-bit Adam/
 AdamW variants; Muon is not accepted because Wavelet has no Muon runtime.
 FSDP1 does not expose a configurable `reshard_after_forward` policy, so that
 key is rejected instead of being accepted without affecting the wrapper.
+Likewise, `fsdp.cp` and `fsdp.ep` values above 1 are rejected before GPU setup;
+the current model stack only supports data and tensor parallel dimensions.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

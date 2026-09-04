@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import ValidationError
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.sft import OptimizerConfig, SFTConfig
+from wavelet.configs.sft import OptimizerConfig
 
 
 def test_legacy_optimizer_normalization_does_not_mutate_input() -> None:
@@ -24,8 +23,3 @@ def test_legacy_rl_normalization_does_not_mutate_input() -> None:
 
     assert raw == {"sampling": {"max_tokens": 17}}
     assert config.inference.sampling.max_completion_tokens == 17
-
-
-def test_context_parallelism_requires_cat_packing() -> None:
-    with pytest.raises(ValidationError, match="Packing function must be 'cat'"):
-        SFTConfig(fsdp={"cp": 2}, data={"seq_len": 128, "pack_function": "pad"})

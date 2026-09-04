@@ -206,6 +206,21 @@ class FSDPConfig(ConfigModel):
     ep: int = Field(default=1, ge=1)
     cpu_offload: bool = False
 
+    @model_validator(mode="after")
+    def validate_supported_parallel_dimensions(self) -> "FSDPConfig":
+        unsupported = [
+            f"fsdp.{name}={degree}"
+            for name, degree in (("cp", self.cp), ("ep", self.ep))
+            if degree > 1
+        ]
+        if unsupported:
+            settings = ", ".join(unsupported)
+            raise ValueError(
+                f"{settings} is unsupported by the current model stack; context "
+                "and expert parallel degrees must remain 1."
+            )
+        return self
+
 
 class LogConfig(ConfigModel):
     level: str = "info"
