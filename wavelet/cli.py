@@ -11,6 +11,10 @@ PUBLIC_COMMANDS = {
         "wavelet.tools.convert_checkpoint",
         "Convert a DCP checkpoint to Hugging Face safetensors",
     ),
+    "benchmark": (
+        "wavelet.tools.benchmark",
+        "Run and compare training performance benchmarks",
+    ),
     "rl-trainer": ("wavelet.entrypoints.rl_trainer", "Run RL trainer"),
     "rl-orchestrator": ("wavelet.entrypoints.rl_orchestrator", "Run RL orchestrator"),
     "rl-inference": (

@@ -216,3 +216,6 @@ uv run python scripts/project_size.py --write docs/project_size.jsonl
 The snapshot records file count, total lines, source lines, Python function/class
 counts, a rough complexity proxy, and the largest files. It intentionally skips
 external checkouts, generated outputs, caches, virtualenvs, and WandB artifacts.
+
+For repeatable performance checks, use the hardware-keyed benchmark harness and
+reviewed baselines described in [benchmarks/README.md](../benchmarks/README.md).
