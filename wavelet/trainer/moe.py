@@ -71,7 +71,7 @@ def _fp32_router_forward(
     *args: Any,
     **kwargs: Any,
 ) -> Any:
-    original_forward = getattr(router, "_wavelet_original_forward")
+    original_forward = router._wavelet_original_forward  # type: ignore[attr-defined]
     with torch.autocast(device_type=hidden_states.device.type, enabled=False):
         return original_forward(hidden_states.float(), *args, **kwargs)
 
