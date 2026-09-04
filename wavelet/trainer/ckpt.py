@@ -76,6 +76,8 @@ class AppState(Stateful):
 class TrainerState:
     step: int
     micro_step: int
+    total_tokens: int = 0
+    total_samples: int = 0
 
 
 @dataclass(slots=True)
@@ -235,6 +237,8 @@ class CheckpointManager:
         return TrainerState(
             step=int(metadata["step"]),
             micro_step=int(metadata["micro_step"]),
+            total_tokens=int(metadata.get("total_tokens", 0)),
+            total_samples=int(metadata.get("total_samples", 0)),
         )
 
     def poll_pending_save(self) -> None:
@@ -265,6 +269,8 @@ class CheckpointManager:
             "format_version": FORMAT_VERSION,
             "step": trainer_state.step,
             "micro_step": trainer_state.micro_step,
+            "total_tokens": trainer_state.total_tokens,
+            "total_samples": trainer_state.total_samples,
             "world_size": self.world.world_size,
             "mode": self.config.mode if self.config is not None else "disabled",
             "created_at": datetime.now(UTC).isoformat(),

@@ -165,6 +165,10 @@ Checkpoint resume is absolute-step based. Both trainer and process-mode rollout
 scheduler restart from the resolved checkpoint optimizer step; streaming modes
 convert that step to the corresponding queue-chunk offset. Completed runs wait
 for a pending async checkpoint to become stable before process teardown. A
+trainer checkpoint also persists cumulative global model-token and logical
+sample counts, which resume without resetting the corresponding
+`progress/total_tokens` and `progress/total_samples` metrics. Checkpoints created
+before these counters were added resume them from zero. A
 restored trainer also forces one policy export at the checkpoint step, even when
 that step is between normal export intervals, and removes newer snapshots left by
 the interrupted run for both filesystem and NCCL transports. The resumed

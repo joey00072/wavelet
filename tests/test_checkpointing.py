@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from concurrent.futures import Future
 
 import pytest
@@ -104,16 +105,68 @@ def test_async_checkpoint_round_trip_restores_model_and_optimizer(tmp_path) -> N
     optimizer.zero_grad(set_to_none=True)
     expected_weight = model.weight.detach().clone()
 
-    assert manager.save(TrainerState(step=1, micro_step=3))
+    expected_state = TrainerState(
+        step=1,
+        micro_step=3,
+        total_tokens=123,
+        total_samples=7,
+    )
+    assert manager.save(expected_state)
     manager.wait_for_pending_save()
     with torch.no_grad():
         model.weight.fill_(99.0)
 
     state = manager.load(tmp_path / "checkpoint-1")
 
-    assert state == TrainerState(step=1, micro_step=3)
+    assert state == expected_state
     assert torch.equal(model.weight, expected_weight)
     assert optimizer.state
+
+    meta_path = tmp_path / "checkpoint-1" / "meta.json"
+    legacy_metadata = json.loads(meta_path.read_text())
+    legacy_metadata.pop("total_tokens")
+    legacy_metadata.pop("total_samples")
+    meta_path.write_text(json.dumps(legacy_metadata))
+
+    legacy_state = manager.load(tmp_path / "checkpoint-1")
+
+    assert legacy_state.total_tokens == 0
+    assert legacy_state.total_samples == 0
+
+
+def test_trainer_progress_counts_global_tokens_and_logical_samples() -> None:
+    trainer = BaseTrainer(TrainerConfig())
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        local_world_size=2,
+        device=torch.device("cpu"),
+    )
+
+    trainer._record_progress({"input_ids": torch.ones((2, 3), dtype=torch.long)})
+    trainer._record_progress(
+        {
+            "input_ids": torch.ones((2, 4), dtype=torch.long),
+            "sample_counts": torch.tensor([1, 3]),
+        }
+    )
+
+    assert trainer.total_tokens == 28
+    assert trainer.total_samples == 12
+    assert trainer._progress_metrics() == {
+        "progress/total_tokens": 28.0,
+        "progress/total_samples": 12.0,
+    }
+
+
+def test_trainer_rejects_negative_checkpoint_progress() -> None:
+    trainer = BaseTrainer(TrainerConfig())
+
+    with pytest.raises(ValueError, match="progress counters"):
+        trainer._validate_resume_state(
+            TrainerState(step=0, micro_step=0, total_tokens=-1)
+        )
 
 
 def test_checkpoint_round_trip_with_cpu_offloaded_optimizer_state(tmp_path) -> None:

@@ -133,6 +133,8 @@ class BaseTrainer:
         self.monitor: RunMonitor | None = None
         self.step = 0
         self._micro_step = 0
+        self.total_tokens = 0
+        self.total_samples = 0
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -162,11 +164,17 @@ class BaseTrainer:
         pass
 
     def _validate_resume_state(self, state: TrainerState) -> None:
+        self._validate_progress_state(state)
         if state.micro_step != state.step * self.accumulation_steps:
             raise ValueError(
                 "Checkpoint micro_step does not match the expected optimizer-step "
                 "boundary for this trainer configuration."
             )
+
+    @staticmethod
+    def _validate_progress_state(state: TrainerState) -> None:
+        if state.total_tokens < 0 or state.total_samples < 0:
+            raise ValueError("Checkpoint progress counters must be non-negative.")
 
     def _checkpoint_dataloader(self) -> StatefulDataLoader | None:
         return self.dataloader
@@ -211,6 +219,8 @@ class BaseTrainer:
             self._validate_resume_state(state)
             self.step = state.step
             self._micro_step = state.micro_step
+            self.total_tokens = state.total_tokens
+            self.total_samples = state.total_samples
             self._after_resume()
         self.monitor.start_run(
             run_config=self.config.model_dump(mode="json", exclude_none=True),
@@ -249,7 +259,9 @@ class BaseTrainer:
             self._before_train_loop()
             while self.step < target_step:
                 for batch in self.dataloader:
-                    output = self._train_step(self._prepare_batch(batch))
+                    prepared_batch = self._prepare_batch(batch)
+                    output = self._train_step(prepared_batch)
+                    self._record_progress(prepared_batch)
                     if not output.stepped:
                         continue
                     self._after_optimizer_step()
@@ -707,7 +719,7 @@ class BaseTrainer:
             raise RuntimeError("Monitor not set up. Call setup() first.")
         self.ckpt_manager.poll_pending_save()
         did_save = self.ckpt_manager.save(
-            TrainerState(step=self.step, micro_step=self._micro_step),
+            self._trainer_state(),
             dataloader=self._checkpoint_dataloader(),
         )
         if did_save:
@@ -723,10 +735,38 @@ class BaseTrainer:
         if self.ckpt_manager is None:
             return False
         return self.ckpt_manager.save(
-            TrainerState(step=self.step, micro_step=self._micro_step),
+            self._trainer_state(),
             dataloader=self._checkpoint_dataloader(),
             force=True,
         )
+
+    def _trainer_state(self) -> TrainerState:
+        return TrainerState(
+            step=self.step,
+            micro_step=self._micro_step,
+            total_tokens=self.total_tokens,
+            total_samples=self.total_samples,
+        )
+
+    def _record_progress(self, batch: dict[str, torch.Tensor]) -> None:
+        input_ids = batch.get("input_ids")
+        if input_ids is None:
+            return
+        data_parallel_size = self._data_parallel_world_size()
+        self.total_tokens += int(input_ids.numel()) * data_parallel_size
+        sample_counts = batch.get("sample_counts")
+        local_samples = (
+            int(sample_counts.sum().item())
+            if sample_counts is not None
+            else int(input_ids.shape[0])
+        )
+        self.total_samples += local_samples * data_parallel_size
+
+    def _progress_metrics(self) -> dict[str, float]:
+        return {
+            "progress/total_tokens": float(self.total_tokens),
+            "progress/total_samples": float(self.total_samples),
+        }
 
     def _get_lr(self) -> float:
         if self.optimizer is None:
@@ -942,6 +982,7 @@ class SFTTrainer(BaseTrainer):
         lr = self._get_lr()
         metrics = dict(output.metrics)
         metrics.update(self._dataset_progress_metrics())
+        metrics.update(self._progress_metrics())
         metrics.update({"loss": loss, "lr": lr})
         self.monitor.log(metrics, self.step)
         progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")

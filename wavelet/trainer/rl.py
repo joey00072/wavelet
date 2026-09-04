@@ -292,6 +292,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._optimizer_batch_loss_scales = None
 
     def _validate_resume_state(self, state: TrainerState) -> None:
+        self._validate_progress_state(state)
         if state.step < 0 or state.micro_step < state.step:
             raise ValueError(
                 "RL checkpoint step counters are invalid: expected non-negative "
@@ -313,6 +314,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         metrics["optim/lr"] = metrics["lr"]
         metrics["progress/step"] = float(self.step)
         metrics["progress/micro_step"] = float(self._micro_step)
+        metrics.update(self._progress_metrics())
         self.monitor.log(metrics, self.step)
         progress.set_postfix(
             loss=f"{metrics['loss']:.4f}",
