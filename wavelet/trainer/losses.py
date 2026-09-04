@@ -27,6 +27,13 @@ def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
     return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
 
 
+def compute_entropy(logits: Tensor) -> Tensor:
+    """Compute per-token categorical entropy without retaining gradients."""
+    with torch.no_grad():
+        probabilities = torch.softmax(logits, dim=-1)
+        return torch.logsumexp(logits, dim=-1) - (probabilities * logits).sum(dim=-1)
+
+
 def _safe_mean(values: Tensor, mask: Tensor) -> Tensor:
     denom = torch.clamp_min(mask.sum(), 1)
     return values[mask].sum() / denom
@@ -289,7 +296,7 @@ class ChunkedLogprobLmHead(nn.Linear):
         labels_flat = labels.reshape(batch * seq_len).contiguous()
         inv_temperature = (1.0 / temperature.reshape(batch * seq_len)).contiguous()
 
-        logprobs = _ChunkedLogprobFn.apply(
+        logprobs, entropy = _ChunkedLogprobFn.apply(
             hidden_flat,
             self.weight,
             labels_flat,
@@ -298,21 +305,23 @@ class ChunkedLogprobLmHead(nn.Linear):
         )
         return {
             "logprobs": logprobs.reshape(batch, seq_len),
-            "entropy": None,
+            "entropy": entropy.reshape(batch, seq_len),
         }
 
 
-def _online_logsumexp_update(
+def _online_softmax_stats_update(
     max_values: Tensor,
     sums: Tensor,
+    weighted_sums: Tensor,
     logits: Tensor,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     chunk_max = torch.amax(logits, dim=-1)
     new_max = torch.maximum(max_values, chunk_max)
     old_scale = torch.exp(max_values - new_max)
     exp_logits = torch.exp(logits - new_max.unsqueeze(-1))
     new_sums = sums * old_scale + exp_logits.sum(dim=-1)
-    return new_max, new_sums
+    new_weighted_sums = weighted_sums * old_scale + (exp_logits * logits).sum(dim=-1)
+    return new_max, new_sums, new_weighted_sums
 
 
 def _validate_chunked_logprob_inputs(
@@ -351,7 +360,7 @@ class _ChunkedLogprobFn(torch.autograd.Function):
         labels: Tensor,
         inv_temperature: Tensor,
         chunk_size: int,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         _validate_chunked_logprob_inputs(
             hidden,
             weight,
@@ -365,6 +374,7 @@ class _ChunkedLogprobFn(torch.autograd.Function):
         vocab_size = weight.shape[0]
         vocab_chunk_size = min(vocab_size, 8192)
         logprobs = torch.empty(token_count, device=device, dtype=torch.float32)
+        entropy = torch.empty(token_count, device=device, dtype=torch.float32)
         log_z = torch.empty(token_count, device=device, dtype=torch.float32)
 
         for start in range(0, token_count, chunk_size):
@@ -381,6 +391,9 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                 dtype=torch.float32,
             )
             sums = torch.zeros(chunk_tokens, device=device, dtype=torch.float32)
+            weighted_sums = torch.zeros(
+                chunk_tokens, device=device, dtype=torch.float32
+            )
             target_logits = torch.zeros(
                 chunk_tokens, device=device, dtype=torch.float32
             )
@@ -390,9 +403,10 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                 weight_chunk = weight[vocab_start:vocab_end]
                 logits = hidden_chunk @ weight_chunk.t()
                 scaled_logits = logits.to(torch.float32) * inv_temperature_chunk
-                max_values, sums = _online_logsumexp_update(
+                max_values, sums, weighted_sums = _online_softmax_stats_update(
                     max_values,
                     sums,
+                    weighted_sums,
                     scaled_logits,
                 )
 
@@ -404,13 +418,19 @@ class _ChunkedLogprobFn(torch.autograd.Function):
             log_z_chunk = max_values + torch.log(sums)
             log_z[start:end] = log_z_chunk
             logprobs[start:end] = target_logits - log_z_chunk
+            entropy[start:end] = log_z_chunk - weighted_sums / sums
 
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(hidden, weight, labels, inv_temperature, log_z)
         ctx.chunk_size = chunk_size
-        return logprobs
+        return logprobs, entropy
 
     @staticmethod
-    def backward(ctx, grad_logprobs: Tensor):
+    def backward(ctx, grad_logprobs: Tensor, grad_entropy: Tensor | None):
+        if grad_entropy is not None:
+            raise RuntimeError("Backward through entropy is not supported.")
+        if grad_logprobs is None:
+            raise RuntimeError("Chunked logprob backward requires logprob gradients.")
         hidden, weight, labels, inv_temperature, log_z = ctx.saved_tensors
         chunk_size: int = ctx.chunk_size
         needs_grad_hidden, needs_grad_weight = ctx.needs_input_grad[:2]

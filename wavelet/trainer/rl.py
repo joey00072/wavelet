@@ -36,6 +36,7 @@ from wavelet.orchestrator.schedule import (
 from wavelet.trainer.ckpt import TrainerState
 from wavelet.trainer.distributed import barrier
 from wavelet.trainer.losses import (
+    compute_entropy,
     compute_loss,
     normalization_unit_count,
     selective_log_softmax,
@@ -713,11 +714,14 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         batch: dict[str, Tensor],
         attention_mask: Tensor | None,
     ) -> LossOutput:
-        trainer_logprobs = self._model_logprobs(batch, attention_mask)
+        trainer_logprobs, entropy = self._model_logprobs_and_entropy(
+            batch,
+            attention_mask,
+        )
         if not batch["loss_mask"].bool().any():
             loss = trainer_logprobs.sum() * 0.0
             return LossOutput(loss=loss, metrics=self._zero_loss_metrics(loss))
-        return compute_loss(
+        output = compute_loss(
             trainer_logprobs,
             self._inference_logprobs(batch, attention_mask),
             self._teacher_logprobs(batch),
@@ -731,6 +735,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             ),
             position_ids=batch["position_ids"],
         )
+        output.metrics.update(self._entropy_metrics(entropy, batch["loss_mask"]))
+        return output
 
     def _backward_rl_loss(self, loss: Tensor) -> None:
         with self._maybe_no_sync():
@@ -855,6 +861,20 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         batch: dict[str, Tensor],
         attention_mask: Tensor | None,
     ) -> Tensor:
+        logprobs, _ = self._model_logprobs_and_entropy(
+            batch,
+            attention_mask,
+            include_entropy=False,
+        )
+        return logprobs
+
+    def _model_logprobs_and_entropy(
+        self,
+        batch: dict[str, Tensor],
+        attention_mask: Tensor | None,
+        *,
+        include_entropy: bool = True,
+    ) -> tuple[Tensor, Tensor | None]:
         if self.model is None:
             raise RuntimeError("Model not set up")
         model_kwargs = {
@@ -869,10 +889,36 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         with self._model_forward_context():
             outputs = self.model(**model_kwargs)
         if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
-            return outputs["logprobs"].float().contiguous()
+            entropy = outputs.get("entropy") if include_entropy else None
+            return (
+                outputs["logprobs"].float().contiguous(),
+                entropy.float().contiguous() if entropy is not None else None,
+            )
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         scaled_logits = logits.float() / batch["temperatures"].float().unsqueeze(-1)
-        return selective_log_softmax(scaled_logits, batch["target_ids"])
+        entropy = compute_entropy(scaled_logits) if include_entropy else None
+        return (
+            selective_log_softmax(scaled_logits, batch["target_ids"]),
+            entropy,
+        )
+
+    def _entropy_metrics(
+        self,
+        entropy: Tensor | None,
+        loss_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        if entropy is None:
+            return {}
+        values = entropy.detach()[loss_mask.bool()]
+        if values.numel() == 0:
+            return {}
+        return {
+            "_entropy_sum": values.sum(),
+            "_entropy_count": values.new_tensor(values.numel()),
+            "entropy/mean": values.mean(),
+            "entropy/min": values.min(),
+            "entropy/max": values.max(),
+        }
 
     def _model_forward_context(self):
         if (
@@ -1045,7 +1091,14 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         for key in all_keys:
             values = [metrics[key] for metrics in micro_metrics if key in metrics]
             if values:
-                aggregated[key] = sum(values) / len(values)
+                if key in {"_entropy_sum", "_entropy_count"}:
+                    aggregated[key] = sum(values)
+                elif key == "entropy/min":
+                    aggregated[key] = min(values)
+                elif key == "entropy/max":
+                    aggregated[key] = max(values)
+                else:
+                    aggregated[key] = sum(values) / len(values)
         return aggregated
 
     def _standard_metric_aliases(self, metrics: dict[str, float]) -> dict[str, float]:
@@ -1149,6 +1202,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if reward_sum is not None and reward_weight is not None and reward_weight > 0:
             metrics["reward/all/mean"] = reward_sum / reward_weight
             metrics["reward_mean"] = metrics["reward/all/mean"]
+        entropy_sum = metrics.pop("_entropy_sum", None)
+        entropy_count = metrics.pop("_entropy_count", None)
+        if entropy_sum is not None and entropy_count is not None and entropy_count > 0:
+            metrics["entropy/mean"] = entropy_sum / entropy_count
         return metrics
 
     def _save_model(self) -> None:

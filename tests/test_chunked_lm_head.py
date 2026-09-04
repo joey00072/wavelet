@@ -17,9 +17,12 @@ def test_chunked_lm_head_matches_full_logits_logprobs() -> None:
 
     full_logits = full_head(hidden) / temperatures.unsqueeze(-1)
     expected = selective_log_softmax(full_logits, labels)
-    actual = chunked_head(hidden, labels=labels, temperature=temperatures)["logprobs"]
+    expected_entropy = torch.distributions.Categorical(logits=full_logits).entropy()
+    output = chunked_head(hidden, labels=labels, temperature=temperatures)
+    actual = output["logprobs"]
 
     torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(output["entropy"], expected_entropy)
 
     expected_loss = expected.sum()
     actual_loss = actual.sum()

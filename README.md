@@ -295,6 +295,10 @@ field as their step metric rather than an explicit monotonic step, so async
 evaluation results for an earlier optimizer step are not discarded, and a
 resumed run continues the previous W&B run through the id persisted in
 `<output_dir>/wandb_run_id.txt`.
+RL trainer metrics include `entropy/mean`, `entropy/min`, and `entropy/max`
+over loss-masked policy tokens. Entropy uses each token's rollout temperature
+and is computed without materializing full-vocabulary logits when the chunked
+LM head is enabled.
 Standalone trainers use the same resolved step count for optimization and the
 learning-rate scheduler; in particular, RL `max_steps: 0` remains evaluation-only
 instead of falling back to an implicit training run. Without `max_steps`,

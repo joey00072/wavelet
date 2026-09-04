@@ -406,6 +406,49 @@ def test_model_logprobs_casts_chunked_output_to_fp32() -> None:
     assert "temperature" in model.kwargs
 
 
+def test_entropy_metrics_cover_only_loss_masked_tokens() -> None:
+    trainer = RLTrainer(RLConfig())
+    metrics = trainer._entropy_metrics(
+        torch.tensor([[1.0, 2.0, 100.0], [3.0, 4.0, 200.0]]),
+        torch.tensor([[True, True, False], [True, True, False]]),
+    )
+
+    assert metrics["entropy/mean"].item() == pytest.approx(2.5)
+    assert metrics["entropy/min"].item() == pytest.approx(1.0)
+    assert metrics["entropy/max"].item() == pytest.approx(4.0)
+    assert metrics["_entropy_sum"].item() == pytest.approx(10.0)
+    assert metrics["_entropy_count"].item() == pytest.approx(4.0)
+
+
+def test_entropy_mean_is_token_weighted_across_micro_batches() -> None:
+    trainer = RLTrainer(RLConfig())
+    metrics = trainer._aggregate_train_metrics(
+        [
+            {
+                "_entropy_sum": 2.0,
+                "_entropy_count": 1.0,
+                "entropy/mean": 2.0,
+                "entropy/min": 2.0,
+                "entropy/max": 2.0,
+            },
+            {
+                "_entropy_sum": 12.0,
+                "_entropy_count": 3.0,
+                "entropy/mean": 4.0,
+                "entropy/min": 3.0,
+                "entropy/max": 5.0,
+            },
+        ]
+    )
+    metrics = trainer._finalize_synced_metrics(metrics)
+
+    assert metrics["entropy/mean"] == pytest.approx(3.5)
+    assert metrics["entropy/min"] == pytest.approx(2.0)
+    assert metrics["entropy/max"] == pytest.approx(5.0)
+    assert "_entropy_sum" not in metrics
+    assert "_entropy_count" not in metrics
+
+
 def test_float32_fsdp_config_uses_bfloat16_params_and_float32_reduce(
     monkeypatch,
 ) -> None:
