@@ -329,7 +329,8 @@ metadata, complete-group admission, and per-problem rollout metrics; interleaved
 rows are summarized against their own group rather than their file position,
 and extra trajectory branches do not count as additional rollouts.
 
-Evaluation `avg@k` and `pass@k` metrics count every requested generation;
+Evaluation `avg@k`, `pass@k` (at least one correct), and `pass^k` (all correct)
+metrics count every requested generation with unbiased combinatorial estimators;
 failed or missing-reward attempts count as incorrect instead of disappearing from
 the denominator. Rollouts whose verifier recorded an internal error are failed
 attempts too, even though verifiers reports them with a zero reward.
