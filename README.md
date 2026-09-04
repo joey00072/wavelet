@@ -320,6 +320,9 @@ SFT sample generation has no trainer implementation, so a `generate` block is
 also rejected; use the inference commands after training instead.
 SFT packing accepts only the implemented `pad` and `cat` modes; the former
 `stack` mode and its bucket settings are rejected.
+Activation offloading uses the trainer's single CUDA stream; the unsupported
+`use_streams` and `max_fwd_stash_size` controls are rejected rather than
+silently ignored. Its `pin_memory` setting remains configurable.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

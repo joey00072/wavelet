@@ -119,6 +119,15 @@ def test_unimplemented_sft_stack_packing_config_is_rejected(
         SFTConfig(data=data)
 
 
+@pytest.mark.parametrize("config_cls", [RLConfig, SFTConfig])
+@pytest.mark.parametrize("field", ["use_streams", "max_fwd_stash_size"])
+def test_unimplemented_activation_offload_controls_are_rejected(
+    config_cls: type[RLConfig | SFTConfig], field: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        config_cls(activation_offloading={field: True})
+
+
 def test_process_mode_export_interval_must_fit_freshness_window() -> None:
     orchestrator = {"max_async_level": 2, "max_off_policy_steps": 1}
 

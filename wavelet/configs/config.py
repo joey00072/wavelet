@@ -12,8 +12,6 @@ class ConfigModel(BaseModel):
 
 class ActivationOffloadingConfig(ConfigModel):
     pin_memory: bool = True
-    use_streams: bool = True
-    max_fwd_stash_size: int = Field(default=5, ge=1)
 
 
 DEFAULT_LORA_TARGET_MODULES = [
