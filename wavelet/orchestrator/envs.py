@@ -20,6 +20,7 @@ from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.advantage import (
     output_completion_token_count,
+    output_input_token_count,
     output_tool_response_token_count,
 )
 from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
@@ -917,8 +918,10 @@ def _algorithm_record_from_output(output: dict[str, Any]) -> RLExample:
         reward=float(output["reward"]),
         metadata={
             "completion_token_count": output_completion_token_count(output),
+            "input_token_count": output_input_token_count(output),
             "tool_response_token_count": output_tool_response_token_count(output),
             "turn_count": len(output.get("trajectory") or []),
+            "is_truncated": bool(output.get("is_truncated")),
         },
         source=str(output.get("env_name") or output.get("task") or "verifier"),
     )
@@ -1152,6 +1155,7 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
             "stop_condition": output.get("stop_condition"),
             "is_truncated": output.get("is_truncated"),
             "completion_token_count": output_completion_token_count(output),
+            "input_token_count": output_input_token_count(output),
             "tool_response_token_count": output_tool_response_token_count(output),
             "turn_count": len(output.get("trajectory") or []),
             "_wavelet_rollout_count": 1 if sample_index == 0 else 0,

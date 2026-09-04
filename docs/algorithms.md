@@ -90,6 +90,36 @@ for the best positive reward, the shorter-than-average rollouts receive an
 efficiency bonus before the group is centered. If the group has no positive
 reward or no usable cost, Wavelet falls back to ordinary reward centering.
 
+For a cost applied to every rollout, use the `linear` penalty. Output tokens,
+input/context tokens, and turns are each normalized by that group's maximum.
+Their weighted sum is multiplied by the group mean reward and subtracted before
+the GRPO baseline:
+
+```yaml
+algo:
+  type: grpo
+  length_penalty:
+    type: linear
+    num_output_tokens_weight: 0.25
+    num_input_tokens_weight: 0.1
+    num_turns_weight: 0.1
+```
+
+To penalize only rollouts stopped by the maximum-length limit, subtract a fixed
+amount from their reward before centering:
+
+```yaml
+algo:
+  type: grpo
+  length_penalty:
+    type: truncation
+    penalty: 1.0
+```
+
+The existing `tokens` and `turns` modes remain efficiency bonuses; `linear` and
+`truncation` are reward penalties. All four modes operate before optional
+advantage standardization.
+
 ### MaxRL
 
 MaxRL assigns `(reward - group_mean) / group_mean`. It is intended for

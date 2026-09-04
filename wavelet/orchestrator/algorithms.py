@@ -9,6 +9,7 @@ from wavelet.configs.rl_config import (
     CustomAlgorithmConfig,
     GRPOAlgorithmConfig,
     LengthPenaltyConfig,
+    LinearLengthPenaltyConfig,
     MaxRLAlgorithmConfig,
     OPDAlgorithmConfig,
     OPSDAlgorithmConfig,
@@ -16,11 +17,16 @@ from wavelet.configs.rl_config import (
     RewardAlgorithmConfig,
     RLAlgorithmConfig,
     SFTDistillAlgorithmConfig,
+    TokensLengthPenaltyConfig,
+    TruncationLengthPenaltyConfig,
+    TurnsLengthPenaltyConfig,
 )
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.advantage import (
     group_reward_advantages,
     length_penalty_cost_for_record,
+    linearly_penalized_rewards,
+    truncation_penalized_rewards,
 )
 from wavelet.orchestrator.custom_algorithms import (
     load_custom_algorithm,
@@ -68,12 +74,21 @@ class GRPOAlgorithm(BaseAlgorithm):
     def score_group(self, records: list[RLExample]) -> list[RLExample]:
         """Assign group-relative advantages without mutating the input records."""
         rewards = _required_rewards(records, algorithm="GRPO")
+        if isinstance(self.length_penalty, LinearLengthPenaltyConfig):
+            rewards = linearly_penalized_rewards(records, rewards, self.length_penalty)
+        elif isinstance(self.length_penalty, TruncationLengthPenaltyConfig):
+            rewards = truncation_penalized_rewards(
+                records, rewards, self.length_penalty
+            )
         costs = (
             [
                 length_penalty_cost_for_record(record, self.length_penalty)
                 for record in records
             ]
-            if self.length_penalty is not None
+            if isinstance(
+                self.length_penalty,
+                (TokensLengthPenaltyConfig, TurnsLengthPenaltyConfig),
+            )
             else None
         )
         advantages = group_reward_advantages(

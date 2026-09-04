@@ -4,8 +4,10 @@ import pytest
 
 from wavelet.configs.rl_config import (
     GRPOAlgorithmConfig,
+    LinearLengthPenaltyConfig,
     RLConfig,
     TokensLengthPenaltyConfig,
+    TruncationLengthPenaltyConfig,
 )
 
 
@@ -101,6 +103,20 @@ def test_named_grpo_accepts_documented_token_cost_fields() -> None:
     assert isinstance(config.algo.length_penalty, TokensLengthPenaltyConfig)
     assert config.algo.length_penalty.completion_weight == pytest.approx(0.5)
     assert config.algo.length_penalty.tool_response_weight == pytest.approx(2.0)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_type"),
+    [
+        ({"type": "linear"}, LinearLengthPenaltyConfig),
+        ({"type": "truncation", "penalty": 0.5}, TruncationLengthPenaltyConfig),
+    ],
+)
+def test_named_grpo_accepts_reward_length_penalties(payload, expected_type) -> None:
+    config = RLConfig(algo={"type": "grpo", "length_penalty": payload})
+
+    assert isinstance(config.algo, GRPOAlgorithmConfig)
+    assert isinstance(config.algo.length_penalty, expected_type)
 
 
 def test_algorithm_config_rejects_unknown_fields() -> None:

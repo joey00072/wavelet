@@ -877,8 +877,23 @@ class TurnsLengthPenaltyConfig(_StrictConfig):
     type: Literal["turns"] = "turns"
 
 
+class LinearLengthPenaltyConfig(_StrictConfig):
+    type: Literal["linear"] = "linear"
+    num_output_tokens_weight: float = Field(default=0.25, ge=0.0, allow_inf_nan=False)
+    num_input_tokens_weight: float = Field(default=0.1, ge=0.0, allow_inf_nan=False)
+    num_turns_weight: float = Field(default=0.1, ge=0.0, allow_inf_nan=False)
+
+
+class TruncationLengthPenaltyConfig(_StrictConfig):
+    type: Literal["truncation"] = "truncation"
+    penalty: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
+
+
 LengthPenaltyConfig = Annotated[
-    TokensLengthPenaltyConfig | TurnsLengthPenaltyConfig,
+    TokensLengthPenaltyConfig
+    | TurnsLengthPenaltyConfig
+    | LinearLengthPenaltyConfig
+    | TruncationLengthPenaltyConfig,
     Field(discriminator="type"),
 ]
 

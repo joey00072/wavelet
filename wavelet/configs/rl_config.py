@@ -5,6 +5,7 @@ from wavelet.configs.config import (
     CustomAlgorithmConfig,
     GRPOAlgorithmConfig,
     LengthPenaltyConfig,
+    LinearLengthPenaltyConfig,
     MaxRLAlgorithmConfig,
     OPDAlgorithmConfig,
     OPSDAlgorithmConfig,
@@ -31,6 +32,7 @@ from wavelet.configs.config import (
     RLVLLMHTTPConfig,
     SFTDistillAlgorithmConfig,
     TokensLengthPenaltyConfig,
+    TruncationLengthPenaltyConfig,
     TurnsLengthPenaltyConfig,
 )
 
@@ -39,6 +41,7 @@ __all__ = [
     "CustomAlgorithmConfig",
     "GRPOAlgorithmConfig",
     "LengthPenaltyConfig",
+    "LinearLengthPenaltyConfig",
     "MaxRLAlgorithmConfig",
     "OPDAlgorithmConfig",
     "OPSDAlgorithmConfig",
@@ -65,5 +68,6 @@ __all__ = [
     "RewardAlgorithmConfig",
     "SFTDistillAlgorithmConfig",
     "TokensLengthPenaltyConfig",
+    "TruncationLengthPenaltyConfig",
     "TurnsLengthPenaltyConfig",
 ]

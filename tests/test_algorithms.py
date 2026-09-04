@@ -9,6 +9,7 @@ from wavelet.configs.rl_config import (
     AlgorithmScope,
     CustomAlgorithmConfig,
     GRPOAlgorithmConfig,
+    LinearLengthPenaltyConfig,
     MaxRLAlgorithmConfig,
     OPDAlgorithmConfig,
     OPSDAlgorithmConfig,
@@ -17,6 +18,7 @@ from wavelet.configs.rl_config import (
     RLAlgorithmConfig,
     RLConfig,
     SFTDistillAlgorithmConfig,
+    TruncationLengthPenaltyConfig,
 )
 from wavelet.data.rl_dataset import RLExample
 from wavelet.orchestrator.algorithms import (
@@ -88,6 +90,61 @@ def test_grpo_algorithm_preserves_input_order() -> None:
 
     assert [record.source for record in scored] == ["first", "second", "third"]
     assert [record.advantage for record in scored] == pytest.approx([-1.0, 1.0, 0.0])
+
+
+def test_grpo_linear_length_penalty_uses_group_normalized_costs() -> None:
+    records = [
+        replace(
+            _example(reward=1.0),
+            metadata={
+                "completion_token_count": 10,
+                "input_token_count": 5,
+                "turn_count": 1,
+            },
+        ),
+        replace(
+            _example(reward=1.0),
+            metadata={
+                "completion_token_count": 20,
+                "input_token_count": 5,
+                "turn_count": 1,
+            },
+        ),
+        replace(
+            _example(reward=0.0),
+            metadata={
+                "completion_token_count": 20,
+                "input_token_count": 5,
+                "turn_count": 1,
+            },
+        ),
+    ]
+    algorithm = GRPOAlgorithm(
+        length_penalty=LinearLengthPenaltyConfig(
+            num_output_tokens_weight=0.25,
+            num_input_tokens_weight=0.0,
+            num_turns_weight=0.0,
+        )
+    )
+
+    scored = algorithm.score_group(records)
+
+    assert [record.advantage for record in scored] == pytest.approx(
+        [7 / 18, 11 / 36, -25 / 36]
+    )
+
+
+def test_grpo_truncation_penalty_demotes_max_length_rollouts() -> None:
+    records = [
+        replace(_example(reward=1.0), metadata={"is_truncated": False}),
+        replace(_example(reward=1.0), metadata={"is_truncated": True}),
+        replace(_example(reward=0.0), metadata={"is_truncated": False}),
+    ]
+    algorithm = GRPOAlgorithm(length_penalty=TruncationLengthPenaltyConfig(penalty=0.5))
+
+    scored = algorithm.score_group(records)
+
+    assert [record.advantage for record in scored] == pytest.approx([0.5, 0.0, -0.5])
 
 
 def test_grpo_algorithm_requires_every_reward() -> None:

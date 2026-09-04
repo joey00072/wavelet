@@ -92,6 +92,7 @@ def test_verifier_step_converts_to_trainable_record() -> None:
         "stop_condition": "done",
         "is_truncated": False,
         "completion_token_count": 2,
+        "input_token_count": 3,
         "tool_response_token_count": 0,
         "turn_count": 1,
         "_wavelet_rollout_count": 1,
@@ -1078,6 +1079,7 @@ def test_verifier_records_include_length_metadata() -> None:
     record = _records_from_output(output)[0]
 
     assert record.metadata["completion_token_count"] == 3
+    assert record.metadata["input_token_count"] == 2
     assert record.metadata["tool_response_token_count"] == 12
     assert record.metadata["turn_count"] == 1
 

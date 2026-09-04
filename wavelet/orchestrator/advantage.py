@@ -4,7 +4,9 @@ import math
 from typing import Any
 
 from wavelet.configs.rl_config import (
+    LinearLengthPenaltyConfig,
     TokensLengthPenaltyConfig,
+    TruncationLengthPenaltyConfig,
     TurnsLengthPenaltyConfig,
 )
 from wavelet.data.rl import RLExample
@@ -51,8 +53,64 @@ def length_penalty_cost_for_record(record: RLExample, penalty: object) -> float:
     return 0.0
 
 
+def linearly_penalized_rewards(
+    records: list[RLExample],
+    rewards: list[float],
+    penalty: LinearLengthPenaltyConfig,
+) -> list[float]:
+    """Apply group-normalized linear costs scaled by the group's mean reward."""
+    if len(records) != len(rewards):
+        raise ValueError("records and rewards must have the same length")
+    if not rewards:
+        return []
+    outputs = [_record_length(record, "completion_token_count") for record in records]
+    inputs = [_record_input_tokens(record) for record in records]
+    turns = [_record_length(record, "turn_count", default=1.0) for record in records]
+    output_max = max(max(outputs), 1.0)
+    input_max = max(max(inputs), 1.0)
+    turn_max = max(max(turns), 1.0)
+    pass_rate = sum(rewards) / len(rewards)
+    return [
+        reward
+        - pass_rate
+        * (
+            penalty.num_output_tokens_weight * output / output_max
+            + penalty.num_input_tokens_weight * input_tokens / input_max
+            + penalty.num_turns_weight * turn_count / turn_max
+        )
+        for reward, output, input_tokens, turn_count in zip(
+            rewards, outputs, inputs, turns, strict=True
+        )
+    ]
+
+
+def truncation_penalized_rewards(
+    records: list[RLExample],
+    rewards: list[float],
+    penalty: TruncationLengthPenaltyConfig,
+) -> list[float]:
+    """Subtract a fixed reward penalty from max-length-truncated rollouts."""
+    if len(records) != len(rewards):
+        raise ValueError("records and rewards must have the same length")
+    return [
+        reward - penalty.penalty if _record_is_truncated(record) else reward
+        for record, reward in zip(records, rewards, strict=True)
+    ]
+
+
 def output_completion_token_count(output: dict[str, Any]) -> int:
     return _output_completion_token_count(output)
+
+
+def output_input_token_count(output: dict[str, Any]) -> int:
+    total = 0
+    for step in output.get("trajectory") or []:
+        if not isinstance(step, dict):
+            continue
+        tokens = step.get("tokens") or {}
+        if isinstance(tokens, dict):
+            total += len(tokens.get("prompt_ids") or [])
+    return total
 
 
 def output_tool_response_token_count(output: dict[str, Any]) -> int:
@@ -105,6 +163,42 @@ def _metadata_number(
 ) -> float:
     value = metadata.get(key, default)
     return float(value) if isinstance(value, (int, float)) else default
+
+
+def _record_length(
+    record: RLExample,
+    key: str,
+    *,
+    default: float = 0.0,
+) -> float:
+    metadata = record.metadata or {}
+    value = _metadata_number(metadata, key, default=default)
+    if value > 0.0 or key != "completion_token_count":
+        return value
+    if record.loss_mask is not None:
+        return float(sum(bool(item) for item in record.loss_mask))
+    return value
+
+
+def _record_input_tokens(record: RLExample) -> float:
+    metadata = record.metadata or {}
+    value = _metadata_number(metadata, "input_token_count")
+    if value > 0.0:
+        return value
+    if record.input_ids is None:
+        return 0.0
+    return max(
+        float(len(record.input_ids)) - _record_length(record, "completion_token_count"),
+        0.0,
+    )
+
+
+def _record_is_truncated(record: RLExample) -> bool:
+    metadata = record.metadata or {}
+    if "is_truncated" in metadata:
+        return bool(metadata["is_truncated"])
+    rollout = metadata.get("rollout")
+    return isinstance(rollout, dict) and bool(rollout.get("is_truncated"))
 
 
 def _output_completion_token_count(output: dict[str, Any]) -> int:
