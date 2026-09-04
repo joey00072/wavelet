@@ -25,6 +25,7 @@ def test_cli_usage_does_not_eagerly_import_entrypoints(monkeypatch, capsys) -> N
     output = capsys.readouterr().out
     assert "Usage: wavelet <command> [args]" in output
     assert "debug" in output
+    assert "evals" in output
     assert "inference-server" in output
     assert "inference-debug" not in output
     assert "orchestrator-debug" not in output

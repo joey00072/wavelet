@@ -227,3 +227,6 @@ reviewed baselines described in [benchmarks/README.md](../benchmarks/README.md).
 Export structured run events for Hugging Face dataset analysis with
 `uv run wavelet convert-traces outputs/run --output-dir <dataset-dir>`; passing
 a run directory discovers only its canonical `traces/` JSONL files.
+Run one evaluation epoch against an existing OpenAI-compatible server with
+`uv run wavelet evals @ run.yaml --orchestrator.verifier-base-url
+http://server:8000/v1`; the command starts neither training nor inference.

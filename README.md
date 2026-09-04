@@ -394,6 +394,18 @@ resumed run continues the previous W&B run through the id persisted in
 Evaluation rollout requests are bounded by `eval.max_inflight_rollouts`
 (default `64`) so a large evaluation set does not enqueue every generation at
 once.
+To evaluate every configured `eval.env` once against an already-running
+OpenAI-compatible server, run:
+
+```bash
+uv run wavelet evals @ run.yaml \
+  --orchestrator.verifier-base-url http://server:8000/v1
+```
+
+This command forces eval-only validation, does not start a trainer or inference
+server, and writes step-0 rollouts and metrics under the configured
+`output_dir`. Set `orchestrator.verifier_model` when the served model name is
+different from `model.name`.
 Online process-mode RL roles use W&B shared mode with that same run id: the
 trainer is the primary writer and the orchestrator is the final writer, so
 training, rollout, and evaluation metrics land in one run. Offline and disabled
