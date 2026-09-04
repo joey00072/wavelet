@@ -3,7 +3,8 @@ model:
   torch_dtype: float32
   attn_implementation: auto
   load_in_4bit: false
-  gradient_checkpointing: true
+  activation_checkpointing:
+    mode: full
   matmul_precision: high
 
 data:

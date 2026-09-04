@@ -1,6 +1,7 @@
 """Compatibility imports for the canonical config module."""
 
 from wavelet.configs.config import (
+    ActivationCheckpointingConfig,
     ActivationOffloadingConfig,
     CheckpointConfig,
     DataConfig,
@@ -21,6 +22,7 @@ from wavelet.configs.config import (
 )
 
 __all__ = [
+    "ActivationCheckpointingConfig",
     "ActivationOffloadingConfig",
     "CheckpointConfig",
     "DataConfig",

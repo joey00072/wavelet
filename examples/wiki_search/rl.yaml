@@ -2,7 +2,8 @@ model:
   name: "Qwen/Qwen3-4B-Instruct-2507"
   torch_dtype: float32
   attn_implementation: auto
-  gradient_checkpointing: true
+  activation_checkpointing:
+    mode: full
   matmul_precision: high
   fused_lm_head_token_chunk_size: auto
 

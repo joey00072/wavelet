@@ -2,7 +2,8 @@ model:
   name: "Qwen/Qwen3-4B-Instruct-2507"
   torch_dtype: bfloat16
   attn_implementation: sdpa
-  gradient_checkpointing: true
+  activation_checkpointing:
+    mode: full
   matmul_precision: high
 
 data:

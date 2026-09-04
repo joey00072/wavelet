@@ -2,7 +2,8 @@ model:
   name: "PrimeIntellect/Qwen3-1.7B-Wordle-SFT"
   torch_dtype: float32
   attn_implementation: auto
-  gradient_checkpointing: true
+  activation_checkpointing:
+    mode: full
   matmul_precision: high
   fused_lm_head_token_chunk_size: auto
 

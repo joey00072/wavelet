@@ -3,7 +3,8 @@ model:
   torch_dtype: bfloat16
   attn_implementation: auto
   trust_remote_code: true
-  gradient_checkpointing: true
+  activation_checkpointing:
+    mode: full
   matmul_precision: high
   fused_lm_head_token_chunk_size: 1024
 

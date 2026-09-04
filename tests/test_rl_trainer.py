@@ -509,7 +509,7 @@ def test_distributed_qlora_uses_current_cuda_device_map(monkeypatch) -> None:
             name="fake/model",
             attn_implementation="sdpa",
             load_in_4bit=True,
-            gradient_checkpointing=False,
+            activation_checkpointing=None,
         ),
         distributed=True,
     )

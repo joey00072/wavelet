@@ -6,8 +6,9 @@ from typing import Literal
 
 import pytest
 import torch
+from torch.utils.checkpoint import CheckpointPolicy
 
-from wavelet.configs.sft import ModelConfig
+from wavelet.configs.sft import ActivationCheckpointingConfig, ModelConfig
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.model import setup_tokenizer
 
@@ -164,17 +165,18 @@ def test_compile_fullgraph_requires_compile_enabled() -> None:
         ModelConfig(compile_fullgraph=True)
 
 
-def test_compiled_debug_layers_match_eager_loss_with_gradient_checkpointing() -> None:
+def test_compiled_debug_layers_match_eager_loss_with_activation_checkpointing() -> None:
     eager = model_utils.build_debug_model(max_seq_length=64)
     compiled = copy.deepcopy(eager)
     for model in (eager, compiled):
         model.config.use_cache = False
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
         model.train()
 
     state_keys = set(compiled.state_dict())
+    checkpointed_count = model_utils.apply_activation_checkpointing(
+        compiled,
+        ActivationCheckpointingConfig(),
+    )
     compiled_count = model_utils.compile_transformer_layers(
         compiled,
         fullgraph=False,
@@ -185,7 +187,82 @@ def test_compiled_debug_layers_match_eager_loss_with_gradient_checkpointing() ->
     compiled_loss = compiled(input_ids=input_ids, labels=input_ids).loss
     compiled_loss.backward()
 
+    assert checkpointed_count == 2
     assert compiled_count == 2
     assert set(compiled.state_dict()) == state_keys
     assert compiled_loss.item() == pytest.approx(eager_loss.item(), rel=1e-5, abs=1e-6)
     assert any(parameter.grad is not None for parameter in compiled.parameters())
+
+
+@pytest.mark.parametrize("mode", ["full", "selective"])
+def test_activation_checkpointing_wraps_configured_layer_frequency(
+    mode: Literal["full", "selective"],
+) -> None:
+    model = model_utils.build_debug_model(max_seq_length=64)
+    model.config.use_cache = False
+    state_keys = set(model.state_dict())
+    config = ActivationCheckpointingConfig(
+        mode=mode,
+        freq=2,
+        targets=[] if mode == "selective" else None,
+    )
+
+    wrapped_count = model_utils.apply_activation_checkpointing(model, config)
+    input_ids = torch.tensor([[1, 7, 8, 9, 10, 1]])
+    loss = model(input_ids=input_ids, labels=input_ids).loss
+    loss.backward()
+
+    assert wrapped_count == 1
+    assert set(model.state_dict()) == state_keys
+    assert any(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_activation_checkpointing_rejects_inert_or_conflicting_settings() -> None:
+    with pytest.raises(ValueError, match="targets"):
+        ActivationCheckpointingConfig(mode="full", targets=["aten::mm"])
+    with pytest.raises(ValueError, match="smart_gc"):
+        ModelConfig(smart_gc=True, activation_checkpointing=None)
+    with pytest.raises(ValueError, match="smart_gc"):
+        ModelConfig(
+            smart_gc=True,
+            activation_checkpointing={"mode": "selective"},
+        )
+    with pytest.raises(ValueError, match="gradient_checkpointing"):
+        ModelConfig.model_validate({"gradient_checkpointing": True})
+
+
+def test_selective_checkpoint_policy_matches_namespaces_and_operations() -> None:
+    class _Operation:
+        def __init__(self, namespace: str, name: str) -> None:
+            self.namespace = namespace
+            self._name = name
+
+        def name(self) -> str:
+            return self._name
+
+    targets = frozenset({"custom", "aten::mm"})
+
+    assert (
+        model_utils._selective_checkpoint_policy(
+            object(),
+            _Operation("custom", "custom::op"),
+            targets=targets,
+        )
+        is CheckpointPolicy.MUST_SAVE
+    )
+    assert (
+        model_utils._selective_checkpoint_policy(
+            object(),
+            _Operation("aten", "aten::mm"),
+            targets=targets,
+        )
+        is CheckpointPolicy.MUST_SAVE
+    )
+    assert (
+        model_utils._selective_checkpoint_policy(
+            object(),
+            _Operation("aten", "aten::relu"),
+            targets=targets,
+        )
+        is CheckpointPolicy.PREFER_RECOMPUTE
+    )

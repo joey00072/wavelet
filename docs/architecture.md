@@ -32,8 +32,14 @@ or RL config. It defaults to 1800 seconds and can be increased for slow or
 multi-node rendezvous without changing code.
 `model.compile: true` compiles each decoder block in place after LoRA and
 optional kernel patches, and before distributed wrapping. This preserves
-checkpoint parameter names and composes with gradient checkpointing;
+checkpoint parameter names and composes with activation checkpointing;
 `model.compile_fullgraph` opts those block compilations into full-graph mode.
+`model.activation_checkpointing` wraps every `freq`-th decoder block in
+non-reentrant checkpointing. `mode: full` recomputes the whole selected block;
+`mode: selective` retains the configured operator names or namespaces while
+recomputing other operations. Set the block to `null` to disable checkpointing.
+Smart GC remains a separate full-checkpoint owner and rejects selective or
+frequency overrides instead of double-wrapping layers.
 `optim.cpu_offload: true` keeps native optimizer state in pinned CPU memory
 between updates. Step hooks restore state to each parameter's device only for
 the optimizer update, then immediately offload it again; state-dict hooks keep

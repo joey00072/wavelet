@@ -427,6 +427,11 @@ class BaseTrainer:
                 self.config.activation_offloading
             )
         self._apply_optional_model_kernels(model)
+        activation_checkpointing = self.config.model.activation_checkpointing
+        if activation_checkpointing is not None and not self.config.model.smart_gc:
+            from wavelet.trainer.model import apply_activation_checkpointing
+
+            apply_activation_checkpointing(model, activation_checkpointing)
         if self.config.model.compile:
             from wavelet.trainer.model import compile_transformer_layers
 

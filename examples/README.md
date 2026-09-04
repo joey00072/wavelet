@@ -13,6 +13,9 @@ its package is installed; other architectures and Hopper environments without
 that package fall back to FlashAttention 2 or SDPA. An explicit
 `flash_attention_3` setting fails fast unless both Hopper and the extension are
 available.
+Activation checkpointing is configured as a block with `mode`, `freq`, and
+optional selective operator `targets`; set `activation_checkpointing: null` to
+disable it. The default full mode checkpoints every decoder layer.
 SFT YAML files do not select a process count. Launch multi-GPU SFT examples
 with:
 

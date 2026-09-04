@@ -2,7 +2,8 @@ model:
   name: "PrimeIntellect/Qwen3-1.7B"
   torch_dtype: bfloat16
   attn_implementation: auto
-  gradient_checkpointing: true
+  activation_checkpointing:
+    mode: full
   matmul_precision: high
 
 data:

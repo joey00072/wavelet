@@ -38,6 +38,26 @@ class LoRAConfig(ConfigModel):
     modules_to_save: list[str] = Field(default_factory=list)
 
 
+class ActivationCheckpointingConfig(ConfigModel):
+    mode: Literal["full", "selective"] = "full"
+    freq: int = Field(default=1, ge=1)
+    targets: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_targets(self):
+        if self.mode == "full" and self.targets is not None:
+            raise ValueError(
+                "activation_checkpointing.targets is only valid in selective mode."
+            )
+        if self.targets is not None and any(
+            not target.strip() for target in self.targets
+        ):
+            raise ValueError(
+                "activation_checkpointing.targets cannot contain blank names."
+            )
+        return self
+
+
 class ModelConfig(ConfigModel):
     name: str = "Qwen/Qwen3-0.6B"
     adapter_path: Path | None = None
@@ -53,7 +73,9 @@ class ModelConfig(ConfigModel):
     ] = "auto"
     load_in_4bit: bool = False
     kbit_cast_non_quantized_to_float32: bool = True
-    gradient_checkpointing: bool = True
+    activation_checkpointing: ActivationCheckpointingConfig | None = (
+        ActivationCheckpointingConfig()
+    )
     meta_device_init: bool = False
     matmul_precision: Literal["highest", "high", "medium"] = "high"
     fused_lora_mlp: bool = False  # patch MLP.forward with fused LoRA_MLP kernel
@@ -68,6 +90,16 @@ class ModelConfig(ConfigModel):
     def validate_compile_fullgraph(self):
         if self.compile_fullgraph and not self.compile:
             raise ValueError("model.compile_fullgraph requires model.compile=true.")
+        if self.smart_gc and self.activation_checkpointing is None:
+            raise ValueError("model.smart_gc requires model.activation_checkpointing.")
+        if (
+            self.smart_gc
+            and self.activation_checkpointing != ActivationCheckpointingConfig()
+        ):
+            raise ValueError(
+                "model.smart_gc owns checkpoint placement and only composes with "
+                "the default full activation_checkpointing mode."
+            )
         return self
 
 

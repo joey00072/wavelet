@@ -40,7 +40,12 @@ from transformers import (
 from transformers.utils import logging as transformers_logging
 
 from wavelet.configs.config import DEFAULT_LORA_TARGET_MODULES
-from wavelet.configs.sft import FSDPConfig, LoRAConfig, ModelConfig
+from wavelet.configs.sft import (
+    ActivationCheckpointingConfig,
+    FSDPConfig,
+    LoRAConfig,
+    ModelConfig,
+)
 from wavelet.trainer.debug import (
     DEBUG_LORA_TARGET_MODULES,
     DEBUG_MODEL_NAME,
@@ -255,7 +260,7 @@ def _setup_debug_model(
         )
     model = build_debug_model(max_seq_length=max_seq_length)
     model.config.use_cache = False
-    if config.gradient_checkpointing:
+    if config.smart_gc and config.activation_checkpointing is not None:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
@@ -394,14 +399,14 @@ def setup_model(
     )
     model = _load_pretrained_model(config, model_kwargs, attention=attention)
     model.config.use_cache = False
-    if config.gradient_checkpointing:
+    if config.smart_gc and config.activation_checkpointing is not None:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
     if config.load_in_4bit and not model_is_prequantized:
         model = prepare_kbit_model(
             model,
-            gradient_checkpointing=config.gradient_checkpointing,
+            gradient_checkpointing=config.activation_checkpointing is not None,
             cast_non_quantized_to_float32=(config.kbit_cast_non_quantized_to_float32),
         )
         # Embedding and lm_head are NOT 4-bit quantized (full precision), but
@@ -620,6 +625,97 @@ def _transformer_layer_classes(model: nn.Module) -> set[type[nn.Module]]:
         if module.__class__.__name__ in class_names:
             layer_classes.add(type(module))
     return layer_classes
+
+
+DEFAULT_SELECTIVE_CHECKPOINT_TARGETS = frozenset(
+    {
+        "aten::_efficient_attention_forward",
+        "aten::_flash_attention_forward",
+        "aten::_scaled_dot_product_attention_math",
+        "aten::_scaled_dot_product_cudnn_attention",
+        "aten::_scaled_dot_product_efficient_attention",
+        "aten::_scaled_dot_product_flash_attention",
+        "aten::_scaled_dot_product_flash_attention_for_cpu",
+        "aten::addmm",
+        "aten::bmm",
+        "aten::linear",
+        "aten::mm",
+        "flash_attn",
+        "flash_attn_3",
+    }
+)
+
+
+def _selective_checkpoint_policy(
+    _context: object,
+    operation: object,
+    *_args: object,
+    targets: frozenset[str],
+    **_kwargs: object,
+) -> object:
+    from torch.utils.checkpoint import CheckpointPolicy
+
+    namespace = getattr(operation, "namespace", None)
+    name = operation.name() if callable(getattr(operation, "name", None)) else None
+    if namespace in targets or name in targets:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def apply_activation_checkpointing(
+    model: nn.Module,
+    config: ActivationCheckpointingConfig,
+) -> int:
+    """Wrap every configured decoder block with non-reentrant checkpointing."""
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        CheckpointImpl,
+        checkpoint_wrapper,
+    )
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts
+
+    layer_classes = _transformer_layer_classes(model)
+    candidates = [
+        (parent, name, child)
+        for parent in model.modules()
+        for name, child in parent.named_children()
+        if type(child) in layer_classes
+    ]
+    if not candidates:
+        raise ValueError(
+            "model.activation_checkpointing requires a model that identifies "
+            "decoder blocks through _no_split_modules."
+        )
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+
+    context_fn = None
+    if config.mode == "selective":
+        targets = (
+            DEFAULT_SELECTIVE_CHECKPOINT_TARGETS
+            if config.targets is None
+            else frozenset(config.targets)
+        )
+        policy = partial(_selective_checkpoint_policy, targets=targets)
+        context_fn = partial(create_selective_checkpoint_contexts, policy)
+
+    wrapped_count = 0
+    for layer_index, (parent, name, layer) in enumerate(candidates):
+        if layer_index % config.freq != 0:
+            continue
+        kwargs: dict[str, object] = {
+            "checkpoint_impl": CheckpointImpl.NO_REENTRANT,
+        }
+        if context_fn is not None:
+            kwargs["context_fn"] = context_fn
+        parent.register_module(name, checkpoint_wrapper(layer, **kwargs))
+        wrapped_count += 1
+    logger.info(
+        "Applied %s activation checkpointing to %s/%s transformer layers",
+        config.mode,
+        wrapped_count,
+        len(candidates),
+    )
+    return wrapped_count
 
 
 def compile_transformer_layers(
