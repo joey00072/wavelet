@@ -288,6 +288,9 @@ optimizer step directly, because restored dataloader state only applies once
 iteration begins, and then returns to the static per-batch estimate.
 
 Every config model rejects unknown or misspelled keys, so a typo such as
+`optim.mu` fails during config loading instead of becoming an inert setting.
+Supported optimizers are AdamW, Adam, SGD, and the configured 8-bit Adam/
+AdamW variants; Muon is not accepted because Wavelet has no Muon runtime.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

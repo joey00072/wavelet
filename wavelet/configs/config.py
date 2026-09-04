@@ -143,7 +143,6 @@ class OptimizerConfig(ConfigModel):
         "adam",
         "adam_8bit",
         "sgd",
-        "muon",
     ] = "adamw"
     implementation: Literal["for-loop", "foreach", "fused"] = "fused"
     lr: float = Field(default=1e-3, gt=0.0)
@@ -152,7 +151,6 @@ class OptimizerConfig(ConfigModel):
     nesterov: bool = True
     betas1: float = Field(default=0.9, ge=0.0)
     betas2: float = Field(default=0.999, ge=0.0)
-    mu: float = Field(default=0.95, ge=0.0)
 
     @model_validator(mode="before")
     @classmethod

@@ -66,6 +66,20 @@ def test_legacy_betas_alias_rejects_conflicting_values() -> None:
         RLConfig(optim={"betas": [0.8, 0.9], "betas1": 0.5})
 
 
+@pytest.mark.parametrize(
+    "optim",
+    [
+        {"type": "muon"},
+        {"mu": 0.95},
+    ],
+)
+def test_unimplemented_muon_optimizer_config_is_rejected(
+    optim: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="muon|mu"):
+        RLConfig(optim=optim)
+
+
 def test_process_mode_export_interval_must_fit_freshness_window() -> None:
     orchestrator = {"max_async_level": 2, "max_off_policy_steps": 1}
 

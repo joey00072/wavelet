@@ -69,7 +69,8 @@ fsdp:
   ep: 8
 
 optim:
-  type: muon
+  # Wavelet does not implement Muon; keep this config on a supported runtime.
+  type: adamw
   implementation: for-loop
   lr: 1e-6
   weight_decay: 0.01

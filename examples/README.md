@@ -17,7 +17,7 @@ that are expected to run on this host.
 | `qwen30b_math` | adapted | Single-node prototype of a larger multi-node config. |
 | `qwen30b_swe` | adapted | Requires SWE environment and reduced sequence length for this host. |
 | `multinode` | adapted | Single-node prototype of a multi-node example. |
-| `intellect_3_1` | config only | Production-scale multi-node/MoE workload. |
+| `intellect_3_1` | config only | Production-scale multi-node/MoE workload using AdamW. |
 | `minimax_m2_5_swe` | config only | Production-scale multi-node/MoE workload. |
 | `glm5_pd_disag` | config only | Production-scale disaggregated/MoE workload. |
 
