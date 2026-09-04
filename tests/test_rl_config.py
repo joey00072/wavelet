@@ -199,6 +199,13 @@ def test_eval_only_group_config_allows_deterministic_sampling() -> None:
     assert config.inference.sampling.seed == 123
 
 
+def test_eval_sampling_forwards_reasoning_effort() -> None:
+    config = RLConfig(eval={"sampling": {"reasoning_effort": "high"}})
+
+    assert config.eval is not None
+    assert config.eval.sampling.to_sampling_args()["reasoning_effort"] == "high"
+
+
 @pytest.mark.parametrize(
     "sampling",
     [

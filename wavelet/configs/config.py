@@ -611,6 +611,7 @@ class RLEvalSamplingConfig(ConfigModel):
     min_tokens: int | None = Field(default=None, ge=0)
     repetition_penalty: float | None = Field(default=None, gt=0.0)
     max_completion_tokens: int | None = Field(default=None, ge=1)
+    reasoning_effort: Literal["minimal", "low", "medium", "high"] | None = None
     seed: int | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
@@ -627,6 +628,8 @@ class RLEvalSamplingConfig(ConfigModel):
             args["top_p"] = self.top_p
         if self.max_completion_tokens is not None:
             args["max_completion_tokens"] = self.max_completion_tokens
+        if self.reasoning_effort is not None:
+            args["reasoning_effort"] = self.reasoning_effort
         if self.seed is not None:
             args["seed"] = self.seed
 

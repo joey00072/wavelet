@@ -211,6 +211,8 @@ Final evaluation reuses an interval result from the same policy rather than
 generating an identical benchmark twice. Before a required final evaluation,
 the persistent scheduler cancels speculative rollout requests that can no
 longer be consumed, then loads and evaluates the final policy in isolation.
+Set `eval.sampling.reasoning_effort` (or the per-environment sampling override)
+to `minimal`, `low`, `medium`, or `high` for reasoning-model evaluations.
 Verifier thread and math-process pools scale to the scheduler's real in-flight
 request high-water mark, which is logged as `generation/executor_concurrency`.
 When `max_pending_rollout_chunks` is set, that queue-derived capacity is a hard
