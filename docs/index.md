@@ -172,6 +172,9 @@ Every diagnostic guide should make the next action obvious to a coding agent:
 
 ## Verification
 
+For CUDA container builds and the operational contract of the local and Ray
+launchers, see [Deployment](deployment.md).
+
 For documentation-only changes, run:
 
 ```bash

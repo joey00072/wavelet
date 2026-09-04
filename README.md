@@ -24,6 +24,8 @@ agent-readable map of workflows, diagnostics, and repository guidance.
   extension boundaries
 - [Data pipeline](docs/data_pipeline.md): loading, tokenization, RL packing, and
   collation contracts
+- [Deployment](docs/deployment.md): CUDA container use and local/Ray launcher
+  boundaries
 - Run preflight checks before expensive RL launches:
   `uv run wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
   This also validates local training data and required LoRA adapter artifacts.
