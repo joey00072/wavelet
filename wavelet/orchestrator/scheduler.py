@@ -13,6 +13,7 @@ from wavelet.configs.rl_config import (
 )
 from wavelet.monitor import finish_orchestrator_wandb, setup_config_logger
 from wavelet.orchestrator.concurrency import AdaptiveConcurrencyController
+from wavelet.orchestrator.curriculum import Curriculum
 from wavelet.orchestrator.envs import (
     _algorithm_record_from_output as _algorithm_record_from_output,
 )
@@ -345,6 +346,8 @@ class _VerifierGroupState:
     algorithm_config: RLAlgorithmConfig | None = None
     sampling: RLSamplingConfig | None = None
     record_cursor: int | None = None
+    curriculum: Curriculum | None = None
+    curriculum_task_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -357,6 +360,7 @@ class _VerifierEnvRuntime:
     algorithm_config: RLAlgorithmConfig
     rollout_count: int
     requires_group_scoring: bool
+    curriculum: Curriculum | None = None
     record_cursor: int = 0
     record_order_epoch: int | None = None
     record_order: list[int] = field(default_factory=list)
@@ -522,6 +526,7 @@ def _training_env_specs(config: RLConfig) -> list[RLTrainEnvConfig]:
             args=config.orchestrator.verifier_env_args,
             group_size=config.orchestrator.rollouts_per_example,
             algo=config.algo,
+            curriculum=config.orchestrator.curriculum,
         )
     ]
 
@@ -536,6 +541,7 @@ class VerifierRolloutScheduler:
         start_record_cursor: int = 0,
         start_environment_record_cursors: dict[str, int] | None = None,
         start_environment_selection_cursor: int = 0,
+        start_curriculum_states: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         vf = _load_verifiers("rollouts")
 
@@ -545,6 +551,7 @@ class VerifierRolloutScheduler:
         self.config = config
         env_specs = _training_env_specs(config)
         start_environment_record_cursors = start_environment_record_cursors or {}
+        start_curriculum_states = start_curriculum_states or {}
         self.env_runtimes: list[_VerifierEnvRuntime] = []
         for spec in env_specs:
             env, _ = _load_cached_env(
@@ -570,6 +577,34 @@ class VerifierRolloutScheduler:
                 if config.orchestrator.envs
                 else _env_name(env, fallback=spec.resolved_name)
             )
+            start_cursor = start_environment_record_cursors.get(
+                env_name,
+                start_record_cursor if len(env_specs) == 1 else 0,
+            )
+            curriculum = (
+                Curriculum(
+                    spec.curriculum,
+                    task_count=len(records),
+                    data_seed=config.data.seed,
+                    shuffle=config.data.shuffle,
+                    start_cursor=(
+                        start_cursor
+                        if spec.curriculum.sampler.type == "standard"
+                        else 0
+                    ),
+                )
+                if spec.curriculum is not None
+                else None
+            )
+            curriculum_state = start_curriculum_states.get(env_name)
+            if (
+                curriculum_state is None
+                and len(env_specs) == 1
+                and len(start_curriculum_states) == 1
+            ):
+                curriculum_state = next(iter(start_curriculum_states.values()))
+            if curriculum is not None and curriculum_state is not None:
+                curriculum.load_state_dict(curriculum_state)
             self.env_runtimes.append(
                 _VerifierEnvRuntime(
                     config=spec,
@@ -584,10 +619,8 @@ class VerifierRolloutScheduler:
                     requires_group_scoring=bool(
                         getattr(env, "requires_group_scoring", False)
                     ),
-                    record_cursor=start_environment_record_cursors.get(
-                        env_name,
-                        start_record_cursor if len(env_specs) == 1 else 0,
-                    ),
+                    curriculum=curriculum,
+                    record_cursor=start_cursor,
                 )
             )
         runtime_names = [runtime.env_name for runtime in self.env_runtimes]
@@ -1060,6 +1093,13 @@ class VerifierRolloutScheduler:
                 self.last_batch_metrics[f"{prefix}/epoch"] = float(
                     runtime.record_cursor // len(runtime.records)
                 )
+                if runtime.curriculum is not None:
+                    self.last_batch_metrics.update(
+                        {
+                            f"generation/curriculum/{runtime.env_name}/{name}": value
+                            for name, value in runtime.curriculum.metrics().items()
+                        }
+                    )
         else:
             record_cursor = getattr(self, "record_cursor", 0)
             self.last_batch_metrics["generation/data/cursor"] = float(record_cursor)
@@ -1221,7 +1261,14 @@ class VerifierRolloutScheduler:
             completed_outputs,
             algorithm_config=algorithm_config,
         )
-        is_usable = _is_usable_training_group(
+        curriculum = getattr(group, "curriculum", None)
+        curriculum_admitted = True
+        if curriculum is not None:
+            task_key = getattr(group, "curriculum_task_key", None)
+            if task_key is None:
+                raise RuntimeError("Curriculum rollout group is missing its task key.")
+            curriculum_admitted = curriculum.on_result(task_key, completed_outputs)
+        is_usable = curriculum_admitted and _is_usable_training_group(
             completed_outputs,
             expected_rollouts=rollout_count,
             filter_zero_advantage=self.config.orchestrator.filter_zero_advantage,
@@ -1548,7 +1595,9 @@ class VerifierRolloutScheduler:
             runtime = self._select_environment_runtime()
             if remaining_capacity < runtime.rollout_count:
                 return False
-        runtime, record, record_cursor = self._next_environment_record()
+        runtime, record, record_cursor, curriculum_task_key = (
+            self._next_environment_record()
+        )
         group_id = self.next_group_id
         self.next_group_id += 1
         group = _VerifierGroupState(
@@ -1562,6 +1611,8 @@ class VerifierRolloutScheduler:
             algorithm_config=runtime.algorithm_config,
             sampling=runtime.sampling,
             record_cursor=record_cursor,
+            curriculum=runtime.curriculum,
+            curriculum_task_key=curriculum_task_key,
         )
         self.groups[group_id] = group
         self._schedule_group_rollout(group_id, group)
@@ -1654,7 +1705,7 @@ class VerifierRolloutScheduler:
 
     def _next_environment_record(
         self,
-    ) -> tuple[_VerifierEnvRuntime, RLExample, int]:
+    ) -> tuple[_VerifierEnvRuntime, RLExample, int, str | None]:
         runtimes = getattr(self, "env_runtimes", None)
         if not runtimes:
             runtime = _VerifierEnvRuntime(
@@ -1678,13 +1729,14 @@ class VerifierRolloutScheduler:
                 runtime,
                 record,
                 self.record_cursor - 1,
+                None,
             )
         runtime = self._select_environment_runtime()
         self.env_selection_cursor += 1
-        record_cursor, record = self._next_runtime_record(runtime)
+        record_cursor, record, task_key = self._next_runtime_record(runtime)
         if runtime is runtimes[0]:
             self.record_cursor = runtime.record_cursor
-        return runtime, record, record_cursor
+        return runtime, record, record_cursor, task_key
 
     def _select_environment_runtime(self) -> _VerifierEnvRuntime:
         runtimes = self.env_runtimes
@@ -1703,11 +1755,24 @@ class VerifierRolloutScheduler:
             self.env_selection_cursor,
         )
 
+    def curriculum_state_snapshot(self) -> dict[str, dict[str, Any]] | None:
+        """Return state for each configured environment curriculum."""
+        states = {
+            runtime.env_name: runtime.curriculum.state_dict()
+            for runtime in self.env_runtimes
+            if runtime.curriculum is not None
+        }
+        return states or None
+
     def _next_runtime_record(
         self,
         runtime: _VerifierEnvRuntime,
-    ) -> tuple[int, RLExample]:
+    ) -> tuple[int, RLExample, str | None]:
         record_cursor = runtime.record_cursor
+        if runtime.curriculum is not None:
+            index, task_key = runtime.curriculum.next_record_index()
+            runtime.record_cursor += 1
+            return record_cursor, runtime.records[index], task_key
         epoch, offset = divmod(record_cursor, len(runtime.records))
         if runtime.record_order_epoch != epoch:
             runtime.record_order = list(range(len(runtime.records)))
@@ -1717,7 +1782,7 @@ class VerifierRolloutScheduler:
             runtime.record_order_epoch = epoch
         record = runtime.records[runtime.record_order[offset]]
         runtime.record_cursor += 1
-        return record_cursor, record
+        return record_cursor, record, None
 
     def _least_loaded_client_index(self) -> int:
         counts = [0] * len(self.clients)
@@ -2867,6 +2932,7 @@ class _VerifierPublisherStrategy:
             environment_record_cursors=_rollout_environment_record_cursors(records),
             environment_next_record_cursors=environment_cursors,
             environment_selection_cursor=environment_selection_cursor,
+            curriculum_state=self.scheduler.curriculum_state_snapshot(),
         )
         publish_seconds = perf_counter() - publish_started_at
         self._record_published_chunk(
@@ -3082,17 +3148,23 @@ async def _run_verifier_scheduler(
             "Either orchestrator.examples_per_step or "
             "orchestrator.token_batch_size is required."
         )
+    resume_queue_step = start_step * _chunks_per_step(config)
     environment_cursors, environment_selection_cursor = (
         _resume_environment_cursor_state(
             config,
-            before_queue_step=start_step * _chunks_per_step(config),
+            before_queue_step=resume_queue_step,
         )
+    )
+    curriculum_states = _resume_curriculum_state(
+        config,
+        before_queue_step=resume_queue_step,
     )
     scheduler = VerifierRolloutScheduler(
         orchestrator,
         start_record_cursor=start_step * (examples_per_step or 0),
         start_environment_record_cursors=environment_cursors,
         start_environment_selection_cursor=environment_selection_cursor,
+        start_curriculum_states=curriculum_states,
     )
     chunks_per_step = _chunks_per_step(config)
     context = _VerifierPublisherStrategy(
@@ -3309,7 +3381,10 @@ def _resume_environment_cursor_state(
     *,
     before_queue_step: int,
 ) -> tuple[dict[str, int], int]:
-    if not config.orchestrator.envs or before_queue_step <= 0:
+    has_legacy_curriculum = config.orchestrator.curriculum is not None
+    if (
+        not config.orchestrator.envs and not has_legacy_curriculum
+    ) or before_queue_step <= 0:
         return {}, 0
     sender = FileSystemRolloutSender(config.output_dir, config.transport)
     queue_step = before_queue_step - 1
@@ -3321,18 +3396,19 @@ def _resume_environment_cursor_state(
         or manifest.environment_selection_cursor is None
     ):
         raise ValueError(
-            "Multi-environment checkpoint resume requires the retained preceding "
+            "Verifier scheduler checkpoint resume requires the retained preceding "
             f"rollout manifest with cumulative environment cursors; queue step "
             f"{queue_step} is unavailable."
         )
-    expected_names = {env.resolved_name for env in config.orchestrator.envs}
-    recorded_names = set(manifest.environment_next_record_cursors)
-    if recorded_names != expected_names:
-        raise ValueError(
-            "Multi-environment checkpoint resume environment names differ from "
-            f"queue step {queue_step}: expected {sorted(expected_names)}, found "
-            f"{sorted(recorded_names)}."
-        )
+    if config.orchestrator.envs:
+        expected_names = {env.resolved_name for env in config.orchestrator.envs}
+        recorded_names = set(manifest.environment_next_record_cursors)
+        if recorded_names != expected_names:
+            raise ValueError(
+                "Multi-environment checkpoint resume environment names differ from "
+                f"queue step {queue_step}: expected {sorted(expected_names)}, found "
+                f"{sorted(recorded_names)}."
+            )
     invalid_cursors = {
         name: value
         for name, value in manifest.environment_next_record_cursors.items()
@@ -3345,13 +3421,53 @@ def _resume_environment_cursor_state(
         or selection_cursor < 0
     ):
         raise ValueError(
-            "Multi-environment checkpoint resume found invalid cumulative cursor "
+            "Verifier scheduler checkpoint resume found invalid cumulative cursor "
             f"values in queue step {queue_step}."
         )
     return (
         dict(manifest.environment_next_record_cursors),
         selection_cursor,
     )
+
+
+def _resume_curriculum_state(
+    config: RLConfig,
+    *,
+    before_queue_step: int,
+) -> dict[str, dict[str, Any]]:
+    curriculum_names = {
+        env.resolved_name
+        for env in config.orchestrator.envs
+        if env.curriculum is not None
+    }
+    has_legacy_curriculum = config.orchestrator.curriculum is not None
+    if not curriculum_names and not has_legacy_curriculum:
+        return {}
+    if before_queue_step <= 0:
+        return {}
+    sender = FileSystemRolloutSender(config.output_dir, config.transport)
+    queue_step = before_queue_step - 1
+    batch = sender.stable_batch(queue_step)
+    manifest = None if batch is None else read_manifest(batch.step_dir)
+    if manifest is None or manifest.curriculum_state is None:
+        raise ValueError(
+            "Curriculum checkpoint resume requires the retained preceding rollout "
+            f"manifest with sampler state; queue step {queue_step} is unavailable."
+        )
+    states = manifest.curriculum_state
+    if config.orchestrator.envs and set(states) != curriculum_names:
+        raise ValueError(
+            "Curriculum checkpoint environment names differ from configuration: "
+            f"expected {sorted(curriculum_names)}, found {sorted(states)}."
+        )
+    if has_legacy_curriculum and len(states) != 1:
+        raise ValueError(
+            "Single-environment curriculum checkpoint must contain exactly one "
+            "environment state."
+        )
+    if not all(isinstance(state, dict) for state in states.values()):
+        raise ValueError("Curriculum checkpoint states must be mappings.")
+    return {name: dict(state) for name, state in states.items()}
 
 
 def _write_materialized_records(

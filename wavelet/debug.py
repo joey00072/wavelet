@@ -1394,6 +1394,14 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
                 env.model_dump(mode="json", exclude_none=True)
                 for env in config.orchestrator.envs
             ],
+            "curriculum": (
+                None
+                if config.orchestrator.curriculum is None
+                else config.orchestrator.curriculum.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                )
+            ),
             "verifier_model": config.orchestrator.verifier_model,
             "verifier_client_type": config.orchestrator.verifier_client_type,
             "filter_zero_advantage": config.orchestrator.filter_zero_advantage,
@@ -1589,6 +1597,14 @@ def _summary(config: RLConfig) -> dict[str, Any]:
             env.model_dump(mode="json", exclude_none=True)
             for env in config.orchestrator.envs
         ],
+        "curriculum": (
+            None
+            if config.orchestrator.curriculum is None
+            else config.orchestrator.curriculum.model_dump(
+                mode="json",
+                exclude_none=True,
+            )
+        ),
         "target_steps": target_steps(config),
         "low_precision": _low_precision_summary(config),
     }

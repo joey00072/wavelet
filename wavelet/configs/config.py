@@ -1117,6 +1117,76 @@ class RLAdaptiveConcurrencyConfig(ConfigModel):
         return self
 
 
+class RLStandardCurriculumSamplerConfig(ConfigModel):
+    type: Literal["standard"] = "standard"
+
+
+class RLDifficultyPoolConfig(ConfigModel):
+    threshold: float = Field(allow_inf_nan=False)
+    weight: float = Field(ge=0.0, allow_inf_nan=False)
+
+
+def _default_difficulty_pools() -> dict[str, RLDifficultyPoolConfig]:
+    return {
+        "hard": RLDifficultyPoolConfig(threshold=0.25, weight=0.2),
+        "normal": RLDifficultyPoolConfig(threshold=0.75, weight=1.0),
+        "easy": RLDifficultyPoolConfig(threshold=1.0, weight=0.2),
+    }
+
+
+class RLDifficultyPoolSamplerConfig(ConfigModel):
+    type: Literal["difficulty_pool"] = "difficulty_pool"
+    pools: dict[str, RLDifficultyPoolConfig] = Field(
+        default_factory=_default_difficulty_pools
+    )
+    seed: int = 42
+    ema_alpha: float = Field(default=0.2, gt=0.0, le=1.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_pools(self) -> "RLDifficultyPoolSamplerConfig":
+        if not self.pools:
+            raise ValueError("curriculum difficulty pools cannot be empty.")
+        if not any(pool.weight > 0.0 for pool in self.pools.values()):
+            raise ValueError(
+                "At least one curriculum difficulty pool must have positive weight."
+            )
+        thresholds = sorted(pool.threshold for pool in self.pools.values())
+        if len(thresholds) != len(set(thresholds)):
+            raise ValueError("Curriculum difficulty pool thresholds must be unique.")
+        return self
+
+
+RLCurriculumSamplerConfig = Annotated[
+    RLStandardCurriculumSamplerConfig | RLDifficultyPoolSamplerConfig,
+    Field(discriminator="type"),
+]
+
+
+class RLAdvRangeGateConfig(ConfigModel):
+    type: Literal["advantage_range"] = "advantage_range"
+    reject_min: float = Field(default=0.0, allow_inf_nan=False)
+    reject_max: float = Field(default=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_range(self) -> "RLAdvRangeGateConfig":
+        if self.reject_min > self.reject_max:
+            raise ValueError("reject_min must be less than or equal to reject_max.")
+        return self
+
+
+RLCurriculumGateConfig = Annotated[
+    RLAdvRangeGateConfig,
+    Field(discriminator="type"),
+]
+
+
+class RLCurriculumConfig(ConfigModel):
+    sampler: RLCurriculumSamplerConfig = Field(
+        default_factory=RLStandardCurriculumSamplerConfig
+    )
+    gates: dict[str, RLCurriculumGateConfig] = Field(default_factory=dict)
+
+
 class RLTrainEnvConfig(ConfigModel):
     """One weighted verifier training environment."""
 
@@ -1128,6 +1198,7 @@ class RLTrainEnvConfig(ConfigModel):
     sampling: RLSamplingConfig | None = None
     group_size: int | None = Field(default=None, ge=1)
     algo: RLAlgorithmConfig | None = None
+    curriculum: RLCurriculumConfig | None = None
 
     @property
     def resolved_name(self) -> str:
@@ -1162,6 +1233,7 @@ class RLOrchestratorConfig(ConfigModel):
     oversampling_factor: float = Field(default=1.0, ge=1.0)
     max_inflight_rollouts: int | None = Field(default=None, ge=1)
     concurrency: RLAdaptiveConcurrencyConfig | None = None
+    curriculum: RLCurriculumConfig | None = None
     rollout_chunk_examples: int | None = Field(default=None, ge=1)
     filter_zero_advantage: bool = True
     zero_advantage_max_retries: int = Field(default=8, ge=0)
@@ -1192,6 +1264,11 @@ class RLOrchestratorConfig(ConfigModel):
             raise ValueError(
                 "orchestrator.verifier_env_args cannot be combined with "
                 "orchestrator.envs; put args on each environment."
+            )
+        if self.envs and self.curriculum is not None:
+            raise ValueError(
+                "orchestrator.curriculum cannot be combined with orchestrator.envs; "
+                "put curriculum on each environment."
             )
         names = [env.resolved_name for env in self.envs]
         duplicates = sorted({name for name in names if names.count(name) > 1})
@@ -1477,6 +1554,24 @@ class RLConfig(TrainerConfig):
             raise ValueError(
                 "orchestrator.max_inflight_rollouts must cover the largest "
                 f"environment group_size={maximum_group_size}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_curriculum_runtime(self) -> "RLConfig":
+        curricula = [self.orchestrator.curriculum] + [
+            env.curriculum for env in self.orchestrator.envs
+        ]
+        if not any(curriculum is not None for curriculum in curricula):
+            return self
+        if self.orchestrator.custom_rollout_function != (
+            "wavelet.orchestrator.verifiers:generate_rollouts"
+        ):
+            raise ValueError("Curriculum requires the Verifiers rollout source.")
+        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+            raise ValueError(
+                "Curriculum requires launcher.mode='process' and "
+                "orchestrator.max_async_level>=1."
             )
         return self
 

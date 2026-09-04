@@ -12,6 +12,7 @@ run in the ordinary test suite.
 | Filesystem queue lifecycle and artifacts | `uv run pytest tests/test_queue.py tests/test_queue_lifecycle.py tests/test_queue_inspect.py` |
 | Rollout scheduling, freshness, and chunking | `uv run pytest tests/test_scheduler.py tests/test_verifiers_rollouts.py` |
 | Weighted multi-environment scheduling and resume cursors | `uv run pytest tests/test_rl_config.py tests/test_verifiers_rollouts.py tests/test_preflight.py tests/test_orchestrator_metrics.py` |
+| Curriculum sampling, admission gates, and state restore | `uv run pytest tests/test_curriculum.py tests/test_verifiers_rollouts.py tests/test_queue.py` |
 | Rewards and advantage algorithms | `uv run pytest tests/test_reward.py tests/test_algorithms.py` |
 | OPD, OPSD, and online SFT distillation | `uv run pytest tests/test_distillation.py tests/test_algorithms.py tests/test_rl_loss.py` |
 | Agent trajectory token provenance | `uv run pytest tests/test_agent_trajectory.py` |

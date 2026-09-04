@@ -15,6 +15,7 @@ from wavelet.configs.rl_config import (
     GRPOAlgorithmConfig,
     RewardAlgorithmConfig,
     RLConfig,
+    RLCurriculumConfig,
 )
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
 from wavelet.orchestrator.queue import FileSystemRolloutSender
@@ -27,6 +28,7 @@ from wavelet.orchestrator.verifiers import (
     _load_cached_env,
     _PendingVerifierRequest,
     _records_from_output,
+    _resume_curriculum_state,
     _resume_environment_cursor_state,
     _rollout_environment_record_cursors,
     _rollout_records_policy_step,
@@ -1994,8 +1996,17 @@ def test_verifier_scheduler_loads_each_environment_runtime(
 ) -> None:
     base = _mixed_environment_config()
     envs = [
-        env.model_copy(update={"data_path": tmp_path / f"{env.resolved_name}.jsonl"})
-        for env in base.orchestrator.envs
+        env.model_copy(
+            update={
+                "data_path": tmp_path / f"{env.resolved_name}.jsonl",
+                "curriculum": (
+                    RLCurriculumConfig(gates={"signal": {"type": "advantage_range"}})
+                    if index == 0
+                    else None
+                ),
+            }
+        )
+        for index, env in enumerate(base.orchestrator.envs)
     ]
     config = base.model_copy(
         update={
@@ -2040,6 +2051,11 @@ def test_verifier_scheduler_loads_each_environment_runtime(
         True,
     ]
     assert scheduler.env_selection_cursor == 8
+    assert scheduler.env_runtimes[0].curriculum is not None
+    assert scheduler.curriculum_state_snapshot()["math"]["sampler"] == {
+        "cursor": 3,
+        "task_count": 1,
+    }
 
 
 def test_verifier_scheduler_selects_weighted_environments_with_independent_cursors() -> (
@@ -2081,8 +2097,8 @@ def test_verifier_scheduler_tracks_absolute_environment_cursors_across_epochs() 
     )
     runtime.record_cursor = 1
 
-    first_cursor, first = scheduler._next_runtime_record(runtime)
-    second_cursor, second = scheduler._next_runtime_record(runtime)
+    first_cursor, first, _ = scheduler._next_runtime_record(runtime)
+    second_cursor, second, _ = scheduler._next_runtime_record(runtime)
 
     assert (first_cursor, first.prompt[0]["content"]) == (1, "b")
     assert (second_cursor, second.prompt[0]["content"]) == (2, "a")
@@ -2172,6 +2188,65 @@ def test_verifier_scheduler_applies_group_size_and_algorithm_per_environment() -
     ]
 
 
+def test_verifier_scheduler_observes_curriculum_and_applies_gate() -> None:
+    config = RLConfig(
+        algo={"type": "reward"},
+        orchestrator={
+            "examples_per_step": 1,
+            "rollouts_per_example": 1,
+            "filter_zero_advantage": False,
+        },
+    )
+    curriculum = Mock()
+    curriculum.on_result.return_value = False
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.orchestrator = RLOrchestrator(config)
+    scheduler.rollout_count = 1
+    scheduler.requires_group_scoring = False
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler.ready_groups = []
+    scheduler.ready_group_off_policy_steps = []
+
+    async def run() -> tuple[tuple[int, int, int], list[dict[str, Any]]]:
+        loop = asyncio.get_running_loop()
+        task = loop.create_future()
+        result = {
+            "reward": 1.0,
+            "trajectory": _trainable_trajectory(),
+        }
+        task.set_result([result])
+        scheduler.pending[task] = _PendingVerifierRequest(
+            group_id=0,
+            client_index=0,
+            rollout_count=1,
+        )
+        scheduler.groups = {
+            0: _VerifierGroupState(
+                example={"example_id": 0},
+                rollouts_to_schedule=0,
+                curriculum=curriculum,
+                curriculum_task_key="record:0",
+            )
+        }
+        outputs: list[dict[str, Any]] = []
+        decision = scheduler._consume_completed_task(
+            task,
+            target_groups=1,
+            outputs=outputs,
+            accepted_groups=0,
+        )
+        return decision, outputs
+
+    decision, outputs = asyncio.run(run())
+
+    assert decision == (0, 1, 1)
+    assert outputs == []
+    curriculum.on_result.assert_called_once()
+    assert curriculum.on_result.call_args.args[0] == "record:0"
+
+
 def test_environment_record_cursors_round_trip_through_queue_manifests(
     tmp_path: Path,
 ) -> None:
@@ -2210,6 +2285,46 @@ def test_environment_cursor_resume_requires_preceding_manifest(tmp_path: Path) -
 
     with pytest.raises(ValueError, match="queue step 0 is unavailable"):
         _resume_environment_cursor_state(config, before_queue_step=1)
+
+
+def test_curriculum_state_round_trips_through_queue_manifest(tmp_path: Path) -> None:
+    base = _mixed_environment_config()
+    envs = [
+        base.orchestrator.envs[0].model_copy(
+            update={
+                "curriculum": RLCurriculumConfig(sampler={"type": "difficulty_pool"})
+            }
+        ),
+        base.orchestrator.envs[1],
+    ]
+    config = base.model_copy(
+        update={
+            "output_dir": tmp_path,
+            "orchestrator": base.orchestrator.model_copy(update={"envs": envs}),
+        }
+    )
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    source = tmp_path / "records.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    state = {
+        "math": {
+            "gates": {},
+            "sampler": {
+                "rng": [3, [1, 2, 3], None],
+                "selections": 4,
+                "task_count": 2,
+                "task_rewards": {"record:0": 0.5},
+            },
+        }
+    }
+    sender.publish(
+        source,
+        step=0,
+        optimizer_step=0,
+        curriculum_state=state,
+    )
+
+    assert _resume_curriculum_state(config, before_queue_step=1) == state
 
 
 def test_rollout_environment_record_cursors_deduplicate_trajectory_rows() -> None:

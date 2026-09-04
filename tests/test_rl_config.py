@@ -530,3 +530,51 @@ def test_multiple_training_environments_require_compatible_loss_components() -> 
                 {"id": "distill", "algo": {"type": "sft"}},
             ]
         )
+
+
+def test_curriculum_parses_difficulty_pool_and_advantage_gate() -> None:
+    config = _multi_environment_config(
+        envs=[
+            {
+                "id": "math",
+                "curriculum": {
+                    "sampler": {
+                        "type": "difficulty_pool",
+                        "ema_alpha": 0.5,
+                    },
+                    "gates": {
+                        "zero_signal": {"type": "advantage_range"},
+                    },
+                },
+            }
+        ]
+    )
+
+    curriculum = config.orchestrator.envs[0].curriculum
+    assert curriculum is not None
+    assert curriculum.sampler.type == "difficulty_pool"
+    assert curriculum.gates["zero_signal"].reject_min == 0.0
+
+
+def test_curriculum_rejects_all_zero_pool_weights() -> None:
+    with pytest.raises(ValueError, match="positive weight"):
+        _multi_environment_config(
+            envs=[
+                {
+                    "id": "math",
+                    "curriculum": {
+                        "sampler": {
+                            "type": "difficulty_pool",
+                            "pools": {
+                                "hard": {"threshold": 1.0, "weight": 0.0},
+                            },
+                        }
+                    },
+                }
+            ]
+        )
+
+
+def test_legacy_curriculum_requires_async_verifiers() -> None:
+    with pytest.raises(ValueError, match="Curriculum requires"):
+        RLConfig(orchestrator={"curriculum": {}})

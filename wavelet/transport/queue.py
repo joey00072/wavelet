@@ -82,6 +82,7 @@ class RolloutManifest:
     environment_record_cursors: dict[str, list[int]] | None = None
     environment_next_record_cursors: dict[str, int] | None = None
     environment_selection_cursor: int | None = None
+    curriculum_state: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,6 +631,7 @@ class FileSystemRolloutSender:
         environment_record_cursors: dict[str, list[int]] | None = None,
         environment_next_record_cursors: dict[str, int] | None = None,
         environment_selection_cursor: int | None = None,
+        curriculum_state: dict[str, dict[str, Any]] | None = None,
         reward_mean: float | None = None,
         producer_id: str | None = None,
         events_dir: Path | None = None,
@@ -657,6 +659,7 @@ class FileSystemRolloutSender:
                 environment_record_cursors,
                 environment_next_record_cursors,
                 environment_selection_cursor,
+                curriculum_state,
                 reward_mean,
                 producer_id,
                 events_dir,
@@ -676,6 +679,7 @@ class FileSystemRolloutSender:
                 environment_record_cursors=environment_record_cursors,
                 environment_next_record_cursors=environment_next_record_cursors,
                 environment_selection_cursor=environment_selection_cursor,
+                curriculum_state=curriculum_state,
                 reward_mean=reward_mean,
                 producer_id=producer_id,
                 created_at=created_at,

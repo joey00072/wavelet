@@ -291,6 +291,38 @@ batch and the cumulative
 per-environment cursor snapshot, so checkpoint resume only needs the immediately
 preceding retained manifest. Preflight checks each effective local dataset and
 reports every ratio, group size, and algorithm.
+
+An environment can opt into stateful curriculum sampling and admission:
+
+```yaml
+orchestrator:
+  envs:
+    - id: math-env
+      curriculum:
+        sampler:
+          type: difficulty_pool
+          ema_alpha: 0.2
+          pools:
+            hard: {threshold: 0.25, weight: 0.2}
+            normal: {threshold: 0.75, weight: 1.0}
+            easy: {threshold: 1.0, weight: 0.2}
+        gates:
+          zero_signal:
+            type: advantage_range
+            reject_min: 0.0
+            reject_max: 0.0
+```
+
+The difficulty sampler maintains a reward EMA for each source record. Unseen
+records have neutral weight; observed records enter the first pool whose
+inclusive threshold covers their EMA, with the final pool as the catch-all.
+The advantage-range gate rejects a group only when every available advantage is
+inside its rejection interval; groups without advantages pass. Multiple gates
+compose with AND. Single-environment legacy configs place the same block at
+`orchestrator.curriculum`. Curriculum sampling is supported by the persistent
+process-mode Verifiers scheduler. Sampler RNG, reward EMAs, and gate counters
+are stored in every rollout manifest and restored with the source cursors.
+Metrics are emitted under `generation/curriculum/<environment>/...`.
 Synchronous and native rollout paths apply the same full-group-count invariant;
 a single surviving group cannot silently stand in for a requested batch, and
 native groups must contain exactly the configured rollout count.

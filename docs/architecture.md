@@ -102,6 +102,12 @@ batch's exact source cursors plus cumulative next-record and selection cursors;
 the latter is the restart boundary even when older consumed queue items have
 been cleaned up. A resumed multi-environment run therefore requires its
 immediately preceding queue manifest to remain available.
+An optional environment curriculum sits inside each runtime. Its sampler picks
+the record index before dispatch, observes every completed scored group, and
+updates per-record reward EMA pools. Named gates then decide whether the group
+is admitted; all gates must pass. Curriculum state is part of the same stable
+queue manifest as the source cursor snapshot, so sampler RNG and online
+difficulty estimates advance atomically with published training data.
 
 ## Inference Scheduling
 
