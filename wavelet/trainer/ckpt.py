@@ -113,17 +113,27 @@ class CheckpointManager:
         trainer_state: TrainerState,
         *,
         dataloader: StatefulDataLoader | None = None,
+        force: bool = False,
     ) -> bool:
         if self.config is None or self.config.mode == "disabled":
             return False
         if self.config.interval is None:
             return False
-        if trainer_state.step % self.config.interval != 0:
+        if not force and trainer_state.step % self.config.interval != 0:
+            return False
+
+        checkpoint_dir = get_checkpoint_dir(self.output_dir, trainer_state.step)
+        if force and (
+            is_stable_checkpoint(checkpoint_dir)
+            or (
+                self.pending_save is not None
+                and self.pending_save.checkpoint_dir == checkpoint_dir
+            )
+        ):
             return False
 
         self.wait_for_pending_save()
 
-        checkpoint_dir = get_checkpoint_dir(self.output_dir, trainer_state.step)
         self._reset_checkpoint_dir(checkpoint_dir)
         self._save_dataloader_state(checkpoint_dir, dataloader)
         meta = self._build_meta(trainer_state)

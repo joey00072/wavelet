@@ -208,6 +208,11 @@ def test_finalize_waits_for_pending_async_checkpoint(monkeypatch) -> None:
 
     trainer.finalize(status="completed")
 
+    trainer.ckpt_manager.save.assert_called_once_with(
+        TrainerState(step=0, micro_step=0),
+        dataloader=None,
+        force=True,
+    )
     trainer.ckpt_manager.wait_for_pending_save.assert_called_once_with()
 
 

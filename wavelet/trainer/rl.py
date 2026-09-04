@@ -577,6 +577,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if self.monitor is None or self._run_closed:
             return
         if status == "completed" and self.ckpt_manager is not None:
+            self._save_final_checkpoint()
             self.ckpt_manager.wait_for_pending_save()
         self.monitor.finish(status=status, step=self.step)
         self._run_closed = True

@@ -50,6 +50,37 @@ def test_async_checkpoint_uses_threads_without_shared_memory(
     assert captured["async_stager"]._config.use_shared_memory is False
 
 
+def test_forced_checkpoint_saves_step_between_intervals(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.AdamW(model.parameters())
+    world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    manager = CheckpointManager(
+        model,
+        optimizer,
+        None,
+        CheckpointConfig(mode="async", interval=10),
+        tmp_path,
+        world,
+    )
+    response: Future[None] = Future()
+    response.set_result(None)
+    monkeypatch.setattr(
+        "wavelet.trainer.ckpt.dcp.async_save", lambda **kwargs: response
+    )
+
+    assert not manager.save(TrainerState(step=3, micro_step=3))
+    assert manager.save(TrainerState(step=3, micro_step=3), force=True)
+    manager.wait_for_pending_save()
+
+    assert (tmp_path / "checkpoint-3" / STABLE_CHECKPOINT_MARKER).exists()
+
+
 def test_async_checkpoint_round_trip_restores_model_and_optimizer(tmp_path) -> None:
     model = torch.nn.Linear(2, 1, bias=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)

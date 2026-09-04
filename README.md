@@ -148,7 +148,9 @@ window; do not disable cleanup for long runs.
 Checkpoint and evaluation-rollout retention also default to the latest two
 sets when those features are enabled. Metrics and traces remain the compact
 long-term record. Set `ckpt.keep_interval` to retain every Nth stable checkpoint
-permanently in addition to the `ckpt.keep_last` rolling window.
+permanently in addition to the `ckpt.keep_last` rolling window. A successful
+run also saves its final optimizer step when that step is between configured
+checkpoint intervals.
 Sample logging retains a rolling window of 256 rows by default
 (`monitor.samples.keep_last`) and compacts it in batches, so enabling rollout
 examples cannot grow `samples.jsonl` without bound during a long run.

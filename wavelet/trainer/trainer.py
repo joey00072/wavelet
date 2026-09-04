@@ -259,6 +259,8 @@ class BaseTrainer:
                     if self.step >= target_step:
                         break
             if self.ckpt_manager is not None:
+                if finish_run:
+                    self._save_final_checkpoint()
                 self.ckpt_manager.wait_for_pending_save()
         except Exception:
             self._finish_if_requested(finish_run, status="failed")
@@ -716,6 +718,15 @@ class BaseTrainer:
                     "mode": self.config.ckpt.mode if self.config.ckpt else "disabled"
                 },
             )
+
+    def _save_final_checkpoint(self) -> bool:
+        if self.ckpt_manager is None:
+            return False
+        return self.ckpt_manager.save(
+            TrainerState(step=self.step, micro_step=self._micro_step),
+            dataloader=self._checkpoint_dataloader(),
+            force=True,
+        )
 
     def _get_lr(self) -> float:
         if self.optimizer is None:
