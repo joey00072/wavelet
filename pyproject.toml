@@ -114,6 +114,10 @@ extend-exclude = ["outputs", "ref"]
 indent-style = "space"
 quote-style = "double"
 
+[tool.ruff.lint.per-file-ignores]
+"wavelet/inference/engine.py" = ["E402"]
+"wavelet/orchestrator/scheduler.py" = ["E402"]
+
 [tool.hatch.metadata]
 allow-direct-references = true
 

@@ -160,7 +160,15 @@ def measure_file(root: Path, path: Path) -> FileMetrics:
             blank_lines=blank_lines,
             comment_lines=comment_lines,
         )
-    return _measure_python_file(relative, path.suffix, text, len(lines), source_lines, blank_lines, comment_lines)
+    return _measure_python_file(
+        relative,
+        path.suffix,
+        text,
+        len(lines),
+        source_lines,
+        blank_lines,
+        comment_lines,
+    )
 
 
 def summarize(
@@ -185,9 +193,9 @@ def summarize(
         by_category[category]["source_lines"] += metric.source_lines
         by_category[category]["python_functions"] += metric.python_functions
         by_category[category]["python_classes"] += metric.python_classes
-        by_category[category][
-            "python_complexity_points"
-        ] += metric.python_complexity_points
+        by_category[category]["python_complexity_points"] += (
+            metric.python_complexity_points
+        )
         if category in CORE_CATEGORIES:
             core["files"] += 1
             core["lines"] += metric.lines
@@ -209,8 +217,7 @@ def summarize(
             metric.python_complexity_points for metric in files
         ),
         "categories": {
-            category: dict(values)
-            for category, values in sorted(by_category.items())
+            category: dict(values) for category, values in sorted(by_category.items())
         },
         "core": dict(core),
         "lines_by_extension": dict(sorted(by_extension.items())),
