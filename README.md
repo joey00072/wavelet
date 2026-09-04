@@ -411,6 +411,12 @@ resumed run continues the previous W&B run through the id persisted in
 Evaluation rollout requests are bounded by `eval.max_inflight_rollouts`
 (default `64`) so a large evaluation set does not enqueue every generation at
 once.
+For persistent process-mode Verifiers runs, set `eval.background: true` to let
+rollout publication continue while an interval evaluation uses the currently
+loaded policy. Before loading newer weights, the orchestrator cancels the older
+evaluation when `eval.cancel_on_new_policy` is true (the default), or waits for
+it when false. Final evaluation always waits for any matching background run,
+and cancellation is recorded in the run event log.
 To evaluate every configured `eval.env` once against an already-running
 OpenAI-compatible server, run:
 

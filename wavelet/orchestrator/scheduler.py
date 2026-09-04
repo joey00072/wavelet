@@ -2291,9 +2291,12 @@ class _VerifierPublisherStrategy:
     last_eval_steps: dict[str, int]
     loaded_policy_step: int | None = None
     pending_policy_update: asyncio.Task[int] | None = None
+    pending_eval_task: asyncio.Task[None] | None = None
+    pending_eval_policy_step: int | None = None
 
     async def prepare_policy(self, optimizer_step: int) -> tuple[float, float]:
         """Make the required policy available without blocking optional refreshes."""
+        await self._finish_completed_eval()
         await self._finish_ready_policy_update(optimizer_step)
         policy_step = _policy_step_to_load(
             self.config,
@@ -2312,6 +2315,7 @@ class _VerifierPublisherStrategy:
         if self.pending_policy_update is None:
             if must_load:
                 return await self._load_now(policy_step, optimizer_step)
+            await self._settle_pending_eval(for_policy_update=True)
             self._start_background_load(policy_step, rollout_step=optimizer_step)
             return 0.0, 0.0
         if not must_load:
@@ -2370,6 +2374,7 @@ class _VerifierPublisherStrategy:
         optimizer_step: int,
     ) -> tuple[float, float]:
         started_at = perf_counter()
+        await self._settle_pending_eval(for_policy_update=True)
         previous_policy_step = self.loaded_policy_step
         self.scheduler.begin_policy_update()
         try:
@@ -2428,14 +2433,72 @@ class _VerifierPublisherStrategy:
                 requested_step=None,
                 available_tail=self.policy_receiver.available_steps()[-20:],
             )
-        await _maybe_run_evals_async(
+        envs = select_due_eval_envs(
+            self.config,
+            policy_step=self.loaded_policy_step,
+            last_eval_steps=self.last_eval_steps,
+        )
+        if not envs:
+            return
+        if self.config.eval is not None and self.config.eval.background:
+            await self._settle_pending_eval(for_policy_update=False)
+            self.pending_eval_policy_step = self.loaded_policy_step
+            self.pending_eval_task = asyncio.create_task(
+                _run_evals_async(
+                    self.config,
+                    self.orchestrator,
+                    policy_step=self.loaded_policy_step,
+                    rollout_step=optimizer_step,
+                    envs=envs,
+                    inference_engine=self.inference_engine,
+                )
+            )
+            return
+        await _run_evals_async(
             self.config,
             self.orchestrator,
             policy_step=self.loaded_policy_step,
             rollout_step=optimizer_step,
-            last_eval_steps=self.last_eval_steps,
+            envs=envs,
             inference_engine=self.inference_engine,
         )
+
+    async def _finish_completed_eval(self) -> None:
+        task = getattr(self, "pending_eval_task", None)
+        if task is None or not task.done():
+            return
+        self.pending_eval_task = None
+        self.pending_eval_policy_step = None
+        await task
+
+    async def _settle_pending_eval(self, *, for_policy_update: bool) -> None:
+        task = getattr(self, "pending_eval_task", None)
+        if task is None:
+            return
+        eval_config = self.config.eval
+        should_cancel = (
+            for_policy_update
+            and eval_config is not None
+            and eval_config.cancel_on_new_policy
+            and not task.done()
+        )
+        policy_step = getattr(self, "pending_eval_policy_step", None)
+        self.pending_eval_task = None
+        self.pending_eval_policy_step = None
+        if should_cancel:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            append_event_best_effort(
+                self.config.output_dir / "events",
+                QueueEvent(
+                    time=utc_now(),
+                    kind="eval_cancelled_for_policy_update",
+                    policy_step=policy_step,
+                ),
+            )
+            emit_perf("eval_cancelled", policy_step=policy_step)
+            return
+        await task
 
     async def publish_chunk(
         self,
@@ -2573,6 +2636,7 @@ class _VerifierPublisherStrategy:
         await self._record_loaded_policy(optimizer_step)
 
     async def run_final_evals(self, target_step: int) -> None:
+        await self._settle_pending_eval(for_policy_update=False)
         if self.config.eval is None or not self.config.eval.final_eval:
             return
         final_policy_step = _final_eval_policy_step(self.config, target_step)
@@ -2643,6 +2707,12 @@ class _VerifierPublisherStrategy:
                 self.pending_policy_update,
                 return_exceptions=True,
             )
+        eval_task = getattr(self, "pending_eval_task", None)
+        if eval_task is not None:
+            eval_task.cancel()
+            await asyncio.gather(eval_task, return_exceptions=True)
+            self.pending_eval_task = None
+            self.pending_eval_policy_step = None
         await self.scheduler.aclose()
         await _teardown_cached_verifier_envs()
 

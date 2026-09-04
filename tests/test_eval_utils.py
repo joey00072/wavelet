@@ -432,6 +432,135 @@ def test_run_evals_async_publishes_metrics_to_monitor(monkeypatch) -> None:
     )
 
 
+def test_background_eval_does_not_block_rollout_publishing(monkeypatch) -> None:
+    async def run() -> None:
+        config = RLConfig.model_validate(
+            {
+                "launcher": {"mode": "process"},
+                "orchestrator": {
+                    "custom_rollout_function": (
+                        "wavelet.orchestrator.verifiers:generate_rollouts"
+                    ),
+                    "examples_per_step": 1,
+                    "max_async_level": 1,
+                },
+                "eval": {
+                    "background": True,
+                    "env": [{"id": "aime", "interval": 1}],
+                },
+            }
+        )
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def evaluate(*_args, **_kwargs) -> None:
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(
+            "wavelet.orchestrator.scheduler._run_evals_async",
+            evaluate,
+        )
+        context = object.__new__(_VerifierPublisherStrategy)
+        context.config = config
+        context.orchestrator = Mock()
+        context.inference_engine = Mock()
+        context.policy_receiver = Mock()
+        context.scheduler = Mock()
+        context.state = None
+        context.loaded_policy_step = 1
+        context.last_eval_steps = {"aime": -1}
+        context.pending_eval_task = None
+        context.pending_eval_policy_step = None
+
+        await context._record_loaded_policy(1)
+        await started.wait()
+
+        assert context.pending_eval_task is not None
+        assert not context.pending_eval_task.done()
+        release.set()
+        await context._settle_pending_eval(for_policy_update=False)
+
+    asyncio.run(run())
+
+
+def test_background_eval_is_cancelled_before_new_policy(monkeypatch, tmp_path) -> None:
+    async def run() -> None:
+        config = RLConfig.model_validate(
+            {
+                "output_dir": tmp_path,
+                "launcher": {"mode": "process"},
+                "orchestrator": {
+                    "custom_rollout_function": (
+                        "wavelet.orchestrator.verifiers:generate_rollouts"
+                    ),
+                    "examples_per_step": 1,
+                    "max_async_level": 1,
+                },
+                "eval": {"background": True, "cancel_on_new_policy": True},
+            }
+        )
+        cancelled = asyncio.Event()
+
+        async def evaluate() -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        context = object.__new__(_VerifierPublisherStrategy)
+        context.config = config
+        context.pending_eval_task = asyncio.create_task(evaluate())
+        context.pending_eval_policy_step = 3
+
+        await asyncio.sleep(0)
+        await context._settle_pending_eval(for_policy_update=True)
+
+        assert cancelled.is_set()
+        assert context.pending_eval_task is None
+        events = (tmp_path / "events" / "queue.jsonl").read_text(encoding="utf-8")
+        assert "eval_cancelled_for_policy_update" in events
+
+    asyncio.run(run())
+
+
+def test_background_eval_can_delay_policy_update_instead_of_cancelling(
+    tmp_path,
+) -> None:
+    async def run() -> None:
+        config = RLConfig.model_validate(
+            {
+                "output_dir": tmp_path,
+                "launcher": {"mode": "process"},
+                "orchestrator": {
+                    "custom_rollout_function": (
+                        "wavelet.orchestrator.verifiers:generate_rollouts"
+                    ),
+                    "examples_per_step": 1,
+                    "max_async_level": 1,
+                },
+                "eval": {"background": True, "cancel_on_new_policy": False},
+            }
+        )
+        release = asyncio.Event()
+        context = object.__new__(_VerifierPublisherStrategy)
+        context.config = config
+        context.pending_eval_task = asyncio.create_task(release.wait())
+        context.pending_eval_policy_step = 3
+
+        waiter = asyncio.create_task(
+            context._settle_pending_eval(for_policy_update=True)
+        )
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        release.set()
+        await waiter
+
+        assert context.pending_eval_task is None
+
+    asyncio.run(run())
+
+
 def test_eval_metrics_include_avg_and_pass_at_k() -> None:
     metrics = _eval_metrics(
         "alphabet",

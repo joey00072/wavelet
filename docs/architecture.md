@@ -169,6 +169,11 @@ replica, and resume even when loading fails. The offline engine, whose adapter
 id is stable across snapshots, resets the prefix cache after each in-place
 adapter reload and forwards the client's `cache_salt`. Never replace adapter or
 model weights while a request is decoding.
+Optional background interval evaluations share the loaded policy with rollout
+generation. A policy update first cancels or drains the older evaluation,
+according to `eval.cancel_on_new_policy`, so an evaluation never spans two
+weight versions. Final evaluation drains matching background work before it
+decides whether another fixed-policy run is needed.
 
 Lightweight LoRA exports from FSDP gather adapter shards over the `dp_shard_cp`
 group, so every HSDP replica reconstructs the full adapter without duplicate

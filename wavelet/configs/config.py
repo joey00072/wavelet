@@ -750,6 +750,8 @@ class RLEvalConfig(ConfigModel):
     interval: int = Field(default=100, ge=1)
     max_retries: int = Field(default=0, ge=0)
     max_inflight_rollouts: int = Field(default=64, ge=1)
+    background: bool = False
+    cancel_on_new_policy: bool = True
     eval_base_model: bool = True
     final_eval: bool = True
     keep_last_rollout_sets: int = Field(default=2, ge=1)
@@ -1464,6 +1466,23 @@ class RLConfig(TrainerConfig):
                 "orchestrator.concurrency limits cannot exceed the explicit "
                 "orchestrator.max_inflight_rollouts ceiling: "
                 f"{', '.join(above_static_ceiling)}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_background_evals(self) -> "RLConfig":
+        if self.eval is None or not self.eval.background:
+            return self
+        if self.orchestrator.custom_rollout_function != (
+            "wavelet.orchestrator.verifiers:generate_rollouts"
+        ):
+            raise ValueError(
+                "eval.background currently requires the Verifiers rollout source."
+            )
+        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+            raise ValueError(
+                "eval.background requires launcher.mode='process' and "
+                "orchestrator.max_async_level>=1."
             )
         return self
 

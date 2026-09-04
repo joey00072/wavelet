@@ -257,6 +257,25 @@ def test_adaptive_concurrency_validates_bounds_and_thresholds() -> None:
         )
 
 
+def test_background_evals_require_streaming_verifier_scheduler() -> None:
+    with pytest.raises(ValueError, match="Verifiers rollout source"):
+        RLConfig(
+            launcher={"mode": "process"},
+            orchestrator={"max_async_level": 1},
+            eval={"background": True},
+        )
+    with pytest.raises(ValueError, match="launcher.mode='process'"):
+        RLConfig(
+            orchestrator={
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                ),
+                "max_async_level": 1,
+            },
+            eval={"background": True},
+        )
+
+
 def test_tasks_per_minute_requires_verifier_rollout_source() -> None:
     with pytest.raises(ValueError, match="tasks_per_minute"):
         RLConfig(orchestrator={"tasks_per_minute": 60})
