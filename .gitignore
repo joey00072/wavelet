@@ -40,6 +40,11 @@ checkpoints/
 *.ckpt
 *.jsonl.tmp
 bench*
+!benchmarks/
+!benchmarks/README.md
+!benchmarks/baselines/
+!benchmarks/baselines/README.md
+!wavelet/tools/benchmark.py
 dev*
 tmp/
 temp/
