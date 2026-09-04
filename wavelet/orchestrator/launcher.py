@@ -40,8 +40,13 @@ def _role_env(
     return env
 
 
-def _log_path(output_dir: Path, log_name: str) -> Path:
-    log_dir = output_dir / "logs"
+def _log_path(
+    output_dir: Path,
+    log_name: str,
+    *,
+    log_dir: Path | None = None,
+) -> Path:
+    log_dir = output_dir / "logs" if log_dir is None else log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir / f"{log_name}.log"
 
@@ -141,8 +146,11 @@ def _start_local_role(
     spec: RoleSpec,
     *,
     output_dir: Path,
+    log_dir: Path | None = None,
 ) -> tuple[subprocess.Popen, TextIO]:
-    log_file = _log_path(output_dir, spec.log_name).open("a", encoding="utf-8")
+    log_file = _log_path(output_dir, spec.log_name, log_dir=log_dir).open(
+        "a", encoding="utf-8"
+    )
     process = subprocess.Popen(
         _role_command(
             spec.command,
@@ -202,11 +210,16 @@ class RayRoleHandle:
 
 
 class LocalRoleLauncher:
-    def __init__(self, output_dir: Path) -> None:
+    def __init__(self, output_dir: Path, *, log_dir: Path | None = None) -> None:
         self.output_dir = output_dir
+        self.log_dir = log_dir
 
     def start(self, spec: RoleSpec) -> LocalRoleHandle:
-        process, log_file = _start_local_role(spec, output_dir=self.output_dir)
+        process, log_file = _start_local_role(
+            spec,
+            output_dir=self.output_dir,
+            log_dir=self.log_dir,
+        )
         return LocalRoleHandle(spec, process, log_file)
 
     def close(self) -> None:
@@ -214,7 +227,7 @@ class LocalRoleLauncher:
 
 
 class RayRoleLauncher:
-    def __init__(self, config: RLConfig) -> None:
+    def __init__(self, config: RLConfig, *, log_dir: Path | None = None) -> None:
         try:
             import ray
         except ImportError as exc:
@@ -223,6 +236,7 @@ class RayRoleLauncher:
                 "launcher.backend='local'."
             ) from exc
         self.config = config
+        self.log_dir = log_dir
         self.ray = ray
         self.remote_runner = ray.remote(_run_role_subprocess)
         ray.init(
@@ -232,7 +246,11 @@ class RayRoleLauncher:
         )
 
     def start(self, spec: RoleSpec) -> RayRoleHandle:
-        log_path = _log_path(self.config.output_dir, spec.log_name)
+        log_path = _log_path(
+            self.config.output_dir,
+            spec.log_name,
+            log_dir=self.log_dir,
+        )
         ref = self.remote_runner.remote(
             command=spec.command,
             config_path=str(spec.config_path),
@@ -251,11 +269,15 @@ class RayRoleLauncher:
 RoleHandle = LocalRoleHandle | RayRoleHandle
 
 
-def create_role_launcher(config: RLConfig) -> LocalRoleLauncher | RayRoleLauncher:
+def create_role_launcher(
+    config: RLConfig,
+    *,
+    log_dir: Path | None = None,
+) -> LocalRoleLauncher | RayRoleLauncher:
     if config.launcher.backend == "local":
-        return LocalRoleLauncher(config.output_dir)
+        return LocalRoleLauncher(config.output_dir, log_dir=log_dir)
     if config.launcher.backend == "ray":
-        return RayRoleLauncher(config)
+        return RayRoleLauncher(config, log_dir=log_dir)
     raise ValueError(f"Unsupported launcher backend: {config.launcher.backend}")
 
 

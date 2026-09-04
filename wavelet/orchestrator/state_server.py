@@ -29,6 +29,8 @@ from wavelet.transport.queue import (
     resolve_policy_dir,
     resolve_queue_dir,
 )
+from wavelet.utils.pathing import get_config_dir
+from wavelet.utils.serialization import load_yaml
 
 
 def _now() -> str:
@@ -140,6 +142,11 @@ class OrchestratorRunState(RolloutStateEventsMixin):
             }
 
     def sanitized_config(self) -> dict[str, Any]:
+        config_dir = get_config_dir(self._config.output_dir)
+        for name in ("rl_orchestrator.yaml", "rl.yaml"):
+            config_path = config_dir / name
+            if config_path.is_file():
+                return _redact(load_yaml(config_path))
         return _redact(self._config.model_dump(mode="json", exclude_none=True))
 
     def metrics(self, *, limit: int) -> list[dict[str, Any]]:

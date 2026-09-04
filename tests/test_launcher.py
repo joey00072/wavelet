@@ -166,6 +166,28 @@ def test_local_role_launcher_preserves_existing_log(tmp_path, monkeypatch) -> No
     assert log_path.read_text(encoding="utf-8") == "previous run\n"
 
 
+def test_local_role_launcher_writes_to_explicit_attempt_log_dir(
+    tmp_path, monkeypatch
+) -> None:
+    attempt_log_dir = tmp_path / "logs" / "attempt_2"
+    monkeypatch.setattr(
+        "wavelet.orchestrator.launcher.subprocess.Popen",
+        lambda *args, **kwargs: _FakeProcess(),
+    )
+
+    handle = LocalRoleLauncher(tmp_path, log_dir=attempt_log_dir).start(
+        RoleSpec(
+            name="inference",
+            command="rl-inference",
+            config_path=Path("config.yaml"),
+            log_name="rl_inference",
+        )
+    )
+    handle.close()
+
+    assert handle.log_path == attempt_log_dir / "rl_inference.log"
+
+
 def test_ray_role_launcher_disconnects_on_close(monkeypatch) -> None:
     calls: list[str] = []
 

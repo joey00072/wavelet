@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import shlex
 import shutil
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 STABLE_CHECKPOINT_MARKER = "STABLE"
@@ -22,6 +25,78 @@ OUTPUT_RUN_STATE_MARKERS = (
 )
 
 
+@dataclass(frozen=True, slots=True)
+class LaunchAttemptPaths:
+    config_attempt_dir: Path
+    config_dir: Path
+    log_dir: Path
+
+
+def _attempt_numbers(parent: Path) -> set[int]:
+    return {
+        int(path.name.removeprefix("attempt_"))
+        for path in parent.glob("attempt_*")
+        if path.is_dir() and path.name.removeprefix("attempt_").isdigit()
+    }
+
+
+def _point_latest(parent: Path, attempt_dir: Path) -> None:
+    temporary = parent / f".latest-{os.getpid()}"
+    if temporary.is_symlink() or temporary.exists():
+        temporary.unlink()
+    temporary.symlink_to(attempt_dir.name, target_is_directory=True)
+    os.replace(temporary, parent / "latest")
+
+
+def create_launch_attempt(output_dir: Path) -> LaunchAttemptPaths:
+    """Allocate matching resolved-config and log directories for one launch."""
+    configs_root = output_dir / "configs"
+    logs_root = output_dir / "logs"
+    configs_root.mkdir(parents=True, exist_ok=True)
+    logs_root.mkdir(parents=True, exist_ok=True)
+    attempts = _attempt_numbers(configs_root) | _attempt_numbers(logs_root)
+    attempt_name = f"attempt_{max(attempts, default=0) + 1}"
+    config_attempt_dir = configs_root / attempt_name
+    config_dir = config_attempt_dir / "resolved"
+    log_dir = logs_root / attempt_name
+    config_dir.mkdir(parents=True)
+    log_dir.mkdir()
+    _point_latest(configs_root, config_attempt_dir)
+    _point_latest(logs_root, log_dir)
+    return LaunchAttemptPaths(config_attempt_dir, config_dir, log_dir)
+
+
+def launch_config_paths(argv: list[str]) -> list[Path]:
+    """Return root config files referenced by the supported CLI syntax."""
+    if "@" in argv:
+        index = argv.index("@")
+        return [Path(argv[index + 1])] if index + 1 < len(argv) else []
+    if argv and argv[0].startswith("@") and len(argv[0]) > 1:
+        return [Path(argv[0][1:])]
+    return []
+
+
+def write_launch_artifacts(
+    attempt: LaunchAttemptPaths,
+    *,
+    command: str,
+    argv: list[str],
+) -> None:
+    """Record a reproducible command and a copy of its root config."""
+    command_line = shlex.join(["uv", "run", "wavelet", command, *argv])
+    (attempt.config_attempt_dir / "command.txt").write_text(
+        f"{command_line}\n",
+        encoding="utf-8",
+    )
+    for source in launch_config_paths(argv):
+        if not source.is_file():
+            continue
+        suffix = source.suffix or ".yaml"
+        destination = attempt.config_attempt_dir / f"{command}{suffix}"
+        if source.resolve() != destination.resolve():
+            shutil.copyfile(source, destination)
+
+
 def resolve_output_dir(base_dir: Path, name: str | None = None) -> Path:
     if name is not None:
         return base_dir / name
@@ -29,7 +104,9 @@ def resolve_output_dir(base_dir: Path, name: str | None = None) -> Path:
 
 
 def get_config_dir(output_dir: Path) -> Path:
-    return output_dir / "configs"
+    configs_root = output_dir / "configs"
+    latest = configs_root / "latest" / "resolved"
+    return latest if latest.exists() else configs_root
 
 
 def get_checkpoint_dir(output_dir: Path, step: int) -> Path:

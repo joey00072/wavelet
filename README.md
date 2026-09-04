@@ -112,12 +112,15 @@ The RL stack is now split into minimal but scalable pieces:
 - `wavelet rl`: convenience launcher; set `launcher.mode: process` to supervise
   `rl-trainer` and `rl-inference` as separate subprocesses
 
-Role logs append under `<output_dir>/logs/`, so a resume attempt preserves the
-trace from the process that produced its checkpoint. Ray-backed launchers
-create that log directory on the worker node and disconnect from Ray during
-teardown after their role handles are closed. A `SIGTERM` sent to `wavelet rl`
-(systemd, SLURM, `timeout`) tears down the role processes exactly like Ctrl-C
-instead of orphaning GPU workers.
+Each `wavelet rl` launch allocates matching
+`<output_dir>/{configs,logs}/attempt_N/` directories. The config attempt stores
+the command, a copy of the supplied root config, and resolved role configs;
+supervised role output goes to the matching log attempt. `latest` symlinks make
+the current attempt easy to inspect without overwriting resume history.
+Ray-backed launchers create the selected log directory on the worker node and
+disconnect from Ray during teardown after their role handles are closed. A
+`SIGTERM` sent to `wavelet rl` (systemd, SLURM, `timeout`) tears down the role
+processes exactly like Ctrl-C instead of orphaning GPU workers.
 
 The transport is intentionally simple and durable: each batch is written under
 `<output_dir>/rollouts/step-000000/rollouts.jsonl` with an atomic stable marker.

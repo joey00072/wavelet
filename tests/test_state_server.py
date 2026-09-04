@@ -63,6 +63,21 @@ def test_orchestrator_state_config_redacts_secrets(tmp_path) -> None:
     assert sanitized["orchestrator"]["verifier_env_args"]["safe"] == "value"
 
 
+def test_orchestrator_state_reads_latest_resolved_config(tmp_path) -> None:
+    resolved = tmp_path / "configs" / "attempt_2" / "resolved"
+    resolved.mkdir(parents=True)
+    (tmp_path / "configs" / "latest").symlink_to("attempt_2", target_is_directory=True)
+    (resolved / "rl_orchestrator.yaml").write_text(
+        "max_steps: 17\nlauncher:\n  mode: process\n",
+        encoding="utf-8",
+    )
+    state = OrchestratorRunState(RLConfig(output_dir=tmp_path), target_step=1)
+
+    sanitized = state.sanitized_config()
+
+    assert sanitized == {"max_steps": 17, "launcher": {"mode": "process"}}
+
+
 def test_orchestrator_state_reads_training_and_eval_metrics_separately(
     tmp_path,
 ) -> None:

@@ -4,7 +4,40 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.utils.pathing import existing_run_state_entries, validate_output_dir
+from wavelet.utils.pathing import (
+    create_launch_attempt,
+    existing_run_state_entries,
+    get_config_dir,
+    validate_output_dir,
+    write_launch_artifacts,
+)
+
+
+def test_launch_attempts_preserve_configs_commands_and_logs(tmp_path: Path) -> None:
+    source = tmp_path / "source config.yaml"
+    source.write_text("max_steps: 3\n", encoding="utf-8")
+    output_dir = tmp_path / "run"
+
+    first = create_launch_attempt(output_dir)
+    write_launch_artifacts(first, command="rl", argv=["@", str(source)])
+    (first.config_dir / "rl_orchestrator.yaml").write_text(
+        "max_steps: 3\n", encoding="utf-8"
+    )
+    (first.log_dir / "rl_inference.log").write_text("first\n", encoding="utf-8")
+    second = create_launch_attempt(output_dir)
+
+    assert first.config_attempt_dir.name == "attempt_1"
+    assert second.config_attempt_dir.name == "attempt_2"
+    assert (first.config_attempt_dir / "rl.yaml").read_text() == "max_steps: 3\n"
+    assert (
+        "source config.yaml" in (first.config_attempt_dir / "command.txt").read_text()
+    )
+    assert (first.log_dir / "rl_inference.log").read_text() == "first\n"
+    assert (output_dir / "configs" / "latest").resolve() == (
+        second.config_attempt_dir.resolve()
+    )
+    assert (output_dir / "logs" / "latest").resolve() == second.log_dir.resolve()
+    assert get_config_dir(output_dir).resolve() == second.config_dir.resolve()
 
 
 def test_validate_output_dir_allows_empty_directory(tmp_path: Path) -> None:

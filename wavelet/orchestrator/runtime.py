@@ -66,9 +66,13 @@ from wavelet.transport.queue import (
 )
 from wavelet.utils.config import load_config
 from wavelet.utils.pathing import (
+    LaunchAttemptPaths,
+    create_launch_attempt,
     get_config_dir,
+    launch_config_paths,
     resolve_resume_checkpoint,
     validate_output_dir,
+    write_launch_artifacts,
 )
 from wavelet.utils.serialization import dump_yaml
 
@@ -90,8 +94,13 @@ def _data_paths(path: Path | list[Path] | None) -> list[Path]:
     return list(path) if isinstance(path, list) else [path]
 
 
-def _write_subconfigs(config: RLConfig, trainer_config: RLConfig | None = None) -> None:
-    config_dir = get_config_dir(config.output_dir)
+def _write_subconfigs(
+    config: RLConfig,
+    trainer_config: RLConfig | None = None,
+    *,
+    config_dir: Path | None = None,
+) -> None:
+    config_dir = get_config_dir(config.output_dir) if config_dir is None else config_dir
     full_trainer_config = trainer_config or config
     dump_yaml(config_dir / "rl_trainer.yaml", _role_config_payload(full_trainer_config))
     dump_yaml(config_dir / "rl_orchestrator.yaml", _role_config_payload(config))
@@ -102,8 +111,15 @@ def _role_config_payload(config: RLConfig) -> dict:
     return config.model_dump(mode="json", exclude_none=False)
 
 
-def _config_path_for_role(config: RLConfig, name: str, role_config: RLConfig) -> Path:
-    config_path = get_config_dir(config.output_dir) / f"{name}.yaml"
+def _config_path_for_role(
+    config: RLConfig,
+    name: str,
+    role_config: RLConfig,
+    *,
+    config_dir: Path | None = None,
+) -> Path:
+    config_dir = get_config_dir(config.output_dir) if config_dir is None else config_dir
+    config_path = config_dir / f"{name}.yaml"
     dump_yaml(config_path, _role_config_payload(role_config))
     return config_path
 
@@ -434,6 +450,7 @@ def _role_specs(
     trainer_config_path: Path,
     inference_config_path: Path,
     inference_ports: list[int],
+    config_dir: Path | None = None,
 ) -> list[RoleSpec]:
     inference_replicas = len(inference_ports)
     eval_only = _target_steps(config) == 0
@@ -463,6 +480,7 @@ def _role_specs(
                 config,
                 f"inference_server_{replica}",
                 replica_config,
+                config_dir=config_dir,
             )
             roles.append(
                 RoleSpec(
@@ -504,7 +522,11 @@ def _role_specs(
     return roles
 
 
-def _run_process_launcher(config: RLConfig) -> int:
+def _run_process_launcher(
+    config: RLConfig,
+    *,
+    attempt: LaunchAttemptPaths | None = None,
+) -> int:
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         raise RuntimeError(
             "Do not run 'wavelet rl' under torchrun. For distributed RL, run "
@@ -520,8 +542,10 @@ def _run_process_launcher(config: RLConfig) -> int:
     inference_ports = _http_ports(config, inference_replicas)
     rollout_config = _rollout_client_config(config, ports=inference_ports)
 
-    _write_subconfigs(rollout_config, config)
-    config_dir = get_config_dir(config.output_dir)
+    config_dir = (
+        get_config_dir(config.output_dir) if attempt is None else attempt.config_dir
+    )
+    _write_subconfigs(rollout_config, config, config_dir=config_dir)
     trainer_config_path = config_dir / "rl_trainer.yaml"
     inference_config_path = config_dir / "rl_inference.yaml"
     dump_yaml(inference_config_path, _role_config_payload(rollout_config))
@@ -530,9 +554,13 @@ def _run_process_launcher(config: RLConfig) -> int:
         trainer_config_path=trainer_config_path,
         inference_config_path=inference_config_path,
         inference_ports=inference_ports,
+        config_dir=config_dir,
     )
 
-    launcher = create_role_launcher(config)
+    launcher = create_role_launcher(
+        config,
+        log_dir=None if attempt is None else attempt.log_dir,
+    )
     handles = []
     previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     try:
@@ -635,7 +663,11 @@ def _sleep_vllm_http_servers(config: RLConfig, *, ports: list[int]) -> None:
             future.result()
 
 
-def _run_integrated_launcher(config: RLConfig) -> int:
+def _run_integrated_launcher(
+    config: RLConfig,
+    *,
+    config_dir: Path | None = None,
+) -> int:
     if int(os.environ.get("WORLD_SIZE", "1")) > 1 and config.orchestrator.enabled:
         raise RuntimeError(
             "The integrated RL launcher is single-process only. For distributed RL, "
@@ -646,7 +678,7 @@ def _run_integrated_launcher(config: RLConfig) -> int:
     if config.orchestrator.enabled:
         queue_dir = config.transport.queue_dir or (config.output_dir / "rollouts")
         trainer_config = config
-        _write_subconfigs(config, trainer_config)
+        _write_subconfigs(config, trainer_config, config_dir=config_dir)
         trainer = RLTrainer(trainer_config)
         trainer.setup()
         if trainer.resume_checkpoint_dir is not None:
@@ -697,7 +729,7 @@ def _run_integrated_launcher(config: RLConfig) -> int:
     else:
         rollout_path = config.data.path
         trainer_config = _trainer_config_for_rollouts(config, rollout_path)
-        _write_subconfigs(config, trainer_config)
+        _write_subconfigs(config, trainer_config, config_dir=config_dir)
         trainer = RLTrainer(trainer_config)
         trainer.setup()
         trainer.train()
@@ -716,7 +748,11 @@ def main(argv: list[str] | None = None) -> int:
         config.output_dir,
         resuming=resuming,
         clean=config.clean_output_dir,
-        protected_paths=(config.model.adapter_path, *_data_paths(config.data.path)),
+        protected_paths=(
+            config.model.adapter_path,
+            *_data_paths(config.data.path),
+            *launch_config_paths(argv),
+        ),
     )
     if resuming:
         assert config.ckpt is not None
@@ -724,17 +760,20 @@ def main(argv: list[str] | None = None) -> int:
             config.checkpoint_output_dir,
             config.ckpt.resume_step,
         )
-    dump_yaml(
-        get_config_dir(config.output_dir) / "rl.yaml",
-        _role_config_payload(config),
-    )
+    attempt = create_launch_attempt(config.output_dir)
+    write_launch_artifacts(attempt, command="rl", argv=argv)
+    dump_yaml(attempt.config_dir / "rl.yaml", _role_config_payload(config))
 
     if config.dry_run:
         if config.orchestrator.enabled:
             rollout_path = config.output_dir / "rollouts"
         else:
             rollout_path = config.data.path
-        _write_subconfigs(config, _trainer_config_for_rollouts(config, rollout_path))
+        _write_subconfigs(
+            config,
+            _trainer_config_for_rollouts(config, rollout_path),
+            config_dir=attempt.config_dir,
+        )
         print("Dry run - configuration loaded successfully")
         print(f"Materialized rollouts: {rollout_path}")
         print(config.model_dump_json(indent=2))
@@ -745,8 +784,8 @@ def main(argv: list[str] | None = None) -> int:
         config.launcher.mode in {"process", "colocate", "colocate_sleep"}
         and config.orchestrator.enabled
     ):
-        return _run_process_launcher(config)
-    return _run_integrated_launcher(config)
+        return _run_process_launcher(config, attempt=attempt)
+    return _run_integrated_launcher(config, config_dir=attempt.config_dir)
 
 
 if __name__ == "__main__":
