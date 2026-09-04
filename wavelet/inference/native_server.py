@@ -248,6 +248,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     config = load_config(RLConfig, argv)
+    from wavelet.monitor import setup_config_logger
+
+    setup_config_logger(f"native_inference_{config.inference.http.port}", config)
     try:
         import uvicorn
     except ImportError as exc:

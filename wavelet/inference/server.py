@@ -1131,6 +1131,9 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
     config = load_config(RLConfig, argv)
     _CONFIG = config
+    from wavelet.monitor import setup_config_logger
+
+    setup_config_logger(f"inference_server_{config.inference.http.port}", config)
     from wavelet.inference.patches import transformers_v5_compat
 
     transformers_v5_compat()

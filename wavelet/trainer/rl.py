@@ -56,7 +56,7 @@ from wavelet.transport.queue import (
     validate_rollout_manifest,
 )
 from wavelet.utils.config import load_config
-from wavelet.utils.monitoring import emit_perf
+from wavelet.utils.monitoring import emit_perf, setup_config_logger
 
 logger = logging.getLogger(__name__)
 SUM_SYNCED_METRIC_KEYS = {
@@ -1184,6 +1184,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     config = load_config(RLConfig, argv)
+    setup_config_logger("rl_trainer", config)
     trainer = RLTrainer(config)
     try:
         trainer.setup()

@@ -14,6 +14,7 @@ from time import perf_counter
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import count_nonempty_jsonl_rows
 from wavelet.inference.policy import create_policy_inference_engine
+from wavelet.monitor import setup_config_logger
 from wavelet.orchestrator.launcher import (
     RoleHandle,
     RoleSpec,
@@ -721,6 +722,7 @@ def main(argv: list[str] | None = None) -> int:
         print(config.model_dump_json(indent=2))
         return 0
 
+    setup_config_logger("rl", config)
     if (
         config.launcher.mode in {"process", "colocate", "colocate_sleep"}
         and config.orchestrator.enabled

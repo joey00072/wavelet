@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -17,7 +18,7 @@ from typing import Any
 
 import torch
 
-from wavelet.configs.config import RLConfig, WandbConfig
+from wavelet.configs.config import RLConfig, SFTConfig, WandbConfig
 from wavelet.orchestrator.rollout_metadata import (
     metadata_harness_name,
     metadata_task_name,
@@ -606,12 +607,100 @@ def _existing_path(path: Path) -> Path:
     return cursor
 
 
-def setup_logger(name: str, level: str = "info") -> Any:
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+_STANDARD_LOG_RECORD_KEYS = frozenset(logging.makeLogRecord({}).__dict__) | {
+    "asctime",
+    "message",
+}
+
+
+class JsonLogFormatter(logging.Formatter):
+    """Format standard-library log records as one flat JSON object."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(),
+            "level": record.levelname.lower(),
+            "logger": record.name,
+            "message": record.getMessage(),
+            "pid": record.process,
+        }
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_LOG_RECORD_KEYS and key not in payload:
+                payload[key] = value
+        if record.exc_info is not None:
+            payload["exception"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            payload["stack"] = self.formatStack(record.stack_info)
+        return json.dumps(payload, default=str, sort_keys=True)
+
+
+def _remove_managed_log_handlers(root: logging.Logger) -> None:
+    for handler in list(root.handlers):
+        if getattr(handler, "_wavelet_managed", False):
+            root.removeHandler(handler)
+            handler.close()
+
+
+def _managed_handler(handler: logging.Handler) -> logging.Handler:
+    handler._wavelet_managed = True  # type: ignore[attr-defined]
+    return handler
+
+
+def _log_file_path(output_dir: Path, name: str) -> Path:
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name).strip("._") or "wavelet"
+    rank = os.environ.get("RANK")
+    rank_suffix = f".rank-{rank}" if rank is not None else ""
+    return output_dir / "logs" / f"{safe_name}{rank_suffix}.jsonl"
+
+
+def setup_logger(
+    name: str,
+    level: str = "info",
+    *,
+    json_console: bool = False,
+    json_file: bool = True,
+    output_dir: Path | None = None,
+) -> logging.Logger:
+    """Configure process-wide Wavelet console and optional JSON-file logging."""
+    numeric_level = getattr(logging, level.upper(), None)
+    if not isinstance(numeric_level, int):
+        raise TypeError(f"Unsupported log level: {level}")
+
+    root = logging.getLogger()
+    root.setLevel(numeric_level)
+    _remove_managed_log_handlers(root)
+    json_formatter = JsonLogFormatter()
+    text_formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
+
+    console_handler = _managed_handler(logging.StreamHandler())
+    console_handler.setLevel(numeric_level)
+    console_handler.setFormatter(json_formatter if json_console else text_formatter)
+    root.addHandler(console_handler)
+
+    if json_file:
+        if output_dir is None:
+            raise ValueError("output_dir is required when JSON file logging is enabled")
+        log_path = _log_file_path(output_dir, name)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = _managed_handler(logging.FileHandler(log_path, encoding="utf-8"))
+        file_handler.setLevel(numeric_level)
+        file_handler.setFormatter(json_formatter)
+        root.addHandler(file_handler)
+
     return logging.getLogger(name)
+
+
+def setup_config_logger(name: str, config: RLConfig | SFTConfig) -> logging.Logger:
+    """Configure logging from a validated trainer/run config."""
+    return setup_logger(
+        name,
+        config.log.level,
+        json_console=config.log.json_console,
+        json_file=config.log.json_file,
+        output_dir=config.output_dir,
+    )
 
 
 _WANDB_RUN = None

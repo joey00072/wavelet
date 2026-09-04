@@ -140,6 +140,10 @@ long-term record.
 Sample logging retains a rolling window of 256 rows by default
 (`monitor.samples.keep_last`) and compacts it in batches, so enabling rollout
 examples cannot grow `samples.jsonl` without bound during a long run.
+Role logging writes structured JSONL under `<output_dir>/logs/` by default.
+Set `log.json_file: false` to disable that file sink or
+`log.json_console: true` to emit the same structured records to the console;
+distributed ranks receive distinct `.rank-N.jsonl` files.
 This publishes policy step 0 before rollout generation and prevents the trainer
 and inference scheduler from waiting on each other at startup.
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
+from wavelet.monitor import setup_config_logger
 from wavelet.orchestrator.envs import (
     _algorithm_record_from_output as _algorithm_record_from_output,
 )
@@ -1239,6 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     config = load_config(RLConfig, argv)
+    setup_config_logger("rl_inference", config)
     start_step = _resume_optimizer_step(config)
     discard_rollout_batches_after_resume(config, start_step=start_step)
     policy_receiver = FileSystemPolicyReceiver(

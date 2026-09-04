@@ -35,7 +35,7 @@ from wavelet.trainer.distributed import (
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
-from wavelet.utils.monitoring import RunMonitor
+from wavelet.utils.monitoring import RunMonitor, setup_config_logger
 from wavelet.utils.pathing import (
     get_config_dir,
     resolve_resume_checkpoint,
@@ -1005,6 +1005,7 @@ def main(argv: list[str] | None = None) -> int:
         print(config.model_dump_json(indent=2))
         return 0
 
+    setup_config_logger("sft", config)
     trainer = SFTTrainer(config)
     trainer.setup()
     trainer.train()

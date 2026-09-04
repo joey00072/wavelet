@@ -218,7 +218,7 @@ class FSDPConfig(ConfigModel):
 
 
 class LogConfig(ConfigModel):
-    level: str = "info"
+    level: Literal["debug", "info", "warning", "error", "critical"] = "info"
     log_every: int = Field(default=1, ge=1)
     json_console: bool = False
     json_file: bool = True

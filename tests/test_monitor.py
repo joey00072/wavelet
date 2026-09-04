@@ -1,14 +1,17 @@
 import json
+import logging
 
 import pytest
 
 import wavelet.monitor as canonical_monitor
 import wavelet.orchestrator.metrics as legacy_metrics
 import wavelet.utils.monitoring as legacy_monitoring
+from wavelet.configs.sft import SFTConfig
 from wavelet.monitor import (
     read_jsonl,
     redact,
     series_stats,
+    setup_config_logger,
     summary_stats,
     tail_jsonl,
 )
@@ -19,6 +22,51 @@ def test_legacy_observability_modules_alias_canonical_module() -> None:
     assert legacy_monitoring is canonical_monitor
     assert legacy_metrics.RolloutMetricInputs is canonical_monitor.RolloutMetricInputs
     assert legacy_monitoring.RunMonitor is canonical_monitor.RunMonitor
+
+
+def test_config_logger_writes_structured_file_and_console(
+    capsys, monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv("RANK", raising=False)
+    config = SFTConfig(
+        output_dir=tmp_path,
+        log={"level": "info", "json_console": True, "json_file": True},
+    )
+    try:
+        logger = setup_config_logger("sft-test", config)
+
+        logger.info("policy loaded", extra={"policy_step": 4})
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        console_row = json.loads(capsys.readouterr().err.strip().splitlines()[-1])
+        file_rows = read_jsonl(tmp_path / "logs" / "sft-test.jsonl")
+        assert console_row["message"] == "policy loaded"
+        assert console_row["policy_step"] == 4
+        assert file_rows[-1]["level"] == "info"
+        assert file_rows[-1]["logger"] == "sft-test"
+        assert file_rows[-1]["policy_step"] == 4
+    finally:
+        canonical_monitor._remove_managed_log_handlers(logging.getLogger())
+
+
+def test_config_logger_can_disable_json_file(capsys, tmp_path) -> None:
+    config = SFTConfig(
+        output_dir=tmp_path,
+        log={"level": "warning", "json_console": False, "json_file": False},
+    )
+    try:
+        logger = setup_config_logger("console-only", config)
+
+        logger.info("hidden")
+        logger.warning("visible")
+        output = capsys.readouterr().err
+
+        assert "visible" in output
+        assert "hidden" not in output
+        assert not (tmp_path / "logs").exists()
+    finally:
+        canonical_monitor._remove_managed_log_handlers(logging.getLogger())
 
 
 def test_jsonl_readers_preserve_strict_and_tail_contracts(tmp_path):
