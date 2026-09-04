@@ -1012,6 +1012,7 @@ class RLOrchestratorConfig(ConfigModel):
     max_async_level: int = Field(default=0, ge=0)
     max_off_policy_steps: int = Field(default=0, ge=0)
     max_pending_rollout_chunks: int | None = Field(default=None, ge=1)
+    pipeline_status_interval_seconds: float = Field(default=30.0, gt=0.0)
     state_server: RLStateServerConfig = RLStateServerConfig()
 
     @model_validator(mode="after")

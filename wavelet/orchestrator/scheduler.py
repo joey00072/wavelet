@@ -1152,6 +1152,7 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import RLExample
 from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.metrics import log_eval_metrics, log_rollout_metrics
+from wavelet.orchestrator.periodic_logger import PeriodicLogger, pipeline_status
 from wavelet.orchestrator.policy_metadata import policy_metadata
 from wavelet.orchestrator.rollouts import RLOrchestrator, _reusable_rollout_batch
 from wavelet.orchestrator.schedule import (
@@ -1401,6 +1402,17 @@ class _SchedulerStateMachine:
     def _rollout_step(self, queue_step: int) -> int:
         return queue_step
 
+    def _pipeline_status(self, target: int) -> str:
+        return pipeline_status(
+            policy_step=self.loaded_policy_step,
+            published=self.next_step_to_publish,
+            target=target,
+            submitted=self.next_step_to_submit,
+            inflight=len(self.pending),
+            ready=len(self.completed),
+            policy_loading=self.pending_policy_load is not None,
+        )
+
     def collect_done(self, done) -> None:
         for future in done:
             step = self.pending.pop(future)
@@ -1544,7 +1556,12 @@ class _SchedulerStateMachine:
         return True, wait_seconds, load_seconds
 
     def run(self, *, target_step: int, prefetch_steps: int) -> int:
+        status_logger = PeriodicLogger(
+            lambda: self._pipeline_status(target_step),
+            interval_seconds=self.config.orchestrator.pipeline_status_interval_seconds,
+        )
         with (
+            status_logger,
             ThreadPoolExecutor(
                 max_workers=prefetch_steps,
                 thread_name_prefix="wavelet-inference-step",
@@ -1814,7 +1831,12 @@ class _ChunkPublisherStrategy(_SchedulerStateMachine):
         )
 
     def run_native(self, *, target_chunks: int, max_pending_chunks: int) -> int:
+        status_logger = PeriodicLogger(
+            lambda: self._pipeline_status(target_chunks),
+            interval_seconds=self.config.orchestrator.pipeline_status_interval_seconds,
+        )
         with (
+            status_logger,
             ThreadPoolExecutor(
                 max_workers=max_pending_chunks,
                 thread_name_prefix="wavelet-native-chunk",
@@ -2392,20 +2414,37 @@ async def _run_verifier_scheduler(
         last_eval_steps=_initial_eval_steps(config, start_step=start_step),
     )
     target_chunks = target_step * chunks_per_step
+    progress = {"published": start_step * chunks_per_step}
+    status_logger = PeriodicLogger(
+        lambda: pipeline_status(
+            policy_step=context.loaded_policy_step,
+            published=progress["published"],
+            target=target_chunks,
+            submitted=progress["published"],
+            inflight=scheduler.inflight_rollout_count,
+            ready=len(scheduler.ready_groups),
+            policy_loading=context.pending_policy_update is not None,
+        ),
+        interval_seconds=config.orchestrator.pipeline_status_interval_seconds,
+    )
     try:
-        for queue_step in range(start_step * chunks_per_step, target_chunks):
-            optimizer_step = queue_step // chunks_per_step
-            wait_seconds, load_seconds = await context.prepare_policy(optimizer_step)
-            await context.publish_chunk(
-                queue_step,
-                wait_policy_seconds=wait_seconds,
-                load_policy_seconds=load_seconds,
-            )
-        await context.finish_pending_policy(target_step)
-        await context.run_final_evals(target_step)
-        if state is not None:
-            state.set_status("completed", phase="completed")
-        return 0
+        with status_logger:
+            for queue_step in range(start_step * chunks_per_step, target_chunks):
+                optimizer_step = queue_step // chunks_per_step
+                wait_seconds, load_seconds = await context.prepare_policy(
+                    optimizer_step
+                )
+                await context.publish_chunk(
+                    queue_step,
+                    wait_policy_seconds=wait_seconds,
+                    load_policy_seconds=load_seconds,
+                )
+                progress["published"] = queue_step + 1
+            await context.finish_pending_policy(target_step)
+            await context.run_final_evals(target_step)
+            if state is not None:
+                state.set_status("completed", phase="completed")
+            return 0
     finally:
         await context.close()
 

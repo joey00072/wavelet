@@ -223,6 +223,9 @@ in-flight bound; `oversampling_factor` does not multiply it a second time.
 `max_inflight_rollouts` is also an exact request ceiling. These explicit bounds
 may intentionally leave inference client routes idle rather than exceed the
 configured memory budget.
+Long-running process schedulers emit a one-line policy, queue, and in-flight
+status every `orchestrator.pipeline_status_interval_seconds` (30 seconds by
+default).
 Cached verifier environments and registered executors are torn down when the
 inference scheduler closes. Integrated runs also close the inference engine and
 verifier resources on both success and failure before finalizing trainer state.
