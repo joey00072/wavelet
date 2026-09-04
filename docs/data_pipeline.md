@@ -21,6 +21,9 @@ baseline; `val.interval` controls evaluation after completed optimizer steps.
 The validation dataset is loaded once and a fresh finite dataloader is built for
 each evaluation, so repeated metrics cover the same configured records without
 advancing the training cursor.
+Training rows also report `perf/tokens_per_second`, `perf/peak_memory_gib`,
+`progress/epoch`, and per-source sample/token ratios from the checkpointed
+stateful-dataset counters.
 
 ## RL Flow
 

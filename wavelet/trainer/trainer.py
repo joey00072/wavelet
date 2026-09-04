@@ -9,6 +9,7 @@ import random
 import sys
 import tempfile
 import time
+from collections import defaultdict
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -56,6 +57,62 @@ def _lora_dtype(dtype: str) -> torch.dtype | None:
     if dtype == "float16":
         return torch.float16
     return None
+
+
+def _unwrap_dataset_state(state: object) -> dict[str, Any] | None:
+    if not isinstance(state, dict):
+        return None
+    nested = state.get("dataset")
+    if isinstance(nested, dict):
+        return _unwrap_dataset_state(nested)
+    return state
+
+
+def _dataloader_progress(
+    dataloader: StatefulDataLoader,
+    dataset: IterableDataset,
+) -> dict[str, Any]:
+    loader_state = dataloader.state_dict()
+    snapshot = loader_state.get("_snapshot")
+    states: list[dict[str, Any]] = []
+    if isinstance(snapshot, dict):
+        worker_snapshots = snapshot.get("_worker_snapshots")
+        if isinstance(worker_snapshots, dict):
+            for worker_snapshot in worker_snapshots.values():
+                if not isinstance(worker_snapshot, dict):
+                    continue
+                state = _unwrap_dataset_state(worker_snapshot.get("dataset_state"))
+                if state is not None:
+                    states.append(state)
+    else:
+        state = _unwrap_dataset_state(loader_state.get("dataset_state"))
+        if state is not None:
+            states.append(state)
+
+    if not states:
+        stats_fn = getattr(dataset, "stats", None)
+        stats = stats_fn() if callable(stats_fn) else {}
+        base = getattr(dataset, "base", dataset)
+        return {
+            "step": int(getattr(base, "step", 0)),
+            "epoch": int(getattr(base, "epoch", 0)),
+            "num_samples": dict(stats.get("samples", {})),
+            "num_tokens": dict(stats.get("tokens", {})),
+        }
+
+    num_samples: defaultdict[str, int] = defaultdict(int)
+    num_tokens: defaultdict[str, int] = defaultdict(int)
+    for state in states:
+        for name, value in state.get("num_samples", {}).items():
+            num_samples[str(name)] += int(value)
+        for name, value in state.get("num_tokens", {}).items():
+            num_tokens[str(name)] += int(value)
+    return {
+        "step": max(int(state.get("step", 0)) for state in states),
+        "epoch": max(int(state.get("epoch", 0)) for state in states),
+        "num_samples": dict(num_samples),
+        "num_tokens": dict(num_tokens),
+    }
 
 
 class BaseTrainer:
@@ -706,6 +763,8 @@ class SFTTrainer(BaseTrainer):
         self.val_dataloader: StatefulDataLoader | None = None
         self._val_records: list[Example] | None = None
         self._validated_steps: set[int] = set()
+        self._step_started_at: float | None = None
+        self._step_model_tokens = 0
 
     def _setup_data(self) -> None:
         super()._setup_data()
@@ -846,12 +905,20 @@ class SFTTrainer(BaseTrainer):
             return
         loss = output.loss.loss.item()
         lr = self._get_lr()
-        self.monitor.log({"loss": loss, "lr": lr}, self.step)
+        metrics = dict(output.metrics)
+        metrics.update(self._dataset_progress_metrics())
+        metrics.update({"loss": loss, "lr": lr})
+        self.monitor.log(metrics, self.step)
         progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None:
             raise RuntimeError("Model not set up")
+        if self._step_started_at is None:
+            self._step_started_at = time.perf_counter()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+        self._step_model_tokens += int(batch["input_ids"].numel())
 
         with self.act_offload_ctx:
             loss_output = self._forward_loss(batch)
@@ -875,7 +942,10 @@ class SFTTrainer(BaseTrainer):
                 stepped=True,
                 step=self.step,
                 micro_step=self._micro_step,
-                metrics={"loss": float(loss.detach().item())},
+                metrics={
+                    "loss": float(loss.detach().item()),
+                    **self._finish_step_performance_metrics(),
+                },
             )
 
         return TrainOutput(
@@ -884,6 +954,67 @@ class SFTTrainer(BaseTrainer):
             step=self.step,
             micro_step=self._micro_step,
         )
+
+    def _finish_step_performance_metrics(self) -> dict[str, float]:
+        if self._step_started_at is None:
+            raise RuntimeError("SFT step timer was not started.")
+        elapsed = max(time.perf_counter() - self._step_started_at, 1e-9)
+        global_tokens = self._step_model_tokens * self._data_parallel_world_size()
+        peak_memory_gib = (
+            torch.cuda.max_memory_reserved() / 1024**3
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        self._step_started_at = None
+        self._step_model_tokens = 0
+        return {
+            "perf/tokens_per_second": global_tokens / elapsed,
+            "perf/peak_memory_gib": peak_memory_gib,
+        }
+
+    def _dataset_progress_metrics(self) -> dict[str, float]:
+        if self.dataset is None or self.dataloader is None:
+            return {}
+        progress = _dataloader_progress(self.dataloader, self.dataset)
+        progress = self._sync_dataset_progress(progress)
+        samples = progress["num_samples"]
+        tokens = progress["num_tokens"]
+        total_samples = sum(samples.values())
+        total_tokens = sum(tokens.values())
+        metrics = {"progress/epoch": float(progress["epoch"])}
+        for source in sorted(set(samples) | set(tokens)):
+            metrics[f"progress/{source}/ratio_samples"] = (
+                samples.get(source, 0) / total_samples if total_samples else 0.0
+            )
+            metrics[f"progress/{source}/ratio_tokens"] = (
+                tokens.get(source, 0) / total_tokens if total_tokens else 0.0
+            )
+        return metrics
+
+    def _sync_dataset_progress(self, progress: dict[str, Any]) -> dict[str, Any]:
+        if (
+            self.world is None
+            or self.world.world_size <= 1
+            or not torch.distributed.is_initialized()
+        ):
+            return progress
+        payload = progress if self._is_data_parallel_metric_leader() else None
+        gathered: list[dict[str, Any] | None] = [None] * self.world.world_size
+        torch.distributed.all_gather_object(gathered, payload)
+        contributors = [item for item in gathered if item is not None]
+        samples: defaultdict[str, int] = defaultdict(int)
+        tokens: defaultdict[str, int] = defaultdict(int)
+        for item in contributors:
+            for name, value in item["num_samples"].items():
+                samples[name] += int(value)
+            for name, value in item["num_tokens"].items():
+                tokens[name] += int(value)
+        return {
+            "step": max(int(item["step"]) for item in contributors),
+            "epoch": max(int(item["epoch"]) for item in contributors),
+            "num_samples": dict(samples),
+            "num_tokens": dict(tokens),
+        }
 
     def _forward_loss(self, batch: dict[str, Tensor]) -> LossOutput:
         if self.model is None:
