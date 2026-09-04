@@ -332,6 +332,9 @@ use snake case or kebab case; structured values are JSON-encoded and boolean
 values become `--flag`/`--no-flag`. Wavelet rejects collisions with arguments
 it manages, such as `model`, `port`, `tensor_parallel_size`, `enable_lora`, and
 `logprobs_mode`.
+`inference.vllm.enforce_eager` defaults to `false`, allowing vLLM to use its
+hybrid eager/CUDA-graph execution path. Set it to `true` for deployments whose
+GPU-memory constraints or model behavior require eager-only execution.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

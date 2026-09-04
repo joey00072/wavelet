@@ -458,6 +458,12 @@ def test_inference_server_returns_sampling_distribution_logprobs() -> None:
     assert _argv_value(argv, "--logprobs-mode") == "processed_logprobs"
 
 
+def test_inference_server_uses_cuda_graphs_by_default() -> None:
+    assert "--enforce-eager" not in _serve_argv(RLConfig())
+    eager = RLConfig(inference={"vllm": {"enforce_eager": True}})
+    assert "--enforce-eager" in _serve_argv(eager)
+
+
 def test_inference_server_enables_fully_sharded_loras() -> None:
     config = RLConfig(
         inference={"vllm": {"fully_sharded_loras": True}},
