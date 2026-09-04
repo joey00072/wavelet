@@ -90,6 +90,12 @@ explicit = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 norecursedirs = ["ref"]
+addopts = ["--strict-markers"]
+markers = [
+    "gpu: requires a CUDA-capable GPU",
+    "integration: exercises multiple Wavelet subsystems or an optional integration",
+    "slow: takes substantially longer than an ordinary unit test",
+]
 filterwarnings = [
     "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
     "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",

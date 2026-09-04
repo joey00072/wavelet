@@ -189,6 +189,11 @@ checks with `uv run pre-commit install`. To check the full tracked Python
 surface used by CI without installing a hook, run
 `uv run pre-commit run --all-files`.
 
+Pytest rejects unknown markers. Registered suites can be selected or excluded
+with expressions such as `uv run pytest -m integration` or
+`uv run pytest -m "not gpu and not slow"`; tests marked `gpu` must also guard
+themselves when CUDA is unavailable.
+
 Track project size when a change adds or removes meaningful surface area:
 
 ```bash
