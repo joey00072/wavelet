@@ -186,6 +186,19 @@ step itself stay reusable. Async checkpoints
 finish copying the live tensors to their staging buffer before the trainer
 returns to the next optimizer step; only the upload continues in the background.
 
+Convert the structured events under a run's `traces/` directory into a local
+Hugging Face parquet dataset with:
+
+```bash
+uv run wavelet convert-traces outputs/run \
+  --output-dir outputs/run-trace-dataset
+```
+
+Pass `--repo-id organization/dataset` instead of `--output-dir` to push a
+private Hub dataset, or add `--public` for a public repository. Variable trace
+`details` remain JSON-encoded while lifecycle ids, steps, timestamps, and event
+names remain directly filterable columns.
+
 Convert a stable full-model DCP checkpoint into an inference-ready Hugging Face
 safetensors directory with:
 

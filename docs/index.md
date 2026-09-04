@@ -221,3 +221,6 @@ external checkouts, generated outputs, caches, virtualenvs, and WandB artifacts.
 
 For repeatable performance checks, use the hardware-keyed benchmark harness and
 reviewed baselines described in [benchmarks/README.md](../benchmarks/README.md).
+Export structured run events for Hugging Face dataset analysis with
+`uv run wavelet convert-traces outputs/run --output-dir <dataset-dir>`; passing
+a run directory discovers only its canonical `traces/` JSONL files.

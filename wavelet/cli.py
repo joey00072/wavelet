@@ -11,6 +11,10 @@ PUBLIC_COMMANDS = {
         "wavelet.tools.convert_checkpoint",
         "Convert a DCP checkpoint to Hugging Face safetensors",
     ),
+    "convert-traces": (
+        "wavelet.tools.convert_traces",
+        "Convert trace JSONL files to a Hugging Face dataset",
+    ),
     "benchmark": (
         "wavelet.tools.benchmark",
         "Run and compare training performance benchmarks",
