@@ -4,7 +4,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
-from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
+from wavelet.configs.rl_config import (
+    RLAlgorithmConfig,
+    RLConfig,
+    RLEvalEnvConfig,
+    RLSamplingConfig,
+    RLTrainEnvConfig,
+)
 from wavelet.monitor import finish_orchestrator_wandb, setup_config_logger
 from wavelet.orchestrator.concurrency import AdaptiveConcurrencyController
 from wavelet.orchestrator.envs import (
@@ -270,7 +276,6 @@ def _resume_optimizer_step(config: RLConfig) -> int:
 
 
 from wavelet.orchestrator.envs import (
-    _assign_completed_group_advantages,
     _completed_group_outputs,
     _env_name,
     _has_trainable_rollout_record,
@@ -333,6 +338,28 @@ class _VerifierGroupState:
     completed_outputs: list[dict[str, Any]] = field(default_factory=list)
     pinned_client_index: int | None = None
     failed_rollouts: int = 0
+    env_index: int = 0
+    env_name: str = "verifier"
+    rollout_count: int | None = None
+    requires_group_scoring: bool | None = None
+    algorithm_config: RLAlgorithmConfig | None = None
+    sampling: RLSamplingConfig | None = None
+    record_cursor: int | None = None
+
+
+@dataclass(slots=True)
+class _VerifierEnvRuntime:
+    config: RLTrainEnvConfig
+    env: Any
+    env_name: str
+    records: list[RLExample]
+    sampling: RLSamplingConfig
+    algorithm_config: RLAlgorithmConfig
+    rollout_count: int
+    requires_group_scoring: bool
+    record_cursor: int = 0
+    record_order_epoch: int | None = None
+    record_order: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -343,11 +370,19 @@ class _VerifierBatchStats:
     rejected_groups: int = 0
     rollout_rewards: list[float] = field(default_factory=list)
     group_reward_sums: list[float] = field(default_factory=list)
+    group_rollout_counts: list[int] = field(default_factory=list)
 
-    def observe(self, outputs: list[dict[str, Any]], *, admitted: bool) -> None:
+    def observe(
+        self,
+        outputs: list[dict[str, Any]],
+        *,
+        admitted: bool,
+        expected_rollouts: int | None = None,
+    ) -> None:
         rewards = [float(output["reward"]) for output in outputs]
         self.rollout_rewards.extend(rewards)
         self.group_reward_sums.append(sum(rewards))
+        self.group_rollout_counts.append(expected_rollouts or len(outputs))
         if admitted:
             self.admitted_groups += 1
         else:
@@ -365,7 +400,15 @@ class _VerifierBatchStats:
             return metrics
 
         solve_none = sum(value == 0.0 for value in self.group_reward_sums)
-        solve_all = sum(value >= rollouts_per_group for value in self.group_reward_sums)
+        rollout_counts = self.group_rollout_counts or [rollouts_per_group] * completed
+        solve_all = sum(
+            value >= group_size
+            for value, group_size in zip(
+                self.group_reward_sums,
+                rollout_counts,
+                strict=True,
+            )
+        )
         metrics.update(
             {
                 "generation/groups/admission_rate": (self.admitted_groups / completed),
@@ -467,6 +510,22 @@ def generate_rollouts(
     return records
 
 
+def _training_env_specs(config: RLConfig) -> list[RLTrainEnvConfig]:
+    if config.orchestrator.envs:
+        return list(config.orchestrator.envs)
+    env_id = config.orchestrator.verifier_env_id
+    if env_id is None:
+        raise ValueError("Configure orchestrator.envs or orchestrator.verifier_env_id.")
+    return [
+        RLTrainEnvConfig(
+            id=env_id,
+            args=config.orchestrator.verifier_env_args,
+            group_size=config.orchestrator.rollouts_per_example,
+            algo=config.algo,
+        )
+    ]
+
+
 class VerifierRolloutScheduler:
     """Persistent verifier rollout scheduler for process-mode async RL."""
 
@@ -475,28 +534,81 @@ class VerifierRolloutScheduler:
         orchestrator: RLOrchestrator,
         *,
         start_record_cursor: int = 0,
+        start_environment_record_cursors: dict[str, int] | None = None,
+        start_environment_selection_cursor: int = 0,
     ) -> None:
         vf = _load_verifiers("rollouts")
 
         config = orchestrator.config
-        env_id = config.orchestrator.verifier_env_id
-        if env_id is None:
-            raise ValueError("orchestrator.verifier_env_id is required.")
-
         self.vf = vf
         self.orchestrator = orchestrator
         self.config = config
-        self.env, _ = _load_cached_env(
-            vf,
-            env_id,
-            config.orchestrator.verifier_env_args,
-            _verifier_extra_env_kwargs(config),
+        env_specs = _training_env_specs(config)
+        start_environment_record_cursors = start_environment_record_cursors or {}
+        self.env_runtimes: list[_VerifierEnvRuntime] = []
+        for spec in env_specs:
+            env, _ = _load_cached_env(
+                vf,
+                spec.id,
+                spec.args,
+                _verifier_extra_env_kwargs(config),
+            )
+            data_config = config.data
+            if spec.data_path is not None:
+                data_config = config.data.model_copy(
+                    update={"source": "local", "path": spec.data_path}
+                )
+            records = load_rl_records(data_config)
+            if not records:
+                raise ValueError(
+                    f"Verifier environment '{spec.resolved_name}' requires at "
+                    "least one train record."
+                )
+            sampling = config.resolved_train_sampling(spec)
+            env_name = (
+                spec.resolved_name
+                if config.orchestrator.envs
+                else _env_name(env, fallback=spec.resolved_name)
+            )
+            self.env_runtimes.append(
+                _VerifierEnvRuntime(
+                    config=spec,
+                    env=env,
+                    env_name=env_name,
+                    records=records,
+                    sampling=sampling,
+                    algorithm_config=spec.algo or config.algo,
+                    rollout_count=(
+                        spec.group_size or config.orchestrator.rollouts_per_example or 1
+                    ),
+                    requires_group_scoring=bool(
+                        getattr(env, "requires_group_scoring", False)
+                    ),
+                    record_cursor=start_environment_record_cursors.get(
+                        env_name,
+                        start_record_cursor if len(env_specs) == 1 else 0,
+                    ),
+                )
+            )
+        runtime_names = [runtime.env_name for runtime in self.env_runtimes]
+        duplicate_runtime_names = sorted(
+            {name for name in runtime_names if runtime_names.count(name) > 1}
         )
-        self.env_name = _env_name(self.env, fallback=env_id)
+        if duplicate_runtime_names:
+            raise ValueError(
+                "Loaded verifier environments must have unique names: "
+                f"{', '.join(duplicate_runtime_names)}. Set explicit env names."
+            )
+        first_runtime = self.env_runtimes[0]
+        self.env = first_runtime.env
+        self.env_name = first_runtime.env_name
         self.model = _verifier_model(config)
         self.policy_step: int | None = None
         self.rollout_step: int | None = None
-        self.rollout_count = config.orchestrator.rollouts_per_example or 1
+        self.rollout_count = max(runtime.rollout_count for runtime in self.env_runtimes)
+        self._minimum_rollout_count = min(
+            runtime.rollout_count for runtime in self.env_runtimes
+        )
         self.target_groups = config.orchestrator.examples_per_step
         self.target_tokens = config.orchestrator.token_batch_size
         if self.target_groups is None and self.target_tokens is None:
@@ -506,12 +618,11 @@ class VerifierRolloutScheduler:
                 "scheduling."
             )
         self.clients = _verifier_clients(vf, config)
-        self.records = load_rl_records(config.data)
-        if not self.records:
-            raise ValueError("Verifier scheduler requires at least one train record.")
-        self.record_cursor = start_record_cursor
+        self.records = first_runtime.records
+        self.record_cursor = first_runtime.record_cursor
         self._record_order_epoch: int | None = None
         self._record_order: list[int] = []
+        self.env_selection_cursor = start_environment_selection_cursor
         self.next_group_id = 0
         self.groups: dict[int, _VerifierGroupState] = {}
         self.pending: dict[
@@ -596,7 +707,12 @@ class VerifierRolloutScheduler:
             self.config.data.micro_batch_size
             * self.config.launcher.trainer_num_processes
         )
-        return max(1, math.ceil(minimum_rows / self.rollout_count))
+        minimum_rollout_count = getattr(
+            self,
+            "_minimum_rollout_count",
+            self.rollout_count,
+        )
+        return max(1, math.ceil(minimum_rows / minimum_rollout_count))
 
     @property
     def max_inflight_rollouts(self) -> int:
@@ -676,6 +792,7 @@ class VerifierRolloutScheduler:
                 drained_completed,
                 drained_rejected,
                 accepted_tokens,
+                accepted_groups,
             ) = self._drain_completed_groups_to_ready(
                 target_groups=target_groups,
                 target_tokens=target_tokens,
@@ -686,7 +803,6 @@ class VerifierRolloutScheduler:
             )
             completed_groups += drained_completed
             rejected_groups += drained_rejected
-            accepted_groups = len(outputs) // self.rollout_count
 
             while True:
                 if self._batch_target_reached(
@@ -752,6 +868,7 @@ class VerifierRolloutScheduler:
             drained_completed,
             drained_rejected,
             accepted_tokens,
+            accepted_groups,
         ) = self._drain_completed_groups_to_ready(
             target_groups=target_groups,
             target_tokens=target_tokens,
@@ -802,8 +919,63 @@ class VerifierRolloutScheduler:
         records = [
             record for output in outputs for record in _records_from_output(output)
         ]
-        records = _mark_zero_advantage_records_metric_only(records, self.config)
+        records = self._mark_environment_records(records)
         return _has_trainable_rollout_record(records)
+
+    def _algorithm_record_groups(
+        self,
+        records: list[RLExample],
+    ) -> list[tuple[RLAlgorithmConfig, list[int]]]:
+        runtimes = getattr(self, "env_runtimes", None)
+        if not runtimes:
+            return [(self.config.algo, list(range(len(records))))]
+        runtime_algorithms = {
+            runtime.env_name: runtime.algorithm_config for runtime in runtimes
+        }
+        grouped: dict[str, tuple[RLAlgorithmConfig, list[int]]] = {}
+        for index, record in enumerate(records):
+            algorithm_config = runtime_algorithms.get(record.source, self.config.algo)
+            key = record.source or "__default__"
+            grouped.setdefault(key, (algorithm_config, []))[1].append(index)
+        return list(grouped.values())
+
+    def _mark_environment_records(
+        self,
+        records: list[RLExample],
+    ) -> list[RLExample]:
+        marked = list(records)
+        for algorithm_config, indexes in self._algorithm_record_groups(records):
+            group_records = [records[index] for index in indexes]
+            group_records = _mark_zero_advantage_records_metric_only(
+                group_records,
+                self.config,
+                algorithm_config=algorithm_config,
+            )
+            for index, record in zip(indexes, group_records, strict=True):
+                marked[index] = record
+        return marked
+
+    def _finalize_environment_records(
+        self,
+        records: list[RLExample],
+    ) -> list[RLExample]:
+        finalized = list(records)
+        for algorithm_config, indexes in self._algorithm_record_groups(records):
+            group_records = [records[index] for index in indexes]
+            group_records = annotate_distillation_records(
+                group_records,
+                self.config,
+                policy_model_name=getattr(self, "model", None),
+                algorithm_config=algorithm_config,
+            )
+            group_records = _mark_zero_advantage_records_metric_only(
+                group_records,
+                self.config,
+                algorithm_config=algorithm_config,
+            )
+            for index, record in zip(indexes, group_records, strict=True):
+                finalized[index] = record
+        return finalized
 
     @staticmethod
     def _raise_if_retries_exhausted(
@@ -862,12 +1034,7 @@ class VerifierRolloutScheduler:
         records = [
             record for output in outputs for record in _records_from_output(output)
         ]
-        records = annotate_distillation_records(
-            records,
-            self.config,
-            policy_model_name=getattr(self, "model", None),
-        )
-        records = _mark_zero_advantage_records_metric_only(records, self.config)
+        records = self._finalize_environment_records(records)
         self.last_batch_metrics = batch_stats.metrics(
             rollouts_per_group=self.rollout_count
         )
@@ -880,11 +1047,25 @@ class VerifierRolloutScheduler:
         self.last_batch_metrics["generation/groups/rejected_total"] = float(
             getattr(self, "rejected_groups_count", 0)
         )
-        record_cursor = getattr(self, "record_cursor", 0)
-        self.last_batch_metrics["generation/data/cursor"] = float(record_cursor)
-        self.last_batch_metrics["generation/data/epoch"] = float(
-            record_cursor // len(getattr(self, "records", [None]))
-        )
+        runtimes = getattr(self, "env_runtimes", None)
+        if runtimes:
+            self.last_batch_metrics["generation/data/cursor"] = float(
+                self.env_selection_cursor
+            )
+            for runtime in runtimes:
+                prefix = f"generation/data/{runtime.env_name}"
+                self.last_batch_metrics[f"{prefix}/cursor"] = float(
+                    runtime.record_cursor
+                )
+                self.last_batch_metrics[f"{prefix}/epoch"] = float(
+                    runtime.record_cursor // len(runtime.records)
+                )
+        else:
+            record_cursor = getattr(self, "record_cursor", 0)
+            self.last_batch_metrics["generation/data/cursor"] = float(record_cursor)
+            self.last_batch_metrics["generation/data/epoch"] = float(
+                record_cursor // len(getattr(self, "records", [None]))
+            )
         self.last_batch_metrics["generation/policy_update_wait_seconds"] = float(
             getattr(self, "policy_update_wait_seconds", 0.0)
         )
@@ -923,7 +1104,7 @@ class VerifierRolloutScheduler:
         accepted_groups: int,
         accepted_tokens: int,
         batch_stats: _VerifierBatchStats,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, int]:
         completed_groups = 0
         rejected_groups = 0
         for task in [task for task in self.pending if task.done()]:
@@ -945,7 +1126,7 @@ class VerifierRolloutScheduler:
         self.rejected_groups_count = (
             getattr(self, "rejected_groups_count", 0) + rejected_groups
         )
-        return completed_groups, rejected_groups, accepted_tokens
+        return completed_groups, rejected_groups, accepted_tokens, accepted_groups
 
     def _consume_completed_task(
         self,
@@ -968,6 +1149,13 @@ class VerifierRolloutScheduler:
             return 0, 0, 0
 
         group_outputs = _completed_group_outputs(task)
+        rollout_count = getattr(group, "rollout_count", None) or self.rollout_count
+        requires_group_scoring = (
+            getattr(self, "requires_group_scoring", False)
+            if getattr(group, "requires_group_scoring", None) is None
+            else group.requires_group_scoring
+        )
+        algorithm_config = getattr(group, "algorithm_config", None) or self.config.algo
         completed_policy_step = request.completed_policy_step
         if not _is_policy_step(completed_policy_step):
             completed_policy_step = request.policy_step
@@ -975,6 +1163,10 @@ class VerifierRolloutScheduler:
             output["_wavelet_policy_step"] = request.policy_step
             output["_wavelet_policy_end_step"] = completed_policy_step
             output["_wavelet_group_id"] = f"persistent:{request.group_id}"
+            output["_wavelet_group_size"] = rollout_count
+            record_cursor = getattr(group, "record_cursor", None)
+            if record_cursor is not None:
+                output["_wavelet_record_cursor"] = record_cursor
         missing_rollouts = request.rollout_count - len(group_outputs)
         if missing_rollouts > 0 and request.policy_step != getattr(
             self, "policy_step", None
@@ -998,7 +1190,7 @@ class VerifierRolloutScheduler:
             return 0, 0, 0
         if missing_rollouts > 0:
             group.failed_rollouts += missing_rollouts
-            if group.failed_rollouts > _MAX_GROUP_RETRIES * self.rollout_count:
+            if group.failed_rollouts > _MAX_GROUP_RETRIES * rollout_count:
                 self.groups.pop(request.group_id, None)
                 logger.warning(
                     "Dropping verifier group %s after %s failed rollout(s); the "
@@ -1008,30 +1200,40 @@ class VerifierRolloutScheduler:
                     request.policy_step,
                 )
                 return 0, 1, 1
-            if self.requires_group_scoring:
+            if requires_group_scoring:
                 # Group scoring needs the whole group from one dispatch, so the
                 # partial outputs are discarded before the full re-run.
                 group.completed_outputs.clear()
-                group.rollouts_to_schedule = self.rollout_count
+                group.rollouts_to_schedule = rollout_count
                 return 0, 0, 0
             group.rollouts_to_schedule += missing_rollouts
         group.completed_outputs.extend(group_outputs)
-        if len(group.completed_outputs) < self.rollout_count:
+        if len(group.completed_outputs) < rollout_count:
             return 0, 0, 0
 
         completed_outputs = group.completed_outputs
         self.groups.pop(request.group_id, None)
-        _stamp_env_name(completed_outputs, getattr(self, "env_name", "verifier"))
-        _assign_completed_group_advantages(completed_outputs, self.config)
+        _stamp_env_name(
+            completed_outputs,
+            getattr(group, "env_name", getattr(self, "env_name", "verifier")),
+        )
+        _assign_group_advantages(
+            completed_outputs,
+            algorithm_config=algorithm_config,
+        )
         is_usable = _is_usable_training_group(
             completed_outputs,
-            expected_rollouts=self.rollout_count,
+            expected_rollouts=rollout_count,
             filter_zero_advantage=self.config.orchestrator.filter_zero_advantage,
-            advantage_epsilon=algorithm_epsilon(self.config.algo),
-            loss_component=algorithm_loss_component(self.config.algo),
+            advantage_epsilon=algorithm_epsilon(algorithm_config),
+            loss_component=algorithm_loss_component(algorithm_config),
         )
         if batch_stats is not None:
-            batch_stats.observe(completed_outputs, admitted=is_usable)
+            batch_stats.observe(
+                completed_outputs,
+                admitted=is_usable,
+                expected_rollouts=rollout_count,
+            )
         if not is_usable:
             return 0, 1, 1
         if not self._batch_target_reached(
@@ -1323,21 +1525,43 @@ class VerifierRolloutScheduler:
                 self.groups.pop(group_id, None)
                 self._count_cancelled_rollouts(len(group.completed_outputs))
                 continue
-            cost = group.rollouts_to_schedule if self.requires_group_scoring else 1
+            requires_group_scoring = (
+                self.requires_group_scoring
+                if getattr(group, "requires_group_scoring", None) is None
+                else group.requires_group_scoring
+            )
+            cost = group.rollouts_to_schedule if requires_group_scoring else 1
             if cost <= remaining_capacity:
                 self._schedule_group_rollout(group_id, group)
                 return True
 
-        if remaining_capacity < self.rollout_count:
+        minimum_rollout_count = getattr(
+            self,
+            "_minimum_rollout_count",
+            self.rollout_count,
+        )
+        if remaining_capacity < minimum_rollout_count:
             return False
 
-        record = self._next_record()
+        runtimes = getattr(self, "env_runtimes", None)
+        if runtimes:
+            runtime = self._select_environment_runtime()
+            if remaining_capacity < runtime.rollout_count:
+                return False
+        runtime, record, record_cursor = self._next_environment_record()
         group_id = self.next_group_id
         self.next_group_id += 1
         group = _VerifierGroupState(
             example=_verifier_example(record),
-            rollouts_to_schedule=self.rollout_count,
+            rollouts_to_schedule=runtime.rollout_count,
             policy_step=current_policy_step,
+            env_index=self.env_runtimes.index(runtime),
+            env_name=runtime.env_name,
+            rollout_count=runtime.rollout_count,
+            requires_group_scoring=runtime.requires_group_scoring,
+            algorithm_config=runtime.algorithm_config,
+            sampling=runtime.sampling,
+            record_cursor=record_cursor,
         )
         self.groups[group_id] = group
         self._schedule_group_rollout(group_id, group)
@@ -1353,8 +1577,15 @@ class VerifierRolloutScheduler:
         client_index = group.pinned_client_index
         client = self.clients[client_index]
         model = self.model
-        sampling_args = self._sampling_args_for_current_policy()
-        if self.requires_group_scoring:
+        sampling_args = self._sampling_args_for_current_policy(group.sampling)
+        runtime = self.env_runtimes[group.env_index]
+        requires_group_scoring = (
+            runtime.requires_group_scoring
+            if group.requires_group_scoring is None
+            else group.requires_group_scoring
+        )
+        algorithm_config = group.algorithm_config or runtime.algorithm_config
+        if requires_group_scoring:
             rollout_count = group.rollouts_to_schedule
             group.rollouts_to_schedule = 0
             task = asyncio.create_task(
@@ -1362,14 +1593,14 @@ class VerifierRolloutScheduler:
                     cost=rollout_count,
                     operation=lambda: _run_group(
                         self.vf,
-                        self.env,
+                        runtime.env,
                         group.example,
                         client=client,
                         model=model,
                         sampling_args=sampling_args,
                         rollout_count=rollout_count,
                         max_retries=self.config.orchestrator.verifier_max_retries,
-                        algorithm_config=self.config.algo,
+                        algorithm_config=algorithm_config,
                         failure_stats=self.failure_stats,
                     ),
                 )
@@ -1382,7 +1613,7 @@ class VerifierRolloutScheduler:
                     cost=rollout_count,
                     operation=lambda: _run_single_rollout(
                         self.vf,
-                        self.env,
+                        runtime.env,
                         group.example,
                         client=client,
                         model=model,
@@ -1421,15 +1652,89 @@ class VerifierRolloutScheduler:
         self.record_cursor += 1
         return record
 
+    def _next_environment_record(
+        self,
+    ) -> tuple[_VerifierEnvRuntime, RLExample, int]:
+        runtimes = getattr(self, "env_runtimes", None)
+        if not runtimes:
+            runtime = _VerifierEnvRuntime(
+                config=RLTrainEnvConfig(id="verifier"),
+                env=self.env,
+                env_name=getattr(self, "env_name", "verifier"),
+                records=self.records,
+                sampling=self.config.inference.sampling,
+                algorithm_config=self.config.algo,
+                rollout_count=self.rollout_count,
+                requires_group_scoring=getattr(
+                    self,
+                    "requires_group_scoring",
+                    False,
+                ),
+            )
+            self.env_runtimes = [runtime]
+            record = self._next_record()
+            runtime.record_cursor = self.record_cursor
+            return (
+                runtime,
+                record,
+                self.record_cursor - 1,
+            )
+        runtime = self._select_environment_runtime()
+        self.env_selection_cursor += 1
+        record_cursor, record = self._next_runtime_record(runtime)
+        if runtime is runtimes[0]:
+            self.record_cursor = runtime.record_cursor
+        return runtime, record, record_cursor
+
+    def _select_environment_runtime(self) -> _VerifierEnvRuntime:
+        runtimes = self.env_runtimes
+        selection_cursor = self.env_selection_cursor
+        rng = random.Random(self.config.data.seed + selection_cursor * 1_000_003)
+        return rng.choices(
+            runtimes,
+            weights=[item.config.ratio for item in runtimes],
+            k=1,
+        )[0]
+
+    def environment_cursor_snapshot(self) -> tuple[dict[str, int], int]:
+        """Return the cumulative source state persisted with a queue batch."""
+        return (
+            {runtime.env_name: runtime.record_cursor for runtime in self.env_runtimes},
+            self.env_selection_cursor,
+        )
+
+    def _next_runtime_record(
+        self,
+        runtime: _VerifierEnvRuntime,
+    ) -> tuple[int, RLExample]:
+        record_cursor = runtime.record_cursor
+        epoch, offset = divmod(record_cursor, len(runtime.records))
+        if runtime.record_order_epoch != epoch:
+            runtime.record_order = list(range(len(runtime.records)))
+            if self.config.data.shuffle:
+                rng = random.Random(self.config.data.seed + epoch * 1_000_003)
+                rng.shuffle(runtime.record_order)
+            runtime.record_order_epoch = epoch
+        record = runtime.records[runtime.record_order[offset]]
+        runtime.record_cursor += 1
+        return record_cursor, record
+
     def _least_loaded_client_index(self) -> int:
         counts = [0] * len(self.clients)
         for request in self.pending.values():
             counts[request.client_index] += request.rollout_count
         return min(range(len(self.clients)), key=counts.__getitem__)
 
-    def _sampling_args_for_current_policy(self) -> dict[str, Any]:
+    def _sampling_args_for_current_policy(
+        self,
+        sampling: RLSamplingConfig | None = None,
+    ) -> dict[str, Any]:
         cache_salt = None if self.policy_step is None else str(self.policy_step)
-        return _sampling_args(self.config, cache_salt=cache_salt)
+        return _sampling_args(
+            self.config,
+            cache_salt=cache_salt,
+            sampling=sampling,
+        )
 
 
 import asyncio
@@ -1478,6 +1783,7 @@ from wavelet.transport.queue import (
     append_event_best_effort,
     prune_rollout_batches_from,
     publish_adapter_policy_snapshot,
+    read_manifest,
     resolve_queue_dir,
     utc_now,
 )
@@ -1501,15 +1807,13 @@ def _preload_rollout_resources(config: RLConfig) -> None:
         _verifier_extra_env_kwargs,
     )
 
-    env_id = config.orchestrator.verifier_env_id
-    if env_id is None:
-        return
-    _load_cached_env(
-        vf,
-        env_id,
-        config.orchestrator.verifier_env_args,
-        _verifier_extra_env_kwargs(config),
-    )
+    for env_config in _training_env_specs(config):
+        _load_cached_env(
+            vf,
+            env_config.id,
+            env_config.args,
+            _verifier_extra_env_kwargs(config),
+        )
 
 
 @dataclass(slots=True)
@@ -2549,6 +2853,9 @@ class _VerifierPublisherStrategy:
         )
         materialize_seconds = perf_counter() - materialize_started_at
         publish_started_at = perf_counter()
+        environment_cursors, environment_selection_cursor = (
+            self.scheduler.environment_cursor_snapshot()
+        )
         batch = self.rollout_sender.publish(
             materialized_path,
             step=queue_step,
@@ -2557,6 +2864,9 @@ class _VerifierPublisherStrategy:
             policy_step=rollout_policy_step,
             rows=_count_nonempty_lines(materialized_path),
             tokens=_rollout_record_tokens(records),
+            environment_record_cursors=_rollout_environment_record_cursors(records),
+            environment_next_record_cursors=environment_cursors,
+            environment_selection_cursor=environment_selection_cursor,
         )
         publish_seconds = perf_counter() - publish_started_at
         self._record_published_chunk(
@@ -2772,9 +3082,17 @@ async def _run_verifier_scheduler(
             "Either orchestrator.examples_per_step or "
             "orchestrator.token_batch_size is required."
         )
+    environment_cursors, environment_selection_cursor = (
+        _resume_environment_cursor_state(
+            config,
+            before_queue_step=start_step * _chunks_per_step(config),
+        )
+    )
     scheduler = VerifierRolloutScheduler(
         orchestrator,
         start_record_cursor=start_step * (examples_per_step or 0),
+        start_environment_record_cursors=environment_cursors,
+        start_environment_selection_cursor=environment_selection_cursor,
     )
     chunks_per_step = _chunks_per_step(config)
     context = _VerifierPublisherStrategy(
@@ -2969,6 +3287,71 @@ def _rollout_records_policy_step(
 def _rollout_record_tokens(records: list[RLExample]) -> int:
     """Count trainer-bound tokens in pretokenized rollout records."""
     return sum(len(record.input_ids or []) for record in records)
+
+
+def _rollout_environment_record_cursors(
+    records: list[RLExample],
+) -> dict[str, list[int]] | None:
+    cursors: dict[str, set[int]] = {}
+    for record in records:
+        metadata = record.metadata or {}
+        cursor = metadata.get("verifier_record_cursor")
+        if not isinstance(cursor, int) or isinstance(cursor, bool):
+            continue
+        cursors.setdefault(record.source or "verifier", set()).add(cursor)
+    if not cursors:
+        return None
+    return {name: sorted(values) for name, values in sorted(cursors.items())}
+
+
+def _resume_environment_cursor_state(
+    config: RLConfig,
+    *,
+    before_queue_step: int,
+) -> tuple[dict[str, int], int]:
+    if not config.orchestrator.envs or before_queue_step <= 0:
+        return {}, 0
+    sender = FileSystemRolloutSender(config.output_dir, config.transport)
+    queue_step = before_queue_step - 1
+    batch = sender.stable_batch(queue_step)
+    manifest = None if batch is None else read_manifest(batch.step_dir)
+    if (
+        manifest is None
+        or manifest.environment_next_record_cursors is None
+        or manifest.environment_selection_cursor is None
+    ):
+        raise ValueError(
+            "Multi-environment checkpoint resume requires the retained preceding "
+            f"rollout manifest with cumulative environment cursors; queue step "
+            f"{queue_step} is unavailable."
+        )
+    expected_names = {env.resolved_name for env in config.orchestrator.envs}
+    recorded_names = set(manifest.environment_next_record_cursors)
+    if recorded_names != expected_names:
+        raise ValueError(
+            "Multi-environment checkpoint resume environment names differ from "
+            f"queue step {queue_step}: expected {sorted(expected_names)}, found "
+            f"{sorted(recorded_names)}."
+        )
+    invalid_cursors = {
+        name: value
+        for name, value in manifest.environment_next_record_cursors.items()
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0
+    }
+    selection_cursor = manifest.environment_selection_cursor
+    if invalid_cursors or (
+        not isinstance(selection_cursor, int)
+        or isinstance(selection_cursor, bool)
+        or selection_cursor < 0
+    ):
+        raise ValueError(
+            "Multi-environment checkpoint resume found invalid cumulative cursor "
+            f"values in queue step {queue_step}."
+        )
+    return (
+        dict(manifest.environment_next_record_cursors),
+        selection_cursor,
+    )
 
 
 def _write_materialized_records(

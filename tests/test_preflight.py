@@ -60,6 +60,91 @@ def test_preflight_reports_missing_local_data(tmp_path) -> None:
     )
 
 
+def test_preflight_reports_each_training_environment_data_path(tmp_path) -> None:
+    shared_path = _write_local_data(tmp_path)
+    missing_path = tmp_path / "missing-code.jsonl"
+    config = RLConfig(
+        algo={"type": "reward"},
+        data={"source": "local", "path": shared_path},
+        output_dir=tmp_path / "run",
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "max_async_level": 1,
+            "examples_per_step": 2,
+            "envs": [
+                {"id": "math"},
+                {"id": "code", "data_path": missing_path, "group_size": 3},
+            ],
+        },
+    )
+
+    report = build_preflight_report(config)
+
+    data_checks = {
+        check["name"]: check
+        for check in report["checks"]
+        if "data_path_env" in check["name"]
+    }
+    assert data_checks["data_path_env_0_0"]["status"] == "ok"
+    assert data_checks["data_path_env_0_0"]["details"]["environment"] == "math"
+    assert data_checks["data_path_env_1_0"]["status"] == "error"
+    rollout_check = next(
+        check for check in report["checks"] if check["name"] == "rollout_chunks"
+    )
+    assert rollout_check["details"]["environments"] == [
+        {
+            "name": "math",
+            "ratio": 1.0,
+            "rollouts_per_group": 1,
+            "algorithm": "reward",
+        },
+        {
+            "name": "code",
+            "ratio": 1.0,
+            "rollouts_per_group": 3,
+            "algorithm": "reward",
+        },
+    ]
+
+
+def test_preflight_loads_environment_specific_custom_algorithm(tmp_path) -> None:
+    data_path = _write_local_data(tmp_path)
+    config = RLConfig(
+        algo={"type": "reward"},
+        data={"source": "local", "path": data_path},
+        output_dir=tmp_path / "run",
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "max_async_level": 1,
+            "examples_per_step": 2,
+            "envs": [
+                {"id": "math"},
+                {
+                    "id": "code",
+                    "algo": {
+                        "type": "custom",
+                        "file": CUSTOM_ALGORITHM_FILE,
+                        "algorithm": "reward_plus_one",
+                        "scope": "group",
+                    },
+                },
+            ],
+        },
+    )
+
+    report = build_preflight_report(config)
+    check = next(item for item in report["checks"] if item["name"] == "algorithm_env_1")
+
+    assert check["status"] == "ok"
+    assert "reward_plus_one" in check["message"]
+
+
 def test_preflight_reports_effective_rollout_batch_shape(tmp_path) -> None:
     config = RLConfig(
         data={"source": "local", "path": _write_local_data(tmp_path)},

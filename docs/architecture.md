@@ -93,6 +93,15 @@ For persistent Verifiers scheduling, `orchestrator.token_batch_size` replaces
 the fixed group count with a minimum serialized-token target and one dynamic
 chunk per optimizer step. Complete scored groups remain atomic, so the batch can
 overshoot the target.
+Persistent process-mode scheduling can also own multiple weighted training
+environments. Selection is deterministic from the global source-selection
+cursor, while records, epoch shuffles, sampling arguments, group sizes, and
+algorithm scoring remain environment-local. Completed records retain their
+environment name and absolute source cursor. The queue manifest records the
+batch's exact source cursors plus cumulative next-record and selection cursors;
+the latter is the restart boundary even when older consumed queue items have
+been cleaned up. A resumed multi-environment run therefore requires its
+immediately preceding queue manifest to remain available.
 
 ## Inference Scheduling
 
@@ -110,7 +119,8 @@ explicit source/publish-mode boundary:
 - Native chunk scheduling permits chunks to finish out of order while tracking
   the contiguous published frontier.
 - Rolling verifier scheduling keeps verifier groups in flight and bounds their
-  off-policy age.
+  off-policy age; its weighted environment runtimes keep independent data and
+  scoring state.
 
 Each scheduler keeps submitted, pending, completed, published, and policy-load
 state explicit. Scheduling code should preserve those states and update the run

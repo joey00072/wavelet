@@ -256,6 +256,41 @@ be persisted without skipping speculative in-flight work.
 Finite verifier training datasets are traversed once per epoch instead of
 sampled with replacement. `data.shuffle: true` uses a deterministic permutation
 for each epoch; sampler cursor and epoch are included in generation metrics.
+Process-mode asynchronous Verifiers runs can mix multiple training environments
+by replacing the legacy `verifier_env_id` with weighted `envs`:
+
+```yaml
+orchestrator:
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  max_async_level: 1
+  examples_per_step: 16
+  rollouts_per_example: 4
+  envs:
+    - id: math-env
+      name: math
+      ratio: 3
+      data_path: outputs/mixed_data/math.jsonl
+    - id: primeintellect/alphabet-sort
+      name: alphabet
+      ratio: 1
+      data_path: outputs/mixed_data/alphabet.jsonl
+      group_size: 8
+      sampling:
+        temperature: 0.8
+      algo:
+        type: grpo
+```
+
+An environment inherits the top-level dataset, sampling, group size, and
+algorithm when it omits an override. Ratios weight group selection; every
+environment keeps its own deterministic dataset cursor and epoch. Algorithms
+may differ when they feed the same trainer loss component. Environment names
+must be unique because they key metrics and resume state. For fixed-group
+batches, queue manifests store both the exact source cursors represented by a
+batch and the cumulative
+per-environment cursor snapshot, so checkpoint resume only needs the immediately
+preceding retained manifest. Preflight checks each effective local dataset and
+reports every ratio, group size, and algorithm.
 Synchronous and native rollout paths apply the same full-group-count invariant;
 a single surviving group cannot silently stand in for a requested batch, and
 native groups must contain exactly the configured rollout count.

@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from wavelet.configs.config import CustomAlgorithmConfig, RLConfig
+from wavelet.configs.config import CustomAlgorithmConfig, RLAlgorithmConfig, RLConfig
 from wavelet.data.rl import RLExample, load_rl_records
 from wavelet.orchestrator.algorithms import build_algorithm
 from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
@@ -1390,6 +1390,10 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
             "enabled": config.orchestrator.enabled,
             "custom_rollout_function": config.orchestrator.custom_rollout_function,
             "verifier_env_id": config.orchestrator.verifier_env_id,
+            "envs": [
+                env.model_dump(mode="json", exclude_none=True)
+                for env in config.orchestrator.envs
+            ],
             "verifier_model": config.orchestrator.verifier_model,
             "verifier_client_type": config.orchestrator.verifier_client_type,
             "filter_zero_advantage": config.orchestrator.filter_zero_advantage,
@@ -1581,6 +1585,10 @@ def _summary(config: RLConfig) -> dict[str, Any]:
         "trainer_attention": config.model.attn_implementation,
         "policy_transfer": config.policy_transfer.type,
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
+        "training_envs": [
+            env.model_dump(mode="json", exclude_none=True)
+            for env in config.orchestrator.envs
+        ],
         "target_steps": target_steps(config),
         "low_precision": _low_precision_summary(config),
     }
@@ -1704,6 +1712,48 @@ def _adapter_path_checks(config: RLConfig) -> list[PreflightCheck]:
 
 
 def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:
+    if config.orchestrator.envs:
+        checks: list[PreflightCheck] = []
+        for env_index, env in enumerate(config.orchestrator.envs):
+            if env.data_path is not None:
+                env_paths = [env.data_path]
+            elif config.data.source == "local":
+                env_paths = (
+                    config.data.path
+                    if isinstance(config.data.path, list)
+                    else [config.data.path]
+                )
+            else:
+                checks.append(
+                    PreflightCheck(
+                        name=f"data_source_env_{env_index}",
+                        status="ok",
+                        message=(
+                            f"Training environment {env.resolved_name!r} uses "
+                            f"data.source={config.data.source!r}, which does not "
+                            "require a local path preflight."
+                        ),
+                        details={"environment": env.resolved_name},
+                    )
+                )
+                continue
+            for path_index, path in enumerate(env_paths):
+                exists = Path(path).exists()
+                checks.append(
+                    PreflightCheck(
+                        name=f"data_path_env_{env_index}_{path_index}",
+                        status="ok" if exists else "error",
+                        message=(
+                            f"Local data path for {env.resolved_name!r} "
+                            f"{'exists' if exists else 'does not exist'}: {path}"
+                        ),
+                        details={
+                            "environment": env.resolved_name,
+                            "path": str(path),
+                        },
+                    )
+                )
+        return checks
     if config.data.source != "local":
         return [
             PreflightCheck(
@@ -1980,6 +2030,33 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
     if config.orchestrator.examples_per_step is not None:
         examples = config.orchestrator.examples_per_step
         rollouts = config.orchestrator.rollouts_per_example or 1
+        if config.orchestrator.envs:
+            environments = [
+                {
+                    "name": env.resolved_name,
+                    "ratio": env.ratio,
+                    "rollouts_per_group": env.group_size or rollouts,
+                    "algorithm": (env.algo or config.algo).type,
+                }
+                for env in config.orchestrator.envs
+            ]
+            checks.append(
+                PreflightCheck(
+                    name="rollout_chunks",
+                    status="ok",
+                    message=(
+                        f"Resolved optimizer batch: {examples} weighted group(s) "
+                        f"across {len(environments)} training environment(s) and "
+                        f"{chunks_per_step(config)} chunk(s)."
+                    ),
+                    details={
+                        "groups": examples,
+                        "chunks": chunks_per_step(config),
+                        "environments": environments,
+                    },
+                )
+            )
+            return checks
         checks.append(
             PreflightCheck(
                 name="rollout_chunks",
@@ -2017,36 +2094,44 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
 
 
 def _algorithm_checks(config: RLConfig) -> list[PreflightCheck]:
-    if not isinstance(config.algo, CustomAlgorithmConfig):
-        return [
-            PreflightCheck(
-                "algorithm",
-                "ok",
-                f"Built-in algorithm is available: {config.algo.type}",
-            )
-        ]
+    algorithms = [("algorithm", config.algo)]
+    algorithms.extend(
+        (f"algorithm_env_{index}", env.algo)
+        for index, env in enumerate(config.orchestrator.envs)
+        if env.algo is not None and env.algo != config.algo
+    )
+    return [_algorithm_check(name, algorithm) for name, algorithm in algorithms]
+
+
+def _algorithm_check(
+    name: str,
+    algorithm: RLAlgorithmConfig,
+) -> PreflightCheck:
+    if not isinstance(algorithm, CustomAlgorithmConfig):
+        return PreflightCheck(
+            name,
+            "ok",
+            f"Built-in algorithm is available: {algorithm.type}",
+        )
     try:
-        build_algorithm(config.algo)
+        build_algorithm(algorithm)
     except (ImportError, OSError, SyntaxError, TypeError, ValueError) as exc:
         status: CheckStatus = "error"
         message = (
-            f"Could not load custom algorithm {config.algo.algorithm!r} "
-            f"from {str(config.algo.file)!r}: {type(exc).__name__}: {exc}"
+            f"Could not load custom algorithm {algorithm.algorithm!r} "
+            f"from {str(algorithm.file)!r}: {type(exc).__name__}: {exc}"
         )
     else:
         status = "ok"
         message = (
-            f"Custom algorithm is loadable: {config.algo.algorithm} "
-            f"from {config.algo.file}"
+            f"Custom algorithm is loadable: {algorithm.algorithm} from {algorithm.file}"
         )
-    return [
-        PreflightCheck(
-            "algorithm",
-            status,
-            message,
-            _custom_algorithm_details(config.algo),
-        )
-    ]
+    return PreflightCheck(
+        name,
+        status,
+        message,
+        _custom_algorithm_details(algorithm),
+    )
 
 
 def _custom_algorithm_details(config: CustomAlgorithmConfig) -> dict[str, Any]:

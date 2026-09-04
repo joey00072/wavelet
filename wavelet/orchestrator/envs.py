@@ -1110,12 +1110,15 @@ def _has_trainable_rollout_record(records: list[RLExample]) -> bool:
 def _mark_zero_advantage_records_metric_only(
     records: list[RLExample],
     config,
+    *,
+    algorithm_config: RLAlgorithmConfig | None = None,
 ) -> list[RLExample]:
     if not config.orchestrator.filter_zero_advantage:
         return records
-    if not uses_group_advantages(config.algo):
+    algorithm_config = algorithm_config or config.algo
+    if not uses_group_advantages(algorithm_config):
         return records
-    epsilon = algorithm_epsilon(config.algo)
+    epsilon = algorithm_epsilon(algorithm_config)
     marked: list[RLExample] = []
     for record in records:
         if record.advantage is not None and abs(float(record.advantage)) > epsilon:
@@ -1203,8 +1206,13 @@ def _verifier_example(record: RLExample) -> dict[str, Any]:
     }
 
 
-def _sampling_args(config, *, cache_salt: str | None = None) -> dict[str, Any]:
-    sampling = config.inference.sampling
+def _sampling_args(
+    config,
+    *,
+    cache_salt: str | None = None,
+    sampling=None,
+) -> dict[str, Any]:
+    sampling = sampling or config.inference.sampling
     args: dict[str, Any] = {
         "temperature": sampling.temperature if sampling.do_sample else 0.0,
         "top_p": sampling.top_p,
@@ -1290,8 +1298,14 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 sample_index=sample_index,
             ),
         }
+        group_size = output.get("_wavelet_group_size")
+        if isinstance(group_size, int) and not isinstance(group_size, bool):
+            metadata["_wavelet_group_size"] = group_size
         if isinstance(output.get("_wavelet_verifier_example"), dict):
             metadata["verifier_example"] = dict(output["_wavelet_verifier_example"])
+        record_cursor = output.get("_wavelet_record_cursor")
+        if isinstance(record_cursor, int) and not isinstance(record_cursor, bool):
+            metadata["verifier_record_cursor"] = record_cursor
         policy_step = output.get("_wavelet_policy_step")
         if isinstance(policy_step, int) and not isinstance(policy_step, bool):
             metadata["policy_step"] = policy_step
@@ -1351,18 +1365,20 @@ def _opsd_prefix_token_ids(
     record: RLExample,
     config,
     *,
+    algorithm_config: RLAlgorithmConfig | None = None,
     tokenizer: Any | None = None,
 ) -> list[int]:
+    algorithm_config = algorithm_config or config.algo
     metadata = record.metadata or {}
     example = metadata.get("verifier_example")
     demonstration = (
-        example.get(config.algo.demo_key) if isinstance(example, dict) else None
+        example.get(algorithm_config.demo_key) if isinstance(example, dict) else None
     )
     if demonstration is None:
-        demonstration = metadata.get(config.algo.demo_key)
+        demonstration = metadata.get(algorithm_config.demo_key)
     if demonstration is None:
         raise ValueError(
-            f"OPSD requires '{config.algo.demo_key}' in verifier example metadata."
+            f"OPSD requires '{algorithm_config.demo_key}' in verifier example metadata."
         )
     if tokenizer is None:
         from wavelet.trainer.model import setup_tokenizer
@@ -1372,7 +1388,7 @@ def _opsd_prefix_token_ids(
         [
             {
                 "role": "system",
-                "content": config.algo.template.format(
+                "content": algorithm_config.template.format(
                     demonstration=str(demonstration)
                 ),
             }
@@ -1388,13 +1404,15 @@ def annotate_distillation_records(
     config,
     *,
     policy_model_name: str | None = None,
+    algorithm_config: RLAlgorithmConfig | None = None,
 ) -> list[RLExample]:
     """Attach teacher scores required by OPD/OPSD loss routing."""
-    component = algorithm_loss_component(config.algo)
+    algorithm_config = algorithm_config or config.algo
+    component = algorithm_loss_component(algorithm_config)
     if component != "ref_kl" or not records:
         return records
 
-    is_opsd = config.algo.type == "opsd"
+    is_opsd = algorithm_config.type == "opsd"
     if is_opsd:
         base_urls = _verifier_base_urls(config)
         model = policy_model_name or _verifier_model(config)
@@ -1425,7 +1443,12 @@ def annotate_distillation_records(
 
         opsd_tokenizer = setup_tokenizer(config.model)
     prefixes = [
-        _opsd_prefix_token_ids(record, config, tokenizer=opsd_tokenizer)
+        _opsd_prefix_token_ids(
+            record,
+            config,
+            algorithm_config=algorithm_config,
+            tokenizer=opsd_tokenizer,
+        )
         if is_opsd
         else []
         for record in records

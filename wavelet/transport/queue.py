@@ -79,6 +79,9 @@ class RolloutManifest:
     created_at: str
     payload_bytes: int | None = None
     transfer_seconds: float | None = None
+    environment_record_cursors: dict[str, list[int]] | None = None
+    environment_next_record_cursors: dict[str, int] | None = None
+    environment_selection_cursor: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,6 +627,9 @@ class FileSystemRolloutSender:
         policy_step: int | None = None,
         rows: int | None = None,
         tokens: int | None = None,
+        environment_record_cursors: dict[str, list[int]] | None = None,
+        environment_next_record_cursors: dict[str, int] | None = None,
+        environment_selection_cursor: int | None = None,
         reward_mean: float | None = None,
         producer_id: str | None = None,
         events_dir: Path | None = None,
@@ -648,6 +654,9 @@ class FileSystemRolloutSender:
                 policy_step,
                 rows,
                 tokens,
+                environment_record_cursors,
+                environment_next_record_cursors,
+                environment_selection_cursor,
                 reward_mean,
                 producer_id,
                 events_dir,
@@ -664,6 +673,9 @@ class FileSystemRolloutSender:
                 policy_step=policy_step,
                 rows=rows,
                 tokens=tokens,
+                environment_record_cursors=environment_record_cursors,
+                environment_next_record_cursors=environment_next_record_cursors,
+                environment_selection_cursor=environment_selection_cursor,
                 reward_mean=reward_mean,
                 producer_id=producer_id,
                 created_at=created_at,

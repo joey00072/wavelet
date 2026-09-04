@@ -11,8 +11,13 @@ from unittest.mock import Mock
 import pytest
 
 import wavelet.orchestrator.envs as verifier_envs
-from wavelet.configs.rl_config import GRPOAlgorithmConfig, RLConfig
+from wavelet.configs.rl_config import (
+    GRPOAlgorithmConfig,
+    RewardAlgorithmConfig,
+    RLConfig,
+)
 from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
+from wavelet.orchestrator.queue import FileSystemRolloutSender
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.verifiers import (
     VerifierRolloutScheduler,
@@ -22,6 +27,8 @@ from wavelet.orchestrator.verifiers import (
     _load_cached_env,
     _PendingVerifierRequest,
     _records_from_output,
+    _resume_environment_cursor_state,
+    _rollout_environment_record_cursors,
     _rollout_records_policy_step,
     _run_all,
     _run_group,
@@ -29,6 +36,7 @@ from wavelet.orchestrator.verifiers import (
     _successful_rollout_outputs,
     _verifier_extra_env_kwargs,
     _VerifierBatchStats,
+    _VerifierEnvRuntime,
     _VerifierFailureStats,
     _VerifierGroupState,
 )
@@ -46,6 +54,32 @@ def _trainable_trajectory() -> list[dict[str, Any]]:
             }
         }
     ]
+
+
+def _mixed_environment_config() -> RLConfig:
+    return RLConfig(
+        algo={"type": "reward"},
+        data={"shuffle": False},
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "examples_per_step": 2,
+            "rollouts_per_example": 1,
+            "max_async_level": 1,
+            "filter_zero_advantage": False,
+            "envs": [
+                {"id": "math", "ratio": 1.0},
+                {
+                    "id": "code",
+                    "ratio": 3.0,
+                    "group_size": 2,
+                    "algo": {"type": "grpo"},
+                },
+            ],
+        },
+    )
 
 
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
@@ -1923,3 +1957,290 @@ def test_policy_update_gate_blocks_new_rollout_submission() -> None:
     scheduler.finish_policy_update()
 
     assert scheduler.policy_update_in_progress is False
+
+
+def _environment_runtime(
+    config: RLConfig,
+    index: int,
+    records: list[RLExample],
+) -> _VerifierEnvRuntime:
+    env_config = config.orchestrator.envs[index]
+    return _VerifierEnvRuntime(
+        config=env_config,
+        env=object(),
+        env_name=env_config.resolved_name,
+        records=records,
+        sampling=config.resolved_train_sampling(env_config),
+        algorithm_config=env_config.algo or config.algo,
+        rollout_count=(
+            env_config.group_size or config.orchestrator.rollouts_per_example or 1
+        ),
+        requires_group_scoring=False,
+    )
+
+
+def _source_record(prompt: str) -> RLExample:
+    return RLExample(
+        prompt=[{"role": "user", "content": prompt}],
+        completion=[],
+        advantage=None,
+        reward=None,
+    )
+
+
+def test_verifier_scheduler_loads_each_environment_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    base = _mixed_environment_config()
+    envs = [
+        env.model_copy(update={"data_path": tmp_path / f"{env.resolved_name}.jsonl"})
+        for env in base.orchestrator.envs
+    ]
+    config = base.model_copy(
+        update={
+            "data": base.data.model_copy(update={"path": tmp_path / "shared.jsonl"}),
+            "orchestrator": base.orchestrator.model_copy(update={"envs": envs}),
+        }
+    )
+    loaded_envs: list[tuple[str, dict[str, Any]]] = []
+
+    def load_env(_vf, env_id, env_args, _extra):
+        loaded_envs.append((env_id, env_args))
+        env = type("Env", (), {"requires_group_scoring": env_id == "code"})()
+        return env, False
+
+    def load_records(data_config):
+        return [_source_record(Path(data_config.path).stem)]
+
+    monkeypatch.setattr(
+        "wavelet.orchestrator.scheduler._load_verifiers", lambda _: object()
+    )
+    monkeypatch.setattr("wavelet.orchestrator.scheduler._load_cached_env", load_env)
+    monkeypatch.setattr("wavelet.orchestrator.scheduler.load_rl_records", load_records)
+    monkeypatch.setattr(
+        "wavelet.orchestrator.scheduler._verifier_clients",
+        lambda _vf, _config: [object()],
+    )
+
+    scheduler = VerifierRolloutScheduler(
+        RLOrchestrator(config),
+        start_environment_record_cursors={"math": 3, "code": 5},
+        start_environment_selection_cursor=8,
+    )
+
+    assert loaded_envs == [("math", {}), ("code", {})]
+    assert [
+        runtime.records[0].prompt[0]["content"] for runtime in scheduler.env_runtimes
+    ] == ["math", "code"]
+    assert [runtime.record_cursor for runtime in scheduler.env_runtimes] == [3, 5]
+    assert [runtime.rollout_count for runtime in scheduler.env_runtimes] == [1, 2]
+    assert [runtime.requires_group_scoring for runtime in scheduler.env_runtimes] == [
+        False,
+        True,
+    ]
+    assert scheduler.env_selection_cursor == 8
+
+
+def test_verifier_scheduler_selects_weighted_environments_with_independent_cursors() -> (
+    None
+):
+    config = _mixed_environment_config()
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.env_selection_cursor = 0
+    scheduler.record_cursor = 0
+    scheduler.env_runtimes = [
+        _environment_runtime(
+            config,
+            0,
+            [_source_record("math-0"), _source_record("math-1")],
+        ),
+        _environment_runtime(
+            config,
+            1,
+            [_source_record("code-0"), _source_record("code-1")],
+        ),
+    ]
+
+    selected = [scheduler._next_environment_record()[0].env_name for _ in range(400)]
+
+    assert 70 <= selected.count("math") <= 130
+    assert 270 <= selected.count("code") <= 330
+    assert sum(runtime.record_cursor for runtime in scheduler.env_runtimes) == 400
+
+
+def test_verifier_scheduler_tracks_absolute_environment_cursors_across_epochs() -> None:
+    config = _mixed_environment_config()
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    runtime = _environment_runtime(
+        config,
+        0,
+        [_source_record("a"), _source_record("b")],
+    )
+    runtime.record_cursor = 1
+
+    first_cursor, first = scheduler._next_runtime_record(runtime)
+    second_cursor, second = scheduler._next_runtime_record(runtime)
+
+    assert (first_cursor, first.prompt[0]["content"]) == (1, "b")
+    assert (second_cursor, second.prompt[0]["content"]) == (2, "a")
+
+
+def test_verifier_scheduler_applies_group_size_and_algorithm_per_environment() -> None:
+    config = _mixed_environment_config()
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.orchestrator = RLOrchestrator(config)
+    scheduler.rollout_count = 2
+    scheduler.requires_group_scoring = False
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler.groups = {}
+    scheduler.ready_groups = []
+    scheduler.ready_group_off_policy_steps = []
+
+    def output(reward: float) -> dict[str, Any]:
+        return {
+            "reward": reward,
+            "error": None,
+            "sampling_args": {"temperature": 1.0},
+            "trajectory": _trainable_trajectory(),
+        }
+
+    async def run() -> list[RLExample]:
+        loop = asyncio.get_running_loop()
+        reward_task = loop.create_future()
+        reward_task.set_result([output(2.0)])
+        grpo_task = loop.create_future()
+        grpo_task.set_result([output(0.0), output(2.0)])
+        scheduler.pending[reward_task] = _PendingVerifierRequest(
+            group_id=0,
+            client_index=0,
+            rollout_count=1,
+        )
+        scheduler.pending[grpo_task] = _PendingVerifierRequest(
+            group_id=1,
+            client_index=0,
+            rollout_count=2,
+        )
+        scheduler.groups[0] = _VerifierGroupState(
+            example={"example_id": "math"},
+            rollouts_to_schedule=0,
+            env_name="math",
+            rollout_count=1,
+            algorithm_config=RewardAlgorithmConfig(),
+            record_cursor=5,
+        )
+        scheduler.groups[1] = _VerifierGroupState(
+            example={"example_id": "code"},
+            rollouts_to_schedule=0,
+            env_name="code",
+            rollout_count=2,
+            algorithm_config=GRPOAlgorithmConfig(),
+            record_cursor=7,
+        )
+        outputs: list[dict[str, Any]] = []
+        accepted, _, _ = scheduler._consume_completed_task(
+            reward_task,
+            target_groups=2,
+            outputs=outputs,
+            accepted_groups=0,
+        )
+        scheduler._consume_completed_task(
+            grpo_task,
+            target_groups=2,
+            outputs=outputs,
+            accepted_groups=accepted,
+        )
+        return [
+            record
+            for completed_output in outputs
+            for record in _records_from_output(completed_output)
+        ]
+
+    records = asyncio.run(run())
+
+    assert [record.source for record in records] == ["math", "code", "code"]
+    assert [record.advantage for record in records] == [2.0, -1.0, 1.0]
+    assert [record.metadata["_wavelet_group_size"] for record in records] == [1, 2, 2]
+    assert [record.metadata["verifier_record_cursor"] for record in records] == [
+        5,
+        7,
+        7,
+    ]
+
+
+def test_environment_record_cursors_round_trip_through_queue_manifests(
+    tmp_path: Path,
+) -> None:
+    config = _mixed_environment_config().model_copy(update={"output_dir": tmp_path})
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    source = tmp_path / "records.jsonl"
+    source.write_text("{}\n", encoding="utf-8")
+    sender.publish(
+        source,
+        step=0,
+        optimizer_step=0,
+        environment_record_cursors={"code": [1, 3], "math": [0]},
+        environment_next_record_cursors={"code": 4, "math": 1},
+        environment_selection_cursor=5,
+    )
+    sender.publish(
+        source,
+        step=1,
+        optimizer_step=0,
+        environment_record_cursors={"math": [2]},
+        environment_next_record_cursors={"code": 4, "math": 3},
+        environment_selection_cursor=7,
+    )
+
+    cursors, selection_cursor = _resume_environment_cursor_state(
+        config,
+        before_queue_step=2,
+    )
+
+    assert cursors == {"code": 4, "math": 3}
+    assert selection_cursor == 7
+
+
+def test_environment_cursor_resume_requires_preceding_manifest(tmp_path: Path) -> None:
+    config = _mixed_environment_config().model_copy(update={"output_dir": tmp_path})
+
+    with pytest.raises(ValueError, match="queue step 0 is unavailable"):
+        _resume_environment_cursor_state(config, before_queue_step=1)
+
+
+def test_rollout_environment_record_cursors_deduplicate_trajectory_rows() -> None:
+    records = [
+        RLExample(
+            prompt=[],
+            completion=[],
+            advantage=1.0,
+            reward=1.0,
+            source="math",
+            metadata={"verifier_record_cursor": 4},
+        ),
+        RLExample(
+            prompt=[],
+            completion=[],
+            advantage=1.0,
+            reward=1.0,
+            source="math",
+            metadata={"verifier_record_cursor": 4},
+        ),
+        RLExample(
+            prompt=[],
+            completion=[],
+            advantage=1.0,
+            reward=1.0,
+            source="code",
+            metadata={"verifier_record_cursor": 9},
+        ),
+    ]
+
+    assert _rollout_environment_record_cursors(records) == {
+        "code": [9],
+        "math": [4],
+    }

@@ -61,6 +61,25 @@ uv run python examples/prepare_verifier_rl_data.py \
   --env-arg dataset_subset=default
 ```
 
+For a mixed-environment run, invoke the helper once per environment and set each
+result as that environment's `data_path`. The scheduler owns the weighted mix;
+do not concatenate datasets merely to approximate ratios. For example:
+
+```bash
+uv run python examples/prepare_verifier_rl_data.py \
+  --env-id math-env \
+  --output outputs/mixed_data/math.jsonl \
+  --examples 512
+uv run python examples/prepare_verifier_rl_data.py \
+  --env-id primeintellect/alphabet-sort \
+  --output outputs/mixed_data/alphabet.jsonl \
+  --examples 512
+```
+
+Configure those files under `orchestrator.envs`; see the mixed-environment YAML
+in the repository README for ratios, sampling, group-size, and algorithm
+overrides.
+
 Some verifier packages are Python 3.12-only. Use `uv run --python 3.12
 --extra envs ...` for the examples that require `wiki-search`, `code-env`,
 `logic-env`, `mini-swe-agent-plus`, or `deepdive`.

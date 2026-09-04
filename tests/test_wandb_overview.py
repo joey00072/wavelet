@@ -23,6 +23,30 @@ def test_overview_inputs_extract_rl_environment_names() -> None:
     assert eval_envs == ["aime2025", "held-out-math"]
 
 
+def test_overview_inputs_extract_multiple_training_environments() -> None:
+    flavor, train_envs, eval_envs = overview.overview_inputs(
+        {
+            "orchestrator": {
+                "envs": [
+                    {"id": "math@1.0.0"},
+                    {"id": "code@2.0.0", "name": "swe"},
+                ]
+            }
+        }
+    )
+
+    assert flavor == "rl"
+    assert train_envs == ["math", "swe"]
+    assert eval_envs == []
+
+    sections = overview.build_sections(
+        flavor=flavor,
+        train_envs=train_envs,
+        eval_envs=eval_envs,
+    )
+    assert sections[0].panels[-1].metric_regex == r"train/(math|swe)/.*"
+
+
 def test_build_sections_uses_wavelet_metrics_and_eval_names() -> None:
     sections = overview.build_sections(
         flavor="rl",

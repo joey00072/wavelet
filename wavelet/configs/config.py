@@ -1117,11 +1117,29 @@ class RLAdaptiveConcurrencyConfig(ConfigModel):
         return self
 
 
+class RLTrainEnvConfig(ConfigModel):
+    """One weighted verifier training environment."""
+
+    id: str = Field(min_length=1)
+    name: str | None = None
+    args: dict[str, Any] = Field(default_factory=dict)
+    ratio: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    data_path: Path | None = None
+    sampling: RLSamplingConfig | None = None
+    group_size: int | None = Field(default=None, ge=1)
+    algo: RLAlgorithmConfig | None = None
+
+    @property
+    def resolved_name(self) -> str:
+        return self.name or self.id.split("@", 1)[0]
+
+
 class RLOrchestratorConfig(ConfigModel):
     enabled: bool = True
     custom_rollout_function: str | None = None
     verifier_env_id: str | None = None
     verifier_env_args: dict[str, Any] = Field(default_factory=dict)
+    envs: list[RLTrainEnvConfig] = Field(default_factory=list)
     verifier_model: str | None = None
     verifier_base_url: str | list[str] | None = None
     verifier_api_key_var: str = "PRIME_API_KEY"
@@ -1160,6 +1178,26 @@ class RLOrchestratorConfig(ConfigModel):
             raise ValueError(
                 "Set only one of orchestrator.examples_per_step and "
                 "orchestrator.token_batch_size."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_training_envs(self) -> "RLOrchestratorConfig":
+        if self.envs and self.verifier_env_id is not None:
+            raise ValueError(
+                "Set orchestrator.envs or legacy orchestrator.verifier_env_id, "
+                "not both."
+            )
+        if self.envs and self.verifier_env_args:
+            raise ValueError(
+                "orchestrator.verifier_env_args cannot be combined with "
+                "orchestrator.envs; put args on each environment."
+            )
+        names = [env.resolved_name for env in self.envs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(
+                f"Duplicate training environment names: {', '.join(duplicates)}."
             )
         return self
 
@@ -1356,12 +1394,91 @@ class RLConfig(TrainerConfig):
     )
     max_steps: int | None = Field(default=None, ge=0)
 
+    def resolved_train_sampling(
+        self,
+        env: RLTrainEnvConfig | None = None,
+    ) -> RLSamplingConfig:
+        if env is None or env.sampling is None:
+            return self.inference.sampling
+        values = self.inference.sampling.model_dump()
+        values.update(env.sampling.model_dump(exclude_unset=True))
+        return RLSamplingConfig.model_validate(values)
+
+    def train_sampling_configs(self) -> list[tuple[str, RLSamplingConfig]]:
+        if not self.orchestrator.envs:
+            return [("train", self.inference.sampling)]
+        return [
+            (env.resolved_name, self.resolved_train_sampling(env))
+            for env in self.orchestrator.envs
+        ]
+
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_algorithm_config(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
         return _normalize_algorithm_config(value)
+
+    @model_validator(mode="after")
+    def validate_environment_algorithms(self) -> "RLConfig":
+        def loss_component(algorithm: RLAlgorithmConfig) -> str:
+            if isinstance(algorithm, SFTDistillAlgorithmConfig):
+                return "ce"
+            if isinstance(algorithm, (OPDAlgorithmConfig, OPSDAlgorithmConfig)):
+                return "ref_kl"
+            return "rl"
+
+        top_component = loss_component(self.algo)
+        incompatible = [
+            env.resolved_name
+            for env in self.orchestrator.envs
+            if env.algo is not None and loss_component(env.algo) != top_component
+        ]
+        if incompatible:
+            raise ValueError(
+                "Per-environment algorithms must use the same trainer loss "
+                f"component as algo.type='{self.algo.type}': "
+                f"{', '.join(incompatible)}."
+            )
+        if top_component != "rl":
+            different_distillation = [
+                env.resolved_name
+                for env in self.orchestrator.envs
+                if env.algo is not None and env.algo.type != self.algo.type
+            ]
+            if different_distillation:
+                raise ValueError(
+                    "Distillation environments must use the top-level algorithm "
+                    f"type '{self.algo.type}': {', '.join(different_distillation)}."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def validate_multiple_training_environments(self) -> "RLConfig":
+        if not self.orchestrator.envs:
+            return self
+        if self.orchestrator.custom_rollout_function != (
+            "wavelet.orchestrator.verifiers:generate_rollouts"
+        ):
+            raise ValueError("orchestrator.envs requires the Verifiers rollout source.")
+        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+            raise ValueError(
+                "orchestrator.envs requires launcher.mode='process' and "
+                "orchestrator.max_async_level>=1."
+            )
+        maximum_group_size = max(
+            env.group_size or self.orchestrator.rollouts_per_example or 1
+            for env in self.orchestrator.envs
+        )
+        if (
+            self.orchestrator.max_inflight_rollouts is not None
+            and self.orchestrator.max_inflight_rollouts < maximum_group_size
+        ):
+            raise ValueError(
+                "orchestrator.max_inflight_rollouts must cover the largest "
+                f"environment group_size={maximum_group_size}."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_distillation_teacher(self) -> "RLConfig":
@@ -1385,9 +1502,14 @@ class RLConfig(TrainerConfig):
             raise ValueError(
                 f"algo.type='{self.algo.type}' requires the Verifiers rollout source."
             )
-        if is_distillation and self.orchestrator.verifier_env_id is None:
+        if (
+            is_distillation
+            and self.orchestrator.verifier_env_id is None
+            and not self.orchestrator.envs
+        ):
             raise ValueError(
-                f"algo.type='{self.algo.type}' requires orchestrator.verifier_env_id."
+                f"algo.type='{self.algo.type}' requires orchestrator.envs or "
+                "orchestrator.verifier_env_id."
             )
         return self
 
@@ -1437,7 +1559,13 @@ class RLConfig(TrainerConfig):
                 "orchestrator.concurrency requires launcher.mode='process' and "
                 "orchestrator.max_async_level>=1."
             )
-        rollout_count = self.orchestrator.rollouts_per_example or 1
+        rollout_count = max(
+            [self.orchestrator.rollouts_per_example or 1]
+            + [
+                env.group_size or self.orchestrator.rollouts_per_example or 1
+                for env in self.orchestrator.envs
+            ]
+        )
         limits = {
             "min_inflight": concurrency.min_inflight,
             "initial_inflight": concurrency.initial_inflight,
@@ -1495,18 +1623,6 @@ class RLConfig(TrainerConfig):
         ):
             return self
 
-        sampling = self.inference.sampling
-        unsupported: list[str] = []
-        if sampling.top_p < 1.0:
-            unsupported.append("top_p")
-        if sampling.top_k > 0:
-            unsupported.append("top_k")
-        if sampling.min_p > 0.0:
-            unsupported.append("min_p")
-        if sampling.min_tokens > 0:
-            unsupported.append("min_tokens")
-        if sampling.repetition_penalty != 1.0:
-            unsupported.append("repetition_penalty")
         distribution_overrides = {
             "frequency_penalty",
             "logit_bias",
@@ -1519,19 +1635,32 @@ class RLConfig(TrainerConfig):
             "top_k",
             "top_p",
         }
-        unsupported.extend(
-            f"extra_body.{field}"
-            for field in sorted(distribution_overrides & sampling.extra_body.keys())
-        )
-        if unsupported:
-            fields = ", ".join(unsupported)
-            raise ValueError(
-                "RL train sampling changes the token distribution with "
-                f"{fields}, but Wavelet does not yet replay those transforms in "
-                "the trainer. Use top_p=1, top_k=-1, min_p=0, min_tokens=0, "
-                "repetition_penalty=1, and keep distribution controls out of "
-                "extra_body for correct importance ratios."
+        for env_name, sampling in self.train_sampling_configs():
+            unsupported: list[str] = []
+            if sampling.top_p < 1.0:
+                unsupported.append("top_p")
+            if sampling.top_k > 0:
+                unsupported.append("top_k")
+            if sampling.min_p > 0.0:
+                unsupported.append("min_p")
+            if sampling.min_tokens > 0:
+                unsupported.append("min_tokens")
+            if sampling.repetition_penalty != 1.0:
+                unsupported.append("repetition_penalty")
+            unsupported.extend(
+                f"extra_body.{field}"
+                for field in sorted(distribution_overrides & sampling.extra_body.keys())
             )
+            if unsupported:
+                fields = ", ".join(unsupported)
+                raise ValueError(
+                    f"RL train sampling for '{env_name}' changes the token "
+                    f"distribution with {fields}, but Wavelet does not yet replay "
+                    "those transforms in the trainer. Use top_p=1, top_k=-1, "
+                    "min_p=0, min_tokens=0, repetition_penalty=1, and keep "
+                    "distribution controls out of extra_body for correct "
+                    "importance ratios."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1540,27 +1669,44 @@ class RLConfig(TrainerConfig):
             not self.orchestrator.enabled
             or not self.inference.enabled
             or self.max_steps == 0
-            or not isinstance(self.algo, (GRPOAlgorithmConfig, MaxRLAlgorithmConfig))
-            or (self.orchestrator.rollouts_per_example or 1) <= 1
         ):
             return self
-
-        sampling = self.inference.sampling
-        deterministic: list[str] = []
-        if not sampling.do_sample:
-            deterministic.append("do_sample=false")
-        if sampling.temperature <= 0:
-            deterministic.append("temperature=0")
-        if sampling.seed is not None:
-            deterministic.append("a fixed sampling seed")
-        if deterministic:
-            settings = ", ".join(deterministic)
-            raise ValueError(
-                "Group-relative RL needs diverse rollouts, but the configured "
-                f"sampling can repeat each completion ({settings}). Use "
-                "do_sample=true, temperature>0, and sampling.seed=null; data.seed "
-                "still provides deterministic task ordering."
+        envs: list[RLTrainEnvConfig | None] = (
+            list(self.orchestrator.envs) if self.orchestrator.envs else [None]
+        )
+        for env in envs:
+            algorithm = self.algo if env is None or env.algo is None else env.algo
+            group_size = (
+                (self.orchestrator.rollouts_per_example or 1)
+                if env is None
+                else (env.group_size or self.orchestrator.rollouts_per_example or 1)
             )
+            if (
+                not isinstance(
+                    algorithm,
+                    (GRPOAlgorithmConfig, MaxRLAlgorithmConfig),
+                )
+                or group_size <= 1
+            ):
+                continue
+            sampling = self.resolved_train_sampling(env)
+            deterministic: list[str] = []
+            if not sampling.do_sample:
+                deterministic.append("do_sample=false")
+            if sampling.temperature <= 0:
+                deterministic.append("temperature=0")
+            if sampling.seed is not None:
+                deterministic.append("a fixed sampling seed")
+            if deterministic:
+                settings = ", ".join(deterministic)
+                env_name = "train" if env is None else env.resolved_name
+                raise ValueError(
+                    f"Group-relative RL for '{env_name}' needs diverse rollouts, "
+                    "but the configured sampling can repeat each completion "
+                    f"({settings}). Use do_sample=true, temperature>0, and "
+                    "sampling.seed=null; data.seed still provides deterministic "
+                    "task ordering."
+                )
         return self
 
     @model_validator(mode="after")
@@ -1572,14 +1718,20 @@ class RLConfig(TrainerConfig):
         ):
             return self
 
-        sampling = self.inference.sampling
-        if sampling.do_sample and sampling.temperature > 0:
-            return self
-        raise ValueError(
-            "Online RL requires stochastic sampling with a positive temperature "
-            "so behavior log-probabilities can be replayed by the trainer. Use "
-            "do_sample=true and temperature>0, or set max_steps=0 for evaluation."
-        )
+        invalid = [
+            env_name
+            for env_name, sampling in self.train_sampling_configs()
+            if not sampling.do_sample or sampling.temperature <= 0
+        ]
+        if invalid:
+            raise ValueError(
+                "Online RL requires stochastic sampling with a positive "
+                "temperature so behavior log-probabilities can be replayed by "
+                f"the trainer; invalid environment(s): {', '.join(invalid)}. Use "
+                "do_sample=true and temperature>0, or set max_steps=0 for "
+                "evaluation."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_export_interval_within_freshness_window(self) -> "RLConfig":

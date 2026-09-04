@@ -1161,6 +1161,7 @@ def _add_environment_metrics(
     *,
     rollouts_per_example: int,
 ) -> None:
+    total_groups = len(_group_by_example(rows))
     for env_name, env_rows in _group_by_env(rows).items():
         grouped = _group_by_example(env_rows)
         metrics[f"batch/{env_name}"] = len(env_rows) / max(len(rows), 1)
@@ -1171,6 +1172,34 @@ def _add_environment_metrics(
             suffix=env_name,
             rollouts_per_example=rollouts_per_example,
         )
+        prefix = f"train/{env_name}"
+        metrics[f"{prefix}/batch_fraction"] = len(env_rows) / max(len(rows), 1)
+        metrics[f"{prefix}/group_fraction"] = len(grouped) / max(total_groups, 1)
+        metrics.update(
+            series_stats(
+                f"{prefix}/reward",
+                _grouped_rollout_means(
+                    grouped,
+                    lambda row: _float_or_none(row.get("reward")),
+                ),
+            )
+        )
+        metrics.update(
+            series_stats(
+                f"{prefix}/advantage",
+                _grouped_rollout_means(
+                    grouped,
+                    lambda row: _float_or_none(row.get("advantage")),
+                ),
+            )
+        )
+        solve_none, solve_all, effective = _solve_rates(
+            grouped,
+            rollouts_per_example,
+        )
+        metrics[f"{prefix}/solve_none"] = solve_none
+        metrics[f"{prefix}/solve_all"] = solve_all
+        metrics[f"{prefix}/effective_batch_size"] = effective
 
 
 def _add_group_metrics(
@@ -1433,18 +1462,31 @@ def _solve_rates(
 ) -> tuple[float, float, float]:
     if not grouped:
         return 0.0, 0.0, 0.0
-    reward_sums = []
+    reward_sums: list[tuple[float, int]] = []
     for rows in grouped.values():
+        configured_group_sizes = {
+            value
+            for row in rows
+            for value in [_metadata(row).get("_wavelet_group_size")]
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        }
+        expected_rollouts = (
+            configured_group_sizes.pop()
+            if len(configured_group_sizes) == 1
+            else rollouts_per_example
+        )
         reward_sums.append(
-            sum(
-                (_float_or_none(row.get("reward")) or 0.0) * max(_sample_count(row), 0)
-                for row in rows
+            (
+                sum(
+                    (_float_or_none(row.get("reward")) or 0.0)
+                    * max(_sample_count(row), 0)
+                    for row in rows
+                ),
+                expected_rollouts,
             )
         )
-    solve_none = sum(value == 0.0 for value in reward_sums) / len(reward_sums)
-    solve_all = sum(value >= rollouts_per_example for value in reward_sums) / len(
-        reward_sums
-    )
+    solve_none = sum(value == 0.0 for value, _ in reward_sums) / len(reward_sums)
+    solve_all = sum(value >= size for value, size in reward_sums) / len(reward_sums)
     return solve_none, solve_all, 1.0 - solve_none - solve_all
 
 

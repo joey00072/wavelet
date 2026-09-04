@@ -441,3 +441,92 @@ def test_checkpoint_and_eval_artifacts_are_bounded_by_default() -> None:
     assert config.ckpt.keep_last == 2
     assert config.eval is not None
     assert config.eval.keep_last_rollout_sets == 2
+
+
+def _multi_environment_config(**orchestrator_overrides) -> RLConfig:
+    orchestrator = {
+        "custom_rollout_function": ("wavelet.orchestrator.verifiers:generate_rollouts"),
+        "examples_per_step": 4,
+        "rollouts_per_example": 2,
+        "max_async_level": 1,
+        "envs": [
+            {"id": "math@1", "ratio": 1.0},
+            {
+                "id": "code@2",
+                "name": "code",
+                "ratio": 3.0,
+                "group_size": 4,
+                "sampling": {"temperature": 0.7},
+                "algo": {"type": "grpo"},
+            },
+        ],
+    }
+    orchestrator.update(orchestrator_overrides)
+    return RLConfig(
+        algo={"type": "reward"},
+        launcher={"mode": "process"},
+        inference={"sampling": {"max_completion_tokens": 128}},
+        orchestrator=orchestrator,
+    )
+
+
+def test_multiple_training_environments_resolve_overrides() -> None:
+    config = _multi_environment_config()
+
+    math, code = config.orchestrator.envs
+    assert math.resolved_name == "math"
+    assert code.resolved_name == "code"
+    assert code.group_size == 4
+    assert code.algo is not None and code.algo.type == "grpo"
+    sampling = config.resolved_train_sampling(code)
+    assert sampling.temperature == pytest.approx(0.7)
+    assert sampling.max_completion_tokens == 128
+
+
+def test_multiple_training_environments_reject_legacy_environment() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        _multi_environment_config(verifier_env_id="legacy")
+
+
+def test_multiple_training_environments_require_unique_names() -> None:
+    with pytest.raises(ValueError, match="Duplicate training environment names"):
+        _multi_environment_config(
+            envs=[{"id": "same@1"}, {"id": "same@2"}],
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"custom_rollout_function": "example:generate"},
+        {"max_async_level": 0},
+    ],
+)
+def test_multiple_training_environments_require_async_verifiers(overrides) -> None:
+    with pytest.raises(ValueError, match="orchestrator.envs requires"):
+        _multi_environment_config(**overrides)
+
+
+def test_multiple_training_environments_bound_largest_group() -> None:
+    with pytest.raises(ValueError, match="largest environment group_size=4"):
+        _multi_environment_config(max_inflight_rollouts=3)
+
+
+def test_multiple_training_environments_validate_effective_sampling() -> None:
+    with pytest.raises(ValueError, match="RL train sampling for 'code'.*top_p"):
+        _multi_environment_config(
+            envs=[
+                {"id": "math"},
+                {"id": "code", "sampling": {"top_p": 0.9}},
+            ]
+        )
+
+
+def test_multiple_training_environments_require_compatible_loss_components() -> None:
+    with pytest.raises(ValueError, match="same trainer loss component"):
+        _multi_environment_config(
+            envs=[
+                {"id": "math"},
+                {"id": "distill", "algo": {"type": "sft"}},
+            ]
+        )

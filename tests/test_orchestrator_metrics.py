@@ -82,7 +82,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
 
     serialized = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
     assert hashlib.sha256(serialized.encode()).hexdigest() == (
-        "ed7453ef43f587296ac12d2e4923c6f8a82d6e58f33278b41368c05cbb909337"
+        "6348ffd3c76fb03f160bf5347d72f8887efbd6f88f87f152fb70d4f7dbb15173"
     )
 
     assert metrics["progress/samples"] == 4
@@ -419,6 +419,49 @@ def test_rollout_metrics_prefer_exact_dispatch_group_identity() -> None:
     assert metrics["progress/problems"] == 2
     assert metrics["solve_none/all"] == pytest.approx(0.5)
     assert metrics["solve_all/all"] == pytest.approx(0.5)
+
+
+def test_rollout_metrics_use_environment_group_sizes() -> None:
+    rows = [
+        {
+            "env_name": "math",
+            "reward": 1.0,
+            "metadata": {
+                "group_key": "math-0",
+                "_wavelet_group_size": 1,
+            },
+        },
+        {
+            "env_name": "code",
+            "reward": 1.0,
+            "metadata": {
+                "group_key": "code-0",
+                "_wavelet_group_size": 2,
+            },
+        },
+        {
+            "env_name": "code",
+            "reward": 1.0,
+            "metadata": {
+                "group_key": "code-0",
+                "_wavelet_group_size": 2,
+            },
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=8, step=1)
+    )
+
+    assert metrics["batch/math"] == pytest.approx(1 / 3)
+    assert metrics["batch/code"] == pytest.approx(2 / 3)
+    assert metrics["solve_all/math"] == 1.0
+    assert metrics["solve_all/code"] == 1.0
+    assert metrics["solve_all/all"] == 1.0
+    assert metrics["train/math/reward/mean"] == 1.0
+    assert metrics["train/code/reward/mean"] == 1.0
+    assert metrics["train/math/batch_fraction"] == pytest.approx(1 / 3)
+    assert metrics["train/math/group_fraction"] == pytest.approx(0.5)
 
 
 def test_rollout_metrics_do_not_count_extra_trajectory_branches_as_rollouts() -> None:

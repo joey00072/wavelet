@@ -99,7 +99,14 @@ def build_sections(
         train = _section("train", metrics=_SFT_TRAIN_METRICS)
     else:
         train_name = f"train/{train_envs[0]}" if len(train_envs) == 1 else "train"
-        train = _section(train_name, metrics=_RL_TRAIN_METRICS)
+        escaped_train_envs = "|".join(re.escape(name) for name in train_envs)
+        train = _section(
+            train_name,
+            metrics=_RL_TRAIN_METRICS,
+            regexes=(
+                (rf"train/({escaped_train_envs})/.*",) if len(train_envs) > 1 else ()
+            ),
+        )
 
     escaped_envs = "|".join(re.escape(name) for name in eval_envs) or ".*"
     evaluation = _section(
@@ -126,6 +133,14 @@ def overview_inputs(
     orchestrator = run_config.get("orchestrator")
     train_envs: list[str] = []
     if isinstance(orchestrator, Mapping):
+        environments = orchestrator.get("envs")
+        if isinstance(environments, list):
+            for environment in environments:
+                if not isinstance(environment, Mapping):
+                    continue
+                name = environment.get("name") or environment.get("id")
+                if isinstance(name, str) and name:
+                    train_envs.append(name.split("@", 1)[0])
         env_id = orchestrator.get("verifier_env_id")
         if isinstance(env_id, str) and env_id:
             train_envs.append(env_id.split("@", 1)[0])
