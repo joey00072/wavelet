@@ -335,6 +335,10 @@ it manages, such as `model`, `port`, `tensor_parallel_size`, `enable_lora`, and
 `inference.vllm.enforce_eager` defaults to `false`, allowing vLLM to use its
 hybrid eager/CUDA-graph execution path. Set it to `true` for deployments whose
 GPU-memory constraints or model behavior require eager-only execution.
+Policy load, pause, and resume calls retry transient connection failures and
+HTTP 5xx responses up to three times with exponential backoff. Control calls
+use a 300-second per-attempt timeout, while policy loads use 720 seconds; a
+successful response acknowledging the wrong policy step fails immediately.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

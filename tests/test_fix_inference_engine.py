@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import io
+import json
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
+
+import pytest
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference import engine as engine_module
 from wavelet.inference.engine import (
+    ADMIN_CONTROL_TIMEOUT_SECONDS,
     NCCL_READY_MARKER,
+    POLICY_LOAD_TIMEOUT_SECONDS,
     HTTPPolicyInferenceEngine,
     VLLMPolicyInferenceEngine,
 )
@@ -48,6 +55,20 @@ class _FakeTokenizer:
         del messages
         self.template_kwargs.append(kwargs)
         return [11, 12, 13]
+
+
+class _HTTPResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
 
 
 def test_inplace_adapter_reload_resets_prefix_cache() -> None:
@@ -123,3 +144,77 @@ def test_nccl_ready_marker_is_written_with_custom_rollout_function(tmp_path) -> 
 
     assert (tmp_path / NCCL_READY_MARKER).exists()
     assert engine.policy_step == 1
+
+
+@pytest.mark.parametrize("failure_kind", ["transport", "server"])
+def test_admin_request_retries_transient_errors_then_succeeds(
+    monkeypatch, tmp_path: Path, failure_kind: str
+) -> None:
+    engine = HTTPPolicyInferenceEngine(RLConfig())
+    attempts: list[float] = []
+    delays: list[float] = []
+
+    def flaky_open(_request: object, *, timeout: float) -> _HTTPResponse:
+        attempts.append(timeout)
+        if len(attempts) < 3:
+            if failure_kind == "transport":
+                raise urllib.error.URLError("server restarting")
+            raise urllib.error.HTTPError(
+                "http://server/load_policy",
+                503,
+                "unavailable",
+                {},
+                io.BytesIO(b"busy"),
+            )
+        return _HTTPResponse({"policy_step": 4})
+
+    monkeypatch.setattr(engine_module.urllib.request, "urlopen", flaky_open)
+    monkeypatch.setattr(engine_module.time, "sleep", delays.append)
+
+    engine.load_policy(tmp_path, step=4)
+
+    assert attempts == [POLICY_LOAD_TIMEOUT_SECONDS] * 3
+    assert delays == [1.0, 2.0]
+    assert engine.policy_step == 4
+
+
+def test_policy_step_mismatch_is_not_retried(monkeypatch, tmp_path: Path) -> None:
+    engine = HTTPPolicyInferenceEngine(RLConfig())
+    attempts = 0
+
+    def wrong_step(_request: object, *, timeout: float) -> _HTTPResponse:
+        nonlocal attempts
+        attempts += 1
+        assert timeout == POLICY_LOAD_TIMEOUT_SECONDS
+        return _HTTPResponse({"policy_step": 3})
+
+    monkeypatch.setattr(engine_module.urllib.request, "urlopen", wrong_step)
+
+    with pytest.raises(RuntimeError, match="wrong policy step"):
+        engine.load_policy(tmp_path, step=4)
+
+    assert attempts == 1
+
+
+def test_admin_operations_use_separate_timeouts(monkeypatch) -> None:
+    config = RLConfig(inference={"http": {"request_timeout_seconds": 17.0}})
+    engine = HTTPPolicyInferenceEngine(config)
+    observed: list[float] = []
+
+    def capture_timeout(_request: object, *, timeout: float) -> _HTTPResponse:
+        observed.append(timeout)
+        return _HTTPResponse({})
+
+    monkeypatch.setattr(engine_module.urllib.request, "urlopen", capture_timeout)
+
+    engine._request("POST", "/pause")
+    engine._request("POST", "/load_policy")
+    engine._request("POST", "/resume")
+    engine._request("POST", "/annotate")
+
+    assert observed == [
+        ADMIN_CONTROL_TIMEOUT_SECONDS,
+        POLICY_LOAD_TIMEOUT_SECONDS,
+        ADMIN_CONTROL_TIMEOUT_SECONDS,
+        17.0,
+    ]

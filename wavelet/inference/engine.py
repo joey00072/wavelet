@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import urllib.error
@@ -19,6 +20,16 @@ from wavelet.data.rl import (
     rl_examples_from_payload,
     rl_examples_to_payload,
 )
+
+logger = logging.getLogger(__name__)
+ADMIN_REQUEST_ATTEMPTS = 3
+ADMIN_RETRY_BACKOFF_SECONDS = 1.0
+ADMIN_CONTROL_TIMEOUT_SECONDS = 300.0
+POLICY_LOAD_TIMEOUT_SECONDS = 720.0
+
+
+class _RetryableHTTPError(RuntimeError):
+    """Transient HTTP response that an idempotent admin call may retry."""
 
 
 def openai_sampling_payload(sampling: RLSamplingConfig) -> dict[str, Any]:
@@ -504,12 +515,17 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         path: str,
         payload: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        request_fn = (
+            self._request_with_retries
+            if path in {"/pause", "/load_policy", "/resume"}
+            else self._request
+        )
         if len(self.base_urls) == 1:
-            return [self._request(method, path, payload, base_url=self.base_url)]
+            return [request_fn(method, path, payload, base_url=self.base_url)]
         with ThreadPoolExecutor(max_workers=len(self.base_urls)) as executor:
             futures = [
                 executor.submit(
-                    self._request,
+                    request_fn,
                     method,
                     path,
                     payload,
@@ -518,6 +534,45 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 for base_url in self.base_urls
             ]
             return [future.result() for future in futures]
+
+    def _request_with_retries(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        base_url: str | None = None,
+    ) -> dict[str, Any]:
+        for attempt in range(1, ADMIN_REQUEST_ATTEMPTS + 1):
+            try:
+                return self._request(
+                    method,
+                    path,
+                    payload,
+                    base_url=base_url,
+                )
+            except (_RetryableHTTPError, OSError) as exc:
+                if attempt == ADMIN_REQUEST_ATTEMPTS:
+                    raise
+                delay = ADMIN_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1)
+                logger.warning(
+                    "Transient vLLM admin error for %s (attempt %s/%s); "
+                    "retrying in %.1fs: %s",
+                    path,
+                    attempt,
+                    ADMIN_REQUEST_ATTEMPTS,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")
+
+    def _request_timeout_seconds(self, path: str) -> float:
+        if path == "/load_policy":
+            return POLICY_LOAD_TIMEOUT_SECONDS
+        if path in {"/pause", "/resume"}:
+            return ADMIN_CONTROL_TIMEOUT_SECONDS
+        return self.config.inference.http.request_timeout_seconds
 
     def _request(
         self,
@@ -541,12 +596,13 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         try:
             with urllib.request.urlopen(
                 request,
-                timeout=self.config.inference.http.request_timeout_seconds,
+                timeout=self._request_timeout_seconds(path),
             ) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
+            error_type = _RetryableHTTPError if exc.code >= 500 else RuntimeError
+            raise error_type(
                 f"vLLM HTTP server returned {exc.code} for {path}: {detail}"
             ) from exc
         if not raw:
