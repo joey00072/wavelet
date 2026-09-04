@@ -291,6 +291,8 @@ Every config model rejects unknown or misspelled keys, so a typo such as
 `optim.mu` fails during config loading instead of becoming an inert setting.
 Supported optimizers are AdamW, Adam, SGD, and the configured 8-bit Adam/
 AdamW variants; Muon is not accepted because Wavelet has no Muon runtime.
+FSDP1 does not expose a configurable `reshard_after_forward` policy, so that
+key is rejected instead of being accepted without affecting the wrapper.
 `rollouts_per_examples` or `learning_rate` is an error rather than a silently
 ignored setting. Several further misconfigurations fail fast instead of
 degrading silently: `ckpt`

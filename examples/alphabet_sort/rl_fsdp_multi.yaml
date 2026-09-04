@@ -83,7 +83,6 @@ fsdp:
   tp: 1
   ep: 1
   cpu_offload: false
-  reshard_after_forward: true
 
 optim:
   type: adamw

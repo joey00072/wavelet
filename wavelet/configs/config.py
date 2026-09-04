@@ -205,7 +205,6 @@ class FSDPConfig(ConfigModel):
     tp: int = Field(default=1, ge=1)
     ep: int = Field(default=1, ge=1)
     cpu_offload: bool = False
-    reshard_after_forward: bool = True
 
 
 class LogConfig(ConfigModel):

@@ -3,6 +3,9 @@
 Wavelet examples cover the local RL, SFT, verifier, and multi-GPU launch paths
 that are expected to run on this host.
 
+The FSDP examples only include settings honored by Wavelet's current FSDP1
+wrapper; FSDP2-only reshard controls are intentionally omitted.
+
 | Example | Status | Notes |
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL. |

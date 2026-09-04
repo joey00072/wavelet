@@ -80,6 +80,11 @@ def test_unimplemented_muon_optimizer_config_is_rejected(
         RLConfig(optim=optim)
 
 
+def test_unimplemented_fsdp_reshard_setting_is_rejected() -> None:
+    with pytest.raises(ValueError, match="reshard_after_forward"):
+        RLConfig(fsdp={"reshard_after_forward": False})
+
+
 def test_process_mode_export_interval_must_fit_freshness_window() -> None:
     orchestrator = {"max_async_level": 2, "max_off_policy_steps": 1}
 

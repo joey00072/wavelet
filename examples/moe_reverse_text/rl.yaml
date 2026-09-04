@@ -108,7 +108,6 @@ fsdp:
   tp: 1
   ep: 1
   cpu_offload: false
-  reshard_after_forward: false
 
 optim:
   type: paged_adamw_8bit
