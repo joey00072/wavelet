@@ -10,7 +10,7 @@ wrapper; FSDP2-only reshard controls are intentionally omitted.
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL. |
 | `equation_builder` | working | Local 3–5 number `+`/`-` environment; 0.6B LoRA plus 7B QLoRA smoke and BF16 LoRA long-run configs with rollout auditing. |
-| `reverse_text` | working | 0.6B LoRA RL with explicit GRPO plus SFT config; includes a 2-GPU INT4 QLoRA 4B experiment. |
+| `reverse_text` | working | 0.6B LoRA RL plus SFT with periodic validation loss; includes a 2-GPU INT4 QLoRA 4B experiment. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
 | `qwen2_5_7b_polaris` | runnable | 7B LoRA GRPO on filtered Polaris with strict tags, diverse group sampling, a zero-step AIME 2024 baseline, and held-out 100-step evals. |

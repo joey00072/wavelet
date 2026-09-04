@@ -46,6 +46,11 @@ Run the SFT warmup:
 uv run python -m wavelet sft @ examples/unsloth_math/sft.yaml
 ```
 
+SFT configs may include a `val` block with independent data settings,
+`eval_on_start`, and an optimizer-step `interval`. Validation runs for one
+finite epoch without gradients and records token-weighted `val/loss`; see
+`examples/reverse_text/sft.yaml` for a configured example.
+
 To continue training an existing LoRA, set `model.adapter_path` to its adapter
 directory. Wavelet uses tokenizer artifacts from that directory when present
 and otherwise falls back to the tokenizer named by `model.name`.

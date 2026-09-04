@@ -14,6 +14,20 @@ data:
   shuffle: true
   seed: 42
 
+val:
+  interval: 25
+  eval_on_start: true
+  data:
+    source: hf
+    hf_name: willcb/R1-reverse-wikipedia-paragraphs-v1-1000
+    hf_splits: [train]
+    max_examples: 64
+    batch_size: 8
+    micro_batch_size: 1
+    seq_len: 4096
+    shuffle: false
+    seed: 42
+
 optim:
   type: adamw
   implementation: fused

@@ -84,6 +84,29 @@ def test_shared_local_iterator_preserves_rank_and_epoch_progress() -> None:
     assert dataset.epoch == 1
 
 
+def test_sft_dataset_can_bound_validation_iteration_to_one_epoch() -> None:
+    tokenizer = build_debug_tokenizer(model_max_length=256)
+    dataset = SFTDataset(
+        records=[
+            Example(
+                prompt=[{"role": "user", "content": f"question {index}"}],
+                completion=[{"role": "assistant", "content": "answer"}],
+            )
+            for index in range(3)
+        ],
+        tokenizer=tokenizer,
+        seq_len=64,
+        loss_mask_config=LossMaskConfig(),
+        max_epochs_per_iteration=1,
+    )
+
+    samples = list(dataset)
+
+    assert len(samples) == 3
+    assert dataset.step == 3
+    assert dataset.epoch == 0
+
+
 def test_cat_dataset_resume_preserves_pending_token_remainder() -> None:
     tokenizer = build_debug_tokenizer(model_max_length=256)
     records = [

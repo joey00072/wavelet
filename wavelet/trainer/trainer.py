@@ -23,7 +23,7 @@ from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from wavelet.configs.sft import SFTConfig
-from wavelet.data.sft import setup_dataloader
+from wavelet.data.sft import Example, load_records, setup_dataloader, setup_dataset
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.distributed import (
     ParallelDims,
@@ -189,11 +189,13 @@ class BaseTrainer:
             disable=not self.world.is_main,
         )
         try:
+            self._before_train_loop()
             while self.step < target_step:
                 for batch in self.dataloader:
                     output = self._train_step(self._prepare_batch(batch))
                     if not output.stepped:
                         continue
+                    self._after_optimizer_step()
                     self._log_train_output(output, progress)
                     self._maybe_checkpoint()
                     progress.update(1)
@@ -210,6 +212,12 @@ class BaseTrainer:
 
     def _train_step(self, batch: dict[str, torch.Tensor]) -> TrainOutput:
         raise NotImplementedError
+
+    def _before_train_loop(self) -> None:
+        pass
+
+    def _after_optimizer_step(self) -> None:
+        pass
 
     def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
         raise NotImplementedError
@@ -694,6 +702,10 @@ class BaseTrainer:
 class SFTTrainer(BaseTrainer):
     def __init__(self, config: SFTConfig) -> None:
         super().__init__(config)
+        self.val_dataset: IterableDataset | None = None
+        self.val_dataloader: StatefulDataLoader | None = None
+        self._val_records: list[Example] | None = None
+        self._validated_steps: set[int] = set()
 
     def _setup_data(self) -> None:
         super()._setup_data()
@@ -706,6 +718,114 @@ class SFTTrainer(BaseTrainer):
             self.config.data,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+        if self.config.val is not None:
+            self._val_records = load_records(self.config.val.data)
+            self.val_dataloader = self._build_validation_dataloader()
+
+    def _build_validation_dataloader(self) -> StatefulDataLoader:
+        if self.config.val is None or self._val_records is None:
+            raise RuntimeError("Validation data is not configured")
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer must be set up before validation data")
+        data_rank, data_world_size = self._data_partition()
+        self.val_dataset = setup_dataset(
+            self.tokenizer,
+            self.config.val.data,
+            data_rank=data_rank,
+            data_world_size=data_world_size,
+            records=self._val_records,
+            max_epochs_per_iteration=1,
+        )
+        return setup_dataloader(
+            self.val_dataset,
+            self.config.val.data,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+
+    def _before_train_loop(self) -> None:
+        self._maybe_run_validation(step=self.step, before_training=True)
+
+    def _after_optimizer_step(self) -> None:
+        self._maybe_run_validation(step=self.step, before_training=False)
+
+    def _maybe_run_validation(self, *, step: int, before_training: bool) -> None:
+        val_config = self.config.val
+        if val_config is None or step in self._validated_steps:
+            return
+        should_run = (before_training and step == 0 and val_config.eval_on_start) or (
+            not before_training and step > 0 and step % val_config.interval == 0
+        )
+        if not should_run:
+            return
+        self._run_validation(step)
+        self._validated_steps.add(step)
+
+    def _run_validation(self, step: int) -> None:
+        if self.model is None or self.world is None:
+            raise RuntimeError("Model and world must be set up before validation")
+        if self.monitor is None:
+            raise RuntimeError("Monitor must be set up before validation")
+        if self.val_dataloader is None:
+            raise RuntimeError("Validation dataloader is not set up")
+
+        was_training = self.model.training
+        total_loss = torch.zeros((), dtype=torch.float32, device=self.world.device)
+        total_tokens = torch.zeros((), dtype=torch.int64, device=self.world.device)
+        nonfinite_batches = torch.zeros((), dtype=torch.int64, device=self.world.device)
+        iterator = iter(self.val_dataloader)
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                while True:
+                    raw_batch = next(iterator, None)
+                    has_batch = torch.tensor(
+                        int(raw_batch is not None),
+                        dtype=torch.int32,
+                        device=self.world.device,
+                    )
+                    if torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(
+                            has_batch, op=torch.distributed.ReduceOp.MIN
+                        )
+                    if not bool(has_batch.item()):
+                        break
+                    assert raw_batch is not None
+                    batch = self._prepare_batch(raw_batch)
+                    loss_output = self._forward_loss(batch)
+                    token_count = (batch["labels"] != -100).sum()
+                    if token_count.item() == 0:
+                        continue
+                    loss = loss_output.loss.detach()
+                    if not torch.isfinite(loss).all():
+                        nonfinite_batches += 1
+                        continue
+                    total_loss += loss.float() * token_count
+                    total_tokens += token_count
+
+            if torch.distributed.is_initialized():
+                for value in (total_loss, total_tokens, nonfinite_batches):
+                    torch.distributed.all_reduce(
+                        value, op=torch.distributed.ReduceOp.SUM
+                    )
+            if nonfinite_batches.item() > 0:
+                logger.warning(
+                    "Validation at step %s skipped %s non-finite batches",
+                    step,
+                    nonfinite_batches.item(),
+                )
+            mean_loss = (
+                float((total_loss / total_tokens).item())
+                if total_tokens.item() > 0
+                else float("nan")
+            )
+            if total_tokens.item() == 0:
+                logger.warning(
+                    "Validation at step %s had no finite trainable tokens", step
+                )
+            self.monitor.log({"val/loss": mean_loss}, step)
+        finally:
+            self.model.train(was_training)
+        self.val_dataloader = self._build_validation_dataloader()
 
     def _setup_accumulation_steps(self) -> None:
         if self.world is None:
@@ -733,33 +853,8 @@ class SFTTrainer(BaseTrainer):
         if self.model is None:
             raise RuntimeError("Model not set up")
 
-        # With cat packing all tokens are real (no padding), so attention_mask
-        # is all-ones. Passing None lets transformers use is_causal=True which
-        # enables the memory-efficient SDPA kernel instead of the O(L²) math backend.
-        attn_mask = batch.get("attention_mask")
-        if attn_mask is not None and attn_mask.all():
-            attn_mask = None
-
         with self.act_offload_ctx:
-            if self.config.loss_impl == "liger_fused":
-                # Liger's fused_linear_cross_entropy computes loss internally.
-                # Wavelet's labels are pre-shifted (labels[i] = next token at i+1),
-                # so we pass them as shift_labels to skip liger's built-in shift.
-                # This avoids a double-shift that would compute loss 2 tokens ahead.
-                outputs = self.model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=attn_mask,
-                    position_ids=batch["position_ids"],
-                    shift_labels=batch["labels"],
-                )
-                loss_output = LossOutput(loss=outputs.loss)
-            else:
-                outputs = self.model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=attn_mask,
-                    position_ids=batch["position_ids"],
-                )
-                loss_output = self.compute_loss(outputs.logits, batch["labels"])
+            loss_output = self._forward_loss(batch)
             loss = loss_output.loss
 
             self._require_finite_loss(loss, label="SFT loss")
@@ -789,6 +884,34 @@ class SFTTrainer(BaseTrainer):
             step=self.step,
             micro_step=self._micro_step,
         )
+
+    def _forward_loss(self, batch: dict[str, Tensor]) -> LossOutput:
+        if self.model is None:
+            raise RuntimeError("Model not set up")
+
+        # With cat packing all tokens are real (no padding), so attention_mask
+        # is all-ones. Passing None lets transformers use is_causal=True which
+        # enables the memory-efficient SDPA kernel instead of the O(L²) math backend.
+        attn_mask = batch.get("attention_mask")
+        if attn_mask is not None and attn_mask.all():
+            attn_mask = None
+
+        if self.config.loss_impl == "liger_fused":
+            # Wavelet's labels are pre-shifted, so shift_labels avoids a
+            # second shift inside Liger's fused linear cross-entropy.
+            outputs = self.model(
+                input_ids=batch["input_ids"],
+                attention_mask=attn_mask,
+                position_ids=batch["position_ids"],
+                shift_labels=batch["labels"],
+            )
+            return LossOutput(loss=outputs.loss)
+        outputs = self.model(
+            input_ids=batch["input_ids"],
+            attention_mask=attn_mask,
+            position_ids=batch["position_ids"],
+        )
+        return self.compute_loss(outputs.logits, batch["labels"])
 
     def compute_loss(
         self,

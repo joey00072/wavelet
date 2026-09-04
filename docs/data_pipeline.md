@@ -10,6 +10,15 @@ boundary that owns it and keeps trainer code independent of file formats.
 normalizes each row into an `Example`, applies the chat template, constructs
 token-aligned loss masks, and owns SFT iteration and collation.
 
+An optional SFT `val` block uses the same loading, tokenization, packing, and
+collation path with its own `data` settings. The trainer evaluates one finite
+validation epoch under `torch.no_grad()`, aggregates a token-weighted loss
+across ranks, and logs `val/loss`. Set `val.eval_on_start: true` for a step-0
+baseline; `val.interval` controls evaluation after completed optimizer steps.
+The validation dataset is loaded once and a fresh finite dataloader is built for
+each evaluation, so repeated metrics cover the same configured records without
+advancing the training cursor.
+
 ## RL Flow
 
 RL records use `RLExample` from `wavelet.data.rl`. The stages are:

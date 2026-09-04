@@ -735,6 +735,7 @@ class SFTDataset(StatefulDatasetMixin[Example], IterableDataset[Sample]):
         seed: int = 0,
         data_rank: int = 0,
         data_world_size: int = 1,
+        max_epochs_per_iteration: int | None = None,
     ) -> None:
         self.records = records
         self.tokenizer = tokenizer
@@ -744,10 +745,14 @@ class SFTDataset(StatefulDatasetMixin[Example], IterableDataset[Sample]):
         self.seed = seed
         self.data_rank = data_rank
         self.data_world_size = data_world_size
+        self.max_epochs_per_iteration = max_epochs_per_iteration
         self._initialize_iteration_state()
 
     def __iter__(self) -> Iterator[Sample]:
-        for record_index in self._local_record_indexes():
+        stop_step = None
+        if self.max_epochs_per_iteration is not None:
+            stop_step = self.step + len(self.records) * self.max_epochs_per_iteration
+        for record_index in self._local_record_indexes(stop_step=stop_step):
             record = self.records[record_index]
             sample = build_sample(
                 record,
@@ -848,9 +853,11 @@ def setup_dataset(
     *,
     data_rank: int,
     data_world_size: int,
+    records: list[Example] | None = None,
+    max_epochs_per_iteration: int | None = None,
 ) -> SFTDataset | CatDataset:
     base = SFTDataset(
-        load_records(config),
+        load_records(config) if records is None else records,
         tokenizer,
         seq_len=config.seq_len,
         loss_mask_config=config.loss_mask,
@@ -858,6 +865,7 @@ def setup_dataset(
         seed=config.seed,
         data_rank=data_rank,
         data_world_size=data_world_size,
+        max_epochs_per_iteration=max_epochs_per_iteration,
     )
     if config.pack_function == "cat":
         return CatDataset(base, config.seq_len)

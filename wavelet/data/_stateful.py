@@ -71,13 +71,13 @@ class StatefulDatasetMixin(Generic[RecordT]):
         self._order_cache = (epoch, order)
         return order
 
-    def _local_record_indexes(self) -> Iterator[int]:
+    def _local_record_indexes(self, *, stop_step: int | None = None) -> Iterator[int]:
         record_count = len(self.records)
         if record_count == 0:
             return
 
         data_rank, data_world_size = self._effective_data_partition()
-        while True:
+        while stop_step is None or self.step < stop_step:
             self.step += 1
             self.epoch = (self.step - 1) // record_count
             if (self.step - 1) % data_world_size != data_rank:
