@@ -217,10 +217,7 @@ def _require_flash_attention() -> None:
 def setup_runtime(config: ModelConfig) -> None:
     if not torch.cuda.is_available():
         return
-    torch.backends.cuda.matmul.allow_tf32 = config.allow_tf32
-    torch.backends.cudnn.allow_tf32 = config.allow_tf32
-    if config.allow_tf32:
-        torch.set_float32_matmul_precision("high")
+    torch.set_float32_matmul_precision(config.matmul_precision)
 
 
 def _setup_debug_model(

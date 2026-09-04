@@ -4,7 +4,7 @@ model:
   attn_implementation: auto
   trust_remote_code: true
   gradient_checkpointing: true
-  allow_tf32: true
+  matmul_precision: high
   fused_lm_head_token_chunk_size: 2048
 
 data:

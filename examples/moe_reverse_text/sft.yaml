@@ -6,7 +6,7 @@ model:
   load_in_4bit: true
   kbit_cast_non_quantized_to_float32: false
   gradient_checkpointing: true
-  allow_tf32: true
+  matmul_precision: high
 
 data:
   source: local

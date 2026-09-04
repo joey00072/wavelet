@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -78,3 +79,26 @@ def test_explicit_flash_attention_requires_importable_extension(
             distributed=False,
             parallel_dims=None,
         )
+
+
+@pytest.mark.parametrize("precision", ["highest", "high", "medium"])
+def test_setup_runtime_applies_configured_matmul_precision(
+    monkeypatch: pytest.MonkeyPatch,
+    precision: Literal["highest", "high", "medium"],
+) -> None:
+    applied: list[str] = []
+    monkeypatch.setattr(model_utils.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        model_utils.torch,
+        "set_float32_matmul_precision",
+        applied.append,
+    )
+
+    model_utils.setup_runtime(ModelConfig(matmul_precision=precision))
+
+    assert applied == [precision]
+
+
+def test_removed_allow_tf32_model_setting_is_rejected() -> None:
+    with pytest.raises(ValueError, match="allow_tf32"):
+        ModelConfig.model_validate({"allow_tf32": True})

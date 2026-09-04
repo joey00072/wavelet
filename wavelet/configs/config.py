@@ -49,7 +49,7 @@ class ModelConfig(ConfigModel):
     kbit_cast_non_quantized_to_float32: bool = True
     gradient_checkpointing: bool = True
     meta_device_init: bool = False
-    allow_tf32: bool = True
+    matmul_precision: Literal["highest", "high", "medium"] = "high"
     fused_lora_mlp: bool = False  # patch MLP.forward with fused LoRA_MLP kernel
     fused_lora_qkv: bool = False  # patch Qwen3Attention forward with fused LoRA_QKV
     fused_lora_o: bool = False  # patch o_proj.forward with fused LoRA_W kernel

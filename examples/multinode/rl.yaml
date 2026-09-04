@@ -4,7 +4,7 @@ model:
   attn_implementation: auto
   trust_remote_code: true
   gradient_checkpointing: true
-  allow_tf32: true
+  matmul_precision: high
 
 data:
   source: local

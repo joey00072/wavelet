@@ -4,7 +4,7 @@ model:
   attn_implementation: sdpa
   load_in_4bit: false
   gradient_checkpointing: true
-  allow_tf32: true
+  matmul_precision: high
   chat_template: |-
     {% if messages[0]['role'] == 'system' %}{{ messages[0]['content'] + eos_token }}{% set loop_messages = messages[1:] %}{% else %}{{ 'You are given a problem.
     Think about the problem and provide your working out.
