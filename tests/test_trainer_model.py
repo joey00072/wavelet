@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Literal
 
 import pytest
+import torch
 
 from wavelet.configs.sft import ModelConfig
 from wavelet.trainer import model as model_utils
@@ -155,3 +157,35 @@ def test_setup_runtime_applies_configured_matmul_precision(
 def test_removed_allow_tf32_model_setting_is_rejected() -> None:
     with pytest.raises(ValueError, match="allow_tf32"):
         ModelConfig.model_validate({"allow_tf32": True})
+
+
+def test_compile_fullgraph_requires_compile_enabled() -> None:
+    with pytest.raises(ValueError, match="compile_fullgraph"):
+        ModelConfig(compile_fullgraph=True)
+
+
+def test_compiled_debug_layers_match_eager_loss_with_gradient_checkpointing() -> None:
+    eager = model_utils.build_debug_model(max_seq_length=64)
+    compiled = copy.deepcopy(eager)
+    for model in (eager, compiled):
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.train()
+
+    state_keys = set(compiled.state_dict())
+    compiled_count = model_utils.compile_transformer_layers(
+        compiled,
+        fullgraph=False,
+        backend="eager",
+    )
+    input_ids = torch.tensor([[1, 7, 8, 9, 10, 1]])
+    eager_loss = eager(input_ids=input_ids, labels=input_ids).loss
+    compiled_loss = compiled(input_ids=input_ids, labels=input_ids).loss
+    compiled_loss.backward()
+
+    assert compiled_count == 2
+    assert set(compiled.state_dict()) == state_keys
+    assert compiled_loss.item() == pytest.approx(eager_loss.item(), rel=1e-5, abs=1e-6)
+    assert any(parameter.grad is not None for parameter in compiled.parameters())

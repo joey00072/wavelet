@@ -61,6 +61,14 @@ class ModelConfig(ConfigModel):
     fused_lora_o: bool = False  # patch o_proj.forward with fused LoRA_W kernel
     fused_lm_head_token_chunk_size: int | Literal["auto", "disabled"] = "disabled"
     smart_gc: bool = False  # sqrt-N gradient checkpointing with CPU offload
+    compile: bool = False
+    compile_fullgraph: bool = False
+
+    @model_validator(mode="after")
+    def validate_compile_fullgraph(self):
+        if self.compile_fullgraph and not self.compile:
+            raise ValueError("model.compile_fullgraph requires model.compile=true.")
+        return self
 
 
 class LossMaskConfig(ConfigModel):

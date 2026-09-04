@@ -622,6 +622,43 @@ def _transformer_layer_classes(model: nn.Module) -> set[type[nn.Module]]:
     return layer_classes
 
 
+def compile_transformer_layers(
+    model: nn.Module,
+    *,
+    fullgraph: bool,
+    backend: str | None = None,
+) -> int:
+    """Compile decoder blocks in place while preserving state-dict names."""
+    layer_classes = _transformer_layer_classes(model)
+    if not layer_classes:
+        raise ValueError(
+            "model.compile=true requires a model that identifies transformer "
+            "blocks through _no_split_modules."
+        )
+
+    torch._dynamo.config.capture_scalar_outputs = True
+    torch._dynamo.config.recompile_limit = max(
+        torch._dynamo.config.recompile_limit,
+        16,
+    )
+    torch._dynamo.config.cache_size_limit = max(
+        torch._dynamo.config.cache_size_limit,
+        64,
+    )
+    compile_kwargs: dict[str, object] = {"fullgraph": fullgraph}
+    if backend is not None:
+        compile_kwargs["backend"] = backend
+
+    compiled = 0
+    for module in model.modules():
+        if type(module) not in layer_classes:
+            continue
+        module.compile(**compile_kwargs)
+        compiled += 1
+    logger.info("Compiled %s transformer layers (fullgraph=%s)", compiled, fullgraph)
+    return compiled
+
+
 def _fsdp_mixed_precision(model_config: ModelConfig) -> MixedPrecision | None:
     dtype = resolve_dtype(model_config.torch_dtype)
     if not isinstance(dtype, torch.dtype):

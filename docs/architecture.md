@@ -30,6 +30,10 @@ code may still import them.
 Trainer process-group initialization uses `dist_timeout_seconds` from the SFT
 or RL config. It defaults to 1800 seconds and can be increased for slow or
 multi-node rendezvous without changing code.
+`model.compile: true` compiles each decoder block in place after LoRA and
+optional kernel patches, and before distributed wrapping. This preserves
+checkpoint parameter names and composes with gradient checkpointing;
+`model.compile_fullgraph` opts those block compilations into full-graph mode.
 
 ## RL Process Flow
 

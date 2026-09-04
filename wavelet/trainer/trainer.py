@@ -427,6 +427,13 @@ class BaseTrainer:
                 self.config.activation_offloading
             )
         self._apply_optional_model_kernels(model)
+        if self.config.model.compile:
+            from wavelet.trainer.model import compile_transformer_layers
+
+            compile_transformer_layers(
+                model,
+                fullgraph=self.config.model.compile_fullgraph,
+            )
         self.model = self._wrap_distributed_model(model, fsdp_config)
 
     def _validate_model_execution_mode(self, fsdp_config: Any) -> None:
