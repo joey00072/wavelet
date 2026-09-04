@@ -205,6 +205,81 @@ def test_checkpoint_load_can_skip_optimizer_scheduler_and_progress(tmp_path) -> 
     assert state == TrainerState(step=0, micro_step=0)
 
 
+def test_checkpoint_load_allows_new_world_size_without_dataloader(tmp_path) -> None:
+    source_world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    source_model = torch.nn.Linear(2, 1, bias=False)
+    source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.01)
+    source_manager = CheckpointManager(
+        source_model,
+        source_optimizer,
+        None,
+        CheckpointConfig(mode="async", interval=1),
+        tmp_path,
+        source_world,
+    )
+    expected_weight = source_model.weight.detach().clone()
+    assert source_manager.save(TrainerState(step=1, micro_step=1))
+    source_manager.wait_for_pending_save()
+
+    target_world = World(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        local_world_size=2,
+        device=torch.device("cpu"),
+    )
+    target_model = torch.nn.Linear(2, 1, bias=False)
+    target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=0.01)
+    target_manager = CheckpointManager(
+        target_model,
+        target_optimizer,
+        None,
+        CheckpointConfig(mode="disabled"),
+        tmp_path / "unused",
+        target_world,
+    )
+
+    state = target_manager.load(tmp_path / "checkpoint-1", dataloader=None)
+
+    assert state.step == 1
+    assert torch.equal(target_model.weight, expected_weight)
+
+
+def test_checkpoint_load_rejects_new_world_size_with_rank_local_dataloader(
+    tmp_path,
+) -> None:
+    model = torch.nn.Linear(2, 1, bias=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    source_manager = CheckpointManager(
+        model,
+        optimizer,
+        None,
+        CheckpointConfig(mode="async", interval=1),
+        tmp_path,
+        World(0, 0, 1, 1, torch.device("cpu")),
+    )
+    assert source_manager.save(TrainerState(step=1, micro_step=1))
+    source_manager.wait_for_pending_save()
+
+    target_manager = CheckpointManager(
+        model,
+        optimizer,
+        None,
+        CheckpointConfig(mode="disabled"),
+        tmp_path / "unused",
+        World(0, 0, 2, 2, torch.device("cpu")),
+    )
+
+    with pytest.raises(ValueError, match="skip_dataloader=true"):
+        target_manager.load(tmp_path / "checkpoint-1", dataloader=Mock())
+
+
 def test_trainer_wires_checkpoint_resume_skip_controls(
     tmp_path,
     monkeypatch,

@@ -208,7 +208,9 @@ with `ckpt.resume_step`. The `ckpt.skip_optimizer`, `skip_scheduler`,
 while loading the checkpoint model. Skipping progress restarts optimizer-step,
 token, sample, rollout-queue, and policy version counters from zero; skipping
 the scheduler rebuilds it from the configured schedule and learning rate over
-the remaining optimizer steps.
+the remaining optimizer steps. DCP can reshard model and optimizer state when
+the new run uses a different world size, but saved dataloader state is
+rank-local; a world-size change therefore requires `ckpt.skip_dataloader: true`.
 Run-directory cleanup refuses to start when it would delete the configured
 input adapter, even if the launch skips the optional preflight command.
 SFT examples longer than `data.seq_len` train on the available assistant-token

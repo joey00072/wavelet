@@ -229,9 +229,12 @@ class CheckpointManager:
             raise ValueError(
                 f"Unsupported checkpoint format version in '{checkpoint_dir.name}'."
             )
-        if int(metadata["world_size"]) != self.world.world_size:
+        saved_world_size = int(metadata["world_size"])
+        if saved_world_size != self.world.world_size and dataloader is not None:
             raise ValueError(
-                "Checkpoint world_size does not match the current runtime world_size."
+                "Checkpoint dataloader state is rank-local and cannot resume with "
+                "a different world size. Set ckpt.skip_dataloader=true to let DCP "
+                "reshard the model and optimizer with fresh dataloader state."
             )
 
         trainer_dir = checkpoint_dir / "trainer"
