@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -201,6 +203,28 @@ def test_wait_for_vllm_http_server_fails_when_service_exits(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="exited with code 1"):
         _wait_for_vllm_http_server(config, handle=ExitedHandle())  # type: ignore[arg-type]
+
+
+def test_wait_for_vllm_http_server_checks_model_listing(monkeypatch) -> None:
+    config = RLConfig(model={"name": "expected/model"})
+    urls: list[str] = []
+
+    def urlopen(url: str, *, timeout: float):
+        assert timeout == 5.0
+        urls.append(url)
+        if url.endswith("/v1/models"):
+            payload = json.dumps({"data": [{"id": "expected/model"}]}).encode()
+            return contextlib.nullcontext(io.BytesIO(payload))
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(runtime.urllib.request, "urlopen", urlopen)
+
+    _wait_for_vllm_http_server(config)
+
+    assert urls == [
+        "http://127.0.0.1:8000/health",
+        "http://127.0.0.1:8000/v1/models",
+    ]
 
 
 def test_streaming_chunk_resume_uses_chunk_index_space() -> None:

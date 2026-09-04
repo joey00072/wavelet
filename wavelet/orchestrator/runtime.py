@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -13,7 +14,11 @@ from time import perf_counter
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import count_nonempty_jsonl_rows
-from wavelet.inference.policy import create_policy_inference_engine
+from wavelet.inference.policy import (
+    create_policy_inference_engine,
+    expected_served_model_names,
+    require_expected_served_model,
+)
 from wavelet.monitor import setup_config_logger
 from wavelet.orchestrator.launcher import (
     RoleHandle,
@@ -565,7 +570,9 @@ def _wait_for_vllm_http_server(
     handle: RoleHandle | None = None,
 ) -> None:
     port = config.inference.http.port if port is None else port
-    url = f"http://{config.inference.http.host}:{port}/health"
+    base_url = f"http://{config.inference.http.host}:{port}"
+    health_url = f"{base_url}/health"
+    models_url = f"{base_url}/v1/models"
     deadline = time.monotonic() + config.inference.http.startup_timeout_seconds
     last_error: Exception | None = None
     while time.monotonic() < deadline:
@@ -573,17 +580,25 @@ def _wait_for_vllm_http_server(
             code = handle.poll()
             if code is not None:
                 raise RuntimeError(
-                    f"vLLM HTTP server exited with code {code} before {url} "
+                    f"vLLM HTTP server exited with code {code} before {health_url} "
                     f"became healthy. Check '{handle.log_path}'."
                 )
         try:
-            with urllib.request.urlopen(url, timeout=5.0):
-                return
+            with urllib.request.urlopen(health_url, timeout=5.0):
+                pass
+            with urllib.request.urlopen(models_url, timeout=5.0) as response:
+                models = json.loads(response.read().decode("utf-8"))
+            require_expected_served_model(
+                models,
+                expected_names=expected_served_model_names(config),
+                server=base_url,
+            )
+            return
         except OSError as exc:
             last_error = exc
             time.sleep(config.launcher.poll_interval_seconds)
     raise TimeoutError(
-        f"Timed out waiting for vLLM HTTP server at {url}"
+        f"Timed out waiting for vLLM HTTP server at {health_url}"
     ) from last_error
 
 

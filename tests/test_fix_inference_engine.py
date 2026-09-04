@@ -218,3 +218,56 @@ def test_admin_operations_use_separate_timeouts(monkeypatch) -> None:
         ADMIN_CONTROL_TIMEOUT_SECONDS,
         17.0,
     ]
+
+
+def test_http_setup_checks_served_model_identity(monkeypatch) -> None:
+    config = RLConfig(
+        model={"name": "expected/model"},
+        orchestrator={"custom_rollout_function": "custom:rollouts"},
+    )
+    engine = HTTPPolicyInferenceEngine(config)
+    paths: list[str] = []
+
+    def request(
+        _method: str,
+        path: str,
+        _payload: dict[str, Any] | None = None,
+        *,
+        base_url: str | None = None,
+    ) -> dict[str, Any]:
+        del base_url
+        paths.append(path)
+        if path == "/v1/models":
+            return {"data": [{"id": "expected/model"}]}
+        return {}
+
+    monkeypatch.setattr(engine, "_request", request)
+
+    engine.setup()
+
+    assert paths == ["/health", "/v1/models"]
+
+
+def test_http_setup_rejects_wrong_served_model(monkeypatch) -> None:
+    config = RLConfig(
+        model={"name": "expected/model"},
+        orchestrator={"custom_rollout_function": "custom:rollouts"},
+    )
+    engine = HTTPPolicyInferenceEngine(config)
+
+    def request(
+        _method: str,
+        path: str,
+        _payload: dict[str, Any] | None = None,
+        *,
+        base_url: str | None = None,
+    ) -> dict[str, Any]:
+        del base_url
+        if path == "/v1/models":
+            return {"data": [{"id": "other/model"}]}
+        return {}
+
+    monkeypatch.setattr(engine, "_request", request)
+
+    with pytest.raises(ValueError, match="expected/model.*other/model"):
+        engine.setup()

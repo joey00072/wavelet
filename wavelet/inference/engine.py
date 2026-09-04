@@ -229,7 +229,12 @@ def extract_vllm_prompt_logprobs(
     return values
 
 
-from wavelet.inference.policy import PolicyInferenceEngine, RLInference
+from wavelet.inference.policy import (
+    PolicyInferenceEngine,
+    RLInference,
+    expected_served_model_names,
+    require_expected_served_model,
+)
 from wavelet.trainer.model import setup_tokenizer
 from wavelet.transport.policy import NCCL_READY_MARKER
 
@@ -254,6 +259,12 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
             try:
                 for base_url in self.base_urls:
                     self._request("GET", "/health", base_url=base_url)
+                    models = self._request("GET", "/v1/models", base_url=base_url)
+                    require_expected_served_model(
+                        models,
+                        expected_names=expected_served_model_names(self.config),
+                        server=base_url,
+                    )
                 if self._uses_openai_rollouts():
                     self.tokenizer = setup_tokenizer(self.config.model)
                 return

@@ -8,6 +8,34 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import RLExample
 
 
+def expected_served_model_names(config: RLConfig) -> set[str]:
+    names = {config.model.name}
+    if config.lora is not None:
+        names.add(config.policy_transfer.adapter_name)
+    return names
+
+
+def require_expected_served_model(
+    payload: dict[str, object],
+    *,
+    expected_names: set[str],
+    server: str,
+) -> None:
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise TypeError(f"vLLM model listing from {server} has no data list.")
+    served_names = {
+        str(item["id"])
+        for item in data
+        if isinstance(item, dict) and item.get("id") is not None
+    }
+    if served_names.isdisjoint(expected_names):
+        raise ValueError(
+            f"Expected vLLM model {sorted(expected_names)} at {server}, but the "
+            f"server listed {sorted(served_names)}."
+        )
+
+
 def create_policy_inference_engine(config: RLConfig) -> PolicyInferenceEngine:
     if config.inference.mode == "vllm_http":
         from wavelet.inference.engine import HTTPPolicyInferenceEngine
