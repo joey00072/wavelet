@@ -44,6 +44,7 @@ from wavelet.trainer.losses import (
     setup_rl_loss_fn,
 )
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.perf import training_flop_metrics
 from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.transport.policy import (
@@ -245,6 +246,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._gradient_accumulation_loss_scale: float | None = None
         self._dynamic_loss_scale_local = 0.0
         self._loaded_micro_batch_count = 0
+        self._step_compute_seconds = 0.0
+        self._step_model_tokens = 0
         self._run_closed = False
         self._rl_loss_fn = setup_rl_loss_fn(config.loss)
         self._init_policy_transport()
@@ -713,6 +716,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
         if self.model is None or self.optimizer is None:
             raise RuntimeError("Trainer not set up")
+        micro_step_started_at = perf_counter()
+        if self._step_model_tokens == 0 and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        self._step_model_tokens += int(batch["input_ids"].numel())
 
         attention_mask = _packed_training_attention_mask(
             self.model,
@@ -773,6 +780,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._micro_step += 1
         self._accumulated_micro_batches += 1
         if self._accumulated_micro_batches < self.accumulation_steps:
+            self._step_compute_seconds += perf_counter() - micro_step_started_at
             return TrainOutput(
                 loss=loss_output,
                 stepped=False,
@@ -782,6 +790,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
         grad_norm = self._apply_optimizer_step()
         metrics = self._finalize_optimizer_metrics(grad_norm)
+        self._step_compute_seconds += perf_counter() - micro_step_started_at
+        metrics.update(self._finish_step_performance_metrics())
         return TrainOutput(
             loss=loss_output,
             stepped=True,
@@ -789,6 +799,38 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             micro_step=self._micro_step,
             metrics=metrics,
         )
+
+    def _finish_step_performance_metrics(self) -> dict[str, float]:
+        elapsed = max(self._step_compute_seconds, 1e-9)
+        global_tokens = self._step_model_tokens * self._data_parallel_world_size()
+        peak_memory_gib = (
+            torch.cuda.max_memory_reserved() / 1024**3
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        compute_dtype = self._model_compute_dtype
+        if (
+            self.world is not None
+            and self.world.device.type == "cuda"
+            and self.config.model.torch_dtype == "float32"
+        ):
+            compute_dtype = torch.bfloat16
+        metrics = {
+            "perf/tokens_per_second": global_tokens / elapsed,
+            "perf/peak_memory_gib": peak_memory_gib,
+        }
+        metrics.update(
+            training_flop_metrics(
+                flops_per_token=self._model_flops_per_token,
+                model_tokens=global_tokens,
+                elapsed_seconds=elapsed,
+                world_size=self.world.world_size if self.world is not None else 1,
+                dtype=compute_dtype,
+            )
+        )
+        self._step_compute_seconds = 0.0
+        self._step_model_tokens = 0
+        return metrics
 
     def _forward_rl_loss(
         self,

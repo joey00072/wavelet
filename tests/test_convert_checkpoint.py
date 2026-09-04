@@ -9,13 +9,13 @@ import torch.distributed.checkpoint as dcp
 from safetensors import safe_open
 
 from wavelet.configs.config import ModelConfig
-from wavelet.trainer.ckpt import AppState
-from wavelet.trainer.debug import DEBUG_MODEL_NAME
-from wavelet.trainer.model import setup_model
 from wavelet.tools.convert_checkpoint import (
     convert_checkpoint,
     resolve_checkpoint_source,
 )
+from wavelet.trainer.ckpt import AppState
+from wavelet.trainer.debug import DEBUG_MODEL_NAME
+from wavelet.trainer.model import setup_model
 from wavelet.utils.pathing import STABLE_CHECKPOINT_MARKER, create_launch_attempt
 from wavelet.utils.serialization import dump_yaml
 

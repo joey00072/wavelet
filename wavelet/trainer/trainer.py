@@ -35,6 +35,11 @@ from wavelet.trainer.distributed import (
 )
 from wavelet.trainer.garbage_collection import DeterministicGarbageCollector
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.perf import (
+    estimate_training_flops_per_token,
+    model_compute_dtype,
+    training_flop_metrics,
+)
 from wavelet.trainer.profiling import CudaMemoryProfiler, StepProfiler
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
@@ -140,6 +145,8 @@ class BaseTrainer:
         self._garbage_collector: DeterministicGarbageCollector | None = None
         self._step_profiler: StepProfiler | None = None
         self._memory_profiler: CudaMemoryProfiler | None = None
+        self._model_flops_per_token: int | None = None
+        self._model_compute_dtype: torch.dtype | None = None
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -528,6 +535,11 @@ class BaseTrainer:
             lora_dtype=lora_dtype,
             match_base_dtype=(lora_dtype is None and cfg_dtype == "auto"),
         )
+        self._model_flops_per_token = estimate_training_flops_per_token(
+            model,
+            seq_len=self.config.data.seq_len,
+        )
+        self._model_compute_dtype = model_compute_dtype(model)
         prepare_hf_tp_lora_for_training(model, self.parallel_dims)
         # Activation offloading: intercepts ALL tensors saved for backward via
         # saved_tensors_hooks and streams them to pinned CPU RAM during forward,
@@ -1153,10 +1165,20 @@ class SFTTrainer(BaseTrainer):
         )
         self._step_started_at = None
         self._step_model_tokens = 0
-        return {
+        metrics = {
             "perf/tokens_per_second": global_tokens / elapsed,
             "perf/peak_memory_gib": peak_memory_gib,
         }
+        metrics.update(
+            training_flop_metrics(
+                flops_per_token=self._model_flops_per_token,
+                model_tokens=global_tokens,
+                elapsed_seconds=elapsed,
+                world_size=self.world.world_size if self.world is not None else 1,
+                dtype=self._model_compute_dtype,
+            )
+        )
+        return metrics
 
     def _dataset_progress_metrics(self) -> dict[str, float]:
         if self.dataset is None or self.dataloader is None:

@@ -374,6 +374,13 @@ W&B modes keep their existing local behavior and do not enable shared mode.
 Training metrics that become NaN or infinite are stored as `null` in local
 JSONL logs and omitted from W&B rows; the monitor warns once for each affected
 metric key.
+Trainer performance rows include an architecture-aware
+`perf/model_flops_per_token` estimate for dense, grouped-query-attention, MLA,
+and MoE models. On supported low-precision accelerators they also include
+`perf/mfu`, expressed as a percentage of dense peak FLOPs across the trainer
+world. The built-in peak table covers A100, H100/H200, B200/B300, GB200/GB300,
+MI300X, and MI325X; unknown devices and float32 runs omit MFU instead of using
+a misleading fallback peak.
 RL trainer metrics include `entropy/mean`, `entropy/min`, and `entropy/max`
 over loss-masked policy tokens. Entropy uses each token's rollout temperature
 and is computed without materializing full-vocabulary logits when the chunked
