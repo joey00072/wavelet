@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 
 class ConfigModel(BaseModel):
@@ -994,6 +994,70 @@ class RLOrchestratorConfig(ConfigModel):
         return self
 
 
+PROTECTED_ROLE_ENV_VARS = frozenset(
+    {
+        "CUDA_VISIBLE_DEVICES",
+        "GROUP_RANK",
+        "LOCAL_RANK",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "RANK",
+        "ROLE_NAME",
+        "ROLE_RANK",
+        "WORLD_SIZE",
+    }
+)
+
+
+def validate_role_env_vars(
+    env_vars: dict[str, str | SecretStr],
+    *,
+    role: str,
+) -> None:
+    """Reject child environment entries owned by the launcher or OS."""
+    protected = sorted(PROTECTED_ROLE_ENV_VARS.intersection(env_vars))
+    if protected:
+        raise ValueError(
+            f"launcher.env_vars.{role} cannot set launcher-managed variables "
+            f"{protected}."
+        )
+    invalid_names = sorted(
+        name for name in env_vars if not name or "=" in name or "\x00" in name
+    )
+    if invalid_names:
+        raise ValueError(
+            f"launcher.env_vars.{role} contains invalid variable names: "
+            f"{invalid_names}."
+        )
+    values = [
+        value.get_secret_value() if isinstance(value, SecretStr) else value
+        for value in env_vars.values()
+    ]
+    if any("\x00" in value for value in values):
+        raise ValueError(f"launcher.env_vars.{role} values cannot contain NUL bytes.")
+
+
+class RLRoleEnvConfig(ConfigModel):
+    common: dict[str, SecretStr] = Field(default_factory=dict)
+    inference: dict[str, SecretStr] = Field(default_factory=dict)
+    trainer: dict[str, SecretStr] = Field(default_factory=dict)
+    orchestrator: dict[str, SecretStr] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_variables(self) -> "RLRoleEnvConfig":
+        for role in ("common", "inference", "trainer", "orchestrator"):
+            validate_role_env_vars(getattr(self, role), role=role)
+        return self
+
+    def for_role(
+        self,
+        role: Literal["inference", "trainer", "orchestrator"],
+    ) -> dict[str, str]:
+        merged = {**self.common, **getattr(self, role)}
+        return {name: value.get_secret_value() for name, value in merged.items()}
+
+
 class RLLauncherConfig(ConfigModel):
     mode: Literal["integrated", "process", "colocate", "colocate_sleep"] = "integrated"
     backend: Literal["local", "ray"] = "local"
@@ -1003,6 +1067,7 @@ class RLLauncherConfig(ConfigModel):
     inference_num_replicas: int = Field(default=1, ge=1)
     ray_address: str | None = None
     ray_runtime_env: dict[str, Any] | None = None
+    env_vars: RLRoleEnvConfig = RLRoleEnvConfig()
     poll_interval_seconds: float = Field(default=1.0, gt=0.0)
     colocate_memory_wait_timeout_seconds: float = Field(default=120.0, ge=0.0)
     colocate_memory_wait_poll_seconds: float = Field(default=0.5, gt=0.0)

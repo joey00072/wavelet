@@ -625,6 +625,55 @@ def test_process_eval_only_launcher_skips_trainer_role(tmp_path: Path) -> None:
     assert roles[0].command == "inference-server"
 
 
+def test_process_roles_receive_common_and_specific_environment(tmp_path: Path) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        launcher={
+            "mode": "process",
+            "env_vars": {
+                "common": {"SHARED": "common"},
+                "inference": {"ROLE": "server", "SHARED": "inference"},
+                "trainer": {"ROLE": "trainer"},
+                "orchestrator": {"ROLE": "orchestrator"},
+            },
+        },
+    )
+
+    roles = _role_specs(
+        config,
+        trainer_config_path=tmp_path / "trainer.yaml",
+        inference_config_path=tmp_path / "inference.yaml",
+        inference_ports=[8100],
+    )
+
+    assert roles[0].env_vars == {"SHARED": "inference", "ROLE": "server"}
+    assert roles[1].env_vars == {"SHARED": "common", "ROLE": "trainer"}
+    assert roles[2].env_vars == {"SHARED": "common", "ROLE": "orchestrator"}
+
+
+def test_launcher_environment_values_are_redacted_from_serialized_config() -> None:
+    config = RLConfig(
+        launcher={"env_vars": {"inference": {"SERVICE_TOKEN": "secret-value"}}}
+    )
+
+    serialized = config.model_dump_json()
+
+    assert "secret-value" not in serialized
+    assert "**********" in serialized
+    assert config.launcher.env_vars.for_role("inference") == {
+        "SERVICE_TOKEN": "secret-value"
+    }
+
+
+@pytest.mark.parametrize(
+    "variable",
+    ["CUDA_VISIBLE_DEVICES", "RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_PORT"],
+)
+def test_launcher_role_environment_rejects_managed_variables(variable: str) -> None:
+    with pytest.raises(ValueError, match=variable):
+        RLConfig(launcher={"env_vars": {"trainer": {variable: "1"}}})
+
+
 def test_eval_only_base_model_keeps_served_model_name() -> None:
     config = RLConfig(
         max_steps=0,

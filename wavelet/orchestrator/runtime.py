@@ -476,6 +476,7 @@ def _role_specs(
                     log_name=f"inference_server_{replica}",
                     cuda_visible_devices=cuda_visible_devices,
                     service=True,
+                    env_vars=config.launcher.env_vars.for_role("inference"),
                 )
             )
     if not eval_only:
@@ -487,6 +488,7 @@ def _role_specs(
                 log_name="rl_trainer",
                 cuda_visible_devices=_trainer_device_group(config),
                 torchrun_nproc_per_node=config.launcher.trainer_num_processes,
+                env_vars=config.launcher.env_vars.for_role("trainer"),
             )
         )
     roles.append(
@@ -496,6 +498,7 @@ def _role_specs(
             config_path=inference_config_path,
             log_name="rl_inference",
             cuda_visible_devices=None,
+            env_vars=config.launcher.env_vars.for_role("orchestrator"),
         )
     )
     return roles

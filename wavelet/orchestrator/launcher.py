@@ -4,11 +4,12 @@ import os
 import signal
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import sleep
 from typing import Any, TextIO
 
+from wavelet.configs.config import validate_role_env_vars
 from wavelet.configs.rl_config import RLConfig
 
 _TERMINATE_TIMEOUT_SECONDS = 10.0
@@ -23,10 +24,17 @@ class RoleSpec:
     cuda_visible_devices: str | None = None
     service: bool = False
     torchrun_nproc_per_node: int = 1
+    env_vars: dict[str, str] = field(default_factory=dict)
 
 
-def _role_env(cuda_visible_devices: str | None) -> dict[str, str]:
+def _role_env(
+    cuda_visible_devices: str | None,
+    env_vars: dict[str, str] | None = None,
+) -> dict[str, str]:
+    env_vars = {} if env_vars is None else env_vars
+    validate_role_env_vars(env_vars, role="role")
     env = os.environ.copy()
+    env.update(env_vars)
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
     return env
@@ -76,6 +84,7 @@ def _run_role_subprocess(
     log_path: str,
     cuda_visible_devices: str | None,
     torchrun_nproc_per_node: int = 1,
+    env_vars: dict[str, str] | None = None,
 ) -> int:
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     with Path(log_path).open("a", encoding="utf-8") as log_file:
@@ -89,7 +98,7 @@ def _run_role_subprocess(
             cwd=cwd,
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            env=_role_env(cuda_visible_devices),
+            env=_role_env(cuda_visible_devices, env_vars),
             start_new_session=True,
         )
         return _wait_for_role_process(process)
@@ -143,7 +152,7 @@ def _start_local_role(
         cwd=Path.cwd(),
         stdout=log_file,
         stderr=subprocess.STDOUT,
-        env=_role_env(spec.cuda_visible_devices),
+        env=_role_env(spec.cuda_visible_devices, spec.env_vars),
         start_new_session=True,
     )
     return process, log_file
@@ -231,6 +240,7 @@ class RayRoleLauncher:
             log_path=str(log_path),
             cuda_visible_devices=spec.cuda_visible_devices,
             torchrun_nproc_per_node=spec.torchrun_nproc_per_node,
+            env_vars=spec.env_vars,
         )
         return RayRoleHandle(spec, ref, self.ray, log_path)
 

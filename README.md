@@ -353,6 +353,27 @@ it manages, such as `model`, `port`, `tensor_parallel_size`, `enable_lora`, and
 `inference.vllm.enforce_eager` defaults to `false`, allowing vLLM to use its
 hybrid eager/CUDA-graph execution path. Set it to `true` for deployments whose
 GPU-memory constraints or model behavior require eager-only execution.
+Process launches can add environment variables globally or per role:
+
+```yaml
+launcher:
+  env_vars:
+    common:
+      TOKENIZERS_PARALLELISM: "false"
+    inference:
+      VLLM_LOGGING_LEVEL: INFO
+    trainer:
+      TORCH_LOGS: recompiles
+    orchestrator:
+      HTTPX_LOG_LEVEL: warning
+```
+
+Role-specific values override `common`. Inference values apply to every vLLM
+server replica, trainer values apply to the `torchrun` parent, and orchestrator
+values apply to `rl-inference`. Launcher-owned GPU placement and distributed
+rank variables are rejected in this table; configure device placement through
+the normal launcher fields. Values are treated as secrets and redacted from
+serialized role configs and dry-run output.
 Both `tool_call_parser` and `reasoning_parser` default to `auto`. Known model
 families resolve to the matching vLLM parser, while unknown or non-reasoning
 models omit the corresponding flag. Set either field explicitly to override

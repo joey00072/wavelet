@@ -6,12 +6,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.launcher import (
     LocalRoleHandle,
     LocalRoleLauncher,
     RayRoleLauncher,
     RoleSpec,
+    _role_env,
 )
 
 
@@ -105,6 +108,38 @@ def test_local_role_launcher_starts_roles_in_new_session(tmp_path, monkeypatch) 
     assert captured["kwargs"]["start_new_session"] is True
     assert captured["kwargs"]["stdout"].name.endswith("rl_inference.log")
     assert captured["kwargs"]["stdout"].mode == "a"
+
+
+def test_local_role_launcher_applies_role_environment(tmp_path, monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeProcess()
+
+    monkeypatch.setenv("WAVELET_PARENT_VALUE", "parent")
+    monkeypatch.setattr("wavelet.orchestrator.launcher.subprocess.Popen", fake_popen)
+
+    handle = LocalRoleLauncher(tmp_path).start(
+        RoleSpec(
+            name="trainer",
+            command="rl-trainer",
+            config_path=Path("config.yaml"),
+            log_name="trainer",
+            cuda_visible_devices="2,3",
+            env_vars={"WAVELET_ROLE_VALUE": "trainer"},
+        )
+    )
+    handle.close()
+
+    assert captured["env"]["WAVELET_PARENT_VALUE"] == "parent"
+    assert captured["env"]["WAVELET_ROLE_VALUE"] == "trainer"
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "2,3"
+
+
+def test_role_environment_rejects_launcher_managed_values() -> None:
+    with pytest.raises(ValueError, match="CUDA_VISIBLE_DEVICES"):
+        _role_env(None, {"CUDA_VISIBLE_DEVICES": "7"})
 
 
 def test_local_role_launcher_preserves_existing_log(tmp_path, monkeypatch) -> None:
