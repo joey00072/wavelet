@@ -134,6 +134,53 @@ def test_max_inflight_rollouts_must_cover_one_group() -> None:
         )
 
 
+def test_rollout_batch_targets_are_mutually_exclusive() -> None:
+    with pytest.raises(ValueError, match="Set only one"):
+        RLConfig(orchestrator={"examples_per_step": 4, "token_batch_size": 1024})
+
+
+def test_token_batches_require_streaming_verifier_scheduler() -> None:
+    base = {
+        "token_batch_size": 1024,
+        "custom_rollout_function": ("wavelet.orchestrator.verifiers:generate_rollouts"),
+        "max_async_level": 1,
+    }
+    with pytest.raises(ValueError, match="launcher.mode='process'"):
+        RLConfig(orchestrator=base)
+    with pytest.raises(ValueError, match="Verifiers rollout source"):
+        RLConfig(
+            launcher={"mode": "process"},
+            orchestrator={
+                "token_batch_size": 1024,
+                "max_async_level": 1,
+            },
+        )
+
+    config = RLConfig(launcher={"mode": "process"}, orchestrator=base)
+
+    assert config.orchestrator.examples_per_step is None
+    assert config.orchestrator.token_batch_size == 1024
+
+
+def test_token_batches_reject_fixed_chunks_and_checkpoint_resume() -> None:
+    base = {
+        "token_batch_size": 1024,
+        "custom_rollout_function": ("wavelet.orchestrator.verifiers:generate_rollouts"),
+        "max_async_level": 1,
+    }
+    with pytest.raises(ValueError, match="rollout_chunk_examples"):
+        RLConfig(
+            launcher={"mode": "process"},
+            orchestrator={**base, "rollout_chunk_examples": 2},
+        )
+    with pytest.raises(ValueError, match="variable record cursor"):
+        RLConfig(
+            launcher={"mode": "process"},
+            orchestrator=base,
+            ckpt={"resume_step": 1},
+        )
+
+
 def test_tasks_per_minute_requires_verifier_rollout_source() -> None:
     with pytest.raises(ValueError, match="tasks_per_minute"):
         RLConfig(orchestrator={"tasks_per_minute": 60})

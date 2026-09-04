@@ -244,6 +244,15 @@ With `orchestrator.filter_zero_advantage: true`, the persistent verifier
 scheduler resamples zero-signal groups until `examples_per_step` admitted groups
 are available. Rejected groups remain visible in scheduler diagnostics but do
 not silently occupy most of an optimizer batch as zero-loss rows.
+Process-mode Verifiers runs may set `orchestrator.token_batch_size` instead of
+`examples_per_step`. The scheduler admits complete scored groups until the
+serialized, pretokenized records meet or exceed that token budget, then ships
+one dynamic queue chunk for the optimizer step. It also admits enough groups to
+cover one distributed trainer micro-batch; the final token count and group count
+can therefore overshoot their minima. Token batching currently requires
+`launcher.mode: process`, `max_async_level >= 1`, and a Verifiers rollout source.
+Checkpoint resume is rejected for this mode until its variable data cursor can
+be persisted without skipping speculative in-flight work.
 Finite verifier training datasets are traversed once per epoch instead of
 sampled with replacement. `data.shuffle: true` uses a deterministic permutation
 for each epoch; sampler cursor and epoch are included in generation metrics.

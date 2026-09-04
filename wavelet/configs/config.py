@@ -1082,6 +1082,11 @@ class RLOrchestratorConfig(ConfigModel):
     materialize_path: Path | None = None
     overwrite: bool = True
     examples_per_step: int | None = Field(default=None, ge=1)
+    token_batch_size: int | None = Field(
+        default=None,
+        ge=1,
+        description="Minimum serialized rollout tokens in one optimizer batch.",
+    )
     rollouts_per_example: int | None = Field(default=None, ge=1)
     oversampling_factor: float = Field(default=1.0, ge=1.0)
     max_inflight_rollouts: int | None = Field(default=None, ge=1)
@@ -1094,6 +1099,15 @@ class RLOrchestratorConfig(ConfigModel):
     tasks_per_minute: int | None = Field(default=None, ge=1)
     pipeline_status_interval_seconds: float = Field(default=30.0, gt=0.0)
     state_server: RLStateServerConfig = RLStateServerConfig()
+
+    @model_validator(mode="after")
+    def validate_batch_target(self) -> "RLOrchestratorConfig":
+        if self.examples_per_step is not None and self.token_batch_size is not None:
+            raise ValueError(
+                "Set only one of orchestrator.examples_per_step and "
+                "orchestrator.token_batch_size."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_max_inflight_rollouts(self) -> "RLOrchestratorConfig":
@@ -1320,6 +1334,35 @@ class RLConfig(TrainerConfig):
         if is_distillation and self.orchestrator.verifier_env_id is None:
             raise ValueError(
                 f"algo.type='{self.algo.type}' requires orchestrator.verifier_env_id."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_token_batch_scheduler(self) -> "RLConfig":
+        if self.orchestrator.token_batch_size is None:
+            return self
+        if self.orchestrator.custom_rollout_function != (
+            "wavelet.orchestrator.verifiers:generate_rollouts"
+        ):
+            raise ValueError(
+                "orchestrator.token_batch_size currently requires the Verifiers "
+                "rollout source."
+            )
+        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+            raise ValueError(
+                "orchestrator.token_batch_size requires launcher.mode='process' "
+                "and orchestrator.max_async_level>=1."
+            )
+        if self.orchestrator.rollout_chunk_examples is not None:
+            raise ValueError(
+                "orchestrator.rollout_chunk_examples cannot be combined with "
+                "orchestrator.token_batch_size; token batches are one dynamic "
+                "chunk per optimizer step."
+            )
+        if self.ckpt is not None and self.ckpt.is_resuming:
+            raise ValueError(
+                "orchestrator.token_batch_size does not yet support checkpoint "
+                "resume because its variable record cursor is not persisted."
             )
         return self
 

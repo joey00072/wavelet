@@ -1500,9 +1500,9 @@ def main(argv: list[str] | None = None) -> int:
 def _use_streaming_rollout_chunks(config: RLConfig) -> bool:
     from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
 
-    return (
-        resolve_rollout_schedule(config).publish_mode is PublishMode.STREAMING
-        and config.orchestrator.examples_per_step is not None
+    return resolve_rollout_schedule(config).publish_mode is PublishMode.STREAMING and (
+        config.orchestrator.examples_per_step is not None
+        or config.orchestrator.token_batch_size is not None
     )
 
 
@@ -1514,8 +1514,12 @@ def _run_streaming_rollout_training(
     target_step: int,
 ) -> None:
     examples_per_step = config.orchestrator.examples_per_step
-    if examples_per_step is None:
-        raise ValueError("orchestrator.examples_per_step is required.")
+    token_batch_size = config.orchestrator.token_batch_size
+    if examples_per_step is None and token_batch_size is None:
+        raise ValueError(
+            "Either orchestrator.examples_per_step or "
+            "orchestrator.token_batch_size is required."
+        )
     chunks_per_step = _chunks_per_step(config)
     min_loadable_rows = _min_loadable_rollout_rows(config, trainer)
     accumulator = _StreamingChunkAccumulator()

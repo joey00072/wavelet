@@ -1346,6 +1346,7 @@ class OrchestratorProbe(_AsDictMixin):
     records_trainable: int
     rollouts_per_example: int
     examples_per_step: int | None
+    token_batch_size: int | None
     metrics: dict[str, float]
     output_path: str | None
 
@@ -1354,6 +1355,7 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
     schedule: dict[str, Any] = {
         "target_steps": target_steps(config),
         "examples_per_step": config.orchestrator.examples_per_step,
+        "token_batch_size": config.orchestrator.token_batch_size,
         "rollouts_per_example": config.orchestrator.rollouts_per_example,
         "max_async_level": config.orchestrator.max_async_level,
         "max_off_policy_steps": config.orchestrator.max_off_policy_steps,
@@ -1367,6 +1369,8 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
             config.orchestrator.examples_per_step
             * (config.orchestrator.rollouts_per_example or 1)
         )
+    elif config.orchestrator.token_batch_size is not None:
+        schedule["chunks_per_step"] = chunks_per_step(config)
     return {
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "data": {
@@ -1481,6 +1485,7 @@ def probe_orchestrator(
         records_trainable=len(trainable_records),
         rollouts_per_example=config.orchestrator.rollouts_per_example,
         examples_per_step=config.orchestrator.examples_per_step,
+        token_batch_size=config.orchestrator.token_batch_size,
         metrics=metrics,
         output_path=output_path,
     )
@@ -1495,6 +1500,7 @@ def with_orchestrator_limits(
     updates: dict[str, Any] = {}
     if examples is not None:
         updates["examples_per_step"] = examples
+        updates["token_batch_size"] = None
     if rollouts is not None:
         updates["rollouts_per_example"] = rollouts
     if not updates:
@@ -1982,6 +1988,22 @@ def _schedule_checks(config: RLConfig) -> list[PreflightCheck]:
                     "groups": examples,
                     "rollouts_per_group": rollouts,
                     "rollouts": examples * rollouts,
+                    "chunks": chunks_per_step(config),
+                },
+            )
+        )
+    elif config.orchestrator.token_batch_size is not None:
+        checks.append(
+            PreflightCheck(
+                name="rollout_chunks",
+                status="ok",
+                message=(
+                    "Resolved optimizer batch: at least "
+                    f"{config.orchestrator.token_batch_size} serialized rollout "
+                    "token(s) in one dynamic chunk."
+                ),
+                details={
+                    "token_batch_size": config.orchestrator.token_batch_size,
                     "chunks": chunks_per_step(config),
                 },
             )

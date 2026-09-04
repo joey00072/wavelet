@@ -1570,6 +1570,118 @@ def test_verifier_scheduler_pops_ready_group_age_when_consumed() -> None:
     assert scheduler.ready_group_off_policy_steps == []
 
 
+def test_verifier_scheduler_stops_after_token_budget_and_buffers_extra_group() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "token_batch_size": 3,
+            "rollouts_per_example": 1,
+            "max_async_level": 1,
+            "filter_zero_advantage": False,
+        },
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.orchestrator = RLOrchestrator(config)
+    scheduler.rollout_count = 1
+    scheduler.target_groups = None
+    scheduler.target_tokens = 3
+    scheduler.clients = [object()]
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler.groups = {}
+    scheduler.ready_groups = [
+        [
+            {
+                "example_id": example_id,
+                "reward": 1.0,
+                "advantage": 1.0,
+                "trajectory": _trainable_trajectory(),
+            }
+        ]
+        for example_id in range(4)
+    ]
+    scheduler.ready_group_off_policy_steps = [0, 0, 0, 0]
+    scheduler._fill_inflight = lambda: None  # type: ignore[method-assign]
+
+    records = asyncio.run(scheduler.generate_batch())
+
+    assert len(records) == 3
+    assert sum(len(record.input_ids or []) for record in records) == 3
+    assert len(scheduler.ready_groups) == 1
+    assert scheduler.last_batch_metrics["generation/batch/tokens"] == 3.0
+
+
+def test_token_batch_covers_one_distributed_micro_batch() -> None:
+    config = RLConfig(
+        launcher={"mode": "process", "trainer_num_processes": 4},
+        data={"micro_batch_size": 1},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "token_batch_size": 1,
+            "rollouts_per_example": 2,
+            "max_async_level": 1,
+            "filter_zero_advantage": False,
+        },
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.orchestrator = RLOrchestrator(config)
+    scheduler.rollout_count = 2
+    scheduler.target_groups = None
+    scheduler.target_tokens = 1
+    scheduler.clients = [object()]
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler.groups = {}
+    scheduler.ready_groups = [
+        [
+            {
+                "example_id": example_id,
+                "reward": 1.0,
+                "advantage": 1.0,
+                "trajectory": _trainable_trajectory(),
+            }
+            for _ in range(2)
+        ]
+        for example_id in range(3)
+    ]
+    scheduler.ready_group_off_policy_steps = [0, 0, 0]
+    scheduler._fill_inflight = lambda: None  # type: ignore[method-assign]
+
+    records = asyncio.run(scheduler.generate_batch())
+
+    assert len(records) == 4
+    assert len(scheduler.ready_groups) == 1
+
+
+def test_token_batch_retry_limit_counts_rejected_groups_not_short_groups() -> None:
+    VerifierRolloutScheduler._raise_if_retries_exhausted(
+        completed_groups=4,
+        max_completed_groups=2,
+        accepted_groups=4,
+        target_groups=None,
+        accepted_tokens=4,
+        target_tokens=8,
+        rejected_groups=0,
+    )
+    with pytest.raises(RuntimeError, match=r"4 token\(s\) across 4 group"):
+        VerifierRolloutScheduler._raise_if_retries_exhausted(
+            completed_groups=6,
+            max_completed_groups=2,
+            accepted_groups=4,
+            target_groups=None,
+            accepted_tokens=4,
+            target_tokens=8,
+            rejected_groups=2,
+        )
+
+
 def test_verifier_scheduler_salts_new_requests_with_loaded_policy() -> None:
     scheduler = object.__new__(VerifierRolloutScheduler)
     scheduler.config = RLConfig()

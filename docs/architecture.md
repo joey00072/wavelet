@@ -89,6 +89,10 @@ source of truth for a completed batch or policy.
 Preflight reports optimizer batches explicitly as groups times rollouts and the
 number of transport chunks. A non-divisible final chunk contains only the
 remaining groups; chunking never rounds the optimizer batch upward.
+For persistent Verifiers scheduling, `orchestrator.token_batch_size` replaces
+the fixed group count with a minimum serialized-token target and one dynamic
+chunk per optimizer step. Complete scored groups remain atomic, so the batch can
+overshoot the target.
 
 ## Inference Scheduling
 

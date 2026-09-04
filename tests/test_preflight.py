@@ -83,6 +83,28 @@ def test_preflight_reports_effective_rollout_batch_shape(tmp_path) -> None:
     }
 
 
+def test_preflight_reports_dynamic_token_batch_shape(tmp_path) -> None:
+    config = RLConfig(
+        data={"source": "local", "path": _write_local_data(tmp_path)},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "token_batch_size": 4096,
+            "max_async_level": 1,
+        },
+    )
+
+    report = build_preflight_report(config)
+    check = next(item for item in report["checks"] if item["name"] == "rollout_chunks")
+
+    assert check["details"] == {"token_batch_size": 4096, "chunks": 1}
+    assert "one dynamic chunk" in check["message"]
+
+
 def test_preflight_reports_missing_model_adapter(tmp_path) -> None:
     data_path = _write_local_data(tmp_path)
     adapter_path = tmp_path / "missing-adapter"

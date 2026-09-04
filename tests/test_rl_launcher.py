@@ -48,6 +48,7 @@ from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
 from wavelet.trainer.rl_trainer import RLTrainer
 from wavelet.trainer.rl_worker import (
     _dummy_rollout_row,
+    _run_streaming_rollout_training,
     _StreamingChunkAccumulator,
     _use_streaming_rollout_chunks,
     _validate_rollout_batch,
@@ -290,6 +291,33 @@ def test_rollout_chunk_examples_defaults_to_async_split() -> None:
         3,
         2,
     ]
+
+
+def test_token_batch_uses_one_dynamic_chunk_per_optimizer_step() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "token_batch_size": 4096,
+            "max_async_level": 2,
+        },
+    )
+
+    assert _use_streaming_rollout_chunks(config) is True
+    assert rollout_chunk_examples(config) == 1
+    assert chunks_per_step(config) == 1
+    with pytest.raises(ValueError, match="dynamic group count"):
+        rollout_groups_for_chunk(config, 0)
+
+    trainer = SimpleNamespace(step=0, world=None)
+    _run_streaming_rollout_training(
+        config,
+        trainer,
+        receiver=object(),  # type: ignore[arg-type]
+        target_step=0,
+    )
 
 
 def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:

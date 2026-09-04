@@ -18,6 +18,8 @@ def target_steps(config: RLConfig) -> int:
 
 
 def rollout_chunk_examples(config: RLConfig) -> int:
+    if config.orchestrator.token_batch_size is not None:
+        return 1
     configured = config.orchestrator.rollout_chunk_examples
     if configured is not None:
         return configured
@@ -29,6 +31,8 @@ def rollout_chunk_examples(config: RLConfig) -> int:
 
 
 def chunks_per_step(config: RLConfig) -> int:
+    if config.orchestrator.token_batch_size is not None:
+        return 1
     examples_per_step = config.orchestrator.examples_per_step
     if examples_per_step is None:
         raise ValueError("orchestrator.examples_per_step is required.")
@@ -37,6 +41,8 @@ def chunks_per_step(config: RLConfig) -> int:
 
 def rollout_groups_for_chunk(config: RLConfig, chunk_index: int) -> int:
     """Return the exact group count for one optimizer-step chunk."""
+    if config.orchestrator.token_batch_size is not None:
+        raise ValueError("Token-based rollout batches have a dynamic group count.")
     examples_per_step = config.orchestrator.examples_per_step
     if examples_per_step is None:
         raise ValueError("orchestrator.examples_per_step is required.")

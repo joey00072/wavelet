@@ -206,6 +206,7 @@ def resolve_rollout_schedule(config: RLConfig) -> RolloutSchedule:
         and (
             source is RolloutSourceKind.VERIFIER
             or config.orchestrator.examples_per_step is not None
+            or config.orchestrator.token_batch_size is not None
         )
     )
     return RolloutSchedule(
@@ -495,9 +496,11 @@ class VerifierRolloutScheduler:
         self.rollout_step: int | None = None
         self.rollout_count = config.orchestrator.rollouts_per_example or 1
         self.target_groups = config.orchestrator.examples_per_step
-        if self.target_groups is None:
+        self.target_tokens = config.orchestrator.token_batch_size
+        if self.target_groups is None and self.target_tokens is None:
             raise ValueError(
-                "orchestrator.examples_per_step is required for rolling verifier "
+                "Either orchestrator.examples_per_step or "
+                "orchestrator.token_batch_size is required for rolling verifier "
                 "scheduling."
             )
         self.clients = _verifier_clients(vf, config)
@@ -546,7 +549,7 @@ class VerifierRolloutScheduler:
         explicit_rollouts = self.config.orchestrator.max_inflight_rollouts
         if explicit_rollouts is not None:
             return max(1, explicit_rollouts // self.rollout_count)
-        base_groups = self.target_groups
+        base_groups = self.target_groups or self._estimated_token_batch_groups
         pending_chunk_limit = self.config.orchestrator.max_pending_rollout_chunks
         if pending_chunk_limit is not None:
             bounded_groups = _rollout_chunk_examples(self.config) * pending_chunk_limit
@@ -558,6 +561,25 @@ class VerifierRolloutScheduler:
             len(self.clients),
             oversampled_groups,
         )
+
+    @property
+    def _estimated_token_batch_groups(self) -> int:
+        target_tokens = getattr(self, "target_tokens", None)
+        if target_tokens is None:
+            return 1
+        maximum_group_tokens = max(self.config.data.seq_len * self.rollout_count, 1)
+        return max(1, math.ceil(target_tokens / maximum_group_tokens))
+
+    @property
+    def _minimum_token_batch_groups(self) -> int:
+        """Conservatively cover one distributed trainer micro-batch."""
+        if getattr(self, "target_tokens", None) is None:
+            return 1
+        minimum_rows = (
+            self.config.data.micro_batch_size
+            * self.config.launcher.trainer_num_processes
+        )
+        return max(1, math.ceil(minimum_rows / self.rollout_count))
 
     @property
     def max_inflight_rollouts(self) -> int:
@@ -582,13 +604,25 @@ class VerifierRolloutScheduler:
             self.max_inflight_rollouts
         )
         target_groups = self.target_groups if target_groups is None else target_groups
+        target_tokens = (
+            getattr(self, "target_tokens", None) if target_groups is None else None
+        )
         outputs: list[dict[str, Any]] = []
         accepted_groups = 0
+        accepted_tokens = 0
         rejected_groups = 0
         completed_groups = 0
         attempt = 0
         batch_stats = _VerifierBatchStats()
-        max_completed_groups = target_groups * (
+        retry_target = (
+            target_groups
+            if target_groups is not None
+            else max(
+                self._estimated_token_batch_groups,
+                self._minimum_token_batch_groups,
+            )
+        )
+        max_completed_groups = retry_target * (
             self.config.orchestrator.zero_advantage_max_retries + 1
         )
         self._sync_ready_group_ages()
@@ -601,15 +635,28 @@ class VerifierRolloutScheduler:
         try:
             # Buffered groups are older than anything completing now; shipping
             # them first keeps them from expiring unused at the next step.
-            while self.ready_groups and accepted_groups < target_groups:
-                outputs.extend(self.ready_groups.pop(0))
+            while self.ready_groups and not self._batch_target_reached(
+                accepted_groups=accepted_groups,
+                accepted_tokens=accepted_tokens,
+                target_groups=target_groups,
+                target_tokens=target_tokens,
+            ):
+                ready_group = self.ready_groups.pop(0)
+                outputs.extend(ready_group)
+                accepted_tokens += self._outputs_token_count(ready_group)
                 if self.ready_group_off_policy_steps:
                     self.ready_group_off_policy_steps.pop(0)
                 accepted_groups += 1
-            drained_completed, drained_rejected = self._drain_completed_groups_to_ready(
+            (
+                drained_completed,
+                drained_rejected,
+                accepted_tokens,
+            ) = self._drain_completed_groups_to_ready(
                 target_groups=target_groups,
+                target_tokens=target_tokens,
                 outputs=outputs,
                 accepted_groups=accepted_groups,
+                accepted_tokens=accepted_tokens,
                 batch_stats=batch_stats,
             )
             completed_groups += drained_completed
@@ -617,7 +664,12 @@ class VerifierRolloutScheduler:
             accepted_groups = len(outputs) // self.rollout_count
 
             while True:
-                if accepted_groups >= target_groups:
+                if self._batch_target_reached(
+                    accepted_groups=accepted_groups,
+                    accepted_tokens=accepted_tokens,
+                    target_groups=target_groups,
+                    target_tokens=target_tokens,
+                ):
                     if self._has_trainable_batch(outputs):
                         break
                     attempt += 1
@@ -626,10 +678,13 @@ class VerifierRolloutScheduler:
                         max_completed_groups=max_completed_groups,
                         accepted_groups=accepted_groups,
                         target_groups=target_groups,
+                        accepted_tokens=accepted_tokens,
+                        target_tokens=target_tokens,
                         rejected_groups=rejected_groups,
                     )
                     outputs = []
                     accepted_groups = 0
+                    accepted_tokens = 0
 
                 await self._wait_for_policy_update()
                 self._fill_inflight()
@@ -638,14 +693,21 @@ class VerifierRolloutScheduler:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for task in done:
+                    output_count = len(outputs)
                     accepted, completed, rejected = self._consume_completed_task(
                         task,
                         target_groups=target_groups,
+                        target_tokens=target_tokens,
                         outputs=outputs,
                         accepted_groups=accepted_groups,
+                        accepted_tokens=accepted_tokens,
                         batch_stats=batch_stats,
                     )
                     accepted_groups += accepted
+                    if accepted:
+                        accepted_tokens += self._outputs_token_count(
+                            outputs[output_count:]
+                        )
                     completed_groups += completed
                     rejected_groups += rejected
                     self._raise_if_retries_exhausted(
@@ -653,16 +715,24 @@ class VerifierRolloutScheduler:
                         max_completed_groups=max_completed_groups,
                         accepted_groups=accepted_groups,
                         target_groups=target_groups,
+                        accepted_tokens=accepted_tokens,
+                        target_tokens=target_tokens,
                         rejected_groups=rejected_groups,
                     )
         except Exception:
             await self.aclose()
             raise
 
-        drained_completed, drained_rejected = self._drain_completed_groups_to_ready(
+        (
+            drained_completed,
+            drained_rejected,
+            accepted_tokens,
+        ) = self._drain_completed_groups_to_ready(
             target_groups=target_groups,
+            target_tokens=target_tokens,
             outputs=outputs,
             accepted_groups=accepted_groups,
+            accepted_tokens=accepted_tokens,
             batch_stats=batch_stats,
         )
         completed_groups += drained_completed
@@ -674,7 +744,33 @@ class VerifierRolloutScheduler:
             accepted_groups=accepted_groups,
             rejected_groups=rejected_groups,
             completed_groups=completed_groups,
+            accepted_tokens=accepted_tokens,
             batch_stats=batch_stats,
+        )
+
+    def _batch_target_reached(
+        self,
+        *,
+        accepted_groups: int,
+        accepted_tokens: int,
+        target_groups: int | None,
+        target_tokens: int | None,
+    ) -> bool:
+        if target_groups is not None:
+            return accepted_groups >= target_groups
+        if target_tokens is None:
+            raise RuntimeError("Verifier scheduler has no batch target.")
+        return (
+            accepted_tokens >= target_tokens
+            and accepted_groups >= self._minimum_token_batch_groups
+        )
+
+    @staticmethod
+    def _outputs_token_count(outputs: list[dict[str, Any]]) -> int:
+        return sum(
+            len(record.input_ids or [])
+            for output in outputs
+            for record in _records_from_output(output)
         )
 
     def _has_trainable_batch(self, outputs: list[dict[str, Any]]) -> bool:
@@ -690,15 +786,36 @@ class VerifierRolloutScheduler:
         completed_groups: int,
         max_completed_groups: int,
         accepted_groups: int,
-        target_groups: int,
+        target_groups: int | None,
+        accepted_tokens: int = 0,
+        target_tokens: int | None = None,
         rejected_groups: int,
     ) -> None:
-        if accepted_groups >= target_groups or completed_groups < max_completed_groups:
+        target_reached = (
+            accepted_groups >= target_groups
+            if target_groups is not None
+            else target_tokens is not None and accepted_tokens >= target_tokens
+        )
+        retries_exhausted = (
+            completed_groups >= max_completed_groups
+            if target_groups is not None
+            else rejected_groups >= max_completed_groups
+        )
+        if target_reached or not retries_exhausted:
             return
+        if target_groups is not None:
+            raise RuntimeError(
+                "Verifier scheduler could not produce enough trainable rollout "
+                f"groups after {completed_groups} completed group(s): accepted "
+                f"{accepted_groups}, rejected {rejected_groups}. Increase "
+                "orchestrator.zero_advantage_max_retries, relax filtering, or "
+                "check reward/model behavior."
+            )
+        accepted = f"{accepted_tokens} token(s) across {accepted_groups} group(s)"
         raise RuntimeError(
             "Verifier scheduler could not produce enough trainable rollout groups "
-            f"after {completed_groups} completed group(s): accepted "
-            f"{accepted_groups}, rejected {rejected_groups}. Increase "
+            f"after {completed_groups} completed group(s): accepted {accepted} "
+            f"toward {target_tokens} token(s), rejected {rejected_groups}. Increase "
             "orchestrator.zero_advantage_max_retries, relax filtering, or check "
             "reward/model behavior."
         )
@@ -712,6 +829,7 @@ class VerifierRolloutScheduler:
         accepted_groups: int,
         rejected_groups: int,
         completed_groups: int,
+        accepted_tokens: int,
         batch_stats: _VerifierBatchStats,
     ) -> list[RLExample]:
         self._fill_inflight()
@@ -745,6 +863,7 @@ class VerifierRolloutScheduler:
         self.last_batch_metrics["generation/policy_update_wait_seconds"] = float(
             getattr(self, "policy_update_wait_seconds", 0.0)
         )
+        self.last_batch_metrics["generation/batch/tokens"] = float(accepted_tokens)
         failure_stats = getattr(self, "failure_stats", None)
         if failure_stats is not None:
             self.last_batch_metrics.update(failure_stats.consume_metrics())
@@ -764,36 +883,45 @@ class VerifierRolloutScheduler:
     def _drain_completed_groups_to_ready(
         self,
         *,
-        target_groups: int,
+        target_groups: int | None,
+        target_tokens: int | None,
         outputs: list[dict[str, Any]],
         accepted_groups: int,
+        accepted_tokens: int,
         batch_stats: _VerifierBatchStats,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, int]:
         completed_groups = 0
         rejected_groups = 0
         for task in [task for task in self.pending if task.done()]:
+            output_count = len(outputs)
             accepted, completed, rejected = self._consume_completed_task(
                 task,
                 target_groups=target_groups,
+                target_tokens=target_tokens,
                 outputs=outputs,
                 accepted_groups=accepted_groups,
+                accepted_tokens=accepted_tokens,
                 batch_stats=batch_stats,
             )
             accepted_groups += accepted
+            if accepted:
+                accepted_tokens += self._outputs_token_count(outputs[output_count:])
             completed_groups += completed
             rejected_groups += rejected
         self.rejected_groups_count = (
             getattr(self, "rejected_groups_count", 0) + rejected_groups
         )
-        return completed_groups, rejected_groups
+        return completed_groups, rejected_groups, accepted_tokens
 
     def _consume_completed_task(
         self,
         task: asyncio.Task[list[dict[str, Any]]],
         *,
-        target_groups: int,
+        target_groups: int | None,
+        target_tokens: int | None = None,
         outputs: list[dict[str, Any]],
         accepted_groups: int,
+        accepted_tokens: int = 0,
         batch_stats: _VerifierBatchStats | None = None,
     ) -> tuple[int, int, int]:
         """Consume one finished request and classify its completed group."""
@@ -872,7 +1000,12 @@ class VerifierRolloutScheduler:
             batch_stats.observe(completed_outputs, admitted=is_usable)
         if not is_usable:
             return 0, 1, 1
-        if accepted_groups < target_groups:
+        if not self._batch_target_reached(
+            accepted_groups=accepted_groups,
+            accepted_tokens=accepted_tokens,
+            target_groups=target_groups,
+            target_tokens=target_tokens,
+        ):
             outputs.extend(completed_outputs)
             return 1, 1, 0
 
@@ -2219,7 +2352,11 @@ class _VerifierPublisherStrategy:
             return
         generate_started_at = perf_counter()
         chunk_index = queue_step % self.chunks_per_step
-        chunk_groups = _rollout_groups_for_chunk(self.config, chunk_index)
+        chunk_groups = (
+            None
+            if self.config.orchestrator.token_batch_size is not None
+            else _rollout_groups_for_chunk(self.config, chunk_index)
+        )
         records = await self.scheduler.generate_batch(
             target_groups=chunk_groups,
             rollout_step=optimizer_step,
@@ -2245,6 +2382,7 @@ class _VerifierPublisherStrategy:
             chunk_index=queue_step % self.chunks_per_step,
             policy_step=rollout_policy_step,
             rows=_count_nonempty_lines(materialized_path),
+            tokens=_rollout_record_tokens(records),
         )
         publish_seconds = perf_counter() - publish_started_at
         self._record_published_chunk(
@@ -2447,11 +2585,15 @@ async def _run_verifier_scheduler(
     from wavelet.orchestrator.scheduler import VerifierRolloutScheduler
 
     examples_per_step = config.orchestrator.examples_per_step
-    if examples_per_step is None:
-        raise ValueError("orchestrator.examples_per_step is required.")
+    token_batch_size = config.orchestrator.token_batch_size
+    if examples_per_step is None and token_batch_size is None:
+        raise ValueError(
+            "Either orchestrator.examples_per_step or "
+            "orchestrator.token_batch_size is required."
+        )
     scheduler = VerifierRolloutScheduler(
         orchestrator,
-        start_record_cursor=start_step * examples_per_step,
+        start_record_cursor=start_step * (examples_per_step or 0),
     )
     chunks_per_step = _chunks_per_step(config)
     context = _VerifierPublisherStrategy(
@@ -2641,6 +2783,11 @@ def _rollout_records_policy_step(
         if isinstance(value, int) and not isinstance(value, bool)
     ]
     return min(policy_steps) if policy_steps else fallback
+
+
+def _rollout_record_tokens(records: list[RLExample]) -> int:
+    """Count trainer-bound tokens in pretokenized rollout records."""
+    return sum(len(record.input_ids or []) for record in records)
 
 
 def _write_materialized_records(
