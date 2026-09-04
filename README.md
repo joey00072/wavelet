@@ -178,6 +178,19 @@ policy versions the resumed run re-derives differently; batches for the resume
 step itself stay reusable. Async checkpoints
 finish copying the live tensors to their staging buffer before the trainer
 returns to the next optimizer step; only the upload continues in the background.
+
+Convert a stable full-model DCP checkpoint into an inference-ready Hugging Face
+safetensors directory with:
+
+```bash
+uv run wavelet convert-checkpoint outputs/run/checkpoint-100
+```
+
+The default destination is `checkpoint-100/weights`. The converter discovers
+`rl_trainer.yaml` or `sft.yaml` from the run's latest resolved config; pass
+`--config PATH` when checkpoints use a separate volume. It runs in one process,
+requires enough CPU memory for the full model, refuses incomplete and non-empty
+destinations, and intentionally rejects LoRA, adapter-backed, and 4-bit runs.
 Set `ckpt.output_dir` to place large checkpoint step directories on a separate
 volume without moving logs, rollouts, policies, or other run state out of the
 top-level `output_dir`. Resume and preflight resolve the same checkpoint volume.

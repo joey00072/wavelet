@@ -7,6 +7,10 @@ PUBLIC_COMMANDS = {
     "rl": ("wavelet.entrypoints.rl_launcher", "Run reinforcement learning launcher"),
     "sft": ("wavelet.entrypoints.sft", "Run supervised fine-tuning"),
     "debug": ("wavelet.entrypoints.rl_debug", "Inspect and probe RL subsystems"),
+    "convert-checkpoint": (
+        "wavelet.tools.convert_checkpoint",
+        "Convert a DCP checkpoint to Hugging Face safetensors",
+    ),
     "rl-trainer": ("wavelet.entrypoints.rl_trainer", "Run RL trainer"),
     "rl-orchestrator": ("wavelet.entrypoints.rl_orchestrator", "Run RL orchestrator"),
     "rl-inference": (
