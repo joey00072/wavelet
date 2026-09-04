@@ -11,6 +11,7 @@ dependencies = [
     "pyyaml>=6.0",
     "tensorboard>=2.15",
     "wandb>=0.16",
+    "wandb-workspaces>=0.4.3",
     "tqdm>=4.66",
     "datasets>=2.18",
     "accelerate>=0.28",

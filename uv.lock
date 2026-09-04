@@ -6147,6 +6147,19 @@ wheels = [
 ]
 
 [[package]]
+name = "wandb-workspaces"
+version = "0.4.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "wandb" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/44/90/749e3af75f1bc2685711176f8f0fe6dae38d5b979e4dc160c30cd4373597/wandb_workspaces-0.4.3.tar.gz", hash = "sha256:2c551bc35cadda14ff0c7c3ac1d7bbbb1c95b8f0dbc662ec2c58f3d3d832f854", size = 234226, upload-time = "2026-06-10T22:27:17.22Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/c0/8f/0c1bc0b48733935031ef8956a1efb1436e3f4e1a3a402eece169a952672b/wandb_workspaces-0.4.3-py3-none-any.whl", hash = "sha256:4536dbc9d57d3aa59318e770b5c526c087f52b6b9488634b1d393163b9f6da2f", size = 109269, upload-time = "2026-06-10T22:27:15.509Z" },
+]
+
+[[package]]
 name = "watchfiles"
 version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -6257,6 +6270,7 @@ dependencies = [
     { name = "uvicorn" },
     { name = "vllm" },
     { name = "wandb" },
+    { name = "wandb-workspaces" },
     { name = "xformers" },
 ]
 
@@ -6330,6 +6344,7 @@ requires-dist = [
     { name = "verifiers", marker = "extra == 'verifiers'", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=77a9f28" },
     { name = "vllm", specifier = ">=0.8.0" },
     { name = "wandb", specifier = ">=0.16" },
+    { name = "wandb-workspaces", specifier = ">=0.4.3" },
     { name = "wiki-search", marker = "python_full_version >= '3.12' and platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'envs'", index = "https://hub.primeintellect.ai/primeintellect/simple/" },
     { name = "xformers", specifier = ">=0.0.35" },
 ]

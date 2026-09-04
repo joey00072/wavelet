@@ -8,6 +8,7 @@ import os
 import random
 import re
 import shutil
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -319,6 +320,7 @@ class RunMonitor:
         self._wandb_samples_columns: list[str] = []
         self._sample_rows_since_compaction: int | None = None
         self._warned_nonfinite_metric_keys: set[str] = set()
+        self._wandb_time_metrics: set[str] = set()
 
     def start_run(
         self,
@@ -355,7 +357,7 @@ class RunMonitor:
         self.log_event(event, payload={"resumed_from": resumed_from})
         self._write_heartbeat(status="running", step=None)
 
-    def log(self, metrics: dict[str, Any], step: int) -> None:
+    def log(self, metrics: dict[str, Any], step: int | None) -> None:
         if not self._should_write():
             return
 
@@ -382,10 +384,19 @@ class RunMonitor:
             wandb_row = {
                 key: value
                 for key, value in row.items()
-                if key != "timestamp" and key not in nonfinite_keys
+                if key != "timestamp"
+                and key not in nonfinite_keys
+                and not (key == "step" and step is None)
             }
             wandb_metrics = dict(wandb_row)
             wandb_metrics.update(self._wandb_alias_metrics(wandb_row))
+            if step is None:
+                _define_wandb_time_metrics(
+                    self._wandb_run,
+                    wandb_metrics,
+                    self._wandb_time_metrics,
+                )
+            wandb_metrics["_timestamp"] = time.time()
             # ``step`` is the declared step metric; an explicit ``step=`` would
             # make W&B drop rows logged for an earlier step (async eval results).
             self._wandb_run.log(wandb_metrics)
@@ -582,6 +593,7 @@ class RunMonitor:
             init_kwargs["settings"] = settings_factory(
                 init_timeout=self.wandb.init_timeout_seconds
             )
+        create_online_overview = self.wandb.mode == "online"
         try:
             if shared_kwargs is None:
                 self._wandb_run = wandb.init(mode=self.wandb.mode, **init_kwargs)
@@ -603,6 +615,7 @@ class RunMonitor:
                     init_timeout=self.wandb.init_timeout_seconds
                 )
             self._wandb_run = wandb.init(mode="offline", **fallback_kwargs)
+            create_online_overview = False
         self._wandb_run.define_metric("step")
         self._wandb_run.define_metric("*", step_metric="step")
         canonical_run_id = (
@@ -611,6 +624,40 @@ class RunMonitor:
             else getattr(self._wandb_run, "id", None)
         )
         self._write_wandb_run_id(canonical_run_id)
+        if create_online_overview:
+            self._create_wandb_overview(run_config, shared_kwargs)
+
+    def _create_wandb_overview(
+        self,
+        run_config: dict[str, Any] | None,
+        shared_kwargs: dict[str, Any] | None,
+    ) -> None:
+        if self.wandb.mode != "online" or not self.wandb.create_overview:
+            return
+        if shared_kwargs is not None and os.environ.get(
+            "WANDB_SHARED_LABEL"
+        ) != os.environ.get("WANDB_SHARED_PRIMARY", "orchestrator"):
+            return
+        entity = getattr(self._wandb_run, "entity", None)
+        project = getattr(self._wandb_run, "project", None)
+        if not isinstance(entity, str) or not isinstance(project, str):
+            logger.warning("Cannot create W&B overview without entity and project.")
+            return
+        try:
+            from wavelet.wandb_overview import ensure_overview_view, overview_inputs
+
+            flavor, train_envs, eval_envs = overview_inputs(run_config)
+            url = ensure_overview_view(
+                entity,
+                project,
+                flavor=flavor,
+                train_envs=train_envs,
+                eval_envs=eval_envs,
+            )
+            if url is not None:
+                logger.info("Created W&B overview view: %s", url)
+        except Exception:
+            logger.warning("Failed to create W&B overview view.", exc_info=True)
 
     def _read_wandb_run_id(self) -> str | None:
         if not self.wandb_run_id_file.exists():
@@ -801,7 +848,26 @@ def _shared_wandb_init_kwargs(
     }
 
 
+def _wandb_metric_pattern(metric: str) -> str:
+    prefix, separator, _ = metric.partition("/")
+    return f"{prefix}/*" if separator else metric
+
+
+def _define_wandb_time_metrics(
+    run: Any,
+    metrics: dict[str, Any],
+    defined: set[str],
+) -> None:
+    """Give step-less metric families a wall-time axis exactly once."""
+    for pattern in sorted({_wandb_metric_pattern(metric) for metric in metrics}):
+        if pattern in defined:
+            continue
+        run.define_metric(pattern, step_metric="_timestamp")
+        defined.add(pattern)
+
+
 _WANDB_RUN = None
+_WANDB_TIME_METRICS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -1202,8 +1268,13 @@ def _append_csv(path: Path, row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
-def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> None:
-    global _WANDB_RUN
+def _wandb_log(
+    config: RLConfig,
+    metrics: dict[str, float],
+    *,
+    step: int | None,
+) -> None:
+    global _WANDB_RUN, _WANDB_TIME_METRICS
     wandb_config = config.monitor.wandb
     if not wandb_config.enabled or wandb_config.mode == "disabled":
         return
@@ -1213,6 +1284,8 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
         return
     try:
         if _WANDB_RUN is None:
+            _WANDB_TIME_METRICS = set()
+            shared_kwargs = None
             active_run = getattr(wandb, "run", None)
             if active_run is not None:
                 _WANDB_RUN = active_run
@@ -1245,19 +1318,61 @@ def _wandb_log(config: RLConfig, metrics: dict[str, float], *, step: int) -> Non
                 _WANDB_RUN = wandb.init(**init_kwargs)
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")
-        _WANDB_RUN.log({**metrics, "step": step})
+            if (
+                wandb_config.mode == "online"
+                and wandb_config.create_overview
+                and (
+                    shared_kwargs is None
+                    or os.environ.get("WANDB_SHARED_LABEL")
+                    == os.environ.get("WANDB_SHARED_PRIMARY", "orchestrator")
+                )
+            ):
+                try:
+                    from wavelet.wandb_overview import (
+                        ensure_overview_view,
+                        overview_inputs,
+                    )
+
+                    entity = getattr(_WANDB_RUN, "entity", None)
+                    project = getattr(_WANDB_RUN, "project", None)
+                    if isinstance(entity, str) and isinstance(project, str):
+                        flavor, train_envs, eval_envs = overview_inputs(
+                            config.model_dump(mode="json", exclude_none=True)
+                        )
+                        url = ensure_overview_view(
+                            entity,
+                            project,
+                            flavor=flavor,
+                            train_envs=train_envs,
+                            eval_envs=eval_envs,
+                        )
+                        if url is not None:
+                            logger.info("Created W&B overview view: %s", url)
+                except Exception:
+                    logger.warning("Failed to create W&B overview view.", exc_info=True)
+        row: dict[str, float] = {**metrics, "_timestamp": time.time()}
+        if step is None:
+            _define_wandb_time_metrics(
+                _WANDB_RUN,
+                metrics,
+                _WANDB_TIME_METRICS,
+            )
+        else:
+            row["step"] = step
+        _WANDB_RUN.log(row)
     except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
 
 
 def finish_orchestrator_wandb() -> None:
-    global _WANDB_RUN
+    global _WANDB_RUN, _WANDB_TIME_METRICS
     if _WANDB_RUN is None:
         return
     try:
         _WANDB_RUN.finish()
     finally:
         _WANDB_RUN = None
+        _WANDB_TIME_METRICS = set()
 
 
 def _group_by_example(

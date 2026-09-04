@@ -371,6 +371,10 @@ Online process-mode RL roles use W&B shared mode with that same run id: the
 trainer is the primary writer and the orchestrator is the final writer, so
 training, rollout, and evaluation metrics land in one run. Offline and disabled
 W&B modes keep their existing local behavior and do not enable shared mode.
+Metrics logged without an optimizer step use W&B wall time as their chart axis.
+Online primary writers also create a versioned `overview` workspace with curated
+training, evaluation, stability, wall-time inference, performance, and resource panels; set
+`monitor.wandb.create_overview: false` to disable that project-level view.
 Training metrics that become NaN or infinite are stored as `null` in local
 JSONL logs and omitted from W&B rows; the monitor warns once for each affected
 metric key.

@@ -6,6 +6,7 @@ import sys
 import types
 from collections import namedtuple
 
+from wavelet import wandb_overview
 from wavelet.configs.sft import WandbConfig
 from wavelet.monitor import read_jsonl
 from wavelet.utils.monitoring import RunMonitor
@@ -14,9 +15,10 @@ from wavelet.utils.monitoring import RunMonitor
 class _FakeRun:
     def __init__(self) -> None:
         self.rows: list[dict[str, object]] = []
+        self.metric_definitions: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    def define_metric(self, *_args, **_kwargs) -> None:
-        return None
+    def define_metric(self, *args, **kwargs) -> None:
+        self.metric_definitions.append((args, kwargs))
 
     def log(self, row, *_args, **_kwargs) -> None:
         self.rows.append(row)
@@ -63,6 +65,51 @@ def test_wandb_group_and_tags_are_forwarded(monkeypatch, tmp_path) -> None:
     assert metadata["config"]["nested"]["api_token"] == "<redacted>"
 
 
+def test_online_primary_creates_curated_wandb_overview(monkeypatch, tmp_path) -> None:
+    created: dict[str, object] = {}
+    run = _FakeRun()
+    run.id = "online-123"
+    run.entity = "test-entity"
+    run.project = "wavelet-tests"
+
+    monkeypatch.delenv("WANDB_SHARED_MODE", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "wandb",
+        types.SimpleNamespace(
+            init=lambda **_kwargs: run,
+            Settings=lambda **kwargs: kwargs,
+        ),
+    )
+
+    def fake_ensure(entity, project, **kwargs):
+        created.update({"entity": entity, "project": project, **kwargs})
+        return "https://wandb.example/overview"
+
+    monkeypatch.setattr(wandb_overview, "ensure_overview_view", fake_ensure)
+    monitor = RunMonitor(
+        tmp_path,
+        log_cuda_memory=False,
+        log_disk_usage=False,
+        wandb=WandbConfig(enabled=True, mode="online"),
+    )
+
+    monitor.start_run(
+        run_config={
+            "orchestrator": {"verifier_env_id": "reverse-text@1"},
+            "eval": {"env": [{"id": "aime2025"}]},
+        }
+    )
+
+    assert created == {
+        "entity": "test-entity",
+        "project": "wavelet-tests",
+        "flavor": "rl",
+        "train_envs": ["reverse-text"],
+        "eval_envs": ["aime2025"],
+    }
+
+
 def test_wandb_alias_metrics_include_lr() -> None:
     aliases = RunMonitor._wandb_alias_metrics({"lr": 1e-6})
 
@@ -106,6 +153,30 @@ def test_nonfinite_metrics_are_null_locally_and_omitted_from_wandb(
     assert len(warnings) == 2
     assert any("'loss'" in message for message in warnings)
     assert any("'scale'" in message for message in warnings)
+
+
+def test_step_less_metrics_use_wandb_wall_time(monkeypatch, tmp_path) -> None:
+    monitor = RunMonitor(
+        tmp_path,
+        log_cuda_memory=False,
+        log_disk_usage=False,
+    )
+    wandb_run = _FakeRun()
+    monitor._wandb_run = wandb_run
+    monkeypatch.setattr("wavelet.monitor.time.time", lambda: 123.5)
+
+    monitor.log({"inference/queue_depth": 4.0}, step=None)
+    monitor.log({"inference/throughput": 2.0}, step=None)
+
+    rows = read_jsonl(tmp_path / "metrics.jsonl")
+    assert rows[0]["step"] is None
+    assert wandb_run.rows[0] == {
+        "inference/queue_depth": 4.0,
+        "_timestamp": 123.5,
+    }
+    assert wandb_run.metric_definitions == [
+        (("inference/*",), {"step_metric": "_timestamp"})
+    ]
 
 
 def test_disk_metrics_cover_run_and_checkpoint_volumes(monkeypatch, tmp_path) -> None:

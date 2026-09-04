@@ -318,6 +318,33 @@ def test_orchestrator_wandb_config_redacts_secrets(monkeypatch, tmp_path) -> Non
     }
 
 
+def test_orchestrator_step_less_metrics_use_wandb_wall_time(
+    monkeypatch, tmp_path
+) -> None:
+    run = Mock()
+    fake_wandb = types.SimpleNamespace(
+        init=Mock(return_value=run),
+        define_metric=Mock(),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
+    monkeypatch.setattr(monitor_module, "_WANDB_RUN", None)
+    monkeypatch.setattr(monitor_module, "_WANDB_TIME_METRICS", set())
+    monkeypatch.setattr("wavelet.monitor.time.time", lambda: 456.0)
+    config = RLConfig(
+        output_dir=tmp_path,
+        monitor={"wandb": {"enabled": True, "mode": "offline"}},
+    )
+
+    monitor_module._wandb_log(
+        config,
+        {"inference/queue_depth": 3.0},
+        step=None,
+    )
+
+    run.define_metric.assert_called_once_with("inference/*", step_metric="_timestamp")
+    run.log.assert_called_once_with({"inference/queue_depth": 3.0, "_timestamp": 456.0})
+
+
 def test_finish_orchestrator_wandb_finishes_once(monkeypatch) -> None:
     run = Mock()
     monkeypatch.setattr(monitor_module, "_WANDB_RUN", run)
