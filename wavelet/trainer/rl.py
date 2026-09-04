@@ -577,14 +577,18 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def finalize(self, *, status: str = "completed") -> None:
         self._close_policy_transport()
         if self.monitor is None or self._run_closed:
+            self._close_garbage_collector()
             return
-        if status == "completed" and self.ckpt_manager is not None:
-            self._save_final_checkpoint()
-            self.ckpt_manager.wait_for_pending_save()
-        self.monitor.finish(status=status, step=self.step)
-        self._run_closed = True
-        if status == "completed" and not self._uses_sleep_colocation():
-            self._save_model()
+        try:
+            if status == "completed" and self.ckpt_manager is not None:
+                self._save_final_checkpoint()
+                self.ckpt_manager.wait_for_pending_save()
+            self.monitor.finish(status=status, step=self.step)
+            self._run_closed = True
+            if status == "completed" and not self._uses_sleep_colocation():
+                self._save_model()
+        finally:
+            self._close_garbage_collector()
 
     def _validate_reference_policy_support(self) -> None:
         if self.config.orchestrator.enabled:

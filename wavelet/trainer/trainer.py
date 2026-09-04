@@ -33,6 +33,7 @@ from wavelet.trainer.distributed import (
     get_world,
     set_world,
 )
+from wavelet.trainer.garbage_collection import DeterministicGarbageCollector
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
@@ -135,6 +136,7 @@ class BaseTrainer:
         self._micro_step = 0
         self.total_tokens = 0
         self.total_samples = 0
+        self._garbage_collector: DeterministicGarbageCollector | None = None
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -261,6 +263,7 @@ class BaseTrainer:
             raise RuntimeError("Trainer run has already been finalized.")
         assert self.model is not None
         assert self.world is not None
+        self._ensure_garbage_collector()
         self.model.train()
         progress = tqdm(
             total=max(target_step - self.step, 0),
@@ -276,6 +279,7 @@ class BaseTrainer:
                     if not output.stepped:
                         continue
                     self._after_optimizer_step()
+                    self._maybe_collect_garbage()
                     self._log_train_output(output, progress)
                     self._maybe_checkpoint()
                     progress.update(1)
@@ -309,10 +313,28 @@ class BaseTrainer:
             return
         if self.monitor is None:
             raise RuntimeError("Monitor not set up. Call setup() first.")
-        self.monitor.finish(status=status, step=self.step)
-        self._run_closed = True
-        if status == "completed":
-            self._save_model()
+        try:
+            self.monitor.finish(status=status, step=self.step)
+            self._run_closed = True
+            if status == "completed":
+                self._save_model()
+        finally:
+            self._close_garbage_collector()
+
+    def _ensure_garbage_collector(self) -> None:
+        if self.config.gc is None or self._garbage_collector is not None:
+            return
+        self._garbage_collector = DeterministicGarbageCollector(self.config.gc.interval)
+
+    def _maybe_collect_garbage(self) -> None:
+        if self._garbage_collector is not None:
+            self._garbage_collector.run(self.step)
+
+    def _close_garbage_collector(self) -> None:
+        if self._garbage_collector is None:
+            return
+        self._garbage_collector.close()
+        self._garbage_collector = None
 
     def _setup_distributed(self) -> None:
         fsdp_config = getattr(self.config, "fsdp", None)

@@ -361,6 +361,10 @@ RL trainer metrics include `entropy/mean`, `entropy/min`, and `entropy/max`
 over loss-masked policy tokens. Entropy uses each token's rollout temperature
 and is computed without materializing full-vocabulary logits when the chunked
 LM head is enabled.
+Trainer-side automatic Python garbage collection is disabled while training and
+generation-1 collection runs on every rank at the same optimizer-step boundary,
+every `gc.interval` steps (default 50), avoiding rank-local pause jitter. Set
+`gc: null` to retain Python's automatic garbage collector instead.
 Standalone trainers use the same resolved step count for optimization and the
 learning-rate scheduler; in particular, RL `max_steps: 0` remains evaluation-only
 instead of falling back to an implicit training run. Without `max_steps`,

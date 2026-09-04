@@ -230,6 +230,10 @@ class SchedulerConfig(ConfigModel):
     decay_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
+class GCConfig(ConfigModel):
+    interval: int = Field(default=50, ge=1)
+
+
 class CheckpointConfig(ConfigModel):
     interval: int | None = Field(default=None, ge=1)
     # Counts optimizer steps, not micro-steps.
@@ -319,6 +323,7 @@ class TrainerConfig(ConfigModel):
     model: ModelConfig = ModelConfig()
     optim: OptimizerConfig = OptimizerConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
+    gc: GCConfig | None = GCConfig()
     max_grad_norm: float = Field(default=1.0, ge=0.0)
     loss_impl: Literal["liger", "torch", "liger_fused"] = "torch"
     ckpt: CheckpointConfig | None = None
