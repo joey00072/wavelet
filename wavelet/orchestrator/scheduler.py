@@ -145,6 +145,9 @@ from wavelet.orchestrator.envs import (
     _write_eval_rollouts as _write_eval_rollouts,
 )
 from wavelet.orchestrator.envs import (
+    annotate_distillation_records as annotate_distillation_records,
+)
+from wavelet.orchestrator.envs import (
     evaluate_env as evaluate_env,
 )
 from wavelet.orchestrator.envs import (
@@ -227,6 +230,7 @@ from typing import Any
 from wavelet.data.rl import RLExample, load_rl_records
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
+    algorithm_loss_component,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import (
@@ -281,6 +285,7 @@ from wavelet.orchestrator.envs import (
     _verifier_example,
     _verifier_extra_env_kwargs,
     _verifier_model,
+    annotate_distillation_records,
 )
 
 logger = logging.getLogger(__name__)
@@ -423,6 +428,11 @@ def generate_rollouts(
     rollout_seconds = perf_counter() - rollout_started_at
     convert_started_at = perf_counter()
     records = [record for output in outputs for record in _records_from_output(output)]
+    records = annotate_distillation_records(
+        records,
+        config,
+        policy_model_name=getattr(_inference_engine, "policy_model_name", None),
+    )
     convert_seconds = perf_counter() - convert_started_at
     emit_perf(
         "verifier_rollouts",
@@ -686,6 +696,11 @@ class VerifierRolloutScheduler:
         records = [
             record for output in outputs for record in _records_from_output(output)
         ]
+        records = annotate_distillation_records(
+            records,
+            self.config,
+            policy_model_name=getattr(self, "model", None),
+        )
         records = _mark_zero_advantage_records_metric_only(records, self.config)
         self.last_batch_metrics = batch_stats.metrics(
             rollouts_per_group=self.rollout_count
@@ -821,6 +836,7 @@ class VerifierRolloutScheduler:
             expected_rollouts=self.rollout_count,
             filter_zero_advantage=self.config.orchestrator.filter_zero_advantage,
             advantage_epsilon=algorithm_epsilon(self.config.algo),
+            loss_component=algorithm_loss_component(self.config.algo),
         )
         if batch_stats is not None:
             batch_stats.observe(completed_outputs, admitted=is_usable)

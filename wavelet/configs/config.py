@@ -895,6 +895,29 @@ class MaxRLAlgorithmConfig(_StrictConfig):
     type: Literal["max_rl"] = "max_rl"
 
 
+class OPDAlgorithmConfig(_StrictConfig):
+    type: Literal["opd"] = "opd"
+
+
+class OPSDAlgorithmConfig(_StrictConfig):
+    type: Literal["opsd"] = "opsd"
+    demo_key: str = Field(default="demonstration", min_length=1)
+    template: str = (
+        "Here is an example of an expert response:\n"
+        "<demonstration>\n{demonstration}\n</demonstration>"
+    )
+
+    @model_validator(mode="after")
+    def validate_template(self) -> "OPSDAlgorithmConfig":
+        if "{demonstration}" not in self.template:
+            raise ValueError("OPSD template must contain '{demonstration}'.")
+        return self
+
+
+class SFTDistillAlgorithmConfig(_StrictConfig):
+    type: Literal["sft"] = "sft"
+
+
 AlgorithmScope = Literal["rollout", "group", "both"]
 
 
@@ -914,9 +937,19 @@ RLAlgorithmConfig = Annotated[
     | RewardAlgorithmConfig
     | GRPOAlgorithmConfig
     | MaxRLAlgorithmConfig
+    | OPDAlgorithmConfig
+    | OPSDAlgorithmConfig
+    | SFTDistillAlgorithmConfig
     | CustomAlgorithmConfig,
     Field(discriminator="type"),
 ]
+
+
+class RLTeacherConfig(ConfigModel):
+    model: str = Field(min_length=1)
+    base_url: str = Field(min_length=1)
+    api_key_var: str = Field(default="OPENAI_API_KEY", min_length=1)
+    timeout_seconds: float = Field(default=120.0, gt=0.0)
 
 
 class RLOrchestratorConfig(ConfigModel):
@@ -1048,6 +1081,7 @@ class RLConfig(TrainerConfig):
     data: RLDataConfig = RLDataConfig()
     loss: RLLossConfig = RLLossConfig()
     algo: RLAlgorithmConfig = PassthroughAlgorithmConfig()
+    teacher: RLTeacherConfig | None = None
     orchestrator: RLOrchestratorConfig = RLOrchestratorConfig()
     eval: RLEvalConfig | None = None
     inference: RLInferenceConfig = RLInferenceConfig()
@@ -1064,6 +1098,34 @@ class RLConfig(TrainerConfig):
         if not isinstance(value, dict):
             return value
         return _normalize_algorithm_config(value)
+
+    @model_validator(mode="after")
+    def validate_distillation_teacher(self) -> "RLConfig":
+        is_distillation = isinstance(
+            self.algo,
+            (OPDAlgorithmConfig, OPSDAlgorithmConfig, SFTDistillAlgorithmConfig),
+        )
+        if (
+            isinstance(self.algo, (OPDAlgorithmConfig, SFTDistillAlgorithmConfig))
+            and self.teacher is None
+        ):
+            raise ValueError(f"algo.type='{self.algo.type}' requires a teacher block.")
+        if isinstance(self.algo, OPSDAlgorithmConfig) and self.teacher is not None:
+            raise ValueError(
+                "algo.type='opsd' self-distills from the live policy and does not "
+                "accept a teacher block."
+            )
+        if is_distillation and self.orchestrator.custom_rollout_function != (
+            "wavelet.orchestrator.verifiers:generate_rollouts"
+        ):
+            raise ValueError(
+                f"algo.type='{self.algo.type}' requires the Verifiers rollout source."
+            )
+        if is_distillation and self.orchestrator.verifier_env_id is None:
+            raise ValueError(
+                f"algo.type='{self.algo.type}' requires orchestrator.verifier_env_id."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_train_sampling_replay(self) -> "RLConfig":

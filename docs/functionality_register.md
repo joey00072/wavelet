@@ -12,6 +12,7 @@ run in the ordinary test suite.
 | Filesystem queue lifecycle and artifacts | `uv run pytest tests/test_queue.py tests/test_queue_lifecycle.py tests/test_queue_inspect.py` |
 | Rollout scheduling, freshness, and chunking | `uv run pytest tests/test_scheduler.py tests/test_verifiers_rollouts.py` |
 | Rewards and advantage algorithms | `uv run pytest tests/test_reward.py tests/test_algorithms.py` |
+| OPD, OPSD, and online SFT distillation | `uv run pytest tests/test_distillation.py tests/test_algorithms.py tests/test_rl_loss.py` |
 | Agent trajectory token provenance | `uv run pytest tests/test_agent_trajectory.py` |
 | RL records, packing, and tokenization | `uv run pytest tests/test_rl_dataset.py tests/test_tokenization_alignment.py` |
 | Component RL/CE/ref-KL losses and trainer stepping | `uv run pytest tests/test_rl_loss.py tests/test_rl_trainer.py` |

@@ -8,6 +8,9 @@ import json
 import logging
 import os
 import shutil
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from time import perf_counter
@@ -22,6 +25,7 @@ from wavelet.orchestrator.advantage import (
 from wavelet.orchestrator.agent_trajectory import TokenSegment, merge_token_segments
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
+    algorithm_loss_component,
     algorithm_scope,
     build_algorithm,
     score_algorithm_records,
@@ -46,6 +50,56 @@ _RATE_LIMIT_ERROR_MARKERS = (
     "usage limit",
     "too many requests",
 )
+
+
+class PrefillScoringClient:
+    """Score fixed token sequences through a Wavelet vLLM server."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        api_key: str,
+        timeout_seconds: float,
+    ) -> None:
+        self.base_url = base_url.rstrip("/").removesuffix("/v1")
+        self.model = model
+        self.api_key = api_key
+        self.timeout_seconds = timeout_seconds
+
+    def score(self, token_ids: list[int]) -> list[float]:
+        payload = json.dumps({"model": self.model, "token_ids": token_ids}).encode(
+            "utf-8"
+        )
+        request = urllib.request.Request(
+            f"{self.base_url}/score",
+            data=payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=self.timeout_seconds,
+            ) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Teacher prefill scoring failed with HTTP {exc.code}: {detail}"
+            ) from exc
+        values = result.get("prompt_logprobs")
+        if not isinstance(values, list) or len(values) != len(token_ids):
+            actual = len(values) if isinstance(values, list) else "missing"
+            raise ValueError(
+                "Teacher prompt logprobs must align with scored token ids "
+                f"({actual} != {len(token_ids)})."
+            )
+        return [float(value) for value in values]
 
 
 def _ensure_verifier_openai_patches() -> None:
@@ -377,17 +431,23 @@ def _verifier_clients(
     client_type: str | None = None,
     client_label: str = "verifier",
 ) -> list[Any]:
-    os.environ.setdefault(config.orchestrator.verifier_api_key_var, "EMPTY")
+    teacher = config.teacher if algorithm_loss_component(config.algo) == "ce" else None
+    api_key_var = (
+        teacher.api_key_var
+        if teacher is not None
+        else config.orchestrator.verifier_api_key_var
+    )
+    os.environ.setdefault(api_key_var, "EMPTY")
     routes = _verifier_client_routes(
         base_urls or _verifier_base_urls(config),
-        config.inference.vllm.data_parallel_size,
+        1 if teacher is not None else config.inference.vllm.data_parallel_size,
     )
     clients = [
         vf.ClientConfig(
             client_idx=index,
             client_type=client_type or config.orchestrator.verifier_client_type,
             api_base_url=base_url,
-            api_key_var=config.orchestrator.verifier_api_key_var,
+            api_key_var=api_key_var,
             extra_headers=headers,
         )
         for index, (base_url, headers) in enumerate(routes)
@@ -398,6 +458,9 @@ def _verifier_clients(
 
 
 def _verifier_base_urls(config) -> list[str]:
+    if algorithm_loss_component(config.algo) == "ce" and config.teacher is not None:
+        base_url = config.teacher.base_url.rstrip("/")
+        return [base_url if base_url.endswith("/v1") else f"{base_url}/v1"]
     base_urls = config.orchestrator.verifier_base_url
     if base_urls is None:
         http = config.inference.http
@@ -409,6 +472,8 @@ def _verifier_base_urls(config) -> list[str]:
 
 
 def _verifier_model(config, inference_engine: Any | None = None) -> str:
+    if algorithm_loss_component(config.algo) == "ce" and config.teacher is not None:
+        return config.teacher.model
     policy_model_name = getattr(inference_engine, "policy_model_name", None)
     if isinstance(policy_model_name, str) and policy_model_name:
         return policy_model_name
@@ -423,7 +488,9 @@ def _verifier_extra_env_kwargs(config) -> dict[str, Any]:
             config.orchestrator.verifier_max_total_completion_tokens
         ),
     }
-    if config.orchestrator.verifier_timeout_seconds is not None:
+    if algorithm_loss_component(config.algo) == "ce" and config.teacher is not None:
+        kwargs["timeout_seconds"] = config.teacher.timeout_seconds
+    elif config.orchestrator.verifier_timeout_seconds is not None:
         kwargs["timeout_seconds"] = config.orchestrator.verifier_timeout_seconds
     return kwargs
 
@@ -640,6 +707,7 @@ async def _run_until_target_groups(
                     expected_rollouts=rollout_count,
                     filter_zero_advantage=filter_zero_advantage,
                     advantage_epsilon=advantage_epsilon,
+                    loss_component=algorithm_loss_component(algorithm_config),
                 ):
                     outputs.extend(group_outputs)
                     accepted_groups += 1
@@ -683,6 +751,7 @@ async def _run_group(
             state_columns=["trajectory", "sampling_args"],
         )
         outputs = _successful_rollout_outputs(list(result))
+        _stamp_verifier_example(outputs, example)
         _stamp_group_id(outputs, group_id)
         _assign_group_advantages(outputs, algorithm_config=algorithm_config)
         return outputs
@@ -700,6 +769,7 @@ async def _run_group(
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     outputs = _successful_rollout_outputs(results)
+    _stamp_verifier_example(outputs, example)
     _stamp_group_id(outputs, group_id)
     _assign_group_advantages(outputs, algorithm_config=algorithm_config)
     return outputs
@@ -710,6 +780,13 @@ def _stamp_group_id(outputs: list[dict[str, Any]], group_id: str | None) -> None
         return
     for output in outputs:
         output["_wavelet_group_id"] = group_id
+
+
+def _stamp_verifier_example(
+    outputs: list[dict[str, Any]], example: dict[str, Any]
+) -> None:
+    for output in outputs:
+        output["_wavelet_verifier_example"] = dict(example)
 
 
 def _env_name(env: Any, *, fallback: str) -> str:
@@ -742,7 +819,9 @@ async def _run_single_rollout(
         max_retries=max_retries,
         state_columns=["trajectory", "sampling_args"],
     )
-    return _successful_rollout_outputs([result])
+    outputs = _successful_rollout_outputs([result])
+    _stamp_verifier_example(outputs, example)
+    return outputs
 
 
 def _successful_rollout_outputs(
@@ -824,6 +903,8 @@ def _assign_group_advantages(
     )
     for output, record in zip(outputs, scored, strict=True):
         output["advantage"] = record.advantage
+        output["ce_weight"] = record.ce_weight
+        output["ref_kl_weight"] = record.ref_kl_weight
 
 
 def _algorithm_record_from_output(output: dict[str, Any]) -> RLExample:
@@ -864,11 +945,14 @@ def _is_usable_training_group(
     expected_rollouts: int,
     filter_zero_advantage: bool,
     advantage_epsilon: float,
+    loss_component: str = "rl",
 ) -> bool:
     if len(outputs) != expected_rollouts:
         return False
     if not all(_has_trainable_trajectory(output) for output in outputs):
         return False
+    if loss_component != "rl":
+        return True
     return _has_trainable_advantage(
         outputs,
         filter_zero_advantage=filter_zero_advantage,
@@ -1077,6 +1161,8 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 sample_index=sample_index,
             ),
         }
+        if isinstance(output.get("_wavelet_verifier_example"), dict):
+            metadata["verifier_example"] = dict(output["_wavelet_verifier_example"])
         policy_step = output.get("_wavelet_policy_step")
         if isinstance(policy_step, int) and not isinstance(policy_step, bool):
             metadata["policy_step"] = policy_step
@@ -1094,11 +1180,146 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 reward=float(output["reward"]),
                 inference_logprobs=inference_logprobs,
                 temperatures=temperatures,
+                ce_weight=output.get("ce_weight"),
+                ref_kl_weight=output.get("ref_kl_weight"),
                 metadata=metadata,
                 source=str(output.get("env_name") or output.get("task") or "verifier"),
             )
         )
     return records
+
+
+def _record_token_ids(record: RLExample) -> list[int]:
+    if (
+        record.input_ids is None
+        or record.target_ids is None
+        or record.loss_mask is None
+    ):
+        raise ValueError("Distillation requires pretokenized rollout records.")
+    if not record.target_ids:
+        raise ValueError("Distillation rollout contains no target tokens.")
+    return [*record.input_ids, record.target_ids[-1]]
+
+
+def _trainable_prefill_logprobs(
+    record: RLExample,
+    prompt_logprobs: list[float],
+    *,
+    prefix_tokens: int = 0,
+) -> list[float]:
+    assert record.loss_mask is not None
+    return [
+        float(prompt_logprobs[prefix_tokens + index + 1])
+        for index, trainable in enumerate(record.loss_mask)
+        if trainable
+    ]
+
+
+def _opsd_prefix_token_ids(
+    record: RLExample,
+    config,
+    *,
+    tokenizer: Any | None = None,
+) -> list[int]:
+    metadata = record.metadata or {}
+    example = metadata.get("verifier_example")
+    demonstration = (
+        example.get(config.algo.demo_key) if isinstance(example, dict) else None
+    )
+    if demonstration is None:
+        demonstration = metadata.get(config.algo.demo_key)
+    if demonstration is None:
+        raise ValueError(
+            f"OPSD requires '{config.algo.demo_key}' in verifier example metadata."
+        )
+    if tokenizer is None:
+        from wavelet.trainer.model import setup_tokenizer
+
+        tokenizer = setup_tokenizer(config.model)
+    rendered = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "system",
+                "content": config.algo.template.format(
+                    demonstration=str(demonstration)
+                ),
+            }
+        ],
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+    return [int(token_id) for token_id in rendered]
+
+
+def annotate_distillation_records(
+    records: list[RLExample],
+    config,
+    *,
+    policy_model_name: str | None = None,
+) -> list[RLExample]:
+    """Attach teacher scores required by OPD/OPSD loss routing."""
+    component = algorithm_loss_component(config.algo)
+    if component != "ref_kl" or not records:
+        return records
+
+    is_opsd = config.algo.type == "opsd"
+    if is_opsd:
+        base_urls = _verifier_base_urls(config)
+        model = policy_model_name or _verifier_model(config)
+        api_key_var = config.orchestrator.verifier_api_key_var
+        timeout_seconds = config.orchestrator.verifier_timeout_seconds or 120.0
+    else:
+        teacher = config.teacher
+        if teacher is None:
+            raise ValueError("OPD requires a configured teacher.")
+        base_urls = [teacher.base_url]
+        model = teacher.model
+        api_key_var = teacher.api_key_var
+        timeout_seconds = teacher.timeout_seconds
+
+    api_key = os.environ.get(api_key_var) or "EMPTY"
+    clients = [
+        PrefillScoringClient(
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+        )
+        for base_url in base_urls
+    ]
+    opsd_tokenizer = None
+    if is_opsd:
+        from wavelet.trainer.model import setup_tokenizer
+
+        opsd_tokenizer = setup_tokenizer(config.model)
+    prefixes = [
+        _opsd_prefix_token_ids(record, config, tokenizer=opsd_tokenizer)
+        if is_opsd
+        else []
+        for record in records
+    ]
+    token_ids = [
+        [*prefix, *_record_token_ids(record)]
+        for prefix, record in zip(prefixes, records, strict=True)
+    ]
+    with ThreadPoolExecutor(max_workers=len(clients)) as executor:
+        scores = list(
+            executor.map(
+                lambda item: clients[item[0] % len(clients)].score(item[1]),
+                enumerate(token_ids),
+            )
+        )
+    return [
+        replace(
+            record,
+            teacher_logprobs=_trainable_prefill_logprobs(
+                record,
+                score,
+                prefix_tokens=len(prefix),
+            ),
+        )
+        for record, score, prefix in zip(records, scores, prefixes, strict=True)
+    ]
 
 
 def _output_group_key(output: dict[str, Any]) -> str:

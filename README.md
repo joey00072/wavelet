@@ -247,6 +247,10 @@ denominator once at the optimizer boundary. Auxiliary components with one data
 worker require a single microbatch per optimizer step. Multi-chunk streaming
 steps remain RL-only because their final auxiliary denominators are not known
 when the first chunk is backpropagated.
+Built-in online distillation supports OPD (frozen-teacher reference KL), OPSD
+(demonstration-conditioned self-distillation), and SFT on frozen-teacher
+samples. See [docs/algorithms.md](docs/algorithms.md#online-distillation) for the
+two-server setup and configuration contract.
 If any distributed rank observes a non-finite loss, all ranks abort before
 backward and accumulated gradients are cleared; the trainer never silently
 skips a microbatch into a later optimizer update.

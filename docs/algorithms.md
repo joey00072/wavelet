@@ -13,6 +13,9 @@ file:
 | `type: reward` | rollout | Copy each reward into its missing advantage. |
 | `type: grpo` | group | Center rewards within each prompt group. |
 | `type: max_rl` | group | Center rewards and divide by the group mean. |
+| `type: opd` | rollout | Distill policy samples from a frozen teacher. |
+| `type: opsd` | rollout | Self-distill policy samples using an expert demonstration. |
+| `type: sft` | rollout | Train with cross entropy on frozen-teacher samples. |
 | `file` + `algorithm` | explicit | Load a registered class or factory from a local file. |
 
 Algorithm and length-penalty configs reject unknown keys so misspellings fail
@@ -97,6 +100,75 @@ zero receives zero advantages.
 algo:
   type: max_rl
 ```
+
+### Online distillation
+
+The three distillation algorithms route every trainable completion token to a
+single loss component and do not assign scalar advantages:
+
+| Algorithm | Generation source | Scoring source | Loss component |
+| --- | --- | --- | --- |
+| OPD (`opd`) | Live policy | Frozen teacher | `ref_kl` |
+| OPSD (`opsd`) | Live policy | Live policy with an expert demonstration prepended | `ref_kl` |
+| SFT distillation (`sft`) | Frozen teacher | Not required | `ce` |
+
+OPD scores the policy's exact sampled token IDs through the frozen teacher. The
+trainer combines those scores with the original policy sampling logprobs using
+the one-sided reference-KL component:
+
+```yaml
+algo:
+  type: opd
+teacher:
+  model: Qwen/Qwen3-8B
+  base_url: http://127.0.0.1:8100
+  api_key_var: OPENAI_API_KEY
+  timeout_seconds: 120
+```
+
+SFT distillation uses the same `teacher` block, but sends rollout generation to
+the teacher and applies ordinary next-token cross entropy to its completions:
+
+```yaml
+algo:
+  type: sft
+teacher:
+  model: Qwen/Qwen3-8B
+  base_url: http://127.0.0.1:8100
+```
+
+For either configuration, run a separate Wavelet `inference-server` whose
+`model.name` equals `teacher.model`; `teacher.base_url` may include or omit the
+trailing `/v1`. The teacher server exposes fixed-token prefill scoring at
+`POST /score`. It returns one prompt logprob per supplied token, with a leading
+zero for the first token, and performs scoring with temperature 1. Keep the
+student's normal inference server configured under `inference.http`.
+
+OPSD needs no teacher process. It obtains an expert demonstration from the
+Verifiers input example, renders it as a system-message prefix, and asks the
+currently loaded policy adapter to score the original sampled tokens under that
+prefix. The source field and template are configurable:
+
+```yaml
+algo:
+  type: opsd
+  demo_key: demonstration
+  template: |-
+    Use this expert response as guidance:
+    <demonstration>{demonstration}</demonstration>
+```
+
+The field named by `demo_key` must be present in each verifier example. Wavelet
+preserves that source example in rollout metadata, scores replicas in parallel,
+and stores only the trainable-token-aligned values in `teacher_logprobs`.
+Distillation groups bypass scalar zero-advantage filtering but still require a
+complete, trainable trajectory. All three modes currently require
+`orchestrator.custom_rollout_function` to be
+`wavelet.orchestrator.verifiers:generate_rollouts` and require a configured
+`orchestrator.verifier_env_id`; configuration fails early for other rollout
+sources. As with other auxiliary components, use one
+microbatch per optimizer step when `data.num_workers: 1`; multi-chunk streaming
+optimizer steps remain RL-only.
 
 ## Custom Algorithm Files
 
@@ -255,8 +327,10 @@ For each scoring batch, Wavelet:
 3. Partitions group-scoped records by prompt group.
 4. Validates hook return types and group cardinality.
 5. Restores original record order.
-6. Applies zero-advantage filtering when configured.
-7. Serializes advantages into the existing trainer rollout format.
+6. Prefill-scores exact sampled tokens for OPD or OPSD when selected.
+7. Applies zero-advantage filtering to RL algorithms when configured.
+8. Serializes advantages, component weights, and teacher scores into the
+   trainer rollout format.
 
 Algorithms only assign credit. The trainer loss remains configured separately
 under `loss`; this interface does not add custom optimizer losses, asynchronous

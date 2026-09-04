@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from argparse import Namespace
 from http import HTTPStatus
 from logging import CRITICAL
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import uvloop
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import Field
 from starlette.datastructures import State
@@ -941,6 +942,95 @@ async def init_broadcaster(payload: dict[str, Any], raw_request: Request):
         ),
     )
     return {"status": "ok"}
+
+
+def _scored_prompt_logprobs(
+    rows: object,
+    token_ids: list[int],
+) -> list[float]:
+    if rows is None:
+        raise ValueError("vLLM scoring output omitted prompt_logprobs.")
+    entries = list(rows)
+    if len(entries) != len(token_ids):
+        raise ValueError(
+            "vLLM prompt logprobs do not align with scored token ids "
+            f"({len(entries)} != {len(token_ids)})."
+        )
+    values = [0.0]
+    for token_id, entry in zip(token_ids[1:], entries[1:], strict=True):
+        if not isinstance(entry, dict):
+            raise TypeError(f"Missing prompt logprob for token id {token_id}.")
+        candidate = entry.get(token_id, entry.get(str(token_id)))
+        if candidate is None:
+            raise ValueError(f"Missing prompt logprob for token id {token_id}.")
+        if hasattr(candidate, "logprob"):
+            candidate = candidate.logprob
+        elif isinstance(candidate, dict):
+            candidate = candidate.get("logprob")
+        if candidate is None:
+            raise ValueError(f"Missing prompt logprob value for token id {token_id}.")
+        values.append(float(candidate))
+    return values
+
+
+@router.post("/score")
+async def score_prompt(payload: dict[str, Any], raw_request: Request):
+    """Return temperature-one prefill logprobs for a fixed token sequence."""
+    token_ids = payload.get("token_ids")
+    if (
+        not isinstance(token_ids, list)
+        or len(token_ids) < 2
+        or any(not isinstance(token_id, int) for token_id in token_ids)
+    ):
+        raise HTTPException(status_code=400, detail="token_ids must contain integers.")
+    model = str(payload.get("model") or "")
+    allowed_models = {_CONFIG.model.name} if _CONFIG is not None else set()
+    adapter_name = getattr(raw_request.app.state, "policy_adapter_name", None)
+    if isinstance(adapter_name, str):
+        allowed_models.add(adapter_name)
+    if model not in allowed_models:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {model!r} is not served by this process.",
+        )
+
+    lora_request = None
+    adapter_path = getattr(raw_request.app.state, "policy_adapter_path", None)
+    if model == adapter_name and isinstance(adapter_path, str):
+        if _CONFIG is None:
+            raise RuntimeError("Wavelet vLLM server config was not initialized.")
+        from vllm.lora.request import LoRARequest
+
+        lora_request = LoRARequest(
+            adapter_name,
+            _CONFIG.policy_transfer.adapter_id,
+            adapter_path,
+        )
+    params = SamplingParams(
+        max_tokens=1,
+        temperature=1.0,
+        top_p=1.0,
+        prompt_logprobs=1,
+    )
+    output = None
+    generator = _engine_client(raw_request).generate(
+        {"prompt_token_ids": token_ids},
+        params,
+        f"score-{uuid.uuid4().hex}",
+        lora_request=lora_request,
+    )
+    async for item in generator:
+        output = item
+    if output is None:
+        raise RuntimeError("vLLM scoring request returned no output.")
+    return {
+        "model": model,
+        "token_ids": token_ids,
+        "prompt_logprobs": _scored_prompt_logprobs(
+            output.prompt_logprobs,
+            token_ids,
+        ),
+    }
 
 
 @router.post(

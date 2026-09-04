@@ -10,19 +10,26 @@ from wavelet.configs.rl_config import (
     CustomAlgorithmConfig,
     GRPOAlgorithmConfig,
     MaxRLAlgorithmConfig,
+    OPDAlgorithmConfig,
+    OPSDAlgorithmConfig,
     PassthroughAlgorithmConfig,
     RewardAlgorithmConfig,
     RLAlgorithmConfig,
     RLConfig,
+    SFTDistillAlgorithmConfig,
 )
 from wavelet.data.rl_dataset import RLExample
 from wavelet.orchestrator.algorithms import (
     BaseAlgorithm,
     GRPOAlgorithm,
     MaxRLAlgorithm,
+    OPDAlgorithm,
+    OPSDAlgorithm,
     PassthroughAlgorithm,
     RewardAlgorithm,
+    SFTDistillAlgorithm,
     algorithm_epsilon,
+    algorithm_loss_component,
     algorithm_scope,
     build_algorithm,
     register_algorithm,
@@ -116,6 +123,9 @@ def test_max_rl_algorithm_zeroes_groups_without_success() -> None:
         (RewardAlgorithmConfig(), RewardAlgorithm, "rollout"),
         (GRPOAlgorithmConfig(), GRPOAlgorithm, "group"),
         (MaxRLAlgorithmConfig(), MaxRLAlgorithm, "group"),
+        (OPDAlgorithmConfig(), OPDAlgorithm, "rollout"),
+        (OPSDAlgorithmConfig(), OPSDAlgorithm, "rollout"),
+        (SFTDistillAlgorithmConfig(), SFTDistillAlgorithm, "rollout"),
     ],
 )
 def test_build_algorithm_dispatches_named_config(
@@ -127,6 +137,69 @@ def test_build_algorithm_dispatches_named_config(
 
     assert isinstance(algorithm, expected_type)
     assert algorithm_scope(config) == expected_scope
+
+
+@pytest.mark.parametrize(
+    ("config", "field", "component"),
+    [
+        (OPDAlgorithmConfig(), "ref_kl_weight", "ref_kl"),
+        (OPSDAlgorithmConfig(), "ref_kl_weight", "ref_kl"),
+        (SFTDistillAlgorithmConfig(), "ce_weight", "ce"),
+    ],
+)
+def test_distillation_algorithms_route_tokens_without_scalar_advantage(
+    config: RLAlgorithmConfig,
+    field: str,
+    component: str,
+) -> None:
+    scored = score_algorithm_records(
+        build_algorithm(config),
+        [_example(reward=1.0)],
+        scope=algorithm_scope(config),
+    )
+
+    assert scored[0].advantage is None
+    assert getattr(scored[0], field) == pytest.approx(1.0)
+    assert algorithm_loss_component(config) == component
+
+
+def test_distillation_config_requires_the_correct_teacher_ownership() -> None:
+    teacher = {"model": "teacher", "base_url": "http://teacher:8000/v1"}
+    orchestrator = {
+        "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
+        "verifier_env_id": "test-env",
+    }
+    assert (
+        RLConfig(
+            algo={"type": "opd"}, teacher=teacher, orchestrator=orchestrator
+        ).teacher
+        is not None
+    )
+    assert (
+        RLConfig(
+            algo={"type": "sft"}, teacher=teacher, orchestrator=orchestrator
+        ).teacher
+        is not None
+    )
+
+    with pytest.raises(ValueError, match="requires a teacher"):
+        RLConfig(algo={"type": "opd"})
+    with pytest.raises(ValueError, match="does not accept"):
+        RLConfig(algo={"type": "opsd"}, teacher=teacher)
+    with pytest.raises(ValueError, match="demonstration"):
+        OPSDAlgorithmConfig(template="missing placeholder")
+    with pytest.raises(ValueError, match="Verifiers rollout source"):
+        RLConfig(algo={"type": "opd"}, teacher=teacher)
+    with pytest.raises(ValueError, match="verifier_env_id"):
+        RLConfig(
+            algo={"type": "opd"},
+            teacher=teacher,
+            orchestrator={
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                )
+            },
+        )
 
 
 def test_custom_algorithm_loads_external_class_with_kwargs() -> None:

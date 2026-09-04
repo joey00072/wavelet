@@ -10,9 +10,12 @@ from wavelet.configs.rl_config import (
     GRPOAlgorithmConfig,
     LengthPenaltyConfig,
     MaxRLAlgorithmConfig,
+    OPDAlgorithmConfig,
+    OPSDAlgorithmConfig,
     PassthroughAlgorithmConfig,
     RewardAlgorithmConfig,
     RLAlgorithmConfig,
+    SFTDistillAlgorithmConfig,
 )
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.advantage import (
@@ -100,6 +103,27 @@ class MaxRLAlgorithm(BaseAlgorithm):
         ]
 
 
+class OPDAlgorithm(BaseAlgorithm):
+    """Route policy samples to reverse-KL distillation against a teacher."""
+
+    def score_rollout(self, record: RLExample) -> RLExample:
+        return replace(record, advantage=None, ref_kl_weight=1.0)
+
+
+class OPSDAlgorithm(BaseAlgorithm):
+    """Route policy samples to demo-conditioned self-distillation."""
+
+    def score_rollout(self, record: RLExample) -> RLExample:
+        return replace(record, advantage=None, ref_kl_weight=1.0)
+
+
+class SFTDistillAlgorithm(BaseAlgorithm):
+    """Route frozen-teacher samples to token-level cross entropy."""
+
+    def score_rollout(self, record: RLExample) -> RLExample:
+        return replace(record, advantage=None, ce_weight=1.0)
+
+
 def _required_rewards(
     records: list[RLExample],
     *,
@@ -129,6 +153,12 @@ def build_algorithm(config: RLAlgorithmConfig) -> Algorithm:
         )
     if isinstance(config, MaxRLAlgorithmConfig):
         return MaxRLAlgorithm()
+    if isinstance(config, OPDAlgorithmConfig):
+        return OPDAlgorithm()
+    if isinstance(config, OPSDAlgorithmConfig):
+        return OPSDAlgorithm()
+    if isinstance(config, SFTDistillAlgorithmConfig):
+        return SFTDistillAlgorithm()
     if isinstance(config, CustomAlgorithmConfig):
         return load_custom_algorithm(
             config.file,
@@ -202,3 +232,12 @@ def algorithm_scope(config: RLAlgorithmConfig) -> AlgorithmScope:
 def uses_group_advantages(config: RLAlgorithmConfig) -> bool:
     """Return whether complete rollout groups are required before scoring."""
     return algorithm_scope(config) in {"group", "both"}
+
+
+def algorithm_loss_component(config: RLAlgorithmConfig) -> str:
+    """Return the token-loss component owned by the algorithm."""
+    if isinstance(config, SFTDistillAlgorithmConfig):
+        return "ce"
+    if isinstance(config, (OPDAlgorithmConfig, OPSDAlgorithmConfig)):
+        return "ref_kl"
+    return "rl"

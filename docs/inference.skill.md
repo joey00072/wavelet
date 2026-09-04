@@ -63,6 +63,8 @@ The vLLM servers expose these debug endpoints:
 
 - `GET /health`: basic liveness, loaded policy step, and sleep state.
 - `GET /debug/state`: resolved inference config plus runtime policy state.
+- `POST /score`: fixed-token prefill scoring for OPD/OPSD distillation. Supply
+  `model` and `token_ids`; the response contains aligned `prompt_logprobs`.
 
 Use the configured `inference.http.host` and `inference.http.port` or the full
 `inference.http.ports` list when multiple replicas are running.
