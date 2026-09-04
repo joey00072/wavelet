@@ -234,6 +234,20 @@ class GCConfig(ConfigModel):
     interval: int = Field(default=50, ge=1)
 
 
+class ProfilerConfig(ConfigModel):
+    start_step: int = Field(default=1, ge=1)
+    end_step: int = Field(default=1, ge=1)
+    trace_path: Path | None = None
+    record_shapes: bool = True
+    profile_memory: bool = True
+
+    @model_validator(mode="after")
+    def validate_step_range(self) -> "ProfilerConfig":
+        if self.end_step < self.start_step:
+            raise ValueError("profiler.end_step must be >= profiler.start_step")
+        return self
+
+
 class CheckpointConfig(ConfigModel):
     interval: int | None = Field(default=None, ge=1)
     # Counts optimizer steps, not micro-steps.
@@ -324,6 +338,7 @@ class TrainerConfig(ConfigModel):
     optim: OptimizerConfig = OptimizerConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
     gc: GCConfig | None = GCConfig()
+    profiler: ProfilerConfig | None = None
     max_grad_norm: float = Field(default=1.0, ge=0.0)
     loss_impl: Literal["liger", "torch", "liger_fused"] = "torch"
     ckpt: CheckpointConfig | None = None

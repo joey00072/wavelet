@@ -35,6 +35,7 @@ from wavelet.trainer.distributed import (
 )
 from wavelet.trainer.garbage_collection import DeterministicGarbageCollector
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.profiling import StepProfiler
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import RunMonitor, setup_config_logger
@@ -137,6 +138,7 @@ class BaseTrainer:
         self.total_tokens = 0
         self.total_samples = 0
         self._garbage_collector: DeterministicGarbageCollector | None = None
+        self._step_profiler: StepProfiler | None = None
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -273,6 +275,7 @@ class BaseTrainer:
             self._before_train_loop()
             while self.step < target_step:
                 for batch in self.dataloader:
+                    self._maybe_start_step_profiler(self.step + 1)
                     prepared_batch = self._prepare_batch(batch)
                     output = self._train_step(prepared_batch)
                     self._record_progress(prepared_batch)
@@ -280,6 +283,7 @@ class BaseTrainer:
                         continue
                     self._after_optimizer_step()
                     self._maybe_collect_garbage()
+                    self._maybe_finish_step_profiler(self.step)
                     self._log_train_output(output, progress)
                     self._maybe_checkpoint()
                     progress.update(1)
@@ -313,6 +317,7 @@ class BaseTrainer:
             return
         if self.monitor is None:
             raise RuntimeError("Monitor not set up. Call setup() first.")
+        self._close_step_profiler()
         try:
             self.monitor.finish(status=status, step=self.step)
             self._run_closed = True
@@ -335,6 +340,39 @@ class BaseTrainer:
             return
         self._garbage_collector.close()
         self._garbage_collector = None
+
+    def _maybe_start_step_profiler(self, step: int) -> None:
+        config = self.config.profiler
+        if config is None:
+            return
+        if self._step_profiler is None:
+            trace_path = config.trace_path or (
+                self.output_dir
+                / "profiler"
+                / f"trace-{config.start_step}-{config.end_step}.json"
+            )
+            if self.world is not None and self.world.world_size > 1:
+                trace_path = trace_path.with_name(
+                    f"{trace_path.stem}.rank-{self.world.rank}{trace_path.suffix}"
+                )
+            self._step_profiler = StepProfiler(
+                trace_path,
+                start_step=config.start_step,
+                end_step=config.end_step,
+                record_shapes=config.record_shapes,
+                profile_memory=config.profile_memory,
+            )
+        self._step_profiler.before_step(step)
+
+    def _maybe_finish_step_profiler(self, step: int) -> None:
+        if self._step_profiler is not None:
+            self._step_profiler.after_step(step)
+
+    def _close_step_profiler(self) -> None:
+        if self._step_profiler is None:
+            return
+        self._step_profiler.close()
+        self._step_profiler = None
 
     def _setup_distributed(self) -> None:
         fsdp_config = getattr(self.config, "fsdp", None)

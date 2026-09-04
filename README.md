@@ -365,6 +365,11 @@ Trainer-side automatic Python garbage collection is disabled while training and
 generation-1 collection runs on every rank at the same optimizer-step boundary,
 every `gc.interval` steps (default 50), avoiding rank-local pause jitter. Set
 `gc: null` to retain Python's automatic garbage collector instead.
+Set `profiler.start_step` and `profiler.end_step` to capture an inclusive
+optimizer-step range as a Chrome trace. The default path is
+`<output_dir>/profiler/trace-<start>-<end>.json`; distributed runs add a rank
+suffix so workers never overwrite one another. Set `profiler.trace_path` to
+override the file location, and open the result in Perfetto or Chrome tracing.
 Standalone trainers use the same resolved step count for optimization and the
 learning-rate scheduler; in particular, RL `max_steps: 0` remains evaluation-only
 instead of falling back to an implicit training run. Without `max_steps`,
