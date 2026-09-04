@@ -51,6 +51,16 @@ server:
 uv run python -m wavelet debug inference continuous-batch @ examples/wordle/rl.yaml --count 96 --concurrency 48 --stagger-ms 100 --max-completion-tokens 512 --json
 ```
 
+Chat interactively with a running server (the model defaults to the first id
+from `/v1/models`):
+
+```bash
+uv run python scripts/chat.py --base-url http://127.0.0.1:8000/v1
+```
+
+Use `--prompt` for a one-shot request, `--model` to select a served adapter,
+and `--api-key-var` to name the environment variable holding a bearer token.
+
 Load a specific exported policy before probing:
 
 ```bash
