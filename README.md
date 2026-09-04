@@ -6,6 +6,9 @@
 
 Minimal post-training scaffolding for SFT and RL experiments.
 
+After `uv sync`, run the installed CLI as `uv run wavelet <command>`. The
+module form, `uv run python -m wavelet <command>`, remains supported.
+
 ## Documentation
 
 Start with the [documentation index](docs/index.md) for the human and
@@ -17,7 +20,7 @@ agent-readable map of workflows, diagnostics, and repository guidance.
 - [Data pipeline](docs/data_pipeline.md): loading, tokenization, RL packing, and
   collation contracts
 - Run preflight checks before expensive RL launches:
-  `uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
+  `uv run wavelet debug preflight @ examples/reverse_text/rl.yaml --json`
   This also validates local training data and required LoRA adapter artifacts.
   The report includes low-precision checks for QLoRA and vLLM quantized
   inference settings. Config loading rejects duplicate YAML keys instead of

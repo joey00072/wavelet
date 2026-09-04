@@ -27,6 +27,9 @@ dependencies = [
     "chardet<6",
 ]
 
+[project.scripts]
+wavelet = "wavelet.cli:main"
+
 [project.optional-dependencies]
 dev = [
     "ruff>=0.3",
