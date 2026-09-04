@@ -8,6 +8,11 @@ wrapper; FSDP2-only reshard controls are intentionally omitted.
 Model configs use `matmul_precision: high` by default. Set it to `highest` for
 full FP32 matrix multiplication, including on ROCm where reduced float32
 precision can be unsuitable for large-vocabulary softmax calculations.
+With `attn_implementation: auto`, Hopper (SM90) GPUs use FlashAttention 3 when
+its package is installed; other architectures and Hopper environments without
+that package fall back to FlashAttention 2 or SDPA. An explicit
+`flash_attention_3` setting fails fast unless both Hopper and the extension are
+available.
 SFT YAML files do not select a process count. Launch multi-GPU SFT examples
 with:
 

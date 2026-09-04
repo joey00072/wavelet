@@ -63,9 +63,48 @@ def test_setup_tokenizer_does_not_hide_base_model_errors(
 def test_auto_attention_falls_back_to_sdpa_without_flash_attention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(model_utils, "_is_hopper_gpu", lambda: False)
     monkeypatch.setattr(model_utils, "_flash_attention_available", lambda: False)
 
     assert model_utils._best_attn_implementation() == "sdpa"
+
+
+def test_auto_attention_selects_flash_attention_3_on_hopper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_utils, "_is_hopper_gpu", lambda: True)
+    monkeypatch.setattr(model_utils, "_flash_attention_3_available", lambda: True)
+
+    assert model_utils._best_attn_implementation() == "flash_attention_3"
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((9, 0), True), ((8, 9), False), ((10, 0), False), ((12, 0), False)],
+)
+def test_hopper_detection_uses_sm_major_version(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(model_utils.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        model_utils.torch.cuda,
+        "get_device_capability",
+        lambda: capability,
+    )
+
+    assert model_utils._is_hopper_gpu() is expected
+
+
+def test_auto_attention_falls_back_from_unavailable_flash_attention_3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_utils, "_is_hopper_gpu", lambda: True)
+    monkeypatch.setattr(model_utils, "_flash_attention_3_available", lambda: False)
+    monkeypatch.setattr(model_utils, "_flash_attention_available", lambda: True)
+
+    assert model_utils._best_attn_implementation() == "flash_attention_2"
 
 
 def test_explicit_flash_attention_requires_importable_extension(
@@ -76,6 +115,20 @@ def test_explicit_flash_attention_requires_importable_extension(
     with pytest.raises(ImportError, match="uv sync --extra flash-attn"):
         model_utils._model_load_kwargs(
             ModelConfig(attn_implementation="flash_attention_2"),
+            distributed=False,
+            parallel_dims=None,
+        )
+
+
+def test_explicit_flash_attention_3_requires_hopper_and_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(model_utils, "_is_hopper_gpu", lambda: False)
+    monkeypatch.setattr(model_utils, "_flash_attention_3_available", lambda: True)
+
+    with pytest.raises(ImportError, match="Hopper GPU"):
+        model_utils._model_load_kwargs(
+            ModelConfig(attn_implementation="flash_attention_3"),
             distributed=False,
             parallel_dims=None,
         )

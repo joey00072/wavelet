@@ -44,7 +44,13 @@ class ModelConfig(ConfigModel):
     chat_template: str | None = None
     trust_remote_code: bool = False
     torch_dtype: Literal["auto", "float32", "float16", "bfloat16"] = "bfloat16"
-    attn_implementation: Literal["auto", "flash_attention_2", "sdpa", "eager"] = "auto"
+    attn_implementation: Literal[
+        "auto",
+        "flash_attention_2",
+        "flash_attention_3",
+        "sdpa",
+        "eager",
+    ] = "auto"
     load_in_4bit: bool = False
     kbit_cast_non_quantized_to_float32: bool = True
     gradient_checkpointing: bool = True

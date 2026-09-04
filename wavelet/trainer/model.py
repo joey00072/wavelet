@@ -191,8 +191,22 @@ def apply_liger_kernel(loss_impl: str, model_name: str) -> None:
 
 
 def _best_attn_implementation() -> str:
-    """Use FlashAttention 2 when installed, otherwise use PyTorch SDPA."""
+    """Use the best installed attention backend for the current GPU."""
+    if _is_hopper_gpu() and _flash_attention_3_available():
+        return "flash_attention_3"
     return "flash_attention_2" if _flash_attention_available() else "sdpa"
+
+
+def _is_hopper_gpu() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
+def _flash_attention_3_available() -> bool:
+    try:
+        from transformers.utils import is_flash_attn_3_available
+    except ImportError:
+        return False
+    return bool(is_flash_attn_3_available())
 
 
 def _flash_attention_available() -> bool:
@@ -211,6 +225,15 @@ def _require_flash_attention() -> None:
     raise ImportError(
         "model.attn_implementation='flash_attention_2' requires a working "
         "flash-attn installation. Install it with `uv sync --extra flash-attn`."
+    )
+
+
+def _require_flash_attention_3() -> None:
+    if _is_hopper_gpu() and _flash_attention_3_available():
+        return
+    raise ImportError(
+        "model.attn_implementation='flash_attention_3' requires a Hopper GPU "
+        "and the flash-attn-3 package."
     )
 
 
@@ -258,6 +281,8 @@ def _model_load_kwargs(
     )
     if attention == "flash_attention_2":
         _require_flash_attention()
+    elif attention == "flash_attention_3":
+        _require_flash_attention_3()
     kwargs: dict[str, Any] = {
         "trust_remote_code": config.trust_remote_code,
         "dtype": resolve_dtype(config.torch_dtype),
