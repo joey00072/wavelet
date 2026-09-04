@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
+from typing import Self
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ class PeriodicLogger:
             self._thread.join(timeout=min(self.interval_seconds, 5.0))
             self._thread = None
 
-    def __enter__(self) -> "PeriodicLogger":
+    def __enter__(self) -> Self:
         self.start()
         return self
 

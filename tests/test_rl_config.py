@@ -134,6 +134,22 @@ def test_max_inflight_rollouts_must_cover_one_group() -> None:
         )
 
 
+def test_tasks_per_minute_requires_verifier_rollout_source() -> None:
+    with pytest.raises(ValueError, match="tasks_per_minute"):
+        RLConfig(orchestrator={"tasks_per_minute": 60})
+
+    config = RLConfig(
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "tasks_per_minute": 60,
+        }
+    )
+
+    assert config.orchestrator.tasks_per_minute == 60
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

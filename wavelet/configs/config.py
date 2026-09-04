@@ -1012,6 +1012,7 @@ class RLOrchestratorConfig(ConfigModel):
     max_async_level: int = Field(default=0, ge=0)
     max_off_policy_steps: int = Field(default=0, ge=0)
     max_pending_rollout_chunks: int | None = Field(default=None, ge=1)
+    tasks_per_minute: int | None = Field(default=None, ge=1)
     pipeline_status_interval_seconds: float = Field(default=30.0, gt=0.0)
     state_server: RLStateServerConfig = RLStateServerConfig()
 
@@ -1023,6 +1024,20 @@ class RLOrchestratorConfig(ConfigModel):
             raise ValueError(
                 "orchestrator.max_inflight_rollouts must be at least "
                 "orchestrator.rollouts_per_example"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_task_rate_limit_source(self) -> "RLOrchestratorConfig":
+        if self.tasks_per_minute is None:
+            return self
+        if (
+            self.custom_rollout_function
+            != "wavelet.orchestrator.verifiers:generate_rollouts"
+        ):
+            raise ValueError(
+                "orchestrator.tasks_per_minute currently requires the Verifiers "
+                "rollout source."
             )
         return self
 

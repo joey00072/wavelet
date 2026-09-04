@@ -10,6 +10,7 @@ import os
 import shutil
 import urllib.error
 import urllib.request
+from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Any
 
 from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
 from wavelet.data.rl import RLExample
+from wavelet.orchestrator.admission import RolloutAdmissionController
 from wavelet.orchestrator.advantage import (
     output_completion_token_count,
     output_input_token_count,
@@ -581,6 +583,7 @@ async def _run_all(
     advantage_epsilon: float,
     algorithm_config: RLAlgorithmConfig,
     env_name: str = "verifier",
+    admission: RolloutAdmissionController | None = None,
 ) -> list[dict[str, Any]]:
     if not clients:
         raise ValueError("At least one verifier client is required.")
@@ -597,6 +600,7 @@ async def _run_all(
             max_retries=max_retries,
             algorithm_config=algorithm_config,
             env_name=env_name,
+            admission=admission,
         )
     return await _run_until_target_groups(
         vf,
@@ -612,6 +616,7 @@ async def _run_all(
         advantage_epsilon=advantage_epsilon,
         algorithm_config=algorithm_config,
         env_name=env_name,
+        admission=admission,
     )
 
 
@@ -627,9 +632,10 @@ async def _run_complete_record_set(
     max_retries: int,
     algorithm_config: RLAlgorithmConfig,
     env_name: str,
+    admission: RolloutAdmissionController | None,
 ) -> list[dict[str, Any]]:
     tasks = [
-        _run_group(
+        _run_admitted_group(
             vf,
             env,
             _verifier_example(record),
@@ -640,6 +646,7 @@ async def _run_complete_record_set(
             rollout_count=rollout_count,
             max_retries=max_retries,
             algorithm_config=algorithm_config,
+            admission=admission,
         )
         for index, record in enumerate(records)
     ]
@@ -670,13 +677,14 @@ async def _run_until_target_groups(
     advantage_epsilon: float,
     algorithm_config: RLAlgorithmConfig,
     env_name: str,
+    admission: RolloutAdmissionController | None,
 ) -> list[dict[str, Any]]:
     group_tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
     for record_index, record in enumerate(records):
         example = _verifier_example(record)
         client = clients[record_index % len(clients)]
         task = asyncio.create_task(
-            _run_group(
+            _run_admitted_group(
                 vf,
                 env,
                 example,
@@ -687,6 +695,7 @@ async def _run_until_target_groups(
                 rollout_count=rollout_count,
                 max_retries=max_retries,
                 algorithm_config=algorithm_config,
+                admission=admission,
             )
         )
         group_tasks.append(task)
@@ -720,6 +729,39 @@ async def _run_until_target_groups(
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
     return outputs
+
+
+async def _run_admitted_group(
+    vf,
+    env,
+    example: dict[str, Any],
+    *,
+    group_id: str | None = None,
+    client: Any,
+    model: str,
+    sampling_args: dict[str, Any],
+    rollout_count: int,
+    max_retries: int,
+    algorithm_config: RLAlgorithmConfig,
+    admission: RolloutAdmissionController | None,
+) -> list[dict[str, Any]]:
+    def operation() -> Awaitable[list[dict[str, Any]]]:
+        return _run_group(
+            vf,
+            env,
+            example,
+            group_id=group_id,
+            client=client,
+            model=model,
+            sampling_args=sampling_args,
+            rollout_count=rollout_count,
+            max_retries=max_retries,
+            algorithm_config=algorithm_config,
+        )
+
+    if admission is None:
+        return await operation()
+    return await admission.run(cost=rollout_count, operation=operation)
 
 
 async def _run_group(

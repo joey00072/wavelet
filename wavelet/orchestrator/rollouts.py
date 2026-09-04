@@ -13,6 +13,7 @@ from pathlib import Path
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import RLExample, load_rl_records, serialize_rl_record
 from wavelet.inference.policy import RLInference
+from wavelet.orchestrator.admission import RolloutAdmissionController
 from wavelet.orchestrator.algorithms import (
     algorithm_epsilon,
     algorithm_scope,
@@ -52,6 +53,22 @@ def _assistant_text(messages: list[dict[str, str]] | None) -> str:
 class RLOrchestrator:
     def __init__(self, config: RLConfig) -> None:
         self.config = config
+        self._verifier_admission: RolloutAdmissionController | None = None
+
+    def verifier_admission(
+        self,
+        *,
+        max_inflight: int,
+        minimum_burst: int,
+    ) -> RolloutAdmissionController:
+        """Return the run-scoped verifier admission and rate controller."""
+        if self._verifier_admission is None:
+            self._verifier_admission = RolloutAdmissionController(
+                max_inflight=max_inflight,
+                minimum_burst=minimum_burst,
+                tasks_per_minute=self.config.orchestrator.tasks_per_minute,
+            )
+        return self._verifier_admission
 
     def materialize(
         self,

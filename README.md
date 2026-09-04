@@ -223,6 +223,13 @@ in-flight bound; `oversampling_factor` does not multiply it a second time.
 `max_inflight_rollouts` is also an exact request ceiling. These explicit bounds
 may intentionally leave inference client routes idle rather than exceed the
 configured memory budget.
+Verifier rollout dispatch grows by at most one group or 10% of its in-flight
+ceiling per five-second window, whichever is larger; normally completed work
+refunds that admission so steady-state replacements remain immediate. Set
+`orchestrator.tasks_per_minute` to a positive integer to add a global rollout
+rate limit for sandbox-backed environments. The rate limit is supported only
+by `wavelet.orchestrator.verifiers:generate_rollouts`, and cancelled work does
+not refund admission into an immediate refill wave.
 Long-running process schedulers emit a one-line policy, queue, and in-flight
 status every `orchestrator.pipeline_status_interval_seconds` (30 seconds by
 default).

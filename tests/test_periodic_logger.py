@@ -29,8 +29,10 @@ def test_periodic_logger_emits_while_running(caplog) -> None:
         emitted.set()
         return "Pipeline | healthy"
 
-    with caplog.at_level(logging.INFO):
-        with PeriodicLogger(collect, interval_seconds=0.01):
-            assert emitted.wait(timeout=1.0)
+    with (
+        caplog.at_level(logging.INFO),
+        PeriodicLogger(collect, interval_seconds=0.01),
+    ):
+        assert emitted.wait(timeout=1.0)
 
     assert "Pipeline | healthy" in caplog.text

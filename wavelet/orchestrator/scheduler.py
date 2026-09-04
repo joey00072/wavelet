@@ -403,6 +403,14 @@ def generate_rollouts(
         cache_salt=None if policy_step is None else str(policy_step),
     )
     rollout_count = config.orchestrator.rollouts_per_example or 1
+    max_inflight = config.orchestrator.max_inflight_rollouts
+    admission = orchestrator.verifier_admission(
+        max_inflight=max(
+            rollout_count,
+            max_inflight or len(records) * rollout_count,
+        ),
+        minimum_burst=rollout_count,
+    )
 
     rollout_started_at = perf_counter()
     outputs = asyncio.run(
@@ -420,6 +428,7 @@ def generate_rollouts(
             advantage_epsilon=algorithm_epsilon(config.algo),
             algorithm_config=config.algo,
             env_name=_env_name(env, fallback=env_id),
+            admission=admission,
         )
     )
     if isinstance(policy_step, int) and not isinstance(policy_step, bool):
@@ -507,6 +516,10 @@ class VerifierRolloutScheduler:
         self._policy_update_ready = asyncio.Event()
         self._policy_update_ready.set()
         self.policy_update_wait_seconds = 0.0
+        self.admission = orchestrator.verifier_admission(
+            max_inflight=self.max_inflight_rollouts,
+            minimum_burst=self.rollout_count,
+        )
 
     def set_policy_step(
         self,
@@ -1078,34 +1091,42 @@ class VerifierRolloutScheduler:
             group.pinned_client_index = self._least_loaded_client_index()
         client_index = group.pinned_client_index
         client = self.clients[client_index]
+        model = self.model
+        sampling_args = self._sampling_args_for_current_policy()
         if self.requires_group_scoring:
             rollout_count = group.rollouts_to_schedule
             group.rollouts_to_schedule = 0
             task = asyncio.create_task(
-                _run_group(
-                    self.vf,
-                    self.env,
-                    group.example,
-                    client=client,
-                    model=self.model,
-                    sampling_args=self._sampling_args_for_current_policy(),
-                    rollout_count=rollout_count,
-                    max_retries=self.config.orchestrator.verifier_max_retries,
-                    algorithm_config=self.config.algo,
+                self.admission.run(
+                    cost=rollout_count,
+                    operation=lambda: _run_group(
+                        self.vf,
+                        self.env,
+                        group.example,
+                        client=client,
+                        model=model,
+                        sampling_args=sampling_args,
+                        rollout_count=rollout_count,
+                        max_retries=self.config.orchestrator.verifier_max_retries,
+                        algorithm_config=self.config.algo,
+                    ),
                 )
             )
         else:
             rollout_count = 1
             group.rollouts_to_schedule -= 1
             task = asyncio.create_task(
-                _run_single_rollout(
-                    self.vf,
-                    self.env,
-                    group.example,
-                    client=client,
-                    model=self.model,
-                    sampling_args=self._sampling_args_for_current_policy(),
-                    max_retries=self.config.orchestrator.verifier_max_retries,
+                self.admission.run(
+                    cost=rollout_count,
+                    operation=lambda: _run_single_rollout(
+                        self.vf,
+                        self.env,
+                        group.example,
+                        client=client,
+                        model=model,
+                        sampling_args=sampling_args,
+                        max_retries=self.config.orchestrator.verifier_max_retries,
+                    ),
                 )
             )
         self.pending[task] = _PendingVerifierRequest(
