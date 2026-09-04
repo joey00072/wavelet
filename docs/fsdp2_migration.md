@@ -59,6 +59,12 @@ are not gathered for an adapter snapshot.
 | Context or expert parallelism | Rejected | Rejected until their model kernels are implemented |
 | `colocate_sleep` CPU movement | Supported FSDP1 path | Validation pending |
 
+For Qwen3-MoE and GPT-OSS, FP32 router modules are sharded separately so the
+block-level mixed-precision policy does not downcast them. FSDP1 likewise
+exempts their router class from its mixed-precision policy. This preserves the
+`model.moe_router_dtype: float32` contract; it does not implement expert
+parallel token dispatch.
+
 With `model.meta_device_init: true`, FSDP2 constructs supported Hugging Face
 models on the meta device, applies LoRA and wrapper transforms, materializes
 only the local DTensor shards, and loads safetensors through DCP's

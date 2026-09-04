@@ -85,6 +85,14 @@ class ModelConfig(ConfigModel):
     smart_gc: bool = False  # sqrt-N gradient checkpointing with CPU offload
     compile: bool = False
     compile_fullgraph: bool = False
+    freeze_moe_router: bool = Field(
+        default=False,
+        description="Freeze supported Hugging Face MoE router parameters.",
+    )
+    moe_router_dtype: Literal["float32", "none"] = Field(
+        default="none",
+        description="Run supported Hugging Face MoE router gates in float32.",
+    )
 
     @model_validator(mode="after")
     def validate_compile_fullgraph(self):

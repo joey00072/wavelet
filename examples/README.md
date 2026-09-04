@@ -44,6 +44,12 @@ uv run torchrun --standalone --nproc-per-node=N \
 | `minimax_m2_5_swe` | config only | Large-model workload; CP/EP remain disabled. |
 | `glm5_pd_disag` | config only | Disaggregated/MoE workload with EP disabled. |
 
+Supported Hugging Face Qwen3-MoE and GPT-OSS models emit router load-balance
+metrics during SFT and RL. Set `model.freeze_moe_router: true` to keep routing
+fixed or `model.moe_router_dtype: float32` to run the small router projection
+outside lower-precision autocast. These controls do not enable expert
+parallelism; `fsdp.ep` remains rejected until an HF-native EP design is chosen.
+
 Use the shared verifier data helper for environment-backed RL examples:
 
 ```bash

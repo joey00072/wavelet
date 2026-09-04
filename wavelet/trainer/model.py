@@ -727,7 +727,17 @@ def maybe_wrap_fsdp(
             transformer_layer_cls=layer_classes,
         )
 
-    mixed_precision = _fsdp_mixed_precision(model_config)
+    from wavelet.trainer.moe import hf_moe_routers
+
+    fp32_router_classes = tuple(
+        {type(router) for router in hf_moe_routers(model)}
+        if model_config.moe_router_dtype == "float32"
+        else ()
+    )
+    mixed_precision = _fsdp_mixed_precision(
+        model_config,
+        module_classes_to_ignore=fp32_router_classes,
+    )
     sharding_strategy = _fsdp_sharding_strategy(parallel_dims)
     device_mesh = None
     if (
@@ -787,6 +797,18 @@ def _wrap_fsdp2(
         for module in model.modules()
         if module is not model and type(module) in layer_classes
     ]
+    if model_config.moe_router_dtype == "float32":
+        from wavelet.trainer.moe import hf_moe_routers
+
+        fp32_shard_kwargs = {
+            **shard_kwargs,
+            "mp_policy": MixedPrecisionPolicy(
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+            ),
+        }
+        for router in hf_moe_routers(model):
+            fully_shard(router, **fp32_shard_kwargs)
     for block in transformer_blocks:
         fully_shard(block, **shard_kwargs)
     fully_shard(model, **shard_kwargs)
@@ -1048,22 +1070,34 @@ def compile_transformer_layers(
     return compiled
 
 
-def _fsdp_mixed_precision(model_config: ModelConfig) -> MixedPrecision | None:
+def _fsdp_mixed_precision(
+    model_config: ModelConfig,
+    *,
+    module_classes_to_ignore: tuple[type[nn.Module], ...] = (),
+) -> MixedPrecision | None:
     dtype = resolve_dtype(model_config.torch_dtype)
     if not isinstance(dtype, torch.dtype):
         return None
     if not torch.cuda.is_available() and dtype is not torch.float32:
         return None
+    kwargs: dict[str, object] = {}
+    if module_classes_to_ignore:
+        default_ignored = MixedPrecision()._module_classes_to_ignore
+        kwargs["_module_classes_to_ignore"] = tuple(
+            dict.fromkeys((*default_ignored, *module_classes_to_ignore))
+        )
     if dtype is torch.float32 and torch.cuda.is_available():
         return MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.float32,
             buffer_dtype=torch.bfloat16,
+            **kwargs,
         )
     return MixedPrecision(
         param_dtype=dtype,
         reduce_dtype=dtype,
         buffer_dtype=dtype,
+        **kwargs,
     )
 
 

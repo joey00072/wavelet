@@ -43,6 +43,7 @@ from wavelet.trainer.losses import (
     setup_rl_loss_fn,
 )
 from wavelet.trainer.model import is_fsdp_model, sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.moe import moe_load_balance_metrics
 from wavelet.trainer.perf import training_flop_metrics
 from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.types import LossOutput, TrainOutput
@@ -836,13 +837,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         batch: dict[str, Tensor],
         attention_mask: Tensor | None,
     ) -> LossOutput:
-        trainer_logprobs, entropy = self._model_logprobs_and_entropy(
+        trainer_logprobs, entropy, moe_metrics = self._model_logprobs_and_entropy(
             batch,
             attention_mask,
         )
         if not batch["loss_mask"].bool().any():
             loss = trainer_logprobs.sum() * 0.0
-            return LossOutput(loss=loss, metrics=self._zero_loss_metrics(loss))
+            metrics = self._zero_loss_metrics(loss)
+            metrics.update(moe_metrics)
+            return LossOutput(loss=loss, metrics=metrics)
         rl_weights, ce_weights, ref_kl_weights = self._component_weights(batch)
         output = compute_loss(
             trainer_logprobs,
@@ -864,6 +867,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             rl_loss_fn=self._rl_loss_fn,
         )
         output.metrics.update(self._entropy_metrics(entropy, batch["loss_mask"]))
+        output.metrics.update(moe_metrics)
         return output
 
     @staticmethod
@@ -1009,7 +1013,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         batch: dict[str, Tensor],
         attention_mask: Tensor | None,
     ) -> Tensor:
-        logprobs, _ = self._model_logprobs_and_entropy(
+        logprobs, _, _ = self._model_logprobs_and_entropy(
             batch,
             attention_mask,
             include_entropy=False,
@@ -1022,7 +1026,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         attention_mask: Tensor | None,
         *,
         include_entropy: bool = True,
-    ) -> tuple[Tensor, Tensor | None]:
+    ) -> tuple[Tensor, Tensor | None, dict[str, Tensor]]:
         if self.model is None:
             raise RuntimeError("Model not set up")
         model_kwargs = {
@@ -1036,11 +1040,17 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
         with self._model_forward_context():
             outputs = self.model(**model_kwargs)
+        moe_metrics = moe_load_balance_metrics(
+            self.model,
+            outputs,
+            token_mask=attention_mask,
+        )
         if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
             entropy = outputs.get("entropy") if include_entropy else None
             return (
                 outputs["logprobs"].float().contiguous(),
                 entropy.float().contiguous() if entropy is not None else None,
+                moe_metrics,
             )
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         scaled_logits = logits.float() / batch["temperatures"].float().unsqueeze(-1)
@@ -1048,6 +1058,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         return (
             selective_log_softmax(scaled_logits, batch["target_ids"]),
             entropy,
+            moe_metrics,
         )
 
     def _entropy_metrics(

@@ -36,6 +36,7 @@ from wavelet.trainer.distributed import (
 )
 from wavelet.trainer.garbage_collection import DeterministicGarbageCollector
 from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.moe import configure_hf_moe_routers, moe_load_balance_metrics
 from wavelet.trainer.perf import (
     estimate_training_flops_per_token,
     model_compute_dtype,
@@ -148,6 +149,7 @@ class BaseTrainer:
         self._memory_profiler: CudaMemoryProfiler | None = None
         self._model_flops_per_token: int | None = None
         self._model_compute_dtype: torch.dtype | None = None
+        self._sft_moe_metric_accum: list[dict[str, float]] = []
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -538,6 +540,7 @@ class BaseTrainer:
             lora_dtype=lora_dtype,
             match_base_dtype=(lora_dtype is None and cfg_dtype == "auto"),
         )
+        configure_hf_moe_routers(model, self.config.model)
         self._model_flops_per_token = estimate_training_flops_per_token(
             model,
             seq_len=self.config.data.seq_len,
@@ -1174,6 +1177,14 @@ class SFTTrainer(BaseTrainer):
 
             (loss / self.accumulation_steps).backward()
 
+        self._sft_moe_metric_accum.append(
+            {
+                key: float(value.detach().item())
+                for key, value in loss_output.metrics.items()
+                if key.startswith("moe/")
+            }
+        )
+
         self._micro_step += 1
         if self._micro_step % self.accumulation_steps == 0:
             sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
@@ -1183,6 +1194,7 @@ class SFTTrainer(BaseTrainer):
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
             self.step += 1
+            moe_metrics = self._aggregate_sft_moe_metrics()
             return TrainOutput(
                 loss=loss_output,
                 stepped=True,
@@ -1190,6 +1202,7 @@ class SFTTrainer(BaseTrainer):
                 micro_step=self._micro_step,
                 metrics={
                     "loss": float(loss.detach().item()),
+                    **moe_metrics,
                     **self._finish_step_performance_metrics(),
                 },
             )
@@ -1200,6 +1213,28 @@ class SFTTrainer(BaseTrainer):
             step=self.step,
             micro_step=self._micro_step,
         )
+
+    def _aggregate_sft_moe_metrics(self) -> dict[str, float]:
+        keys = {key for metrics in self._sft_moe_metric_accum for key in metrics}
+        aggregated = {
+            key: (
+                max(
+                    metrics[key]
+                    for metrics in self._sft_moe_metric_accum
+                    if key in metrics
+                )
+                if key.endswith("/max")
+                else sum(
+                    metrics[key]
+                    for metrics in self._sft_moe_metric_accum
+                    if key in metrics
+                )
+                / sum(key in metrics for metrics in self._sft_moe_metric_accum)
+            )
+            for key in keys
+        }
+        self._sft_moe_metric_accum.clear()
+        return aggregated
 
     def _finish_step_performance_metrics(self) -> dict[str, float]:
         if self._step_started_at is None:
@@ -1292,13 +1327,28 @@ class SFTTrainer(BaseTrainer):
                 position_ids=batch["position_ids"],
                 shift_labels=batch["labels"],
             )
-            return LossOutput(loss=outputs.loss)
+            return LossOutput(
+                loss=outputs.loss,
+                metrics=moe_load_balance_metrics(
+                    self.model,
+                    outputs,
+                    token_mask=batch.get("attention_mask"),
+                ),
+            )
         outputs = self.model(
             input_ids=batch["input_ids"],
             attention_mask=attn_mask,
             position_ids=batch["position_ids"],
         )
-        return self.compute_loss(outputs.logits, batch["labels"])
+        result = self.compute_loss(outputs.logits, batch["labels"])
+        result.metrics.update(
+            moe_load_balance_metrics(
+                self.model,
+                outputs,
+                token_mask=batch.get("attention_mask"),
+            )
+        )
+        return result
 
     def compute_loss(
         self,
