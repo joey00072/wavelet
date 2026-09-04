@@ -353,6 +353,10 @@ it manages, such as `model`, `port`, `tensor_parallel_size`, `enable_lora`, and
 `inference.vllm.enforce_eager` defaults to `false`, allowing vLLM to use its
 hybrid eager/CUDA-graph execution path. Set it to `true` for deployments whose
 GPU-memory constraints or model behavior require eager-only execution.
+Both `tool_call_parser` and `reasoning_parser` default to `auto`. Known model
+families resolve to the matching vLLM parser, while unknown or non-reasoning
+models omit the corresponding flag. Set either field explicitly to override
+resolution, or to `null` to disable that parser.
 Policy load, pause, and resume calls retry transient connection failures and
 HTTP 5xx responses up to three times with exponential backoff. Control calls
 use a 300-second per-attempt timeout, while policy loads use 720 seconds; a

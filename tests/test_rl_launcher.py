@@ -738,6 +738,47 @@ def test_inference_server_unknown_auto_tool_parser_disabled() -> None:
     assert "--enable-auto-tool-choice" not in argv
 
 
+@pytest.mark.parametrize(
+    ("model_name", "parser"),
+    [
+        ("zai-org/GLM-4.7-Flash", "glm45"),
+        ("MiniMaxAI/MiniMax-M2.5", "minimax_m2_append_think"),
+        ("PrimeIntellect/INTELLECT-3.1", "deepseek_r1"),
+        ("Qwen/Qwen3-30B-A3B-Thinking-2507", "deepseek_r1"),
+        ("Qwen/Qwen3.5-35B-A3B", "qwen3"),
+        ("nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16", "nemotron_v3"),
+    ],
+)
+def test_inference_server_auto_detects_reasoning_parser(
+    model_name: str,
+    parser: str,
+) -> None:
+    argv = _serve_argv(RLConfig(model={"name": model_name}))
+
+    assert _argv_value(argv, "--reasoning-parser") == parser
+
+
+def test_inference_server_auto_reasoning_parser_skips_non_reasoning_models() -> None:
+    argv = _serve_argv(RLConfig(model={"name": "Qwen/Qwen3-4B-Instruct-2507"}))
+
+    assert "--reasoning-parser" not in argv
+
+
+def test_inference_server_reasoning_parser_can_be_overridden_or_disabled() -> None:
+    model = {"name": "Qwen/Qwen3-4B-Thinking-2507"}
+    custom = RLConfig(
+        model=model,
+        inference={"vllm": {"reasoning_parser": "custom"}},
+    )
+    disabled = RLConfig(
+        model=model,
+        inference={"vllm": {"reasoning_parser": None}},
+    )
+
+    assert _argv_value(_serve_argv(custom), "--reasoning-parser") == "custom"
+    assert "--reasoning-parser" not in _serve_argv(disabled)
+
+
 def test_inference_server_allows_disabling_tool_parser() -> None:
     config = RLConfig(
         model={"name": "Qwen/Qwen3-4B-Instruct-2507"},

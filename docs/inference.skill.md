@@ -85,6 +85,9 @@ Use the configured `inference.http.host` and `inference.http.port` or the full
 - `records_with_inference_logprobs`: should equal `records` for RL generation.
 - vLLM `logprobs_mode` must be `processed_logprobs` so behavior logprobs and
   trainer replay use the same temperature-adjusted sampling distribution.
+- `tool_call_parser` and `reasoning_parser` default to `auto`; inspect the
+  resolved server command for known model-family mappings. An explicit value
+  overrides auto-detection and `null` disables the parser.
 - `records_with_loss_mask`: should equal `records` for trainable rollouts.
 - `model_input_tokens_per_second`: shows model-side token processing throughput.
 - `trainable_tokens_per_second`: useful for comparing rollout configurations.

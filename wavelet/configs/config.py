@@ -733,7 +733,7 @@ class RLVLLMConfig(ConfigModel):
     trust_remote_code: bool | None = None
     dtype: Literal["auto", "float32", "float16", "bfloat16"] | None = None
     tool_call_parser: str | None = "auto"
-    reasoning_parser: str | None = None
+    reasoning_parser: str | None = "auto"
     use_generation_logprobs: bool = True
     openai_batch_wait_seconds: float = Field(default=0.01, ge=0.0)
     openai_batch_min_size: int = Field(default=1, ge=1)

@@ -143,6 +143,15 @@ MODEL_TOOL_CALL_PARSER: dict[str, str] = {
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "qwen3_coder",
 }
 
+MODEL_REASONING_PARSER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^zai-org/GLM-"), "glm45"),
+    (re.compile(r"^MiniMaxAI/MiniMax-M2"), "minimax_m2_append_think"),
+    (re.compile(r"^PrimeIntellect/INTELLECT-3"), "deepseek_r1"),
+    (re.compile(r"^nvidia/NVIDIA-Nemotron-3-Super"), "nemotron_v3"),
+    (re.compile(r"^Qwen/Qwen3-.*Thinking"), "deepseek_r1"),
+    (re.compile(r"^Qwen/Qwen3\.(5|6|8)-"), "qwen3"),
+)
+
 
 def _resolve_tool_call_parser(
     model_name: str, tool_call_parser: str | None
@@ -150,6 +159,18 @@ def _resolve_tool_call_parser(
     if tool_call_parser == "auto":
         return MODEL_TOOL_CALL_PARSER.get(model_name)
     return tool_call_parser
+
+
+def _resolve_reasoning_parser(
+    model_name: str,
+    reasoning_parser: str | None,
+) -> str | None:
+    if reasoning_parser != "auto":
+        return reasoning_parser
+    for pattern, parser_name in MODEL_REASONING_PARSER_PATTERNS:
+        if pattern.search(model_name):
+            return parser_name
+    return None
 
 
 class ChatCompletionRequestWithTokens(ChatCompletionRequest):
@@ -1179,8 +1200,12 @@ def _append_parser_serve_args(argv: list[str], config: RLConfig) -> None:
     if tool_call_parser is not None:
         argv.extend(["--tool-call-parser", tool_call_parser])
         argv.append("--enable-auto-tool-choice")
-    if vllm_config.reasoning_parser is not None:
-        argv.extend(["--reasoning-parser", vllm_config.reasoning_parser])
+    reasoning_parser = _resolve_reasoning_parser(
+        config.model.name,
+        vllm_config.reasoning_parser,
+    )
+    if reasoning_parser is not None:
+        argv.extend(["--reasoning-parser", reasoning_parser])
     if vllm_config.enforce_eager:
         argv.append("--enforce-eager")
     if config.launcher.mode == "colocate_sleep":
