@@ -295,6 +295,9 @@ field as their step metric rather than an explicit monotonic step, so async
 evaluation results for an earlier optimizer step are not discarded, and a
 resumed run continues the previous W&B run through the id persisted in
 `<output_dir>/wandb_run_id.txt`.
+Training metrics that become NaN or infinite are stored as `null` in local
+JSONL logs and omitted from W&B rows; the monitor warns once for each affected
+metric key.
 RL trainer metrics include `entropy/mean`, `entropy/min`, and `entropy/max`
 over loss-masked policy tokens. Entropy uses each token's rollout temperature
 and is computed without materializing full-vocabulary logits when the chunked

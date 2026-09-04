@@ -305,6 +305,7 @@ class RunMonitor:
         self._wandb_samples_table: Any | None = None
         self._wandb_samples_columns: list[str] = []
         self._sample_rows_since_compaction: int | None = None
+        self._warned_nonfinite_metric_keys: set[str] = set()
 
     def start_run(
         self,
@@ -349,6 +350,14 @@ class RunMonitor:
         row["step"] = step
         row["timestamp"] = self._timestamp()
         row.update(self._resource_metrics())
+        row, nonfinite_keys = _sanitize_metric_row(row)
+        for key in sorted(nonfinite_keys - self._warned_nonfinite_metric_keys):
+            logger.warning(
+                "Replacing non-finite metric %r with null in local logs and "
+                "omitting it from W&B.",
+                key,
+            )
+        self._warned_nonfinite_metric_keys.update(nonfinite_keys)
 
         if self.write_metrics_jsonl:
             append_jsonl(self.metrics_file, row)
@@ -357,8 +366,13 @@ class RunMonitor:
             _append_csv(self.csv_file, row)
 
         if self._wandb_run is not None:
-            wandb_metrics = {k: v for k, v in row.items() if k != "timestamp"}
-            wandb_metrics.update(self._wandb_alias_metrics(row))
+            wandb_row = {
+                key: value
+                for key, value in row.items()
+                if key != "timestamp" and key not in nonfinite_keys
+            }
+            wandb_metrics = dict(wandb_row)
+            wandb_metrics.update(self._wandb_alias_metrics(wandb_row))
             # ``step`` is the declared step metric; an explicit ``step=`` would
             # make W&B drop rows logged for an earlier step (async eval results).
             self._wandb_run.log(wandb_metrics)
@@ -605,6 +619,21 @@ def _existing_path(path: Path) -> Path:
     while not cursor.exists() and cursor != cursor.parent:
         cursor = cursor.parent
     return cursor
+
+
+def _sanitize_metric_row(
+    row: dict[str, Any],
+) -> tuple[dict[str, Any], set[str]]:
+    """Replace non-finite top-level floats with JSON-safe null values."""
+    nonfinite_keys = {
+        key
+        for key, value in row.items()
+        if isinstance(value, float) and not math.isfinite(value)
+    }
+    return (
+        {key: None if key in nonfinite_keys else value for key, value in row.items()},
+        nonfinite_keys,
+    )
 
 
 _STANDARD_LOG_RECORD_KEYS = frozenset(logging.makeLogRecord({}).__dict__) | {

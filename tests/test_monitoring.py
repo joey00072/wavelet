@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import types
 from collections import namedtuple
@@ -11,11 +12,14 @@ from wavelet.utils.monitoring import RunMonitor
 
 
 class _FakeRun:
+    def __init__(self) -> None:
+        self.rows: list[dict[str, object]] = []
+
     def define_metric(self, *_args, **_kwargs) -> None:
         return None
 
-    def log(self, *_args, **_kwargs) -> None:
-        return None
+    def log(self, row, *_args, **_kwargs) -> None:
+        self.rows.append(row)
 
     def finish(self) -> None:
         return None
@@ -64,6 +68,44 @@ def test_wandb_alias_metrics_include_lr() -> None:
 
     assert aliases["train/lr"] == 1e-6
     assert aliases["scheduler/lr"] == 1e-6
+
+
+def test_nonfinite_metrics_are_null_locally_and_omitted_from_wandb(
+    caplog, tmp_path
+) -> None:
+    monitor = RunMonitor(
+        tmp_path,
+        log_cuda_memory=False,
+        log_disk_usage=False,
+    )
+    wandb_run = _FakeRun()
+    monitor._wandb_run = wandb_run
+
+    with caplog.at_level(logging.WARNING, logger="wavelet.monitor"):
+        monitor.log(
+            {"loss": float("nan"), "scale": float("inf"), "finite": 1.5},
+            step=1,
+        )
+        monitor.log({"loss": float("-inf"), "finite": 2.5}, step=2)
+
+    rows = read_jsonl(tmp_path / "metrics.jsonl")
+    assert rows[0]["loss"] is None
+    assert rows[0]["scale"] is None
+    assert rows[0]["finite"] == 1.5
+    assert rows[1]["loss"] is None
+    assert "loss" not in wandb_run.rows[0]
+    assert "train/loss" not in wandb_run.rows[0]
+    assert "scale" not in wandb_run.rows[0]
+    assert wandb_run.rows[0]["finite"] == 1.5
+    assert "loss" not in wandb_run.rows[1]
+    warnings = [
+        record.message
+        for record in caplog.records
+        if record.message.startswith("Replacing non-finite metric")
+    ]
+    assert len(warnings) == 2
+    assert any("'loss'" in message for message in warnings)
+    assert any("'scale'" in message for message in warnings)
 
 
 def test_disk_metrics_cover_run_and_checkpoint_volumes(monkeypatch, tmp_path) -> None:
