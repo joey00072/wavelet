@@ -53,22 +53,31 @@ are not gathered for an adapter snapshot.
 | HSDP (`dp_replicate > 1`) | Supported | Uses the existing HSDP mesh; GPU validation pending |
 | DCP sync/async checkpoints | Supported | Unified state-dict path; sync round trip tested |
 | Lightweight LoRA export | Supported | Trainable-only DCP gather tested |
+| Meta-device Hugging Face load | Low-memory `from_pretrained` hint | Direct safetensors-to-DTensor loading for full model and fresh LoRA |
 | Hugging Face tensor parallel plus DP sharding | Supported where the model has a TP plan | Wrapper composition is present; GPU validation pending |
 | QLoRA | Replicated DDP only | FSDP remains rejected by preflight |
 | Context or expert parallelism | Rejected | Rejected until their model kernels are implemented |
 | `colocate_sleep` CPU movement | Supported FSDP1 path | Validation pending |
 
-The first FSDP2 phase deliberately retains the current Hugging Face loading
-path: every rank materializes pretrained weights on CPU before sharding. The
-next migration phase is meta-device construction followed by direct loading of
-Hugging Face safetensors into DCP shards. Until that lands, `model.meta_device_init`
-does not provide a zero-materialization FSDP2 load path.
+With `model.meta_device_init: true`, FSDP2 constructs supported Hugging Face
+models on the meta device, applies LoRA and wrapper transforms, materializes
+only the local DTensor shards, and loads safetensors through DCP's
+`HuggingFaceStorageReader`. The loader reconstructs standard rotary-frequency
+buffers and fails before loading when a model has non-persistent buffers it
+cannot reconstruct.
+
+The optimized path currently falls back to standard `from_pretrained` loading
+for tensor-parallel configurations, an existing `model.adapter_path`, or LoRA
+`modules_to_save`. Fresh LoRA adapters without `modules_to_save` use direct base
+weight loading and are initialized after shard materialization. The fallback is
+logged and preserves the prior behavior; it is not a zero-materialization load.
 
 ## Validation
 
-The CPU integration test exercises per-block wrapping, forward/backward, an
-optimizer step, DCP save/load restoration of model and optimizer shards, and a
-lightweight LoRA safetensors export:
+The CPU integration test starts from a local Hugging Face safetensors model,
+constructs it on meta, verifies direct loading into two FSDP2 shards, and then
+exercises forward/backward, an optimizer step, DCP model-and-optimizer
+restoration, and a lightweight LoRA safetensors export:
 
 ```bash
 uv run pytest tests/integration/test_fsdp2_checkpoint.py -q

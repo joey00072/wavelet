@@ -26,6 +26,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from wavelet.configs.sft import SFTConfig
 from wavelet.data.sft import Example, load_records, setup_dataloader, setup_dataset
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
+from wavelet.trainer.debug import DEBUG_MODEL_NAME
 from wavelet.trainer.distributed import (
     ParallelDims,
     World,
@@ -512,6 +513,7 @@ class BaseTrainer:
         # are in place when model weights are loaded.
         apply_liger_kernel(self.config.loss_impl, self.config.model.name)
         fsdp_config = getattr(self.config, "fsdp", None)
+        use_fsdp2_meta_init = self._use_fsdp2_meta_init(fsdp_config)
         self._validate_model_execution_mode(fsdp_config)
         model = setup_model(
             self.config.model,
@@ -523,6 +525,7 @@ class BaseTrainer:
                 or (self.parallel_dims is not None and self.parallel_dims.tp_enabled)
             ),
             parallel_dims=self.parallel_dims,
+            initialize_on_meta=use_fsdp2_meta_init,
         )
         # Cast LoRA adapters to match the model's compute dtype so flash
         # attention doesn't have to upcast fp32 LoRA outputs at every layer.
@@ -564,6 +567,51 @@ class BaseTrainer:
                 fullgraph=self.config.model.compile_fullgraph,
             )
         self.model = self._wrap_distributed_model(model, fsdp_config)
+        if use_fsdp2_meta_init:
+            from wavelet.trainer.model import load_fsdp2_model_from_hf
+
+            if self.world is None:
+                raise RuntimeError("World must be initialized before loading FSDP2.")
+            load_fsdp2_model_from_hf(
+                self.model,
+                self.config.model,
+                world=self.world,
+                cpu_offload=bool(fsdp_config.cpu_offload),
+            )
+
+    def _use_fsdp2_meta_init(self, fsdp_config: Any) -> bool:
+        if not (
+            self.config.model.meta_device_init
+            and getattr(fsdp_config, "enabled", False)
+            and getattr(fsdp_config, "impl", "fsdp1") == "fsdp2"
+        ):
+            return False
+        if self.config.model.name == DEBUG_MODEL_NAME:
+            logger.warning(
+                "The random debug model has no Hugging Face weights to load; "
+                "ignoring model.meta_device_init."
+            )
+            return False
+        if self.config.model.adapter_path is not None:
+            logger.warning(
+                "FSDP2 meta initialization does not yet support resuming a PEFT "
+                "adapter; using the standard Hugging Face load path."
+            )
+            return False
+        if self.parallel_dims is not None and self.parallel_dims.tp_enabled:
+            logger.warning(
+                "FSDP2 meta initialization with tensor parallelism is not yet "
+                "validated; using the standard Hugging Face load path."
+            )
+            return False
+        lora_config = self.config.lora
+        if lora_config is not None and lora_config.modules_to_save:
+            logger.warning(
+                "FSDP2 meta initialization does not yet support LoRA "
+                "modules_to_save; using the standard Hugging Face load path."
+            )
+            return False
+        return True
 
     def _validate_model_execution_mode(self, fsdp_config: Any) -> None:
         if self.config.model.load_in_4bit and getattr(fsdp_config, "enabled", False):

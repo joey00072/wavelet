@@ -21,10 +21,12 @@ from peft import (
 )
 from safetensors.torch import save_file as save_safetensors
 from torch import nn
+from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
 )
+from torch.distributed.checkpoint.state_dict_loader import load as dcp_load
 from torch.distributed.fsdp import (
     CPUOffload,
     CPUOffloadPolicy,
@@ -399,6 +401,28 @@ def _load_pretrained_model(
             transformers_logging.set_verbosity(previous_verbosity)
 
 
+def _build_pretrained_model_on_meta(
+    config: ModelConfig,
+    *,
+    attention: str,
+) -> PreTrainedModel:
+    model_config = AutoConfig.from_pretrained(
+        config.name,
+        trust_remote_code=config.trust_remote_code,
+    )
+    dtype = resolve_dtype(config.torch_dtype)
+    if dtype == "auto":
+        dtype = getattr(model_config, "dtype", None) or torch.float32
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(
+            model_config,
+            trust_remote_code=config.trust_remote_code,
+            attn_implementation=attention,
+            dtype=dtype,
+        )
+    return cast(PreTrainedModel, model)
+
+
 def _prepare_quantized_modules(model: PreTrainedModel, config: ModelConfig) -> None:
     compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     for module_name in ("embed_tokens", "lm_head", "norm"):
@@ -413,8 +437,13 @@ def setup_model(
     max_seq_length: int | None = None,
     distributed: bool = False,
     parallel_dims: ParallelDims | None = None,
+    initialize_on_meta: bool = False,
 ) -> PreTrainedModel:
     if config.name == DEBUG_MODEL_NAME:
+        if initialize_on_meta:
+            raise ValueError(
+                "The random debug model cannot be loaded from Hugging Face shards."
+            )
         return _setup_debug_model(
             config,
             max_seq_length=max_seq_length,
@@ -427,7 +456,24 @@ def setup_model(
         distributed=distributed,
         parallel_dims=parallel_dims,
     )
-    model = _load_pretrained_model(config, model_kwargs, attention=attention)
+    if initialize_on_meta:
+        if config.load_in_4bit:
+            raise ValueError(
+                "Meta-device model construction does not support 4-bit load."
+            )
+        if parallel_dims is not None and parallel_dims.tp_enabled:
+            raise ValueError(
+                "Meta-device FSDP2 loading with tensor parallelism is not yet "
+                "validated. Disable model.meta_device_init for this configuration."
+            )
+        if config.adapter_path is not None:
+            raise ValueError(
+                "Meta-device FSDP2 loading cannot resume a PEFT adapter yet. "
+                "Disable model.meta_device_init for this configuration."
+            )
+        model = _build_pretrained_model_on_meta(config, attention=attention)
+    else:
+        model = _load_pretrained_model(config, model_kwargs, attention=attention)
     model.config.use_cache = False
     if config.smart_gc and config.activation_checkpointing is not None:
         model.gradient_checkpointing_enable(
@@ -454,6 +500,142 @@ def setup_model(
             is_trainable=True,
         )
     return cast(PreTrainedModel, model)
+
+
+def load_fsdp2_model_from_hf(
+    model: nn.Module,
+    config: ModelConfig,
+    *,
+    world: World,
+    cpu_offload: bool = False,
+) -> None:
+    """Materialize an FSDP2 meta model directly from HF safetensor shards."""
+    if not isinstance(model, FSDPModule):
+        raise TypeError("Direct Hugging Face shard loading requires an FSDP2 model.")
+
+    snapshot_path = Path(config.name)
+    if not snapshot_path.exists():
+        snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
+    reader = HuggingFaceStorageReader(snapshot_path.as_posix())
+    checkpoint_keys = set(reader.read_metadata().state_dict_metadata)
+
+    meta_state_dict = model.state_dict()
+    _validate_meta_model_buffers(model, set(meta_state_dict))
+    tied_checkpoint_keys = _tied_checkpoint_keys(model)
+    missing = [
+        model_key
+        for model_key in meta_state_dict
+        if not _is_lora_state_key(model_key)
+        and _hf_checkpoint_key(model_key) not in checkpoint_keys
+        and _hf_checkpoint_key(model_key) not in tied_checkpoint_keys
+    ]
+    if missing:
+        names = ", ".join(sorted(missing)[:5])
+        suffix = "..." if len(missing) > 5 else ""
+        raise RuntimeError(
+            "Hugging Face checkpoint does not match the meta-initialized model; "
+            f"missing {len(missing)} state entries: {names}{suffix}"
+        )
+
+    load_device = (
+        torch.device("cpu")
+        if cpu_offload or world.device.type == "cpu"
+        else world.device
+    )
+    model.to_empty(device=load_device)
+    torch.distributed.barrier()
+    _initialize_meta_model_buffers(model)
+
+    state_dict = model.state_dict()
+    load_state: dict[str, torch.Tensor] = {}
+    for model_key, value in state_dict.items():
+        if _is_lora_state_key(model_key):
+            continue
+        checkpoint_key = _hf_checkpoint_key(model_key)
+        if checkpoint_key in tied_checkpoint_keys:
+            continue
+        load_state.setdefault(checkpoint_key, value)
+
+    logger.info("Loading FSDP2 weights directly from %s.", snapshot_path)
+    dcp_load(load_state, storage_reader=reader)
+    if getattr(model.config, "tie_word_embeddings", False):
+        model.tie_weights()
+    _initialize_lora_parameters(model)
+
+
+def _hf_checkpoint_key(model_key: str) -> str:
+    key = model_key.removeprefix("base_model.model.")
+    return key.replace(".base_layer.", ".")
+
+
+def _is_lora_state_key(key: str) -> bool:
+    return any(f".{attr}." in key for attr in LORA_STATE_ATTRS)
+
+
+def _tied_checkpoint_keys(model: nn.Module) -> set[str]:
+    if not getattr(model.config, "tie_word_embeddings", False):
+        return set()
+    tied = getattr(model, "_tied_weights_keys", None)
+    if isinstance(tied, dict):
+        return set(tied)
+    if isinstance(tied, (list, set, tuple)):
+        return set(tied)
+    return set()
+
+
+def _validate_meta_model_buffers(
+    model: nn.Module,
+    persistent_names: set[str],
+) -> None:
+    unsupported = [
+        name
+        for name, _ in model.named_buffers()
+        if name not in persistent_names
+        and not name.endswith(("rotary_emb.inv_freq", "rotary_emb.original_inv_freq"))
+    ]
+    if unsupported:
+        names = ", ".join(unsupported[:5])
+        suffix = "..." if len(unsupported) > 5 else ""
+        raise RuntimeError(
+            "Meta-device initialization cannot reconstruct model buffers: "
+            f"{names}{suffix}. Disable model.meta_device_init."
+        )
+
+
+def _initialize_meta_model_buffers(model: nn.Module) -> None:
+    with torch.no_grad():
+        for module in model.modules():
+            inv_freq = getattr(module, "inv_freq", None)
+            if not isinstance(inv_freq, torch.Tensor):
+                continue
+            rope_init_fn = getattr(module, "rope_init_fn", None)
+            if rope_init_fn is None:
+                rope_init_fn = getattr(module, "compute_default_rope_parameters", None)
+            module_config = getattr(module, "config", None)
+            if not callable(rope_init_fn) or module_config is None:
+                raise RuntimeError(
+                    "Meta-device initialization cannot reconstruct rotary buffers "
+                    f"for {type(module).__name__}. Disable model.meta_device_init."
+                )
+            initialized, attention_scaling = rope_init_fn(
+                module_config,
+                inv_freq.device,
+            )
+            inv_freq.copy_(initialized)
+            if hasattr(module, "original_inv_freq"):
+                module.original_inv_freq.copy_(initialized)
+            if hasattr(module, "attention_scaling"):
+                module.attention_scaling = attention_scaling
+
+
+def _initialize_lora_parameters(model: nn.Module) -> None:
+    for module in model.modules():
+        reset = getattr(module, "reset_lora_parameters", None)
+        lora_a = getattr(module, "lora_A", None)
+        if not callable(reset) or not isinstance(lora_a, nn.ModuleDict):
+            continue
+        for adapter_name in lora_a:
+            reset(adapter_name, True)
 
 
 def save_model(

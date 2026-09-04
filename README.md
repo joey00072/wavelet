@@ -93,8 +93,9 @@ Current distributed scope is experimental:
 
 - FSDP1 remains the default; `fsdp.impl: fsdp2` opts into per-transformer-block
   `fully_shard` plus a root shard, using the existing HSDP mesh. See the
-  [FSDP2 migration guide](docs/fsdp2_migration.md) for the tested boundary and
-  pending meta-device weight-loading work
+  [FSDP2 migration guide](docs/fsdp2_migration.md) for the tested boundary;
+  `model.meta_device_init: true` directly loads supported Hugging Face
+  safetensors into local FSDP2 shards
 - `fsdp.backend: auto` selects `cpu:gloo,cuda:nccl` on CUDA so async
   checkpoints, which require a CPU backend in the default group, work out of
   the box; the explicit `hybrid` setting remains accepted

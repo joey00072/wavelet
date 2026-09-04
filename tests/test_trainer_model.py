@@ -9,10 +9,17 @@ import pytest
 import torch
 from torch.utils.checkpoint import CheckpointPolicy
 
-from wavelet.configs.sft import ActivationCheckpointingConfig, ModelConfig
+from wavelet.configs.sft import (
+    ActivationCheckpointingConfig,
+    LoRAConfig,
+    ModelConfig,
+    SFTConfig,
+)
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.debug import DEBUG_MODEL_NAME
+from wavelet.trainer.distributed import ParallelDims
 from wavelet.trainer.model import setup_tokenizer
+from wavelet.trainer.trainer import BaseTrainer
 
 
 class _Tokenizer:
@@ -180,6 +187,56 @@ def test_setup_runtime_applies_configured_matmul_precision(
 def test_removed_allow_tf32_model_setting_is_rejected() -> None:
     with pytest.raises(ValueError, match="allow_tf32"):
         ModelConfig.model_validate({"allow_tf32": True})
+
+
+def test_fsdp2_meta_init_selection_rejects_unsupported_lora_copies() -> None:
+    trainer = BaseTrainer(
+        SFTConfig(
+            model={"meta_device_init": True},
+            fsdp={"enabled": True, "impl": "fsdp2"},
+            lora=LoRAConfig(modules_to_save=["lm_head"]),
+        )
+    )
+    trainer.parallel_dims = ParallelDims(world_size=1)
+
+    assert trainer._use_fsdp2_meta_init(trainer.config.fsdp) is False
+
+
+def test_fsdp2_meta_init_selection_accepts_fresh_lora() -> None:
+    trainer = BaseTrainer(
+        SFTConfig(
+            model={"meta_device_init": True},
+            fsdp={"enabled": True, "impl": "fsdp2"},
+            lora=LoRAConfig(),
+        )
+    )
+    trainer.parallel_dims = ParallelDims(world_size=1)
+
+    assert trainer._use_fsdp2_meta_init(trainer.config.fsdp) is True
+
+
+def test_fsdp2_meta_init_selection_skips_random_debug_model() -> None:
+    trainer = BaseTrainer(
+        SFTConfig(
+            model={"name": DEBUG_MODEL_NAME, "meta_device_init": True},
+            fsdp={"enabled": True, "impl": "fsdp2"},
+        )
+    )
+    trainer.parallel_dims = ParallelDims(world_size=1)
+
+    assert trainer._use_fsdp2_meta_init(trainer.config.fsdp) is False
+
+
+def test_meta_init_rejects_nonpersistent_buffers_it_cannot_rebuild() -> None:
+    model = torch.nn.Module()
+    model.register_buffer(
+        "attention_cache",
+        torch.empty(2, device="meta"),
+        persistent=False,
+    )
+
+    with pytest.raises(RuntimeError, match="attention_cache"):
+        model_utils._validate_meta_model_buffers(model, set(model.state_dict()))
 
 
 def test_compile_fullgraph_requires_compile_enabled() -> None:
