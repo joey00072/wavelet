@@ -29,6 +29,7 @@ from wavelet.orchestrator.verifiers import (
     _successful_rollout_outputs,
     _verifier_extra_env_kwargs,
     _VerifierBatchStats,
+    _VerifierFailureStats,
     _VerifierGroupState,
 )
 
@@ -1118,6 +1119,11 @@ def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
         "harness_version": "1",
         "trajectory_id": "traj-7",
         "elapsed_seconds": 1.25,
+        "timing": {
+            "generation_ms": 800.0,
+            "scoring_ms": 200.0,
+            "total_ms": 1100.0,
+        },
         "reward_components": {"exact": 1.0},
         "is_truncated": True,
         "error": None,
@@ -1166,6 +1172,11 @@ def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
         "is_truncated": True,
         "error": None,
         "reward_components": {"exact": 1.0},
+        "timing_seconds": {
+            "generation": 0.8,
+            "scoring": 0.2,
+            "total": 1.1,
+        },
     }
 
 
@@ -1212,6 +1223,7 @@ def test_successful_rollout_outputs_skip_exceptions_errors_and_missing_rewards()
     None
 ):
     trainable_trajectory = _trainable_trajectory()
+    failure_stats = _VerifierFailureStats()
     outputs = _successful_rollout_outputs(
         [
             RuntimeError("boom"),
@@ -1224,7 +1236,8 @@ def test_successful_rollout_outputs_skip_exceptions_errors_and_missing_rewards()
                 "error": None,
                 "trajectory": trainable_trajectory,
             },
-        ]
+        ],
+        failure_stats=failure_stats,
     )
 
     assert outputs == [
@@ -1235,6 +1248,13 @@ def test_successful_rollout_outputs_skip_exceptions_errors_and_missing_rewards()
             "trajectory": trainable_trajectory,
         }
     ]
+    assert failure_stats.consume_metrics() == {
+        "fate/errors/invalid_result": 1.0,
+        "fate/errors/missing_reward": 1.0,
+        "fate/errors/runtime_error": 1.0,
+        "fate/errors/timeout": 1.0,
+    }
+    assert failure_stats.consume_metrics() == {}
 
 
 def test_successful_rollout_outputs_skip_empty_or_untrainable_trajectories() -> None:

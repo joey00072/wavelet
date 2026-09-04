@@ -10,9 +10,10 @@ import os
 import shutil
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -36,7 +37,10 @@ from wavelet.orchestrator.algorithms import (
 )
 from wavelet.orchestrator.eval_utils import pass_at_k
 from wavelet.orchestrator.patches import apply_verifier_openai_patches
-from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
+from wavelet.orchestrator.rollout_metadata import (
+    error_metric_name,
+    rollout_task_harness_metadata,
+)
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
 _ENV_CACHE: dict[tuple[str, str], Any] = {}
@@ -53,6 +57,23 @@ _RATE_LIMIT_ERROR_MARKERS = (
     "usage limit",
     "too many requests",
 )
+
+
+@dataclass(slots=True)
+class _VerifierFailureStats:
+    counts: Counter[str] = field(default_factory=Counter)
+    _reported: Counter[str] = field(default_factory=Counter)
+
+    def record(self, error: object) -> None:
+        self.counts[error_metric_name(error)] += 1
+
+    def consume_metrics(self) -> dict[str, float]:
+        delta = self.counts - self._reported
+        self._reported = self.counts.copy()
+        return {
+            f"fate/errors/{error_type}": float(count)
+            for error_type, count in sorted(delta.items())
+        }
 
 
 class PrefillScoringClient:
@@ -584,6 +605,7 @@ async def _run_all(
     algorithm_config: RLAlgorithmConfig,
     env_name: str = "verifier",
     admission: RolloutAdmissionController | None = None,
+    failure_stats: _VerifierFailureStats | None = None,
 ) -> list[dict[str, Any]]:
     if not clients:
         raise ValueError("At least one verifier client is required.")
@@ -601,6 +623,7 @@ async def _run_all(
             algorithm_config=algorithm_config,
             env_name=env_name,
             admission=admission,
+            failure_stats=failure_stats,
         )
     return await _run_until_target_groups(
         vf,
@@ -617,6 +640,7 @@ async def _run_all(
         algorithm_config=algorithm_config,
         env_name=env_name,
         admission=admission,
+        failure_stats=failure_stats,
     )
 
 
@@ -633,6 +657,7 @@ async def _run_complete_record_set(
     algorithm_config: RLAlgorithmConfig,
     env_name: str,
     admission: RolloutAdmissionController | None,
+    failure_stats: _VerifierFailureStats | None,
 ) -> list[dict[str, Any]]:
     tasks = [
         _run_admitted_group(
@@ -647,6 +672,7 @@ async def _run_complete_record_set(
             max_retries=max_retries,
             algorithm_config=algorithm_config,
             admission=admission,
+            failure_stats=failure_stats,
         )
         for index, record in enumerate(records)
     ]
@@ -678,6 +704,7 @@ async def _run_until_target_groups(
     algorithm_config: RLAlgorithmConfig,
     env_name: str,
     admission: RolloutAdmissionController | None,
+    failure_stats: _VerifierFailureStats | None,
 ) -> list[dict[str, Any]]:
     group_tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
     for record_index, record in enumerate(records):
@@ -696,6 +723,7 @@ async def _run_until_target_groups(
                 max_retries=max_retries,
                 algorithm_config=algorithm_config,
                 admission=admission,
+                failure_stats=failure_stats,
             )
         )
         group_tasks.append(task)
@@ -744,6 +772,7 @@ async def _run_admitted_group(
     max_retries: int,
     algorithm_config: RLAlgorithmConfig,
     admission: RolloutAdmissionController | None,
+    failure_stats: _VerifierFailureStats | None = None,
 ) -> list[dict[str, Any]]:
     def operation() -> Awaitable[list[dict[str, Any]]]:
         return _run_group(
@@ -757,6 +786,7 @@ async def _run_admitted_group(
             rollout_count=rollout_count,
             max_retries=max_retries,
             algorithm_config=algorithm_config,
+            failure_stats=failure_stats,
         )
 
     if admission is None:
@@ -776,46 +806,65 @@ async def _run_group(
     rollout_count: int,
     max_retries: int,
     algorithm_config: RLAlgorithmConfig,
+    failure_stats: _VerifierFailureStats | None = None,
 ) -> list[dict[str, Any]]:
-    if getattr(env, "requires_group_scoring", False):
-        run_group = getattr(env, "run_group", None)
-        if not callable(run_group):
-            raise ValueError(
-                "Verifier environment requires group scoring but does not expose "
-                "run_group()."
+    try:
+        if getattr(env, "requires_group_scoring", False):
+            run_group = getattr(env, "run_group", None)
+            if not callable(run_group):
+                raise ValueError(
+                    "Verifier environment requires group scoring but does not expose "
+                    "run_group()."
+                )
+            group_inputs = [vf.RolloutInput(**example) for _ in range(rollout_count)]
+            result = list(
+                await run_group(
+                    group_inputs,
+                    client=client,
+                    model=model,
+                    sampling_args=sampling_args,
+                    max_retries=max_retries,
+                    state_columns=["trajectory", "sampling_args"],
+                )
             )
-        group_inputs = [vf.RolloutInput(**example) for _ in range(rollout_count)]
-        result = await run_group(
-            group_inputs,
-            client=client,
-            model=model,
-            sampling_args=sampling_args,
-            max_retries=max_retries,
-            state_columns=["trajectory", "sampling_args"],
+            if failure_stats is not None:
+                for _ in range(max(0, rollout_count - len(result))):
+                    failure_stats.record("MissingRollout")
+            outputs = _successful_rollout_outputs(
+                result,
+                failure_stats=failure_stats,
+            )
+            _stamp_verifier_example(outputs, example)
+            _stamp_group_id(outputs, group_id)
+            _assign_group_advantages(outputs, algorithm_config=algorithm_config)
+            return outputs
+
+        tasks = [
+            env.run_rollout(
+                vf.RolloutInput(**example),
+                client=client,
+                model=model,
+                sampling_args=sampling_args,
+                max_retries=max_retries,
+                state_columns=["trajectory", "sampling_args"],
+            )
+            for _ in range(rollout_count)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        outputs = _successful_rollout_outputs(
+            results,
+            failure_stats=failure_stats,
         )
-        outputs = _successful_rollout_outputs(list(result))
         _stamp_verifier_example(outputs, example)
         _stamp_group_id(outputs, group_id)
         _assign_group_advantages(outputs, algorithm_config=algorithm_config)
         return outputs
-
-    tasks = [
-        env.run_rollout(
-            vf.RolloutInput(**example),
-            client=client,
-            model=model,
-            sampling_args=sampling_args,
-            max_retries=max_retries,
-            state_columns=["trajectory", "sampling_args"],
-        )
-        for _ in range(rollout_count)
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    outputs = _successful_rollout_outputs(results)
-    _stamp_verifier_example(outputs, example)
-    _stamp_group_id(outputs, group_id)
-    _assign_group_advantages(outputs, algorithm_config=algorithm_config)
-    return outputs
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if failure_stats is not None:
+            failure_stats.record(exc)
+        raise
 
 
 def _stamp_group_id(outputs: list[dict[str, Any]], group_id: str | None) -> None:
@@ -853,16 +902,24 @@ async def _run_single_rollout(
     model: str,
     sampling_args: dict[str, Any],
     max_retries: int,
+    failure_stats: _VerifierFailureStats | None = None,
 ) -> list[dict[str, Any]]:
-    result = await env.run_rollout(
-        vf.RolloutInput(**example),
-        client=client,
-        model=model,
-        sampling_args=sampling_args,
-        max_retries=max_retries,
-        state_columns=["trajectory", "sampling_args"],
-    )
-    outputs = _successful_rollout_outputs([result])
+    try:
+        result = await env.run_rollout(
+            vf.RolloutInput(**example),
+            client=client,
+            model=model,
+            sampling_args=sampling_args,
+            max_retries=max_retries,
+            state_columns=["trajectory", "sampling_args"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if failure_stats is not None:
+            failure_stats.record(exc)
+        raise
+    outputs = _successful_rollout_outputs([result], failure_stats=failure_stats)
     _stamp_verifier_example(outputs, example)
     return outputs
 
@@ -871,24 +928,35 @@ def _successful_rollout_outputs(
     results: list[Any],
     *,
     require_trainable: bool = True,
+    failure_stats: _VerifierFailureStats | None = None,
 ) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
     for result in results:
         if isinstance(result, Exception):
             _raise_if_external_rate_limit(result)
+            if failure_stats is not None:
+                failure_stats.record(result)
             logger.warning("Verifier rollout failed: %r", result)
             continue
         try:
             output = dict(result)
         except (TypeError, ValueError):
+            if failure_stats is not None:
+                failure_stats.record("InvalidResult")
             continue
         error = output.get("error")
         if error is not None:
             _raise_if_external_rate_limit(error)
+            if failure_stats is not None:
+                failure_stats.record(error)
             continue
         if "reward" not in output:
+            if failure_stats is not None:
+                failure_stats.record("MissingReward")
             continue
         if require_trainable and not _has_trainable_trajectory(output):
+            if failure_stats is not None:
+                failure_stats.record("UntrainableTrajectory")
             continue
         outputs.append(output)
     return outputs

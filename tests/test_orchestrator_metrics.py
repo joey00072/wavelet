@@ -82,7 +82,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
 
     serialized = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
     assert hashlib.sha256(serialized.encode()).hexdigest() == (
-        "d07682cf864d09be205ad8969d96c24958bb5684d5fab47ae8a9374ef0962ffc"
+        "ed7453ef43f587296ac12d2e4923c6f8a82d6e58f33278b41368c05cbb909337"
     )
 
     assert metrics["progress/samples"] == 4
@@ -105,6 +105,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
     assert metrics["fate/all/with_inference_logprobs"] == 1
     assert metrics["fate/all/with_teacher_logprobs"] == 1
     assert metrics["fate/reverse-text/filtered_rate"] == pytest.approx(0.25)
+    assert metrics["fate/errors/parser"] == 1.0
 
 
 def test_policy_staleness_splits_generation_and_queue_lag() -> None:
@@ -155,6 +156,57 @@ def test_rollout_metrics_report_off_policy_components_once_per_rollout() -> None
     assert metrics["off_policy/in_flight/max"] == 2.0
     assert metrics["off_policy/in_queue/mean"] == 1.5
     assert metrics["off_policy/in_queue/max"] == 2.0
+
+
+def test_rollout_metrics_report_per_phase_timing() -> None:
+    rows = [
+        {
+            "metadata": {
+                "_wavelet_rollout_count": 1,
+                "rollout": {
+                    "timing_seconds": {
+                        "generation": 0.8,
+                        "scoring": 0.2,
+                        "total": 1.1,
+                    }
+                },
+            }
+        },
+        {
+            "metadata": {
+                "_wavelet_rollout_count": 1,
+                "rollout": {
+                    "timing_seconds": {
+                        "generation": 1.2,
+                        "scoring": 0.4,
+                        "total": 1.8,
+                    }
+                },
+            }
+        },
+    ]
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=1, step=0)
+    )
+
+    assert metrics["time/rollout/generation/mean"] == 1.0
+    assert metrics["time/rollout/generation/max"] == 1.2
+    assert metrics["time/rollout/scoring/mean"] == pytest.approx(0.3)
+    assert metrics["time/rollout/total/max"] == 1.8
+
+
+def test_dropped_and_materialized_error_counts_are_combined() -> None:
+    metrics = rollout_metrics(
+        RolloutMetricInputs(
+            rows=[{"metadata": {"error": {"type": "TimeoutError"}}}],
+            rollouts_per_example=1,
+            step=0,
+            extra_metrics={"fate/errors/timeout_error": 2.0},
+        )
+    )
+
+    assert metrics["fate/errors/timeout_error"] == 3.0
 
 
 def test_log_rollout_metrics_writes_per_step_trace(tmp_path) -> None:

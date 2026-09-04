@@ -54,6 +54,7 @@ class RLOrchestrator:
     def __init__(self, config: RLConfig) -> None:
         self.config = config
         self._verifier_admission: RolloutAdmissionController | None = None
+        self._rollout_metrics: dict[str, float] = {}
 
     def verifier_admission(
         self,
@@ -69,6 +70,17 @@ class RLOrchestrator:
                 tasks_per_minute=self.config.orchestrator.tasks_per_minute,
             )
         return self._verifier_admission
+
+    def add_rollout_metrics(self, metrics: dict[str, float]) -> None:
+        """Accumulate metrics produced before materialized rows exist."""
+        for name, value in metrics.items():
+            self._rollout_metrics[name] = self._rollout_metrics.get(name, 0.0) + value
+
+    def consume_rollout_metrics(self) -> dict[str, float]:
+        """Return and clear metrics accumulated for the next published batch."""
+        metrics = self._rollout_metrics
+        self._rollout_metrics = {}
+        return metrics
 
     def materialize(
         self,

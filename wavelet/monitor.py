@@ -20,6 +20,7 @@ import torch
 
 from wavelet.configs.config import RLConfig, SFTConfig, WandbConfig
 from wavelet.orchestrator.rollout_metadata import (
+    error_metric_name,
     metadata_harness_name,
     metadata_task_name,
 )
@@ -904,6 +905,8 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     if inputs.chunk_index is not None:
         metrics["progress/chunk_index"] = float(inputs.chunk_index)
     metrics.update(_off_policy_metrics(rows, training_step=inputs.step))
+    metrics.update(_rollout_timing_metrics(rows))
+    metrics.update(_fate_error_metrics(rows))
 
     for name, value_fn, include_min in (
         (
@@ -947,14 +950,16 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
 
     if inputs.extra_metrics:
         duplicate_keys = metrics.keys() & inputs.extra_metrics.keys()
-        if duplicate_keys:
-            duplicates = ", ".join(sorted(duplicate_keys))
+        invalid_duplicates = {
+            key for key in duplicate_keys if not key.startswith("fate/errors/")
+        }
+        if invalid_duplicates:
+            duplicates = ", ".join(sorted(invalid_duplicates))
             raise ValueError(
                 f"Extra rollout metrics replace core metrics: {duplicates}"
             )
-        metrics.update(
-            {key: float(value) for key, value in inputs.extra_metrics.items()}
-        )
+        for key, value in inputs.extra_metrics.items():
+            metrics[key] = metrics.get(key, 0.0) + float(value)
 
     return metrics
 
@@ -992,6 +997,39 @@ def _off_policy_metrics(
         "off_policy/in_flight/max": float(max(in_flight)),
         "off_policy/in_queue/mean": float(mean(in_queue)),
         "off_policy/in_queue/max": float(max(in_queue)),
+    }
+
+
+def _rollout_timing_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
+    phases: dict[str, list[float]] = defaultdict(list)
+    for row in rows:
+        if _sample_count(row) <= 0:
+            continue
+        rollout = _metadata(row).get("rollout")
+        if not isinstance(rollout, dict):
+            continue
+        timings = rollout.get("timing_seconds")
+        if not isinstance(timings, dict):
+            continue
+        for phase, value in timings.items():
+            duration = _float_or_none(value)
+            if duration is not None:
+                phases[str(phase)].append(duration)
+    metrics: dict[str, float] = {}
+    for phase, durations in sorted(phases.items()):
+        metrics.update(series_stats(f"time/rollout/{phase}", durations))
+    return metrics
+
+
+def _fate_error_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        error = _row_error(row)
+        if error is not None:
+            counts[error_metric_name(error)] += 1
+    return {
+        f"fate/errors/{error_type}": float(count)
+        for error_type, count in sorted(counts.items())
     }
 
 
@@ -1309,9 +1347,19 @@ def _fate_metrics(prefix: str, counts: dict[str, int]) -> dict[str, float]:
 
 
 def _has_error(row: dict[str, Any]) -> bool:
+    return _row_error(row) is not None
+
+
+def _row_error(row: dict[str, Any]) -> object | None:
     if row.get("error") is not None:
-        return True
-    return _metadata(row).get("error") is not None
+        return row["error"]
+    metadata = _metadata(row)
+    if metadata.get("error") is not None:
+        return metadata["error"]
+    rollout = metadata.get("rollout")
+    if isinstance(rollout, dict):
+        return rollout.get("error")
+    return None
 
 
 def _float_or_none(value: object) -> float | None:

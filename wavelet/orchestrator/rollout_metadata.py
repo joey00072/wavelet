@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -16,6 +17,7 @@ def rollout_task_harness_metadata(
     rollout_key = f"{group_key}:{sample_index}"
     trajectory = output.get("trajectory")
     trajectory = trajectory if isinstance(trajectory, list) else []
+    timing_seconds = _timing_seconds(output.get("timing"))
     return {
         "task": {
             "name": task_name,
@@ -40,6 +42,7 @@ def rollout_task_harness_metadata(
             "is_truncated": output.get("is_truncated"),
             "error": output.get("error"),
             "reward_components": _reward_components(output),
+            **({"timing_seconds": timing_seconds} if timing_seconds else {}),
         },
     }
 
@@ -56,6 +59,23 @@ def metadata_harness_name(metadata: dict[str, Any]) -> str | None:
     if isinstance(harness, dict) and harness.get("name") is not None:
         return str(harness["name"])
     return None
+
+
+def error_metric_name(error: object) -> str:
+    """Return a stable, path-safe metric label for a rollout error."""
+    if isinstance(error, BaseException):
+        name = type(error).__name__
+    elif isinstance(error, dict):
+        candidate = error.get("type") or error.get("error")
+        name = str(candidate) if candidate else "VerifierError"
+    elif isinstance(error, str):
+        name = error
+    else:
+        name = type(error).__name__
+    name = name.split(":", 1)[0].split("(", 1)[0]
+    name = re.sub(r"(?<!^)(?=[A-Z])", "_", name)
+    name = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
+    return name or "unknown_error"
 
 
 def _tool_call_count(trajectory: list[Any]) -> int:
@@ -92,6 +112,37 @@ def _float_or_none(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _timing_seconds(value: object) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    timings: dict[str, float] = {}
+    for source, target in (
+        ("generation_ms", "generation"),
+        ("scoring_ms", "scoring"),
+        ("total_ms", "total"),
+    ):
+        duration = _float_or_none(value.get(source))
+        if duration is not None:
+            timings[target] = duration / 1000.0
+    for phase in ("setup", "agent", "finalize", "scoring", "total"):
+        duration = _span_duration(value.get(phase))
+        if duration is not None:
+            timings[phase] = duration
+    agent = value.get("agent")
+    if isinstance(agent, dict):
+        for phase in ("model", "harness"):
+            duration = _span_duration(agent.get(phase))
+            if duration is not None:
+                timings[f"agent/{phase}"] = duration
+    return timings
+
+
+def _span_duration(value: object) -> float | None:
+    if isinstance(value, dict):
+        return _float_or_none(value.get("duration"))
+    return _float_or_none(value)
 
 
 def _reward_components(output: dict[str, Any]) -> dict[str, Any] | None:

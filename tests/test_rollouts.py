@@ -71,6 +71,16 @@ class _FlakyIncompleteGroupEngine:
         return annotated
 
 
+def test_orchestrator_accumulates_and_consumes_pre_materialization_metrics() -> None:
+    orchestrator = RLOrchestrator(RLConfig())
+
+    orchestrator.add_rollout_metrics({"fate/errors/timeout_error": 1.0})
+    orchestrator.add_rollout_metrics({"fate/errors/timeout_error": 2.0})
+
+    assert orchestrator.consume_rollout_metrics() == {"fate/errors/timeout_error": 3.0}
+    assert orchestrator.consume_rollout_metrics() == {}
+
+
 def test_native_rollout_materialization_retries_empty_completions(
     tmp_path,
     monkeypatch,

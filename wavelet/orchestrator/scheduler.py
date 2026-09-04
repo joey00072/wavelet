@@ -285,6 +285,7 @@ from wavelet.orchestrator.envs import (
     _verifier_example,
     _verifier_extra_env_kwargs,
     _verifier_model,
+    _VerifierFailureStats,
     annotate_distillation_records,
 )
 
@@ -404,6 +405,7 @@ def generate_rollouts(
         cache_salt=None if policy_step is None else str(policy_step),
     )
     rollout_count = config.orchestrator.rollouts_per_example or 1
+    failure_stats = _VerifierFailureStats()
     max_inflight = config.orchestrator.max_inflight_rollouts
     admission = orchestrator.verifier_admission(
         max_inflight=max(
@@ -430,8 +432,10 @@ def generate_rollouts(
             algorithm_config=config.algo,
             env_name=_env_name(env, fallback=env_id),
             admission=admission,
+            failure_stats=failure_stats,
         )
     )
+    orchestrator.add_rollout_metrics(failure_stats.consume_metrics())
     if isinstance(policy_step, int) and not isinstance(policy_step, bool):
         for output in outputs:
             output["_wavelet_policy_step"] = policy_step
@@ -515,6 +519,7 @@ class VerifierRolloutScheduler:
         self.cancelled_rollouts_count = 0
         self.rejected_groups_count = 0
         self.last_batch_metrics: dict[str, float] = {}
+        self.failure_stats = _VerifierFailureStats()
         self._policy_update_ready = asyncio.Event()
         self._policy_update_ready.set()
         self.policy_update_wait_seconds = 0.0
@@ -737,6 +742,9 @@ class VerifierRolloutScheduler:
         self.last_batch_metrics["generation/policy_update_wait_seconds"] = float(
             getattr(self, "policy_update_wait_seconds", 0.0)
         )
+        failure_stats = getattr(self, "failure_stats", None)
+        if failure_stats is not None:
+            self.last_batch_metrics.update(failure_stats.consume_metrics())
         emit_perf(
             "verifier_scheduler",
             attempts=attempts,
@@ -1115,6 +1123,7 @@ class VerifierRolloutScheduler:
                         rollout_count=rollout_count,
                         max_retries=self.config.orchestrator.verifier_max_retries,
                         algorithm_config=self.config.algo,
+                        failure_stats=self.failure_stats,
                     ),
                 )
             )
@@ -1132,6 +1141,7 @@ class VerifierRolloutScheduler:
                         model=model,
                         sampling_args=sampling_args,
                         max_retries=self.config.orchestrator.verifier_max_retries,
+                        failure_stats=self.failure_stats,
                     ),
                 )
             )
@@ -2736,6 +2746,7 @@ def _time_materialize_and_publish(
             "publish": publish_seconds,
             "step": materialize_seconds + publish_seconds,
         },
+        extra_metrics=orchestrator.consume_rollout_metrics(),
     )
     return step, batch, materialize_seconds, publish_seconds
 
