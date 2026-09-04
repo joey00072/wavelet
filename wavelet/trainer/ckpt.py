@@ -315,7 +315,15 @@ class CheckpointManager:
         if not self.world.is_main:
             return
         steps = list_checkpoint_steps(self.output_dir, stable_only=True)
-        for step in steps[: -self.config.keep_last]:
+        recent_steps = set(steps[-self.config.keep_last :])
+        permanent_steps = (
+            {step for step in steps if step % self.config.keep_interval == 0}
+            if self.config.keep_interval is not None
+            else set()
+        )
+        for step in steps:
+            if step in recent_steps or step in permanent_steps:
+                continue
             checkpoint_dir = get_checkpoint_dir(self.output_dir, step)
             if (
                 self.pending_save is not None

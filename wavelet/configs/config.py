@@ -235,6 +235,7 @@ class CheckpointConfig(ConfigModel):
     # Counts optimizer steps, not micro-steps.
     resume_step: int | None = None
     keep_last: int = Field(default=2, ge=1)
+    keep_interval: int | None = Field(default=None, ge=1)
     mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
     output_dir: Path | None = Field(default=None)
 
@@ -372,6 +373,7 @@ class TrainerConfig(ConfigModel):
                 f"ckpt.{name}"
                 for name, value in (
                     ("interval", self.ckpt.interval),
+                    ("keep_interval", self.ckpt.keep_interval),
                     ("output_dir", self.ckpt.output_dir),
                 )
                 if value is not None

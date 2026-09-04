@@ -10,6 +10,7 @@ from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.distributed import World
 from wavelet.trainer.optim import enable_optimizer_state_offload
 from wavelet.trainer.trainer import BaseTrainer
+from wavelet.utils.pathing import STABLE_CHECKPOINT_MARKER
 
 
 def test_async_checkpoint_uses_threads_without_shared_memory(
@@ -120,6 +121,40 @@ def test_checkpoint_round_trip_with_cpu_offloaded_optimizer_state(tmp_path) -> N
     assert torch.equal(model.weight, expected_weight)
     assert torch.equal(optimizer.state[model.weight]["exp_avg"], expected_exp_avg)
     assert optimizer.state[model.weight]["exp_avg"].device.type == "cpu"
+
+
+def test_checkpoint_cleanup_preserves_interval_and_recent_steps(tmp_path) -> None:
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters())
+    world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    manager = CheckpointManager(
+        model,
+        optimizer,
+        None,
+        CheckpointConfig(
+            mode="async",
+            interval=1,
+            keep_last=2,
+            keep_interval=3,
+        ),
+        tmp_path,
+        world,
+    )
+    for step in range(1, 7):
+        checkpoint_dir = tmp_path / f"checkpoint-{step}"
+        checkpoint_dir.mkdir()
+        (checkpoint_dir / STABLE_CHECKPOINT_MARKER).touch()
+
+    manager._maybe_clean()
+
+    remaining = sorted(path.name for path in tmp_path.glob("checkpoint-*"))
+    assert remaining == ["checkpoint-3", "checkpoint-5", "checkpoint-6"]
 
 
 def test_fixed_accumulation_trainer_still_rejects_misaligned_resume_state() -> None:

@@ -147,7 +147,8 @@ Increase `transport.keep_last_consumed` for a larger reward-hacking audit
 window; do not disable cleanup for long runs.
 Checkpoint and evaluation-rollout retention also default to the latest two
 sets when those features are enabled. Metrics and traces remain the compact
-long-term record.
+long-term record. Set `ckpt.keep_interval` to retain every Nth stable checkpoint
+permanently in addition to the `ckpt.keep_last` rolling window.
 Sample logging retains a rolling window of 256 rows by default
 (`monitor.samples.keep_last`) and compacts it in batches, so enabling rollout
 examples cannot grow `samples.jsonl` without bound during a long run.
