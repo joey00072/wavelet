@@ -113,20 +113,7 @@ class TrainingDataConfig(ConfigModel):
 
 class DataConfig(TrainingDataConfig):
     path: Path | list[Path] = Path("outputs/unsloth_math_data/sft_train.jsonl")
-    pack_function: Literal["pad", "cat", "stack"] = "pad"
-    stack_bucket_multiple: int = Field(default=256, ge=1)
-    stack_bucket_timeout: int = Field(default=10, ge=1)
-
-    @model_validator(mode="after")
-    def validate_stack_packing(self):
-        if self.pack_function == "stack":
-            max_area = self.seq_len * self.micro_batch_size
-            if max_area % self.stack_bucket_multiple != 0:
-                raise ValueError(
-                    "seq_len * micro_batch_size must be divisible by "
-                    "stack_bucket_multiple for stack packing"
-                )
-        return self
+    pack_function: Literal["pad", "cat"] = "pad"
 
 
 class SFTValConfig(ConfigModel):

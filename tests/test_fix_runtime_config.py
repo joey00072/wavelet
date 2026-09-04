@@ -104,6 +104,21 @@ def test_inert_sft_deployment_config_is_rejected() -> None:
         SFTConfig(deployment={"type": "single_node", "num_gpus": 2})
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"pack_function": "stack"},
+        {"stack_bucket_multiple": 256},
+        {"stack_bucket_timeout": 10},
+    ],
+)
+def test_unimplemented_sft_stack_packing_config_is_rejected(
+    data: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="stack"):
+        SFTConfig(data=data)
+
+
 def test_process_mode_export_interval_must_fit_freshness_window() -> None:
     orchestrator = {"max_async_level": 2, "max_off_policy_steps": 1}
 

@@ -9,6 +9,9 @@ boundary that owns it and keeps trainer code independent of file formats.
 `wavelet.data.sft` reads local JSON/JSONL, Hugging Face datasets, or fake data,
 normalizes each row into an `Example`, applies the chat template, constructs
 token-aligned loss masks, and owns SFT iteration and collation.
+`data.pack_function` supports padded batches (`pad`) and concatenative packing
+(`cat`). Unsupported bucketed `stack` settings are rejected during config
+loading rather than failing after data and model setup.
 
 An optional SFT `val` block uses the same loading, tokenization, packing, and
 collation path with its own `data` settings. The trainer evaluates one finite
