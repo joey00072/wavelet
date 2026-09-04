@@ -39,7 +39,7 @@ from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import RunMonitor, setup_config_logger
 from wavelet.utils.pathing import (
     get_config_dir,
-    resolve_resume_checkpoint,
+    resolve_resume_checkpoint_source,
     validate_output_dir,
 )
 from wavelet.utils.serialization import dump_yaml
@@ -207,15 +207,26 @@ class BaseTrainer:
             self.config.checkpoint_output_dir,
             self.world,
         )
-        if self.config.ckpt is not None and self.config.ckpt.resume_step is not None:
-            self.resume_checkpoint_dir = resolve_resume_checkpoint(
+        checkpoint = self.config.ckpt
+        if checkpoint is not None and checkpoint.is_resuming:
+            self.resume_checkpoint_dir = resolve_resume_checkpoint_source(
                 self.config.checkpoint_output_dir,
-                self.config.ckpt.resume_step,
+                resume_step=checkpoint.resume_step,
+                resume_dir=checkpoint.resume_dir,
             )
             state = self.ckpt_manager.load(
                 self.resume_checkpoint_dir,
-                dataloader=self._checkpoint_dataloader(),
+                dataloader=(
+                    None
+                    if checkpoint.skip_dataloader
+                    else self._checkpoint_dataloader()
+                ),
+                load_optimizer=not checkpoint.skip_optimizer,
+                load_scheduler=not checkpoint.skip_scheduler,
+                load_progress=not checkpoint.skip_progress,
             )
+            if checkpoint.skip_scheduler:
+                self._reset_scheduler(completed_steps=state.step)
             self._validate_resume_state(state)
             self.step = state.step
             self._micro_step = state.micro_step
@@ -609,19 +620,31 @@ class BaseTrainer:
         if self.config.optim.cpu_offload:
             enable_optimizer_state_offload(self.optimizer)
 
-    def _setup_scheduler(self) -> None:
+    def _setup_scheduler(self, *, total_steps: int | None = None) -> None:
         from wavelet.trainer.optim import setup_scheduler
 
         if not self.optimizer:
             raise RuntimeError("Optimizer must be set up before scheduler")
 
-        total_steps = self._compute_total_steps()
+        if total_steps is None:
+            total_steps = self._compute_total_steps()
         self.scheduler = setup_scheduler(
             self.optimizer,
             self.config.scheduler,
             total_steps=total_steps,
             lr=self.config.optim.lr,
         )
+
+    def _reset_scheduler(self, *, completed_steps: int) -> None:
+        if self.optimizer is None:
+            raise RuntimeError("Optimizer must be set up before scheduler reset")
+        for group in self.optimizer.param_groups:
+            group["lr"] = self.config.optim.lr
+            group["initial_lr"] = self.config.optim.lr
+        remaining_steps = max(self._compute_total_steps() - completed_steps, 1)
+        self._setup_scheduler(total_steps=remaining_steps)
+        if self.ckpt_manager is not None:
+            self.ckpt_manager.scheduler = self.scheduler
 
     def prepare_for_training(self) -> None:
         if not self._uses_sleep_colocation():
@@ -1179,7 +1202,7 @@ def main(argv: list[str] | None = None) -> int:
         argv = sys.argv[1:]
 
     config = load_config(SFTConfig, argv)
-    resuming = config.ckpt is not None and config.ckpt.resume_step is not None
+    resuming = config.ckpt is not None and config.ckpt.is_resuming
     local_rank = _distributed_local_rank()
     config_path = get_config_dir(config.output_dir) / "sft.yaml"
     if local_rank in {None, 0}:
@@ -1196,9 +1219,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if resuming:
             assert config.ckpt is not None
-            resolve_resume_checkpoint(
+            resolve_resume_checkpoint_source(
                 config.checkpoint_output_dir,
-                config.ckpt.resume_step,
+                resume_step=config.ckpt.resume_step,
+                resume_dir=config.ckpt.resume_dir,
             )
         dump_yaml(
             config_path,

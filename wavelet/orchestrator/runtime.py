@@ -70,7 +70,7 @@ from wavelet.utils.pathing import (
     create_launch_attempt,
     get_config_dir,
     launch_config_paths,
-    resolve_resume_checkpoint,
+    resolve_resume_checkpoint_source,
     validate_output_dir,
     write_launch_artifacts,
 )
@@ -743,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(RLConfig, argv)
     _validate_rollout_reward_mode(config)
     _validate_device_groups(config)
-    resuming = config.ckpt is not None and config.ckpt.resume_step is not None
+    resuming = config.ckpt is not None and config.ckpt.is_resuming
     validate_output_dir(
         config.output_dir,
         resuming=resuming,
@@ -756,9 +756,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     if resuming:
         assert config.ckpt is not None
-        resolve_resume_checkpoint(
+        resolve_resume_checkpoint_source(
             config.checkpoint_output_dir,
-            config.ckpt.resume_step,
+            resume_step=config.ckpt.resume_step,
+            resume_dir=config.ckpt.resume_dir,
         )
     attempt = create_launch_attempt(config.output_dir)
     write_launch_artifacts(attempt, command="rl", argv=argv)

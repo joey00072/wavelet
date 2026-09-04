@@ -167,6 +167,27 @@ def resolve_resume_checkpoint(output_dir: Path, resume_step: int) -> Path:
     return checkpoint_dir
 
 
+def resolve_resume_checkpoint_source(
+    output_dir: Path,
+    *,
+    resume_step: int | None,
+    resume_dir: Path | None,
+) -> Path:
+    """Resolve a checkpoint from this run's root or an explicit step directory."""
+    if resume_dir is None:
+        if resume_step is None:
+            raise ValueError("Checkpoint resume requires resume_step or resume_dir.")
+        return resolve_resume_checkpoint(output_dir, resume_step)
+    checkpoint_dir = Path(resume_dir)
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint not found at '{checkpoint_dir}'.")
+    if not is_stable_checkpoint(checkpoint_dir):
+        raise FileNotFoundError(
+            f"Checkpoint '{checkpoint_dir.name}' exists but is not stable."
+        )
+    return checkpoint_dir
+
+
 def existing_run_state_entries(output_dir: Path) -> list[str]:
     if not output_dir.exists():
         return []

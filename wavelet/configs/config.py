@@ -234,10 +234,19 @@ class CheckpointConfig(ConfigModel):
     interval: int | None = Field(default=None, ge=1)
     # Counts optimizer steps, not micro-steps.
     resume_step: int | None = None
+    resume_dir: Path | None = None
+    skip_optimizer: bool = False
+    skip_scheduler: bool = False
+    skip_dataloader: bool = False
+    skip_progress: bool = False
     keep_last: int = Field(default=2, ge=1)
     keep_interval: int | None = Field(default=None, ge=1)
     mode: Literal["disabled", "async", "async_with_pinned_mem"] = "disabled"
     output_dir: Path | None = Field(default=None)
+
+    @property
+    def is_resuming(self) -> bool:
+        return self.resume_step is not None or self.resume_dir is not None
 
 
 class FSDPConfig(ConfigModel):
@@ -364,6 +373,29 @@ class TrainerConfig(ConfigModel):
             return self
         if self.ckpt.resume_step is not None and self.ckpt.resume_step < -1:
             raise ValueError("ckpt.resume_step must be >= -1")
+        if self.ckpt.resume_step is not None and self.ckpt.resume_dir is not None:
+            raise ValueError(
+                "ckpt.resume_step and ckpt.resume_dir are mutually exclusive"
+            )
+        if self.ckpt.resume_dir is not None:
+            step_text = self.ckpt.resume_dir.name.removeprefix("checkpoint-")
+            if not step_text.isdigit():
+                raise ValueError(
+                    "ckpt.resume_dir must point to a checkpoint-N step directory"
+                )
+        skip_fields = [
+            name
+            for name in (
+                "skip_optimizer",
+                "skip_scheduler",
+                "skip_dataloader",
+                "skip_progress",
+            )
+            if getattr(self.ckpt, name)
+        ]
+        if skip_fields and not self.ckpt.is_resuming:
+            fields = ", ".join(f"ckpt.{name}" for name in skip_fields)
+            raise ValueError(f"{fields} require checkpoint resume")
         if self.ckpt.mode != "disabled" and self.ckpt.interval is None:
             raise ValueError("ckpt.interval is required when checkpointing is enabled")
         if self.ckpt.mode == "disabled":

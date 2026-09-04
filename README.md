@@ -184,6 +184,14 @@ top-level `output_dir`. Resume and preflight resolve the same checkpoint volume.
 Trainer metrics report byte counts and free-space ratios for both the run and
 checkpoint filesystems, including when either configured directory has not yet
 been created.
+Set `ckpt.resume_dir` to a stable `checkpoint-N` directory from another run to
+fork its state into the configured output directory; it is mutually exclusive
+with `ckpt.resume_step`. The `ckpt.skip_optimizer`, `skip_scheduler`,
+`skip_dataloader`, and `skip_progress` flags selectively keep fresh local state
+while loading the checkpoint model. Skipping progress restarts optimizer-step,
+token, sample, rollout-queue, and policy version counters from zero; skipping
+the scheduler rebuilds it from the configured schedule and learning rate over
+the remaining optimizer steps.
 Run-directory cleanup refuses to start when it would delete the configured
 input adapter, even if the launch skips the optional preflight command.
 SFT examples longer than `data.seq_len` train on the available assistant-token

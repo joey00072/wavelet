@@ -50,6 +50,24 @@ def test_disabled_checkpoint_mode_still_rejects_explicit_interval() -> None:
         RLConfig(ckpt={"interval": 5})
 
 
+def test_checkpoint_resume_source_is_unambiguous() -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        RLConfig(
+            ckpt={
+                "resume_step": 3,
+                "resume_dir": "other/checkpoint-3",
+            }
+        )
+
+    with pytest.raises(ValueError, match="checkpoint-N"):
+        RLConfig(ckpt={"resume_dir": "other/latest"})
+
+
+def test_checkpoint_skip_flags_require_resume() -> None:
+    with pytest.raises(ValueError, match="require checkpoint resume"):
+        RLConfig(ckpt={"skip_optimizer": True, "skip_progress": True})
+
+
 # ── config validation ─────────────────────────────────────────────────────────
 
 

@@ -240,17 +240,20 @@ from wavelet.orchestrator.schedule import (
     rollout_chunk_examples as _rollout_chunk_examples,
 )
 from wavelet.utils.monitoring import emit_perf
-from wavelet.utils.pathing import resolve_resume_checkpoint
+from wavelet.utils.pathing import resolve_resume_checkpoint_source
 
 
 def _resume_optimizer_step(config: RLConfig) -> int:
     checkpoint = config.ckpt
-    if checkpoint is None or checkpoint.resume_step is None:
+    if checkpoint is None or not checkpoint.is_resuming:
         return 0
-    checkpoint_dir = resolve_resume_checkpoint(
+    checkpoint_dir = resolve_resume_checkpoint_source(
         config.checkpoint_output_dir,
-        checkpoint.resume_step,
+        resume_step=checkpoint.resume_step,
+        resume_dir=checkpoint.resume_dir,
     )
+    if checkpoint.skip_progress:
+        return 0
     try:
         step = int(checkpoint_dir.name.removeprefix("checkpoint-"))
     except ValueError as exc:

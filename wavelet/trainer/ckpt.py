@@ -13,7 +13,11 @@ import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemWriter
 from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
-from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    get_state_dict,
+    set_model_state_dict,
+    set_state_dict,
+)
 from torch.distributed.checkpoint.state_dict_saver import (
     AsyncCheckpointerType,
     AsyncSaveResponse,
@@ -42,7 +46,7 @@ class AppState(Stateful):
     def __init__(
         self,
         model: torch.nn.Module,
-        optimizer: Optimizer,
+        optimizer: Optimizer | None,
         scheduler: LRScheduler | None,
     ) -> None:
         self.model = model
@@ -50,26 +54,33 @@ class AppState(Stateful):
         self.scheduler = scheduler
 
     def state_dict(self) -> dict[str, Any]:
-        model_state_dict, optimizer_state_dict = get_state_dict(
-            self.model, [self.optimizer]
-        )
-        state_dict: dict[str, Any] = {
-            "model": model_state_dict,
-            "optimizer": optimizer_state_dict,
-        }
+        optimizers = [] if self.optimizer is None else [self.optimizer]
+        model_state_dict, optimizer_state_dict = get_state_dict(self.model, optimizers)
+        state_dict: dict[str, Any] = {"model": model_state_dict}
+        if self.optimizer is not None:
+            state_dict["optimizer"] = optimizer_state_dict
         if self.scheduler is not None:
             state_dict["scheduler"] = self.scheduler.state_dict()
         return state_dict
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        set_state_dict(
-            self.model,
-            [self.optimizer],
-            model_state_dict=state_dict["model"],
-            optim_state_dict=state_dict["optimizer"],
-        )
+        if self.optimizer is None:
+            set_model_state_dict(self.model, model_state_dict=state_dict["model"])
+        else:
+            set_state_dict(
+                self.model,
+                [self.optimizer],
+                model_state_dict=state_dict["model"],
+                optim_state_dict=state_dict["optimizer"],
+            )
         if self.scheduler is not None and "scheduler" in state_dict:
             self.scheduler.load_state_dict(state_dict["scheduler"])
+            for group, lr in zip(
+                self.scheduler.optimizer.param_groups,
+                self.scheduler.get_last_lr(),
+                strict=True,
+            ):
+                group["lr"] = lr
 
 
 @dataclass(slots=True)
@@ -197,6 +208,9 @@ class CheckpointManager:
         checkpoint_dir: Path,
         *,
         dataloader: StatefulDataLoader | None = None,
+        load_optimizer: bool = True,
+        load_scheduler: bool = True,
+        load_progress: bool = True,
     ) -> TrainerState:
         meta_path = checkpoint_dir / "meta.json"
         if not checkpoint_dir.exists():
@@ -226,7 +240,13 @@ class CheckpointManager:
                 f"Checkpoint '{checkpoint_dir.name}' is missing trainer state."
             )
 
-        state_dict = {"app": AppState(self.model, self.optimizer, self.scheduler)}
+        state_dict = {
+            "app": AppState(
+                self.model,
+                self.optimizer if load_optimizer else None,
+                self.scheduler if load_scheduler else None,
+            )
+        }
         dcp.load(
             state_dict=state_dict,
             checkpoint_id=trainer_dir,
@@ -234,6 +254,8 @@ class CheckpointManager:
         )
 
         self._load_dataloader_state(checkpoint_dir, dataloader)
+        if not load_progress:
+            return TrainerState(step=0, micro_step=0)
         return TrainerState(
             step=int(metadata["step"]),
             micro_step=int(metadata["micro_step"]),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import Future
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -132,6 +133,144 @@ def test_async_checkpoint_round_trip_restores_model_and_optimizer(tmp_path) -> N
 
     assert legacy_state.total_tokens == 0
     assert legacy_state.total_samples == 0
+
+
+def test_checkpoint_load_can_skip_optimizer_scheduler_and_progress(tmp_path) -> None:
+    world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    source_model = torch.nn.Linear(2, 1, bias=False)
+    source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.01)
+    source_scheduler = torch.optim.lr_scheduler.StepLR(
+        source_optimizer,
+        step_size=1,
+        gamma=0.5,
+    )
+    source_model(torch.ones(1, 2)).sum().backward()
+    source_optimizer.step()
+    source_scheduler.step()
+    source_optimizer.zero_grad(set_to_none=True)
+    expected_weight = source_model.weight.detach().clone()
+    source_manager = CheckpointManager(
+        source_model,
+        source_optimizer,
+        source_scheduler,
+        CheckpointConfig(mode="async", interval=1),
+        tmp_path,
+        world,
+    )
+    assert source_manager.save(
+        TrainerState(step=4, micro_step=8, total_tokens=80, total_samples=8)
+    )
+    source_manager.wait_for_pending_save()
+
+    target_model = torch.nn.Linear(2, 1, bias=False)
+    target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=0.02)
+    target_scheduler = torch.optim.lr_scheduler.StepLR(
+        target_optimizer,
+        step_size=2,
+        gamma=0.1,
+    )
+    target_model(torch.ones(1, 2)).sum().backward()
+    target_optimizer.step()
+    target_optimizer.zero_grad(set_to_none=True)
+    target_optimizer.state[target_model.weight]["exp_avg"].fill_(77.0)
+    expected_exp_avg = target_optimizer.state[target_model.weight]["exp_avg"].clone()
+    expected_scheduler_state = target_scheduler.state_dict()
+    target_manager = CheckpointManager(
+        target_model,
+        target_optimizer,
+        target_scheduler,
+        CheckpointConfig(mode="disabled"),
+        tmp_path / "unused",
+        world,
+    )
+
+    state = target_manager.load(
+        tmp_path / "checkpoint-4",
+        load_optimizer=False,
+        load_scheduler=False,
+        load_progress=False,
+    )
+
+    assert torch.equal(target_model.weight, expected_weight)
+    assert torch.equal(
+        target_optimizer.state[target_model.weight]["exp_avg"], expected_exp_avg
+    )
+    assert target_scheduler.state_dict() == expected_scheduler_state
+    assert state == TrainerState(step=0, micro_step=0)
+
+
+def test_trainer_wires_checkpoint_resume_skip_controls(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    checkpoint_dir = tmp_path / "source" / "checkpoint-4"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / STABLE_CHECKPOINT_MARKER).touch()
+    trainer = BaseTrainer(
+        TrainerConfig(
+            output_dir=tmp_path / "target",
+            max_steps=10,
+            ckpt={
+                "resume_dir": checkpoint_dir,
+                "skip_optimizer": True,
+                "skip_scheduler": True,
+                "skip_dataloader": True,
+                "skip_progress": True,
+            },
+        )
+    )
+    trainer.model = torch.nn.Linear(2, 1)
+    trainer.optimizer = torch.optim.AdamW(trainer.model.parameters(), lr=0.01)
+    trainer.scheduler = torch.optim.lr_scheduler.ConstantLR(
+        trainer.optimizer,
+        factor=1.0,
+    )
+    trainer.dataloader = object()
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        local_world_size=1,
+        device=torch.device("cpu"),
+    )
+    load = Mock(return_value=TrainerState(step=0, micro_step=0))
+    monkeypatch.setattr(CheckpointManager, "load", load)
+
+    trainer._setup_run()
+
+    assert trainer.resume_checkpoint_dir == checkpoint_dir
+    load.assert_called_once_with(
+        checkpoint_dir,
+        dataloader=None,
+        load_optimizer=False,
+        load_scheduler=False,
+        load_progress=False,
+    )
+    assert trainer.ckpt_manager is not None
+    assert trainer.ckpt_manager.scheduler is trainer.scheduler
+
+
+def test_skipped_scheduler_restarts_over_remaining_steps() -> None:
+    trainer = BaseTrainer(TrainerConfig(max_steps=10))
+    trainer.optimizer = torch.optim.SGD(
+        torch.nn.Linear(1, 1).parameters(),
+        lr=0.25,
+    )
+    trainer.scheduler = Mock()
+    trainer.ckpt_manager = Mock()
+    setup_scheduler = Mock()
+    trainer._setup_scheduler = setup_scheduler
+
+    trainer._reset_scheduler(completed_steps=4)
+
+    setup_scheduler.assert_called_once_with(total_steps=6)
+    assert trainer.optimizer.param_groups[0]["lr"] == trainer.config.optim.lr
 
 
 def test_trainer_progress_counts_global_tokens_and_logical_samples() -> None:

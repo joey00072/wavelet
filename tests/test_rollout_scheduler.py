@@ -154,6 +154,32 @@ def test_process_scheduler_resumes_from_checkpoint_output_dir(tmp_path) -> None:
     assert _resume_optimizer_step(config) == 7
 
 
+def test_process_scheduler_resumes_from_external_checkpoint_dir(tmp_path) -> None:
+    checkpoint_dir = tmp_path / "other-run" / "checkpoint-9"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / STABLE_CHECKPOINT_MARKER).touch()
+    config = RLConfig(
+        output_dir=tmp_path / "new-run",
+        ckpt={"resume_dir": checkpoint_dir},
+    )
+
+    assert _resume_optimizer_step(config) == 9
+
+
+def test_process_scheduler_resets_step_when_progress_restore_is_skipped(
+    tmp_path,
+) -> None:
+    checkpoint_dir = tmp_path / "other-run" / "checkpoint-9"
+    checkpoint_dir.mkdir(parents=True)
+    (checkpoint_dir / STABLE_CHECKPOINT_MARKER).touch()
+    config = RLConfig(
+        output_dir=tmp_path / "new-run",
+        ckpt={"resume_dir": checkpoint_dir, "skip_progress": True},
+    )
+
+    assert _resume_optimizer_step(config) == 0
+
+
 def test_process_scheduler_rejects_checkpoint_after_target_step(tmp_path) -> None:
     checkpoint_dir = tmp_path / "checkpoint-7"
     checkpoint_dir.mkdir()
