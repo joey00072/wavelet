@@ -574,7 +574,10 @@ class BaseTrainer:
 
     def _setup_optimizer(self) -> None:
         from wavelet.trainer.model import enforce_single_lora_adapter
-        from wavelet.trainer.optim import setup_optimizer
+        from wavelet.trainer.optim import (
+            enable_optimizer_state_offload,
+            setup_optimizer,
+        )
 
         if not self.model:
             raise RuntimeError("Model must be set up before optimizer")
@@ -584,6 +587,8 @@ class BaseTrainer:
             self.config.optim,
             self.model.named_parameters(),
         )
+        if self.config.optim.cpu_offload:
+            enable_optimizer_state_offload(self.optimizer)
 
     def _setup_scheduler(self) -> None:
         from wavelet.trainer.optim import setup_scheduler
@@ -630,6 +635,13 @@ class BaseTrainer:
 
     def _move_optimizer_state(self, device: str) -> None:
         if self.optimizer is None:
+            return
+        offloader = getattr(self.optimizer, "_wavelet_state_offloader", None)
+        if offloader is not None:
+            if device == "cpu":
+                offloader.move_to_cpu()
+            elif not self.config.optim.cpu_offload:
+                offloader.move_to_parameters()
             return
         target = torch.device(device)
         for state in self.optimizer.state.values():

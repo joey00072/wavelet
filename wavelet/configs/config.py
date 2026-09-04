@@ -151,6 +151,7 @@ class OptimizerConfig(ConfigModel):
     nesterov: bool = True
     betas1: float = Field(default=0.9, ge=0.0)
     betas2: float = Field(default=0.999, ge=0.0)
+    cpu_offload: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -170,6 +171,21 @@ class OptimizerConfig(ConfigModel):
                 )
             normalized[name] = beta
         return normalized
+
+    @model_validator(mode="after")
+    def validate_cpu_offload(self):
+        if self.cpu_offload and self.type == "sign_sgd":
+            raise ValueError("optim.cpu_offload has no effect on stateless sign_sgd.")
+        if self.cpu_offload and self.type in {
+            "adamw_8bit",
+            "paged_adamw_8bit",
+            "adam_8bit",
+        }:
+            raise ValueError(
+                "optim.cpu_offload supports native PyTorch optimizers only; "
+                f"{self.type} manages state through bitsandbytes."
+            )
+        return self
 
 
 class SchedulerConfig(ConfigModel):

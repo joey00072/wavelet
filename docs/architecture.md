@@ -34,6 +34,11 @@ multi-node rendezvous without changing code.
 optional kernel patches, and before distributed wrapping. This preserves
 checkpoint parameter names and composes with gradient checkpointing;
 `model.compile_fullgraph` opts those block compilations into full-graph mode.
+`optim.cpu_offload: true` keeps native optimizer state in pinned CPU memory
+between updates. Step hooks restore state to each parameter's device only for
+the optimizer update, then immediately offload it again; state-dict hooks keep
+checkpoint save/load compatible. Bitsandbytes optimizers reject this option
+because their state placement is managed internally.
 
 ## RL Process Flow
 

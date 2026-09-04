@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import warnings
@@ -10,6 +11,7 @@ import psutil
 import torch
 from torch import Tensor, nn
 from torch.autograd.graph import saved_tensors_hooks
+from torch.distributed.tensor import DTensor
 from torch.optim import SGD, Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import (
     ConstantLR,
@@ -19,6 +21,7 @@ from torch.optim.lr_scheduler import (
     LRScheduler,
     SequentialLR,
 )
+from torch.utils.hooks import RemovableHandle
 
 from wavelet.configs.sft import (
     ActivationOffloadingConfig,
@@ -62,6 +65,138 @@ class SignSGD(Optimizer):
                     param.mul_(1.0 - lr * weight_decay)
                 param.add_(param.grad.sign(), alpha=-lr)
         return loss
+
+
+class OptimizerStateOffloader:
+    """Keep optimizer state in pinned CPU memory between optimizer steps."""
+
+    def __init__(self, optimizer: Optimizer, *, pin_memory: bool = True) -> None:
+        self.optimizer = optimizer
+        self.pin_memory = pin_memory
+        self._handles: list[RemovableHandle] = []
+
+    def install(self) -> None:
+        if self._handles:
+            raise RuntimeError("Optimizer state offload hooks are already installed.")
+        self._handles = [
+            self.optimizer.register_step_pre_hook(self._before_step),
+            self.optimizer.register_step_post_hook(self._after_step),
+            self.optimizer.register_state_dict_pre_hook(self._before_state_dict),
+            self.optimizer.register_state_dict_post_hook(self._after_state_dict),
+            self.optimizer.register_load_state_dict_post_hook(
+                self._after_load_state_dict
+            ),
+        ]
+        self.move_to_cpu()
+
+    def move_to_parameters(self) -> None:
+        for parameter, state in self.optimizer.state.items():
+            for key, value in list(state.items()):
+                state[key] = _move_optimizer_state_value(
+                    value,
+                    parameter.device,
+                    pin_memory=False,
+                )
+
+    def move_to_cpu(self) -> None:
+        should_pin = self.pin_memory and torch.cuda.is_available()
+        for state in self.optimizer.state.values():
+            for key, value in list(state.items()):
+                state[key] = _move_optimizer_state_value(
+                    value,
+                    torch.device("cpu"),
+                    pin_memory=should_pin,
+                )
+
+    def _before_step(
+        self,
+        _optimizer: Optimizer,
+        _args: tuple[object, ...],
+        _kwargs: dict[str, object],
+    ) -> None:
+        self.move_to_parameters()
+
+    def _after_step(
+        self,
+        _optimizer: Optimizer,
+        _args: tuple[object, ...],
+        _kwargs: dict[str, object],
+    ) -> None:
+        self.move_to_cpu()
+
+    def _before_state_dict(self, _optimizer: Optimizer) -> None:
+        self.move_to_parameters()
+
+    def _after_state_dict(
+        self,
+        _optimizer: Optimizer,
+        state_dict: dict[str, object],
+    ) -> dict[str, object]:
+        self.move_to_cpu()
+        return state_dict
+
+    def _after_load_state_dict(self, _optimizer: Optimizer) -> None:
+        self.move_to_cpu()
+
+
+def _move_optimizer_state_value(
+    value: object,
+    device: torch.device,
+    *,
+    pin_memory: bool,
+) -> object:
+    if isinstance(value, DTensor):
+        local_tensor = _move_optimizer_state_value(
+            value._local_tensor,
+            device,
+            pin_memory=pin_memory,
+        )
+        moved = copy.copy(value)
+        moved._local_tensor = local_tensor
+        return moved
+    if torch.is_tensor(value):
+        moved = value.to(
+            device,
+            non_blocking=device.type == "cuda" and value.is_pinned(),
+        )
+        if pin_memory and not moved.is_pinned():
+            moved = moved.pin_memory()
+        return moved
+    if isinstance(value, dict):
+        return {
+            key: _move_optimizer_state_value(
+                item,
+                device,
+                pin_memory=pin_memory,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _move_optimizer_state_value(item, device, pin_memory=pin_memory)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _move_optimizer_state_value(item, device, pin_memory=pin_memory)
+            for item in value
+        )
+    return value
+
+
+def enable_optimizer_state_offload(
+    optimizer: Optimizer,
+    *,
+    pin_memory: bool = True,
+) -> OptimizerStateOffloader:
+    """Install state movement hooks without changing optimizer identity."""
+    existing = getattr(optimizer, "_wavelet_state_offloader", None)
+    if existing is not None:
+        raise RuntimeError("Optimizer state offload is already enabled.")
+    offloader = OptimizerStateOffloader(optimizer, pin_memory=pin_memory)
+    offloader.install()
+    optimizer._wavelet_state_offloader = offloader
+    return offloader
 
 
 def setup_optimizer(
