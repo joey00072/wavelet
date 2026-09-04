@@ -157,7 +157,9 @@ already-derived component mask and optional token weights, and return
 Filesystem policy exports use a temporary directory followed by an atomic
 rename and stable marker. Metadata is written beside the model or adapter. NCCL
 transfer uses the same metadata and readiness concepts, but broadcasts named
-tensors after inference workers enter the update collective.
+tensors after inference workers enter the update collective. NCCL transfers
+pack adjacent tensors into large double-buffered byte tensors, reducing the
+number of collectives while preserving incremental loading on each worker.
 Full-model filesystem refreshes use vLLM's layerwise reload lifecycle, so each
 layer is processed and copied into its existing kernel storage as its checkpoint
 weights arrive instead of materializing a second processed model at once.

@@ -115,3 +115,54 @@ def test_nccl_weight_update_worker_loads_broadcast_weights(
 
     assert worker.model_runner.model.loaded[0][0] == "model.layers.0.weight"
     assert worker.model_runner.model.loaded[0][1].tolist() == [3.0, 3.0]
+
+
+def test_nccl_weight_update_worker_loads_packed_weight_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        weight_update,
+        "process_weights_after_loading",
+        lambda *args, **kwargs: None,
+    )
+    policy_dir = tmp_path / "policy"
+    policy_dir.mkdir()
+    (policy_dir / NCCL_UPDATE_INFO_FILENAME).write_text(
+        json.dumps(
+            {
+                "names": ["model.a", "model.b"],
+                "dtype_names": ["float32", "bfloat16"],
+                "shapes": [[2], [1]],
+                "packed": True,
+            }
+        )
+    )
+    worker = weight_update.NCCLWeightUpdateWorker()
+    worker.model_runner = _DummyRunner()
+    worker._wavelet_nccl_communicator = _DummyCommunicator()
+    received: list[tuple[str, tuple[list[int], torch.dtype]]] = []
+
+    def consume(*, iterator, group, src, post_unpack_func):  # type: ignore[no-untyped-def]
+        assert group is worker._wavelet_nccl_communicator
+        assert src == 0
+        received.extend(iterator)
+        post_unpack_func(
+            [
+                ("model.a", torch.tensor([1.0, 2.0])),
+                ("model.b", torch.tensor([3.0], dtype=torch.bfloat16)),
+            ]
+        )
+
+    monkeypatch.setattr(weight_update, "_require_vllm_packed_receiver", lambda: consume)
+
+    worker.update_weights_from_path(str(policy_dir))
+
+    assert received == [
+        ("model.a", ([2], torch.float32)),
+        ("model.b", ([1], torch.bfloat16)),
+    ]
+    assert [name for name, _ in worker.model_runner.model.loaded] == [
+        "model.a",
+        "model.b",
+    ]

@@ -47,6 +47,7 @@ else:
 
 NCCL_READY_MARKER = "NCCL_READY"
 NCCL_UPDATE_INFO_FILENAME = "update_info.json"
+NCCL_PACKED_TRANSFER = True
 NamedTensor = tuple[str, Tensor]
 
 
@@ -243,6 +244,18 @@ def _require_vllm_receiver_nccl() -> tuple[type[object], type[object]]:
     return PyNcclCommunicator, StatelessProcessGroup
 
 
+def _require_vllm_packed_receiver() -> Any:
+    try:
+        from vllm.distributed.weight_transfer.packed_tensor import (
+            packed_broadcast_consumer,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "Packed NCCL weight updates require vLLM weight-transfer support."
+        ) from exc
+    return packed_broadcast_consumer
+
+
 def _worker_model(worker: object) -> Module:
     model_runner = worker.model_runner  # type: ignore[attr-defined]
     if hasattr(model_runner.model, "runnable"):
@@ -332,6 +345,26 @@ class NCCLWeightUpdateWorker(Worker):
         update_info_path = Path(weight_path) / NCCL_UPDATE_INFO_FILENAME
         update_info = json.loads(update_info_path.read_text())
         model = _worker_model(self)
+        if update_info.get("packed", False):
+            state_dict_info = (
+                (name, (shape, getattr(torch, dtype_name)))
+                for name, dtype_name, shape in zip(
+                    update_info["names"],
+                    update_info["dtype_names"],
+                    update_info["shapes"],
+                    strict=True,
+                )
+            )
+            _require_vllm_packed_receiver()(
+                iterator=state_dict_info,
+                group=communicator,
+                src=0,
+                post_unpack_func=model.load_weights,
+            )
+            device = next(model.parameters()).device
+            process_weights_after_loading(model, self.model_runner.model_config, device)
+            return
+
         stream = (
             torch.cuda.current_stream(communicator.device)
             if communicator.device.type == "cuda"
@@ -588,7 +621,10 @@ class PolicyExportMixin:
         state_dict: dict[str, Tensor] | None,
     ) -> None:
         named_tensors = [] if state_dict is None else list(state_dict.items())
-        update_info = update_info_for_named_tensors(named_tensors)
+        update_info = update_info_for_named_tensors(
+            named_tensors,
+            packed=NCCL_PACKED_TRANSFER,
+        )
         (tmp_dir / NCCL_UPDATE_INFO_FILENAME).write_text(json.dumps(update_info))
         self._write_policy_metadata(
             tmp_dir,
@@ -671,4 +707,5 @@ class PolicyExportMixin:
             ),
             device=device,
             timeout_seconds=self.config.policy_transfer.nccl_timeout_seconds,
+            packed=NCCL_PACKED_TRANSFER,
         )
