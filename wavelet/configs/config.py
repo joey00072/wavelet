@@ -1064,6 +1064,57 @@ class RLTeacherConfig(ConfigModel):
     timeout_seconds: float = Field(default=120.0, gt=0.0)
 
 
+class RLAdaptiveConcurrencyConfig(ConfigModel):
+    """Bounds and thresholds for verifier inference load control."""
+
+    min_inflight: int = Field(default=1, ge=1)
+    max_inflight: int | None = Field(default=None, ge=1)
+    initial_inflight: int | None = Field(default=None, ge=1)
+    additive_increase: int = Field(default=1, ge=1)
+    decrease_factor: float = Field(default=0.8, gt=0.0, lt=1.0)
+    growth_kv_cache_usage: float = Field(default=0.6, ge=0.0, lt=1.0)
+    target_kv_cache_usage: float = Field(default=0.7, gt=0.0, lt=1.0)
+    hard_kv_cache_usage: float = Field(default=0.9, gt=0.0, le=1.0)
+    max_waiting_requests: int = Field(default=0, ge=0)
+    queue_persistence_polls: int = Field(default=3, ge=1)
+    decrease_cooldown_polls: int = Field(default=2, ge=0)
+    poll_interval_seconds: float = Field(default=5.0, gt=0.0)
+    request_timeout_seconds: float = Field(default=5.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "RLAdaptiveConcurrencyConfig":
+        if self.max_inflight is not None:
+            if self.min_inflight > self.max_inflight:
+                raise ValueError(
+                    "concurrency.min_inflight must not exceed concurrency.max_inflight."
+                )
+            if (
+                self.initial_inflight is not None
+                and self.initial_inflight > self.max_inflight
+            ):
+                raise ValueError(
+                    "concurrency.initial_inflight must not exceed "
+                    "concurrency.max_inflight."
+                )
+        if (
+            self.initial_inflight is not None
+            and self.initial_inflight < self.min_inflight
+        ):
+            raise ValueError(
+                "concurrency.initial_inflight must be at least "
+                "concurrency.min_inflight."
+            )
+        if not (
+            self.growth_kv_cache_usage
+            < self.target_kv_cache_usage
+            < self.hard_kv_cache_usage
+        ):
+            raise ValueError(
+                "concurrency KV thresholds must satisfy growth < target < hard."
+            )
+        return self
+
+
 class RLOrchestratorConfig(ConfigModel):
     enabled: bool = True
     custom_rollout_function: str | None = None
@@ -1090,6 +1141,7 @@ class RLOrchestratorConfig(ConfigModel):
     rollouts_per_example: int | None = Field(default=None, ge=1)
     oversampling_factor: float = Field(default=1.0, ge=1.0)
     max_inflight_rollouts: int | None = Field(default=None, ge=1)
+    concurrency: RLAdaptiveConcurrencyConfig | None = None
     rollout_chunk_examples: int | None = Field(default=None, ge=1)
     filter_zero_advantage: bool = True
     zero_advantage_max_retries: int = Field(default=8, ge=0)
@@ -1363,6 +1415,55 @@ class RLConfig(TrainerConfig):
             raise ValueError(
                 "orchestrator.token_batch_size does not yet support checkpoint "
                 "resume because its variable record cursor is not persisted."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_adaptive_concurrency(self) -> "RLConfig":
+        concurrency = self.orchestrator.concurrency
+        if concurrency is None:
+            return self
+        if self.orchestrator.custom_rollout_function != (
+            "wavelet.orchestrator.verifiers:generate_rollouts"
+        ):
+            raise ValueError(
+                "orchestrator.concurrency currently requires the Verifiers "
+                "rollout source."
+            )
+        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+            raise ValueError(
+                "orchestrator.concurrency requires launcher.mode='process' and "
+                "orchestrator.max_async_level>=1."
+            )
+        rollout_count = self.orchestrator.rollouts_per_example or 1
+        limits = {
+            "min_inflight": concurrency.min_inflight,
+            "initial_inflight": concurrency.initial_inflight,
+            "max_inflight": concurrency.max_inflight,
+        }
+        too_small = [
+            name
+            for name, value in limits.items()
+            if value is not None and value < rollout_count
+        ]
+        if too_small:
+            raise ValueError(
+                "orchestrator.concurrency limits must be at least "
+                f"rollouts_per_example={rollout_count}: {', '.join(too_small)}."
+            )
+        static_ceiling = self.orchestrator.max_inflight_rollouts
+        above_static_ceiling = [
+            name
+            for name, value in limits.items()
+            if static_ceiling is not None
+            and value is not None
+            and value > static_ceiling
+        ]
+        if above_static_ceiling:
+            raise ValueError(
+                "orchestrator.concurrency limits cannot exceed the explicit "
+                "orchestrator.max_inflight_rollouts ceiling: "
+                f"{', '.join(above_static_ceiling)}."
             )
         return self
 

@@ -1362,6 +1362,11 @@ def orchestrator_debug_state(config: RLConfig) -> dict[str, Any]:
         "required_policy_step_at_rollout_0": required_policy_step(config, 0),
         "required_policy_step_at_rollout_1": required_policy_step(config, 1),
     }
+    if config.orchestrator.concurrency is not None:
+        schedule["concurrency"] = config.orchestrator.concurrency.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
     if config.orchestrator.examples_per_step is not None:
         schedule["rollout_chunk_examples"] = rollout_chunk_examples(config)
         schedule["chunks_per_step"] = chunks_per_step(config)

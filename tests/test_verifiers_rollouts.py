@@ -671,6 +671,46 @@ def test_explicit_rollout_limit_is_hard_with_many_clients() -> None:
     assert scheduler.max_inflight_rollouts == 130
 
 
+def test_adaptive_concurrency_cancels_youngest_complete_group() -> None:
+    async def run() -> None:
+        scheduler = object.__new__(VerifierRolloutScheduler)
+        scheduler.pending = {}
+        scheduler.pending_clients = {}
+        scheduler.groups = {}
+        scheduler.cancelled_rollouts_count = 0
+        scheduler.adaptive_cancelled_rollouts = 0
+        tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
+        gate = asyncio.Event()
+        for group_id in range(3):
+            task = asyncio.create_task(gate.wait())  # type: ignore[arg-type]
+            tasks.append(task)
+            scheduler.pending[task] = _PendingVerifierRequest(
+                group_id=group_id,
+                client_index=0,
+                rollout_count=1,
+            )
+            scheduler.pending_clients[task] = 0
+            scheduler.groups[group_id] = _VerifierGroupState(
+                example={"id": group_id},
+                rollouts_to_schedule=0,
+            )
+
+        cancelled = scheduler._cancel_youngest_requests(1)
+        await asyncio.sleep(0)
+
+        assert cancelled == 1
+        assert tasks[2].cancelled()
+        assert set(scheduler.groups) == {0, 1}
+        assert {request.group_id for request in scheduler.pending.values()} == {0, 1}
+        assert scheduler.adaptive_cancelled_rollouts == 1
+
+        for task in scheduler.pending:
+            task.cancel()
+        await asyncio.gather(*scheduler.pending, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_pending_chunk_limit_is_hard_with_many_clients() -> None:
     config = RLConfig(
         orchestrator={

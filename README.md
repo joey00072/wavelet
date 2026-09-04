@@ -281,6 +281,14 @@ in-flight bound; `oversampling_factor` does not multiply it a second time.
 `max_inflight_rollouts` is also an exact request ceiling. These explicit bounds
 may intentionally leave inference client routes idle rather than exceed the
 configured memory budget.
+Set `orchestrator.concurrency` to enable adaptive process-mode Verifiers
+concurrency. The scheduler scrapes each configured vLLM `/metrics` endpoint,
+adds capacity when KV-cache use is low, and cuts capacity when KV pressure,
+queued requests, or preemptions indicate overload. Hard overload cancels the
+youngest whole rollout groups first. `min_inflight`, `max_inflight`, and
+`initial_inflight` bound the controller; when scraping is unavailable, the
+existing static `max_inflight_rollouts` behavior remains the fallback. Scraped
+per-replica metrics are logged under `inference/replica_<n>/...`.
 Verifier rollout dispatch grows by at most one group or 10% of its in-flight
 ceiling per five-second window, whichever is larger; normally completed work
 refunds that admission so steady-state replacements remain immediate. Set

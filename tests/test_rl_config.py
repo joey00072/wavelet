@@ -181,6 +181,82 @@ def test_token_batches_reject_fixed_chunks_and_checkpoint_resume() -> None:
         )
 
 
+def test_adaptive_concurrency_requires_streaming_verifier_scheduler() -> None:
+    with pytest.raises(ValueError, match="Verifiers rollout source"):
+        RLConfig(
+            launcher={"mode": "process"},
+            orchestrator={"max_async_level": 1, "concurrency": {}},
+        )
+    with pytest.raises(ValueError, match="launcher.mode='process'"):
+        RLConfig(
+            orchestrator={
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                ),
+                "max_async_level": 1,
+                "concurrency": {},
+            },
+        )
+    with pytest.raises(ValueError, match="rollouts_per_example=8"):
+        RLConfig(
+            launcher={"mode": "process"},
+            orchestrator={
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                ),
+                "max_async_level": 1,
+                "rollouts_per_example": 8,
+                "concurrency": {"min_inflight": 4},
+            },
+        )
+
+
+def test_adaptive_concurrency_validates_bounds_and_thresholds() -> None:
+    with pytest.raises(ValueError, match="min_inflight must not exceed"):
+        RLConfig.model_validate(
+            {
+                "launcher": {"mode": "process"},
+                "orchestrator": {
+                    "custom_rollout_function": (
+                        "wavelet.orchestrator.verifiers:generate_rollouts"
+                    ),
+                    "max_async_level": 1,
+                    "concurrency": {"min_inflight": 8, "max_inflight": 4},
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="cannot exceed the explicit"):
+        RLConfig.model_validate(
+            {
+                "launcher": {"mode": "process"},
+                "orchestrator": {
+                    "custom_rollout_function": (
+                        "wavelet.orchestrator.verifiers:generate_rollouts"
+                    ),
+                    "max_async_level": 1,
+                    "max_inflight_rollouts": 8,
+                    "concurrency": {"max_inflight": 16},
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="growth < target < hard"):
+        RLConfig.model_validate(
+            {
+                "launcher": {"mode": "process"},
+                "orchestrator": {
+                    "custom_rollout_function": (
+                        "wavelet.orchestrator.verifiers:generate_rollouts"
+                    ),
+                    "max_async_level": 1,
+                    "concurrency": {
+                        "growth_kv_cache_usage": 0.8,
+                        "target_kv_cache_usage": 0.7,
+                    },
+                },
+            }
+        )
+
+
 def test_tasks_per_minute_requires_verifier_rollout_source() -> None:
     with pytest.raises(ValueError, match="tasks_per_minute"):
         RLConfig(orchestrator={"tasks_per_minute": 60})

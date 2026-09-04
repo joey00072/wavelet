@@ -96,6 +96,13 @@ overshoot the target.
 
 ## Inference Scheduling
 
+Persistent process-mode Verifiers runs can opt into an AIMD concurrency
+controller with `orchestrator.concurrency`. A best-effort scraper reads vLLM's
+Prometheus endpoint per replica. Clear KV headroom grows the rollout cap
+additively; KV pressure, request queues, and preemptions reduce it
+multiplicatively. Hard overload sheds the youngest whole groups, while scrape
+failures retain the static scheduler cap.
+
 `wavelet.orchestrator.scheduler` owns the scheduling strategies behind one
 explicit source/publish-mode boundary:
 
