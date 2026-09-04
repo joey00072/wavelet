@@ -180,8 +180,14 @@ For code changes, run a targeted test for the changed behavior, then:
 
 ```bash
 uvx ruff check wavelet tests
+uvx ruff format --check wavelet tests
 git diff --check
 ```
+
+Install the optional `dev` dependencies and enable the equivalent staged-file
+checks with `uv run pre-commit install`. To check the full tracked Python
+surface used by CI without installing a hook, run
+`uv run pre-commit run --all-files`.
 
 Track project size when a change adds or removes meaningful surface area:
 
