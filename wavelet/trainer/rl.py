@@ -1111,11 +1111,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             token_mask=attention_mask,
         )
         if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
-            if has_sampling_mask:
-                raise RuntimeError(
-                    "Sampling-mask replay requires model logits, but the model "
-                    "returned precomputed logprobs."
-                )
             entropy = outputs.get("entropy") if include_entropy else None
             return (
                 outputs["logprobs"].float().contiguous(),

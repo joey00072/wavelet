@@ -550,6 +550,30 @@ def test_model_logprobs_casts_chunked_output_to_fp32() -> None:
     assert "temperature" in model.kwargs
 
 
+def test_model_logprobs_accepts_masked_chunked_output() -> None:
+    config = RLConfig()
+    config.model.fused_lm_head_token_chunk_size = 1024
+    trainer = RLTrainer(config)
+    logprobs = torch.tensor([[-0.2, -0.4]])
+    model = _LogprobModel(logprobs)
+    trainer.model = model  # type: ignore[assignment]
+
+    actual = trainer._model_logprobs(
+        {
+            "input_ids": torch.ones((1, 2), dtype=torch.long),
+            "position_ids": torch.zeros((1, 2), dtype=torch.long),
+            "target_ids": torch.ones((1, 2), dtype=torch.long),
+            "temperatures": torch.ones((1, 2), dtype=torch.float32),
+            "loss_mask": torch.ones((1, 2), dtype=torch.bool),
+            "sampling_mask_ids": torch.tensor([[[1], [1]]]),
+            "sampling_mask_lengths": torch.ones((1, 2), dtype=torch.long),
+        },
+        attention_mask=None,
+    )
+
+    torch.testing.assert_close(actual, logprobs)
+
+
 def test_model_logprobs_rejects_missing_required_sampling_masks() -> None:
     trainer = RLTrainer(RLConfig(inference={"sampling": {"top_k": 8}}))
     trainer.model = _LogitModel(torch.zeros(1, 2, 5))  # type: ignore[assignment]
