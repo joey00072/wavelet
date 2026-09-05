@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import time
 import urllib.request
 from dataclasses import dataclass
 
@@ -14,6 +15,8 @@ _KV_USAGE_NAMES = {"vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"}
 _RUNNING_NAMES = {"vllm:num_requests_running"}
 _WAITING_NAMES = {"vllm:num_requests_waiting"}
 _PREEMPTION_NAMES = {"vllm:num_preemptions", "vllm:num_preemptions_total"}
+_GENERATION_TOKEN_NAMES = {"vllm:generation_tokens", "vllm:generation_tokens_total"}
+_PROMPT_TOKEN_NAMES = {"vllm:prompt_tokens", "vllm:prompt_tokens_total"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,12 +26,22 @@ class ParsedVLLMMetrics:
     running: int = 0
     waiting: int = 0
     preemptions_total: int = 0
+    generation_tokens_total: float = 0.0
+    prompt_tokens_total: float = 0.0
+    token_counters: bool = False
 
 
 def parse_vllm_metrics(text: str) -> ParsedVLLMMetrics:
     """Parse the small Prometheus subset used by adaptive concurrency."""
     values: dict[str, list[float]] = {}
-    supported = _KV_USAGE_NAMES | _RUNNING_NAMES | _WAITING_NAMES | _PREEMPTION_NAMES
+    supported = (
+        _KV_USAGE_NAMES
+        | _RUNNING_NAMES
+        | _WAITING_NAMES
+        | _PREEMPTION_NAMES
+        | _GENERATION_TOKEN_NAMES
+        | _PROMPT_TOKEN_NAMES
+    )
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -58,6 +71,15 @@ def parse_vllm_metrics(text: str) -> ParsedVLLMMetrics:
         preemptions_total=int(
             max((summed({name}) for name in _PREEMPTION_NAMES), default=0.0)
         ),
+        generation_tokens_total=max(
+            (summed({name}) for name in _GENERATION_TOKEN_NAMES), default=0.0
+        ),
+        prompt_tokens_total=max(
+            (summed({name}) for name in _PROMPT_TOKEN_NAMES), default=0.0
+        ),
+        token_counters=any(
+            name in values for name in _GENERATION_TOKEN_NAMES | _PROMPT_TOKEN_NAMES
+        ),
     )
 
 
@@ -68,7 +90,9 @@ class InferenceMetricsScraper:
         self.base_urls = [url.rstrip("/").removesuffix("/v1") for url in base_urls]
         self.timeout_seconds = timeout_seconds
         self.previous_preemptions: dict[str, int] = {}
+        self.previous_tokens: dict[str, tuple[float, float, float]] = {}
         self.latest_metrics: dict[str, float] = {}
+        self._clock = time.monotonic
 
     async def scrape(self) -> list[EngineLoadSample]:
         results = await asyncio.gather(
@@ -101,6 +125,9 @@ class InferenceMetricsScraper:
                 0 if previous is None else max(parsed.preemptions_total - previous, 0)
             )
             self.previous_preemptions[replica] = parsed.preemptions_total
+            token_rates = (
+                self._token_rates(replica, parsed) if parsed.token_counters else {}
+            )
             samples.append(
                 EngineLoadSample(
                     replica=replica,
@@ -120,8 +147,40 @@ class InferenceMetricsScraper:
                     f"{prefix}/preemptions_delta": float(preemptions_delta),
                 }
             )
+            if parsed.token_counters:
+                metrics[f"{prefix}/generation_tokens_total"] = (
+                    parsed.generation_tokens_total
+                )
+                metrics[f"{prefix}/prompt_tokens_total"] = parsed.prompt_tokens_total
+                metrics.update(
+                    {f"{prefix}/{key}": value for key, value in token_rates.items()}
+                )
         self.latest_metrics = metrics
         return samples if len(samples) == len(self.base_urls) else []
+
+    def _token_rates(self, replica: str, parsed: ParsedVLLMMetrics) -> dict[str, float]:
+        """Tokens per second per replica from the cumulative vLLM counters."""
+        now = self._clock()
+        previous = self.previous_tokens.get(replica)
+        self.previous_tokens[replica] = (
+            now,
+            parsed.generation_tokens_total,
+            parsed.prompt_tokens_total,
+        )
+        if previous is None:
+            return {}
+        then, generation, prompt = previous
+        elapsed = now - then
+        if elapsed <= 0:
+            return {}
+        return {
+            "generation_tokens_per_second": max(
+                parsed.generation_tokens_total - generation, 0.0
+            )
+            / elapsed,
+            "prompt_tokens_per_second": max(parsed.prompt_tokens_total - prompt, 0.0)
+            / elapsed,
+        }
 
     def _fetch(self, base_url: str) -> str:
         request = urllib.request.Request(

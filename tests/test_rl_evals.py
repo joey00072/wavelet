@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -53,3 +54,25 @@ def test_evals_main_forces_eval_only_config(monkeypatch) -> None:
     assert rl_evals.main(["@", "run.yaml"]) == 0
     assert captured == ["@", "run.yaml", "--max-steps", "0"]
     run.assert_awaited_once_with(loaded)
+
+
+def test_eval_rollouts_serialize_message_models_structurally(tmp_path) -> None:
+    from wavelet.orchestrator.envs import _write_eval_rollouts
+
+    class Message:
+        def __init__(self, role: str, content: str) -> None:
+            self.role = role
+            self.content = content
+
+        def model_dump(self, *, mode: str = "json", exclude_none: bool = False) -> dict:
+            assert mode == "json" and exclude_none
+            return {"role": self.role, "content": self.content}
+
+    path = tmp_path / "evals" / "step-000000" / "env.jsonl"
+    _write_eval_rollouts(
+        path,
+        [{"example_id": "a", "prompt": [Message("user", "hi")], "reward": 1.0}],
+    )
+
+    row = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert row["prompt"] == [{"role": "user", "content": "hi"}]

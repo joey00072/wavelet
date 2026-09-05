@@ -1990,6 +1990,175 @@ def _source_record(prompt: str) -> RLExample:
     )
 
 
+def _bounded_group_scheduler(
+    *,
+    oversampling_factor: float = 1.0,
+    max_inflight_rollouts: int = 128,
+    max_async_level: int = 1,
+    max_off_policy_steps: int = 0,
+) -> VerifierRolloutScheduler:
+    config = RLConfig(
+        data={"shuffle": False},
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "examples_per_step": 8,
+            "rollouts_per_example": 16,
+            "oversampling_factor": oversampling_factor,
+            "max_inflight_rollouts": max_inflight_rollouts,
+            "max_async_level": max_async_level,
+            "max_off_policy_steps": max_off_policy_steps,
+            "filter_zero_advantage": False,
+            "envs": [{"id": "verifier", "group_size": 16}],
+        },
+    )
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler.config = config
+    scheduler.rollout_count = 16
+    scheduler._minimum_rollout_count = 16
+    scheduler.target_groups = 8
+    scheduler.target_tokens = None
+    scheduler.clients = [object()]
+    scheduler.pending = {}
+    scheduler.pending_clients = {}
+    scheduler.groups = {}
+    scheduler.ready_groups = []
+    scheduler.policy_step = 0
+    scheduler.next_group_id = 0
+    scheduler.env_selection_cursor = 0
+    scheduler.concurrency_controller = None
+    scheduler.cancelled_rollouts_count = 0
+    scheduler.requires_group_scoring = False
+    record = _source_record("sort")
+    runtime = _environment_runtime(config, 0, [record])
+    scheduler.env_runtimes = [runtime]
+    scheduler._next_environment_record = lambda: (runtime, record, 0, None)
+
+    def schedule_group_rollout(
+        self: VerifierRolloutScheduler,
+        group_id: int,
+        group: _VerifierGroupState,
+    ) -> None:
+        group.rollouts_to_schedule = 0
+        request = object()
+        self.pending[request] = _PendingVerifierRequest(  # type: ignore[index]
+            group_id=group_id,
+            client_index=0,
+            rollout_count=16,
+            policy_step=0,
+        )
+        self.pending_clients[request] = 0  # type: ignore[index]
+
+    scheduler._schedule_group_rollout = MethodType(
+        schedule_group_rollout,
+        scheduler,
+    )
+    scheduler._set_group_admission_target(8, accepted_groups=0)
+    return scheduler
+
+
+def _remove_bounded_candidate(
+    scheduler: VerifierRolloutScheduler,
+    group_id: int,
+) -> None:
+    request = next(
+        request
+        for request, info in scheduler.pending.items()
+        if info.group_id == group_id
+    )
+    scheduler.pending.pop(request)
+    scheduler.pending_clients.pop(request)
+    scheduler.groups.pop(group_id)
+
+
+def test_group_admission_does_not_refill_accepted_stragglers() -> None:
+    scheduler = _bounded_group_scheduler()
+
+    scheduler._fill_inflight()
+
+    assert len(scheduler.groups) == 8
+    assert scheduler.inflight_rollout_count == 128
+    assert scheduler.next_group_id == 8
+
+    # A completed group buffered for this batch is still a candidate, so the
+    # newly available request capacity must not admit a ninth group.
+    _remove_bounded_candidate(scheduler, 0)
+    scheduler.ready_groups.append([{"example_id": 0}])
+    scheduler._fill_inflight()
+    assert scheduler.next_group_id == 8
+
+    # Once that group is accepted, it leaves the active candidate set but also
+    # reduces the remaining batch target. Repeated straggler completions cannot
+    # refill the freed slots with unrelated groups.
+    scheduler.ready_groups.clear()
+    scheduler._set_group_admission_target(8, accepted_groups=1)
+    for accepted_groups, group_id in enumerate(range(1, 8), start=2):
+        _remove_bounded_candidate(scheduler, group_id)
+        scheduler._set_group_admission_target(
+            8,
+            accepted_groups=accepted_groups,
+        )
+        scheduler._fill_inflight()
+        assert scheduler.next_group_id == 8
+
+
+def test_group_admission_replaces_rejected_candidate() -> None:
+    scheduler = _bounded_group_scheduler()
+    scheduler._fill_inflight()
+
+    _remove_bounded_candidate(scheduler, 0)
+    scheduler._fill_inflight()
+
+    assert len(scheduler.groups) == 8
+    assert scheduler.inflight_rollout_count == 128
+    assert scheduler.next_group_id == 9
+
+
+def test_group_admission_preserves_configured_oversampling() -> None:
+    scheduler = _bounded_group_scheduler(
+        oversampling_factor=2.0,
+        max_inflight_rollouts=256,
+    )
+
+    scheduler._fill_inflight()
+
+    assert len(scheduler.groups) == 16
+    assert scheduler.inflight_rollout_count == 256
+    assert scheduler.next_group_id == 16
+
+
+def test_group_prewarm_skips_policy_outside_next_rollout_window() -> None:
+    scheduler = _bounded_group_scheduler(
+        max_async_level=3,
+        max_off_policy_steps=8,
+    )
+    scheduler.policy_step = 4
+
+    prewarmed = scheduler._prewarm_next_batch(8, rollout_step=7)
+
+    assert prewarmed is False
+    assert scheduler.groups == {}
+    assert scheduler.pending == {}
+    assert scheduler.next_group_id == 0
+
+
+def test_group_prewarm_keeps_policy_at_next_rollout_window_boundary() -> None:
+    scheduler = _bounded_group_scheduler(
+        max_async_level=3,
+        max_off_policy_steps=8,
+    )
+    scheduler.policy_step = 4
+
+    prewarmed = scheduler._prewarm_next_batch(8, rollout_step=6)
+
+    assert prewarmed is True
+    assert scheduler.rollout_step == 6
+    assert len(scheduler.groups) == 8
+    assert scheduler.inflight_rollout_count == 128
+
+
 def test_verifier_scheduler_loads_each_environment_runtime(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

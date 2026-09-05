@@ -168,3 +168,38 @@ def test_scraper_requires_supported_metrics_from_every_replica(monkeypatch) -> N
     assert samples == []
     assert scraper.latest_metrics["inference/replica_0/scrape_success"] == 1.0
     assert scraper.latest_metrics["inference/replica_1/scrape_success"] == 0.0
+
+
+def test_scraper_reports_token_throughput_per_replica(monkeypatch) -> None:
+    scraper = InferenceMetricsScraper(
+        ["http://localhost:8000/v1"],
+        timeout_seconds=1.0,
+    )
+    responses = iter(
+        [
+            (
+                "vllm:kv_cache_usage_perc 0.2\n"
+                "vllm:generation_tokens_total 1000\n"
+                "vllm:prompt_tokens_total 400\n"
+            ),
+            (
+                "vllm:kv_cache_usage_perc 0.3\n"
+                "vllm:generation_tokens_total 1600\n"
+                "vllm:prompt_tokens_total 500\n"
+            ),
+        ]
+    )
+    clock = iter([10.0, 12.0])
+    monkeypatch.setattr(scraper, "_fetch", lambda _base_url: next(responses))
+    monkeypatch.setattr(scraper, "_clock", lambda: next(clock))
+
+    asyncio.run(scraper.scrape())
+    first = dict(scraper.latest_metrics)
+    asyncio.run(scraper.scrape())
+    second = scraper.latest_metrics
+
+    assert first["inference/replica_0/generation_tokens_total"] == 1000.0
+    assert "inference/replica_0/generation_tokens_per_second" not in first
+    assert second["inference/replica_0/generation_tokens_per_second"] == 300.0
+    assert second["inference/replica_0/prompt_tokens_per_second"] == 50.0
+    assert second["inference/replica_0/prompt_tokens_total"] == 500.0

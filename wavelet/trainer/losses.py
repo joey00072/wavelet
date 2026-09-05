@@ -152,6 +152,48 @@ def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput
     return LossOutput(loss=loss, metrics=metrics)
 
 
+def ipo_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
+    """Return IPO with a symmetric sampled-token probability trust region."""
+    trainer_logprobs = inputs.trainer_logprobs
+    inference_logprobs = inputs.inference_logprobs
+    advantages = inputs.advantages
+    loss_mask = inputs.loss_mask
+
+    trainer_probs = torch.exp(trainer_logprobs)
+    inference_probs = torch.exp(inference_logprobs)
+    probs_diff = trainer_probs - inference_probs
+    invalid = probs_diff.abs() > loss_config.ipo_epsilon
+    invalid_high = probs_diff > loss_config.ipo_epsilon
+    invalid_low = probs_diff < -loss_config.ipo_epsilon
+    keep_mask = loss_mask & ~invalid
+
+    log_importance_ratio = trainer_logprobs - inference_logprobs
+    importance_ratio = torch.exp(log_importance_ratio)
+    mismatch_kl = importance_ratio - log_importance_ratio - 1
+    scaled_advantages = loss_config.adv_tau * advantages
+
+    pg_loss = keep_mask * scaled_advantages * importance_ratio
+    kl_loss = loss_mask * log_importance_ratio.square()
+    per_token_loss = -pg_loss + loss_config.kl_tau * kl_loss
+    if inputs.loss_weights is not None:
+        per_token_loss = per_token_loss * inputs.loss_weights
+
+    return LossOutput(
+        loss=per_token_loss.sum(),
+        metrics={
+            "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),
+            "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & invalid),
+            "unmasked_mismatch_kl": _safe_mean(mismatch_kl, keep_mask),
+            "is_masked": _safe_mean(invalid.float(), loss_mask),
+            "is_masked_low": _safe_mean(invalid_low.float(), loss_mask),
+            "is_masked_high": _safe_mean(invalid_high.float(), loss_mask),
+            "policy_loss": _safe_mean(-pg_loss, loss_mask),
+            "kl_loss": _safe_mean(kl_loss, loss_mask),
+            "advantage_mean": _safe_mean(advantages, loss_mask),
+        },
+    )
+
+
 def ce_loss_fn(inputs: LossInputs) -> LossOutput:
     """Return weighted next-token cross entropy for one sequence."""
     per_token_loss = -inputs.trainer_logprobs
@@ -224,6 +266,13 @@ def setup_rl_loss_fn(loss_config: RLLossConfig) -> LossFn:
             return output
 
         return custom_loss
+
+    if loss_config.type == "ipo":
+
+        def ipo_loss(inputs: LossInputs) -> LossOutput:
+            return ipo_loss_fn(inputs, loss_config)
+
+        return ipo_loss
 
     def dppo_loss(inputs: LossInputs) -> LossOutput:
         return default_loss_fn(inputs, loss_config)

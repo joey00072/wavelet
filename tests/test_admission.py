@@ -20,11 +20,34 @@ class _Clock:
         self.now += delay
 
 
-def test_admission_controller_smooths_net_growth_by_window() -> None:
+def test_unrate_limited_admission_allows_max_inflight_burst() -> None:
+    clock = _Clock()
+    controller = RolloutAdmissionController(
+        max_inflight=128,
+        minimum_burst=16,
+        clock=clock,
+        sleeper=clock.sleep,
+    )
+
+    async def exercise() -> None:
+        for _ in range(128):
+            await controller.acquire()
+
+        assert clock.sleeps == []
+        await controller.acquire()
+
+    asyncio.run(exercise())
+
+    assert controller.burst_limit == 128
+    assert clock.sleeps == [5.0]
+
+
+def test_rate_limited_admission_smooths_net_growth_by_window() -> None:
     clock = _Clock()
     controller = RolloutAdmissionController(
         max_inflight=100,
         minimum_burst=8,
+        tasks_per_minute=100,
         clock=clock,
         sleeper=clock.sleep,
     )

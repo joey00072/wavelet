@@ -1339,7 +1339,9 @@ def apply_lora(
         return model
     if isinstance(model, PeftModel):
         enforce_single_lora_adapter(model)
-        if match_base_dtype:
+        if lora_dtype is not None:
+            _cast_lora_dtypes(model, lora_dtype)
+        elif match_base_dtype:
             _align_lora_dtypes(model)
         return model
     _normalize_hf_tp_linear_feature_metadata(model)

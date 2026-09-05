@@ -21,6 +21,26 @@ file:
 Algorithm and length-penalty configs reject unknown keys so misspellings fail
 during configuration loading rather than being silently ignored.
 
+## RL Losses
+
+The `loss` block is independent of advantage assignment. DPPO remains the
+default and applies its existing advantage-directional probability masks.
+Select IPO for a symmetric importance-ratio trust region:
+
+```yaml
+loss:
+  type: ipo
+  ipo_epsilon: 0.1
+  adv_tau: 1.0
+  kl_tau: 0.001
+```
+
+IPO removes a trainable token from the policy-gradient term when
+`abs(exp(trainer_logprob) - exp(inference_logprob)) > ipo_epsilon`. The squared
+log-ratio KL regularizer still applies to every loss-masked token. IPO mask
+rates are emitted as `ipo/is_masked`, `ipo/is_masked_low`, and
+`ipo/is_masked_high`; DPPO keeps the corresponding `dppo/*` metric names.
+
 ## Built-in Algorithms
 
 ### Passthrough

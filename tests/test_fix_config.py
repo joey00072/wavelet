@@ -46,12 +46,25 @@ def test_custom_rl_loss_requires_import_path_and_owns_kwargs() -> None:
         RLLossConfig(type="custom")
     with pytest.raises(ValueError, match="only valid"):
         RLLossConfig(type="dppo", kwargs={"scale": 2.0})
-    with pytest.raises(ValueError, match="DPPO-only"):
+    with pytest.raises(ValueError, match="Built-in loss fields"):
         RLLossConfig(
             type="custom",
             import_path="package.module.loss",
             kl_tau=0.5,
         )
+
+
+def test_ipo_loss_owns_symmetric_mask_threshold() -> None:
+    config = RLLossConfig(type="ipo")
+    assert config.ipo_epsilon == pytest.approx(0.1)
+
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        RLLossConfig(type="ipo", ipo_epsilon=-0.1)
+    with pytest.raises(ValueError, match="Input should be 'dppo', 'ipo' or 'custom'"):
+        RLLossConfig(type="unknown")  # type: ignore[arg-type]
+
+    restored = RLLossConfig.model_validate(config.model_dump(mode="json"))
+    assert restored == config
 
 
 # ── legacy advantage keys ─────────────────────────────────────────────────────

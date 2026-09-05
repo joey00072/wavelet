@@ -104,6 +104,31 @@ def test_policy_gradient_moves_logprobs_in_advantage_direction() -> None:
     assert trainer_logprobs[0, 1].item() < 0.0
 
 
+def test_ipo_masks_probability_moves_symmetrically() -> None:
+    trainer_logprobs = torch.log(
+        torch.tensor([[0.32, 0.18, 0.59, 0.41]])
+    ).requires_grad_()
+    inference_logprobs = torch.log(torch.tensor([[0.20, 0.30, 0.50, 0.50]]))
+
+    output = compute_loss(
+        trainer_logprobs,
+        inference_logprobs,
+        None,
+        torch.tensor([[1.0, 1.0, 1.0, -1.0]]),
+        torch.ones((1, 4), dtype=torch.bool),
+        RLLossConfig(type="ipo", ipo_epsilon=0.1, kl_tau=0.0),
+        loss_scale=4,
+    )
+    output.loss.backward()
+
+    assert output.metrics["is_masked"].item() == pytest.approx(0.5)
+    assert output.metrics["is_masked_high"].item() == pytest.approx(0.25)
+    assert output.metrics["is_masked_low"].item() == pytest.approx(0.25)
+    torch.testing.assert_close(trainer_logprobs.grad[0, :2], torch.zeros(2))
+    assert trainer_logprobs.grad[0, 2].item() < 0.0
+    assert trainer_logprobs.grad[0, 3].item() > 0.0
+
+
 def test_packed_loss_metrics_are_averaged_per_sequence() -> None:
     loss_config = RLLossConfig(kl_tau=0.0)
     trainer_logprobs = torch.tensor([[0.0, 0.0, 0.0, math.log(0.5)]])

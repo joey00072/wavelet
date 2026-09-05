@@ -47,6 +47,12 @@ from wavelet.trainer.perf import (
     training_flop_metrics,
 )
 from wavelet.trainer.profiling import CudaMemoryProfiler, StepProfiler
+from wavelet.trainer.telemetry import (
+    gather_rank_telemetry,
+    node_metrics,
+    rank_rows,
+    sample_rank_telemetry,
+)
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import RunMonitor, setup_config_logger
@@ -64,11 +70,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _lora_dtype(dtype: str) -> torch.dtype | None:
+def _lora_dtype(
+    model_dtype: str, optimization_dtype: str = "model"
+) -> torch.dtype | None:
+    dtype = model_dtype if optimization_dtype == "model" else optimization_dtype
     if dtype == "bfloat16":
         return torch.bfloat16
     if dtype == "float16":
         return torch.float16
+    if dtype == "float32":
+        return torch.float32
     return None
 
 
@@ -533,11 +544,16 @@ class BaseTrainer:
             parallel_dims=self.parallel_dims,
             initialize_on_meta=use_fsdp2_meta_init,
         )
-        # Cast LoRA adapters to match the model's compute dtype so flash
-        # attention doesn't have to upcast fp32 LoRA outputs at every layer.
-        # "auto" → align adapters to whatever dtype the base weights loaded as.
+        # Keep the compatibility default aligned with the base model while allowing
+        # explicit FP32 adapter parameters for higher-fidelity optimizer updates.
+        # "auto" + "model" aligns to whatever dtype the base weights loaded as.
         cfg_dtype = self.config.model.torch_dtype
-        lora_dtype = _lora_dtype(cfg_dtype)
+        lora_optimization_dtype = (
+            self.config.lora.optimization_dtype
+            if self.config.lora is not None
+            else "model"
+        )
+        lora_dtype = _lora_dtype(cfg_dtype, lora_optimization_dtype)
         model = apply_lora(
             model,
             self.config.lora,
@@ -585,6 +601,21 @@ class BaseTrainer:
                 world=self.world,
                 cpu_offload=bool(fsdp_config.cpu_offload),
             )
+
+    def _model_forward_context(self) -> contextlib.AbstractContextManager[None]:
+        if self.world is None or self.world.device.type != "cuda":
+            return contextlib.nullcontext()
+        if self.config.model.torch_dtype == "float32":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if (
+            self.config.lora is not None
+            and self.config.lora.optimization_dtype == "float32"
+            and self.config.model.torch_dtype in {"bfloat16", "float16"}
+        ):
+            dtype = _lora_dtype(self.config.model.torch_dtype)
+            assert dtype is not None
+            return torch.autocast(device_type="cuda", dtype=dtype)
+        return contextlib.nullcontext()
 
     def _use_fsdp2_meta_init(self, fsdp_config: Any) -> bool:
         if not (
@@ -1180,7 +1211,9 @@ class SFTTrainer(BaseTrainer):
         metrics.update(self._dataset_progress_metrics())
         metrics.update(self._progress_metrics())
         metrics.update({"loss": loss, "lr": lr})
-        self.monitor.log(metrics, self.step)
+        self.monitor.log(
+            metrics, self.step, ranks=getattr(self, "_latest_rank_telemetry", None)
+        )
         progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
@@ -1270,20 +1303,32 @@ class SFTTrainer(BaseTrainer):
             else 0.0
         )
         self._step_started_at = None
+        local_tokens = self._step_model_tokens
         self._step_model_tokens = 0
         metrics = {
             "perf/tokens_per_second": global_tokens / elapsed,
             "perf/peak_memory_gib": peak_memory_gib,
         }
+        world_size = self.world.world_size if self.world is not None else 1
         metrics.update(
             training_flop_metrics(
                 flops_per_token=self._model_flops_per_token,
                 model_tokens=global_tokens,
                 elapsed_seconds=elapsed,
-                world_size=self.world.world_size if self.world is not None else 1,
+                world_size=world_size,
                 dtype=self._model_compute_dtype,
             )
         )
+        replication = max(world_size // max(self._data_parallel_world_size(), 1), 1)
+        sample = sample_rank_telemetry(
+            self.world,
+            tokens=local_tokens,
+            seconds=elapsed,
+            replication=replication,
+        )
+        ranks = gather_rank_telemetry(sample, self.world)
+        self._latest_rank_telemetry = rank_rows(ranks)
+        metrics.update(node_metrics(ranks))
         return metrics
 
     def _dataset_progress_metrics(self) -> dict[str, float]:
@@ -1344,12 +1389,13 @@ class SFTTrainer(BaseTrainer):
         if self.config.loss_impl == "liger_fused":
             # Wavelet's labels are pre-shifted, so shift_labels avoids a
             # second shift inside Liger's fused linear cross-entropy.
-            outputs = self.model(
-                input_ids=batch["input_ids"],
-                attention_mask=attn_mask,
-                position_ids=batch["position_ids"],
-                shift_labels=batch["labels"],
-            )
+            with self._model_forward_context():
+                outputs = self.model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=attn_mask,
+                    position_ids=batch["position_ids"],
+                    shift_labels=batch["labels"],
+                )
             return LossOutput(
                 loss=outputs.loss,
                 metrics=moe_load_balance_metrics(
@@ -1358,11 +1404,12 @@ class SFTTrainer(BaseTrainer):
                     token_mask=batch.get("attention_mask"),
                 ),
             )
-        outputs = self.model(
-            input_ids=batch["input_ids"],
-            attention_mask=attn_mask,
-            position_ids=batch["position_ids"],
-        )
+        with self._model_forward_context():
+            outputs = self.model(
+                input_ids=batch["input_ids"],
+                attention_mask=attn_mask,
+                position_ids=batch["position_ids"],
+            )
         result = self.compute_loss(outputs.logits, batch["labels"])
         result.metrics.update(
             moe_load_balance_metrics(

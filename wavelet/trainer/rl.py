@@ -46,6 +46,12 @@ from wavelet.trainer.losses import (
 from wavelet.trainer.model import is_fsdp_model, sync_hf_tp_lora_replicated_grads
 from wavelet.trainer.moe import moe_load_balance_metrics
 from wavelet.trainer.perf import training_flop_metrics
+from wavelet.trainer.telemetry import (
+    gather_rank_telemetry,
+    node_metrics,
+    rank_rows,
+    sample_rank_telemetry,
+)
 from wavelet.trainer.trainer import BaseTrainer
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.transport.policy import (
@@ -100,9 +106,6 @@ TRAIN_METRIC_ALIASES = {
     "mismatch_kl": "kl/mismatch",
     "masked_mismatch_kl": "kl/masked_mismatch",
     "unmasked_mismatch_kl": "kl/unmasked_mismatch",
-    "is_masked": "dppo/is_masked",
-    "is_masked_low": "dppo/is_masked_low",
-    "is_masked_high": "dppo/is_masked_high",
     "advantage_mean": "advantage/token/mean",
 }
 
@@ -259,6 +262,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._gradient_accumulation_loss_scale: float | None = None
         self._dynamic_loss_scale_local = 0.0
         self._loaded_micro_batch_count = 0
+        self._rollout_batch_loaded = False
         self._step_compute_seconds = 0.0
         self._step_model_tokens = 0
         self._run_closed = False
@@ -289,9 +293,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         )
         if isinstance(self.dataset, PackedRLDataset):
             self.accumulation_steps = self._packed_dataloader_batch_count()
-        self._set_optimizer_batch_loss_scales(
-            self._estimate_optimizer_batch_loss_scales()
-        )
+        loss_scales = None
+        if not self.config.orchestrator.enabled or self._rollout_batch_loaded:
+            loss_scales = self._estimate_optimizer_batch_loss_scales()
+        self._set_optimizer_batch_loss_scales(loss_scales)
 
     def _validate_ready(self) -> None:
         super()._validate_ready()
@@ -331,7 +336,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         metrics["progress/step"] = float(self.step)
         metrics["progress/micro_step"] = float(self._micro_step)
         metrics.update(self._progress_metrics())
-        self.monitor.log(metrics, self.step)
+        self.monitor.log(
+            metrics, self.step, ranks=getattr(self, "_latest_rank_telemetry", None)
+        )
         progress.set_postfix(
             loss=f"{metrics['loss']:.4f}",
             kl=f"{metrics['mismatch_kl']:.4f}",
@@ -378,6 +385,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 )
             }
         )
+        self._rollout_batch_loaded = True
         self._setup_data()
         self._loaded_micro_batch_count = self._current_micro_batch_count(
             optimizer_batch_size
@@ -872,9 +880,23 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 dtype=compute_dtype,
             )
         )
+        metrics.update(self._gather_node_metrics(elapsed))
         self._step_compute_seconds = 0.0
         self._step_model_tokens = 0
         return metrics
+
+    def _gather_node_metrics(self, elapsed: float) -> dict[str, float]:
+        world_size = self.world.world_size if self.world is not None else 1
+        replication = max(world_size // max(self._data_parallel_world_size(), 1), 1)
+        sample = sample_rank_telemetry(
+            self.world,
+            tokens=self._step_model_tokens,
+            seconds=elapsed,
+            replication=replication,
+        )
+        ranks = gather_rank_telemetry(sample, self.world)
+        self._latest_rank_telemetry = rank_rows(ranks)
+        return node_metrics(ranks)
 
     def _forward_rl_loss(
         self,
@@ -1156,15 +1178,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             "entropy/max": values.max(),
         }
 
-    def _model_forward_context(self):
-        if (
-            self.world is not None
-            and self.world.device.type == "cuda"
-            and self.config.model.torch_dtype == "float32"
-        ):
-            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        return contextlib.nullcontext()
-
     def _teacher_logprobs(self, batch: dict[str, Tensor]) -> Tensor | None:
         has_teacher = batch["has_teacher_logprobs"].bool()
         _, _, ref_kl_weights = self._component_weights(batch)
@@ -1351,6 +1364,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             for key, alias in TRAIN_METRIC_ALIASES.items()
             if key in metrics
         }
+        if self.config.loss.type in {"dppo", "ipo"}:
+            for key in ("is_masked", "is_masked_low", "is_masked_high"):
+                if key in metrics:
+                    aliases[f"{self.config.loss.type}/{key}"] = metrics[key]
         if "reward_mean" in metrics:
             aliases.setdefault("reward/all/mean", metrics["reward_mean"])
         return aliases

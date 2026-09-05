@@ -47,6 +47,18 @@ def test_precision_metadata_marks_intentional_low_precision_mismatch() -> None:
     assert metadata["train_serve_low_precision_match"] is False
 
 
+def test_precision_metadata_records_distinct_lora_optimization_dtype() -> None:
+    config = RLConfig(
+        model={"torch_dtype": "bfloat16"},
+        lora={"optimization_dtype": "float32"},
+    )
+
+    metadata = precision_metadata(config)
+
+    assert metadata["trainer"]["torch_dtype"] == "bfloat16"
+    assert metadata["adapter"]["dtype"] == "float32"
+
+
 def test_policy_metadata_wraps_precision_contract() -> None:
     config = RLConfig(model={"torch_dtype": "float32"})
 

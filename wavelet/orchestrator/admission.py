@@ -39,7 +39,11 @@ class RolloutAdmissionController:
         if tasks_per_minute is not None and tasks_per_minute < 1:
             raise ValueError("tasks_per_minute must be at least 1.")
 
-        self.burst_limit = max(minimum_burst, max_inflight // 10)
+        self.burst_limit = (
+            max_inflight
+            if tasks_per_minute is None
+            else max(minimum_burst, max_inflight // 10)
+        )
         self.window_seconds = window_seconds
         self._clock = clock
         self._sleeper = sleeper

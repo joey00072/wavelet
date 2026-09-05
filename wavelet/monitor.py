@@ -357,7 +357,15 @@ class RunMonitor:
         self.log_event(event, payload={"resumed_from": resumed_from})
         self._write_heartbeat(status="running", step=None)
 
-    def log(self, metrics: dict[str, Any], step: int | None) -> None:
+    def log(
+        self,
+        metrics: dict[str, Any],
+        step: int | None,
+        *,
+        ranks: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Append one metric row; ``ranks`` is the per-rank telemetry table
+        written only into the heartbeat so it never grows on disk."""
         if not self._should_write():
             return
 
@@ -401,7 +409,7 @@ class RunMonitor:
             # make W&B drop rows logged for an earlier step (async eval results).
             self._wandb_run.log(wandb_metrics)
 
-        self._write_heartbeat(status="running", step=step, metrics=row)
+        self._write_heartbeat(status="running", step=step, metrics=row, ranks=ranks)
 
     def log_event(
         self,
@@ -544,10 +552,11 @@ class RunMonitor:
         status: str,
         step: int | None,
         metrics: dict[str, Any] | None = None,
+        ranks: list[dict[str, Any]] | None = None,
     ) -> None:
         if not self.write_heartbeat:
             return
-        payload = {
+        payload: dict[str, Any] = {
             "timestamp": self._timestamp(),
             "pid": os.getpid(),
             "status": status,
@@ -555,6 +564,8 @@ class RunMonitor:
         }
         if metrics is not None:
             payload["metrics"] = metrics
+        if ranks is not None:
+            payload["ranks"] = ranks
         self.heartbeat_file.write_text(json.dumps(payload, indent=2))
 
     def _init_wandb(

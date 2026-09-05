@@ -8,6 +8,11 @@ from wavelet.configs.rl_config import RLConfig
 
 def precision_metadata(config: RLConfig) -> dict[str, Any]:
     inference_dtype = config.inference.vllm.dtype or config.model.torch_dtype
+    adapter_dtype = None
+    if config.lora is not None:
+        adapter_dtype = config.lora.optimization_dtype
+        if adapter_dtype == "model":
+            adapter_dtype = config.model.torch_dtype
     return {
         "trainer": {
             "model_name": config.model.name,
@@ -22,7 +27,7 @@ def precision_metadata(config: RLConfig) -> dict[str, Any]:
             "path": str(config.model.adapter_path)
             if config.model.adapter_path is not None
             else None,
-            "dtype": config.model.torch_dtype if config.lora is not None else None,
+            "dtype": adapter_dtype,
             "rank": config.lora.rank if config.lora is not None else None,
         },
         "inference": {

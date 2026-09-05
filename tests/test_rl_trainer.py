@@ -304,6 +304,47 @@ def test_optimizer_batch_scales_count_each_loss_component_independently() -> Non
     }
 
 
+def test_orchestrated_trainer_defers_loss_scale_until_rollouts_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = RLConfig(
+        data={"batch_size": 2, "micro_batch_size": 1, "seq_len": 8},
+        orchestrator={"enabled": True},
+    )
+    trainer = RLTrainer(config)
+    trainer.tokenizer = Mock(pad_token_id=0)
+    trainer.world = _cpu_world()
+    dataset = Mock()
+    dataloader = Mock()
+    monkeypatch.setattr(
+        "wavelet.trainer.rl.setup_rl_dataset", Mock(return_value=dataset)
+    )
+    monkeypatch.setattr(
+        "wavelet.trainer.rl.setup_rl_dataloader", Mock(return_value=dataloader)
+    )
+    estimate = Mock(side_effect=AssertionError("raw prompts are not trainable"))
+    monkeypatch.setattr(trainer, "_estimate_optimizer_batch_loss_scales", estimate)
+
+    trainer._setup_data()
+
+    assert trainer.dataset is dataset
+    assert trainer.dataloader is dataloader
+    assert trainer._optimizer_batch_loss_scales is None
+    estimate.assert_not_called()
+
+    trainer._rollout_batch_loaded = True
+    estimate.return_value = {"rl": 4.0, "ce": 0.0, "ref_kl": 0.0}
+    estimate.side_effect = None
+    trainer._setup_data()
+
+    estimate.assert_called_once_with()
+    assert trainer._optimizer_batch_loss_scales == {
+        "rl": 4.0,
+        "ce": 0.0,
+        "ref_kl": 0.0,
+    }
+
+
 def test_loss_scale_uses_global_token_mean_for_averaged_dp_gradients(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -855,3 +896,24 @@ def test_packed_micro_batch_count_covers_whole_epoch_without_spillover() -> None
 
     assert trainer._packed_dataloader_batch_count() == 3
     assert trainer.dataset.micro_batch_count() == 6
+
+
+def test_ipo_mask_metrics_use_ipo_namespace() -> None:
+    trainer = RLTrainer(RLConfig(loss={"type": "ipo"}))
+
+    aliases = trainer._standard_metric_aliases(
+        {
+            "is_masked": 0.25,
+            "is_masked_low": 0.10,
+            "is_masked_high": 0.15,
+        }
+    )
+
+    assert aliases["ipo/is_masked"] == pytest.approx(0.25)
+    assert aliases["ipo/is_masked_low"] == pytest.approx(0.10)
+    assert aliases["ipo/is_masked_high"] == pytest.approx(0.15)
+    assert "dppo/is_masked" not in aliases
+
+    dppo_aliases = RLTrainer(RLConfig())._standard_metric_aliases({"is_masked": 0.20})
+    assert dppo_aliases["dppo/is_masked"] == pytest.approx(0.20)
+    assert "ipo/is_masked" not in dppo_aliases

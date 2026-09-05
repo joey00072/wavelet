@@ -32,6 +32,13 @@ class LoRAConfig(ConfigModel):
     rank: int = Field(default=16, ge=1)
     alpha: float = Field(default=32.0, ge=0.0)
     dropout: float = Field(default=0.0, ge=0.0, le=1.0)
+    optimization_dtype: Literal["model", "float32"] = Field(
+        default="model",
+        description=(
+            "Parameter and optimizer-state dtype for LoRA adapters. 'model' keeps "
+            "the base model dtype; 'float32' keeps FP32 adapter master parameters."
+        ),
+    )
     target_modules: list[str] = Field(
         default_factory=lambda: list(DEFAULT_LORA_TARGET_MODULES)
     )
@@ -414,6 +421,12 @@ class TrainerConfig(ConfigModel):
                 f"model.{fused[0]} does not apply lora.dropout; set lora.dropout=0 "
                 "or disable the fused LoRA kernels."
             )
+        if self.lora.optimization_dtype != "model":
+            raise ValueError(
+                f"model.{fused[0]} does not support a distinct LoRA optimization "
+                "dtype; set lora.optimization_dtype='model' or disable the fused "
+                "LoRA kernels."
+            )
         return self
 
     @model_validator(mode="after")
@@ -583,11 +596,12 @@ class RLDataConfig(TrainingDataConfig):
 
 
 class RLLossConfig(ConfigModel):
-    type: Literal["dppo", "custom"] = "dppo"
+    type: Literal["dppo", "ipo", "custom"] = "dppo"
     import_path: str | None = None
     kwargs: dict[str, Any] = Field(default_factory=dict)
     dppo_mask_high: float = Field(default=0.20, ge=0.0)
     dppo_mask_low: float = Field(default=0.20, ge=0.0)
+    ipo_epsilon: float = Field(default=0.10, ge=0.0)
     kl_tau: float = Field(default=1e-3, ge=0.0)
     adv_tau: float = Field(default=1.0, ge=0.0)
     teacher_tau: float = Field(default=0.0, ge=0.0)
@@ -602,17 +616,18 @@ class RLLossConfig(ConfigModel):
         if "advantage_scale" in normalized and "adv_tau" not in normalized:
             normalized["adv_tau"] = normalized.pop("advantage_scale")
         if normalized.get("type") == "custom":
-            dppo_fields = {
+            built_in_fields = {
                 "dppo_mask_high",
                 "dppo_mask_low",
+                "ipo_epsilon",
                 "kl_tau",
                 "adv_tau",
                 "teacher_tau",
             }
-            conflicts = sorted(dppo_fields & normalized.keys())
+            conflicts = sorted(built_in_fields & normalized.keys())
             if conflicts:
                 raise ValueError(
-                    "DPPO-only loss fields cannot be set for a custom loss: "
+                    "Built-in loss fields cannot be set for a custom loss: "
                     f"{', '.join(conflicts)}. Pass custom arguments through kwargs."
                 )
         return normalized

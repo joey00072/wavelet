@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
+from functools import cache
 from typing import Any
 
 
@@ -74,6 +76,7 @@ class TrajectorySample:
 class _ActiveSample:
     prefix_ids: list[int]
     sample: TrajectorySample
+    segments: list[TokenSegment]
 
 
 def merge_token_segments(
@@ -82,22 +85,32 @@ def merge_token_segments(
     temperature: float = 1.0,
     mask_outputs: bool = False,
 ) -> list[TrajectorySample]:
-    """Merge tokenized agent turns when each prompt exactly extends prior tokens."""
+    """Merge turns with exact prefixes or unambiguous rerendered output spans."""
     active: list[_ActiveSample] = []
     for segment in segments:
         for active_index, item in enumerate(active):
             prefix_len = len(item.prefix_ids)
-            if segment.prompt_ids[:prefix_len] != item.prefix_ids:
-                continue
-            active[active_index] = _ActiveSample(
-                prefix_ids=segment.prompt_ids + segment.output_ids,
-                sample=_extend_sample(
+            if segment.prompt_ids[:prefix_len] == item.prefix_ids:
+                sample = _extend_sample(
                     item.sample,
                     segment,
                     prefix_len=prefix_len,
                     temperature=temperature,
                     mask_outputs=mask_outputs,
-                ),
+                )
+            else:
+                sample = _rebase_sample_on_prompt(
+                    item.segments,
+                    segment,
+                    temperature=temperature,
+                    mask_outputs=mask_outputs,
+                )
+                if sample is None:
+                    continue
+            active[active_index] = _ActiveSample(
+                prefix_ids=segment.prompt_ids + segment.output_ids,
+                sample=sample,
+                segments=[*item.segments, segment],
             )
             break
         else:
@@ -109,6 +122,7 @@ def merge_token_segments(
                         temperature=temperature,
                         mask_outputs=mask_outputs,
                     ),
+                    segments=[segment],
                 )
             )
     return [item.sample for item in active if item.sample.input_ids]
@@ -136,6 +150,109 @@ def _sample_from_segment(
         sampling_masks,
         temperature=temperature,
     )
+
+
+def _rebase_sample_on_prompt(
+    historical_segments: list[TokenSegment],
+    segment: TokenSegment,
+    *,
+    temperature: float,
+    mask_outputs: bool,
+) -> TrajectorySample | None:
+    """Rebase sampled spans onto a prompt whose chat framing was rerendered.
+
+    Some chat templates do not render an assistant message in history exactly as
+    they rendered its generation prompt. Reusing the new prompt is safe only when
+    every earlier sampled span has one unambiguous, ordered, exact-token match.
+    """
+    matches = _unique_ordered_output_matches(
+        [historical.output_ids for historical in historical_segments],
+        segment.prompt_ids,
+    )
+    if matches is None:
+        return None
+
+    token_ids = segment.prompt_ids + segment.output_ids
+    token_mask = list(segment.prompt_loss_mask or []) + _output_mask(
+        segment,
+        mask_outputs=mask_outputs,
+    )
+    logprobs = [0.0] * len(segment.prompt_ids) + segment.output_logprobs
+    sampling_masks: list[list[int] | None] = [None] * len(segment.prompt_ids)
+    sampling_masks.extend(
+        segment.output_sampling_mask or [None] * len(segment.output_ids)
+    )
+    turn_ids = [segment.turn_id] * len(token_ids)
+
+    for historical, start in zip(historical_segments, matches, strict=True):
+        stop = start + len(historical.output_ids)
+        token_mask[start:stop] = _output_mask(
+            historical,
+            mask_outputs=mask_outputs,
+        )
+        logprobs[start:stop] = historical.output_logprobs
+        sampling_masks[start:stop] = historical.output_sampling_mask or [None] * len(
+            historical.output_ids
+        )
+        turn_ids[start:stop] = [historical.turn_id] * len(historical.output_ids)
+
+    return _shift_tokens(
+        token_ids,
+        token_mask,
+        logprobs,
+        turn_ids,
+        sampling_masks,
+        temperature=temperature,
+    )
+
+
+def _unique_ordered_output_matches(
+    outputs: list[list[int]],
+    prompt_ids: list[int],
+) -> list[int] | None:
+    """Find one exact ordered prompt occurrence for every prior output span."""
+    if any(not output_ids for output_ids in outputs):
+        return None
+
+    occurrences = [
+        [
+            start
+            for start in range(len(prompt_ids) - len(output_ids) + 1)
+            if prompt_ids[start : start + len(output_ids)] == output_ids
+        ]
+        for output_ids in outputs
+    ]
+
+    @cache
+    def search(
+        output_index: int,
+        cursor: int,
+    ) -> tuple[int, tuple[int, ...] | None]:
+        if output_index == len(outputs):
+            return 1, ()
+        solution_count = 0
+        unique_matches: tuple[int, ...] | None = None
+        output_ids = outputs[output_index]
+        starts = occurrences[output_index]
+        for start in starts[bisect_left(starts, cursor) :]:
+            child_count, child_matches = search(
+                output_index + 1,
+                start + len(output_ids),
+            )
+            if child_count == 0:
+                continue
+            if solution_count == 0 and child_count == 1:
+                assert child_matches is not None
+                unique_matches = (start, *child_matches)
+            else:
+                unique_matches = None
+            solution_count = min(solution_count + child_count, 2)
+            if solution_count > 1:
+                break
+        return solution_count, unique_matches
+
+    solution_count, matches = search(0, 0)
+    return list(matches) if solution_count == 1 and matches is not None else None
 
 
 def _extend_sample(

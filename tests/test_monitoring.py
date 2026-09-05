@@ -245,3 +245,30 @@ def test_sample_history_compacts_existing_file_on_first_write(tmp_path) -> None:
 
     rows = read_jsonl(samples_path)
     assert [row["completion"] for row in rows] == ["3", "4", "new"]
+
+
+def test_heartbeat_carries_per_rank_table_without_growing_metrics(tmp_path) -> None:
+    monitor = RunMonitor(
+        tmp_path,
+        log_cuda_memory=False,
+        log_disk_usage=False,
+        write_metrics_csv=False,
+    )
+    monitor.start_run(run_config={})
+    ranks = [{"rank": 0, "node": "host-a", "tokens_per_second": 120.0}]
+
+    monitor.log({"loss": 1.0, "node/host-a/tokens_per_second": 120.0}, 3, ranks=ranks)
+    monitor.log({"loss": 0.5}, 4)
+
+    heartbeat = json.loads((tmp_path / "heartbeat.json").read_text())
+    assert heartbeat["step"] == 4
+    assert "ranks" not in heartbeat
+    monitor.log({"loss": 0.4}, 5, ranks=ranks)
+    heartbeat = json.loads((tmp_path / "heartbeat.json").read_text())
+    assert heartbeat["ranks"] == ranks
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert all("ranks" not in row for row in rows)
+    assert rows[0]["node/host-a/tokens_per_second"] == 120.0

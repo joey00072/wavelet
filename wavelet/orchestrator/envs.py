@@ -13,7 +13,7 @@ import urllib.request
 from collections import Counter
 from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -413,11 +413,25 @@ def _completion_len(output: dict[str, Any]) -> float:
     return float(len(str(completion).split()))
 
 
+def _eval_json_default(value: Any) -> Any:
+    """Serialize verifier objects structurally instead of via ``repr``.
+
+    Chat messages arrive as pydantic models; dumping them with ``str`` loses the
+    role/content structure that the dashboard and later analysis need.
+    """
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return dump(mode="json", exclude_none=True)
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
+    return str(value)
+
+
 def _write_eval_rollouts(path: Path, outputs: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for output in outputs:
-            handle.write(json.dumps(output, default=str) + "\n")
+            handle.write(json.dumps(output, default=_eval_json_default) + "\n")
 
 
 def _append_eval_metrics(path: Path, metrics: dict[str, float]) -> None:

@@ -665,6 +665,8 @@ class VerifierRolloutScheduler:
         self.pending_clients: dict[asyncio.Task[list[dict[str, Any]]], int] = {}
         self.ready_groups: list[list[dict[str, Any]]] = []
         self.ready_group_off_policy_steps: list[int] = []
+        self._admission_target_groups: int | None = None
+        self._admission_accepted_groups = 0
         self.requires_group_scoring = bool(
             getattr(self.env, "requires_group_scoring", False)
         )
@@ -770,6 +772,7 @@ class VerifierRolloutScheduler:
         *,
         target_groups: int | None = None,
         rollout_step: int | None = None,
+        prewarm_rollout_step: int | None = None,
     ) -> list[RLExample]:
         """Build one batch for ``rollout_step`` from groups the trainer accepts."""
         started_at = perf_counter()
@@ -781,6 +784,7 @@ class VerifierRolloutScheduler:
         target_tokens = (
             getattr(self, "target_tokens", None) if target_groups is None else None
         )
+        self._set_group_admission_target(target_groups, accepted_groups=0)
         outputs: list[dict[str, Any]] = []
         accepted_groups = 0
         accepted_tokens = 0
@@ -861,6 +865,10 @@ class VerifierRolloutScheduler:
                     accepted_tokens = 0
 
                 await self._wait_for_policy_update()
+                self._set_group_admission_target(
+                    target_groups,
+                    accepted_groups=accepted_groups,
+                )
                 self._fill_inflight()
                 done, _ = await asyncio.wait(
                     self.pending,
@@ -912,6 +920,12 @@ class VerifierRolloutScheduler:
         )
         completed_groups += drained_completed
         rejected_groups += drained_rejected
+        self._prewarm_next_batch(
+            target_groups,
+            rollout_step=(
+                rollout_step if prewarm_rollout_step is None else prewarm_rollout_step
+            ),
+        )
         return self._finalize_batch(
             outputs,
             started_at=started_at,
@@ -1062,7 +1076,6 @@ class VerifierRolloutScheduler:
         accepted_tokens: int,
         batch_stats: _VerifierBatchStats,
     ) -> list[RLExample]:
-        self._fill_inflight()
         convert_started_at = perf_counter()
         records = [
             record for output in outputs for record in _records_from_output(output)
@@ -1449,6 +1462,48 @@ class VerifierRolloutScheduler:
             if not self._schedule_next_rollout():
                 break
 
+    def _set_group_admission_target(
+        self,
+        target_groups: int | None,
+        *,
+        accepted_groups: int,
+    ) -> None:
+        self._admission_target_groups = target_groups
+        self._admission_accepted_groups = accepted_groups
+
+    def _can_admit_new_group(self) -> bool:
+        """Return whether the active batch has room for another candidate group."""
+        target_groups = getattr(self, "_admission_target_groups", None)
+        if target_groups is None:
+            return True
+        accepted_groups = getattr(self, "_admission_accepted_groups", 0)
+        candidate_budget = max(
+            math.ceil(target_groups * self.config.orchestrator.oversampling_factor)
+            - accepted_groups,
+            0,
+        )
+        active_candidates = len(self.groups) + len(getattr(self, "ready_groups", ()))
+        return active_candidates < candidate_budget
+
+    def _prewarm_next_batch(
+        self,
+        target_groups: int | None,
+        *,
+        rollout_step: int | None,
+    ) -> bool:
+        """Prewarm only when the loaded policy is valid for the next batch."""
+        self._set_group_admission_target(target_groups, accepted_groups=0)
+        if rollout_step is not None:
+            required_policy_step = _required_policy_step(self.config, rollout_step)
+            policy_step = getattr(self, "policy_step", None)
+            if (policy_step is not None and policy_step < required_policy_step) or (
+                policy_step is None and required_policy_step > 0
+            ):
+                return False
+            self.rollout_step = rollout_step
+        self._fill_inflight()
+        return True
+
     def _ensure_inference_metrics_task(self) -> None:
         if getattr(self, "inference_metrics_scraper", None) is None:
             return
@@ -1581,6 +1636,9 @@ class VerifierRolloutScheduler:
             if cost <= remaining_capacity:
                 self._schedule_group_rollout(group_id, group)
                 return True
+
+        if not self._can_admit_new_group():
+            return False
 
         minimum_rollout_count = getattr(
             self,
@@ -2903,6 +2961,7 @@ class _VerifierPublisherStrategy:
         records = await self.scheduler.generate_batch(
             target_groups=chunk_groups,
             rollout_step=optimizer_step,
+            prewarm_rollout_step=(queue_step + 1) // self.chunks_per_step,
         )
         generate_seconds = perf_counter() - generate_started_at
         rollout_policy_step = _rollout_records_policy_step(
