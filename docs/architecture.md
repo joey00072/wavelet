@@ -16,6 +16,7 @@ filesystem artifacts carry state between independently restartable processes.
 | `wavelet.inference` | Native and vLLM policy inference, HTTP clients, policy loading, and diagnostics |
 | `wavelet.trainer` | Model/LoRA and distributed setup, RL/SFT training, losses, optimization, and checkpointing |
 | `wavelet.distributed` | Compatibility imports for distributed APIs now owned by `wavelet.trainer.distributed` |
+| `wavelet.dashboard` | Read-only run artifact readers, the `/api/runs` router for the dashboard and live state server, W&B/Trackio history providers, and synthetic runs |
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
 | `wavelet.utils` | Configuration loading and path helpers |
 
@@ -246,6 +247,59 @@ processes.
 Rollout manifests and claim/consumed records are required queue state. Their
 write failures stop the run; only duplicate diagnostic events and traces are
 best-effort.
+
+## Run Artifacts and Observability
+
+Every role writes under the configured `output_dir`; nothing outside it is the
+source of truth for a run:
+
+- `configs/attempt_<n>/` and the `configs/latest` symlink: resolved per-role
+  YAML for each launch attempt.
+- `metrics.jsonl`, `orchestrator_metrics.jsonl`, and `eval_metrics.jsonl`:
+  trainer, rollout-generation, and fixed-policy evaluation metrics keyed by
+  step. `evals/step-XXXXXX/<env>.jsonl` keeps the per-example eval rollouts.
+- `events.jsonl`, `heartbeat.json`, and `run_metadata.json`: run lifecycle
+  events, the trainer heartbeat that run status is derived from, and
+  world/resume facts. `samples.jsonl` holds a bounded set of trainer samples.
+- `rollouts/`, `policies/`, `checkpoints/`, and `events/`: queue batches with
+  manifests and claim/consumed records, exported policies with adjacent
+  metadata, trainer checkpoints, and queue lifecycle events.
+- `logs/<role>[.rank-N].jsonl` and `traces/`: structured per-role logs and
+  optional rollout traces.
+
+Per-node telemetry stays inside those files. Each optimizer step every rank
+samples its token count, compute time, and CUDA memory (`wavelet.trainer.telemetry`);
+one small `all_gather_object` brings the samples to the main rank, which writes
+`node/<host>/tokens_per_second`, `node/<host>/peak_memory_gib`, and
+`perf/rank_tokens_per_second_{min,max}` into `metrics.jsonl` and the per-rank
+table into `heartbeat.json`. Nothing is written per rank, so the artifact
+footprint does not grow with world size. The orchestrator's vLLM scraper adds
+`inference/replica_<n>/generation_tokens_per_second` from the cumulative
+Prometheus counters. `WAVELET_NODE_NAME` overrides the hostname label.
+
+`wavelet.monitor` owns the trainer-side writers and shared JSONL readers.
+`wavelet.dashboard.artifacts` reads the same files read-only and never claims,
+consumes, or rewrites queue state. Metric files are held columnar
+(`wavelet.dashboard.metrics`) and refreshed incrementally; the series API
+downsamples with a min/max envelope on request and supports step windows and
+incremental `after` polling, so the server's memory is bounded by the number of
+runs it holds open rather than by run length. Two servers expose that reader over HTTP with
+one route contract under `/api/runs/<run>`:
+
+- The live state server (`orchestrator.state_server.enabled: true`) runs inside
+  the orchestrator process, tracks rollout and policy transitions as they
+  happen, and serves its own run beside the legacy `/state`, `/queues`,
+  `/metrics`, `/eval-metrics`, `/events`, `/samples`, `/config`, and
+  `/rollouts/inspect` routes.
+- `wavelet dashboard` serves any number of run directories, live or completed,
+  from `--runs-root` and explicit paths. `/api/current` names the run that is
+  active right now: a fresh `running` heartbeat wins, then a `running` run with
+  a stale heartbeat, then the most recently updated run. The alias `current` is
+  accepted wherever a run id is.
+
+`wavelet synth-run` writes a deterministic run directory with this full layout
+so the readers and the web UI can be exercised without a GPU. See the
+[dashboard guide](../webui/README.md).
 
 ## Extension Points
 

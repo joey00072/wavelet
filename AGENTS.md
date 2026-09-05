@@ -34,9 +34,13 @@ Guidance for coding agents working in this repository.
   serialization.
 - `wavelet/data/`: canonical `sft.py` and `rl.py` data pipelines; historical
   fine-grained module paths remain compatibility wrappers.
+- `wavelet/dashboard/`: read-only run artifact readers, the `/api/runs` HTTP
+  router shared by `wavelet dashboard` and the live state server, and the
+  synthetic run writer used for UI development and tests.
 - `examples/`: runnable example configs and data-preparation helpers.
 - `tests/`: pytest suite.
-- `webui/`: lightweight run-state UI.
+- `webui/`: browser dashboard (React/Vite); build with `bun run build` so
+  `wavelet dashboard` can serve `webui/dist`.
 - `outputs/` and run directories: generated data, rollouts, policies,
   checkpoints, logs, and metrics. Do not commit generated run artifacts.
 - `README.md`: project overview and quick-start notes.
@@ -80,12 +84,20 @@ Guidance for coding agents working in this repository.
   - `uv run python -m wavelet debug preflight @ <config>.yaml --json`
   - `uv run python -m wavelet debug inference inspect @ <config>.yaml --json`
   - `uv run python -m wavelet debug orchestrator inspect @ <config>.yaml --json`
+  - `uv run python -m wavelet dashboard --runs-root outputs` (read-only run
+    dashboard; `wavelet synth-run --output <dir>` writes a synthetic run for
+    UI work without GPUs)
 - Build source/wheel packages: `uv build`
 
 ### Known Runnable Examples
 
 - `examples/reverse_text/`: small RL/SFT path; use this for fast pipeline checks.
 - `examples/alphabet_sort/`: working 4B LoRA RL path.
+- `examples/equation_builder/`: local arithmetic environment with no external
+  verifier dependencies; its RL configs enable the state server, so use it for
+  dashboard work.
+- `examples/moe_reverse_text/`: Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on
+  two GPUs.
 - `examples/qwen4b_math/`: single-node 4B math adaptation.
 - `examples/unsloth_math/`: SFT and RL math quick-start.
 - `examples/qwen30b_math/`: larger-model configs, including colocate/sleep

@@ -26,7 +26,13 @@ training or inference runs.
   starting the trainer.
 - [Agent trajectory artifacts](agent_trajectory.md): token provenance contract
   for custom multi-turn and tool rollouts.
-- [WebUI](../webui/README.md): run the browser dashboard for the RL state server.
+- [Dashboard](../webui/README.md): browser dashboard over live or completed run
+  directories with training, generation, rollout inspection, evaluation,
+  pipeline, infrastructure, config, and multi-run comparison views.
+- [Deployment](deployment.md): CUDA container use and the local/Ray launcher
+  contract.
+- [Functionality register](functionality_register.md): preservation checks per
+  surface and canonical implementation owners.
 - [Agent instructions](../AGENTS.md): repository rules for coding agents and
   contributors.
 
@@ -135,6 +141,22 @@ uv run python -m wavelet debug trainer parity \
 
 If trainer logprobs are absent, the parity report records an explicit skip
 reason instead of silently claiming parity.
+
+### Observe A Run In The Browser
+
+Build the web UI once, then serve any number of run directories read-only:
+
+```bash
+cd webui && bun install && bun run build && cd ..
+uv run wavelet dashboard --runs-root outputs
+```
+
+The page opens on the current run (fresh heartbeat first, then most recently
+updated); older runs are listed separately and can be compared. The dashboard
+reads the same artifacts the diagnostics commands read and works for completed
+runs. Without a GPU, `uv run wavelet synth-run --output
+outputs/demo_run` writes a synthetic run for exercising the UI. See the
+[dashboard guide](../webui/README.md).
 
 ### Run Split RL Processes
 

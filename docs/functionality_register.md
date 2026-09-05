@@ -23,6 +23,12 @@ run in the ordinary test suite.
 | HTTP, offline, and native inference | `uv run pytest tests/test_http_inference.py tests/test_native_inference_server.py tests/test_vllm_batching.py` |
 | Diagnostics, metrics, monitoring, state server | `uv run pytest tests/test_monitor.py tests/test_monitoring.py tests/test_inference_diagnostics.py tests/test_orchestrator_diagnostics.py tests/test_trainer_diagnostics.py tests/test_orchestrator_metrics.py tests/test_state_server.py` |
 | Launcher modes and placement | `uv run pytest tests/test_launcher.py tests/test_rl_launcher.py` |
+| MoE router metrics and expert parallelism | `uv run pytest tests/test_moe.py tests/integration/test_expert_parallel.py -q` |
+| Context parallel loss scaling and sampling-mask sharding | `uv run pytest tests/test_context_parallel.py` |
+| vLLM sampling-mask replay in RL | `uv run pytest tests/test_vllm_batching.py tests/test_rl_records.py tests/test_rl_trainer.py` |
+| Adaptive inference concurrency | `uv run pytest tests/test_adaptive_concurrency.py` |
+| Checkpointing, FSDP2 checkpoints, and checkpoint conversion | `uv run pytest tests/test_checkpointing.py tests/test_convert_checkpoint.py tests/integration/test_fsdp2_checkpoint.py -q` |
+| Trace export and benchmark harness | `uv run pytest tests/test_convert_traces.py tests/test_benchmark.py` |
 | Reverse-text SFT | `uv run python -m wavelet sft @ examples/reverse_text/sft.yaml` |
 | Reverse-text integrated RL | `uv run python -m wavelet rl @ examples/reverse_text/rl.yaml` |
 | Process-mode roles | `uv run python -m wavelet debug preflight @ examples/reverse_text/rl.yaml --json` followed by the resolved `rl-inference`, `rl-trainer`, and `rl-orchestrator` commands |
@@ -34,7 +40,9 @@ run in the ordinary test suite.
 | NCCL policy transport | Run the dedicated two-GPU configuration and `uv run pytest tests/test_vllm_weight_update.py` |
 | Colocate and sleep choreography | Run the colocate and colocate-sleep smoke configs under `examples/qwen30b_math/` after checking GPU availability |
 | Ray launcher backend | Set `launcher.backend: ray` in a temporary process-mode config and run preflight plus the resolved launcher |
-| Web UI compatibility | Start the state server for a smoke run and verify the overview, queues, policies, metrics, and trace views |
+| Dashboard API and artifact readers | `uv run pytest tests/test_dashboard.py` |
+| Per-node trainer telemetry and heartbeat rank table | `uv run pytest tests/test_telemetry.py tests/test_monitoring.py` |
+| Web UI compatibility | `uv run wavelet synth-run --output outputs/demo_run`, `uv run wavelet dashboard --runs-root outputs`, then verify the current-run landing, older-runs list, overview, inspector, evals, pipeline, infra, config, and compare views; repeat against a live state server for a smoke run |
 
 For training parity, record baseline evaluation and final evaluation at fixed
 policy steps, failed-rollout counts, queue lifecycle counts, and policy lag.
@@ -55,3 +63,4 @@ these implementation owners:
 | Model loading, LoRA, and QLoRA | `wavelet.trainer.model` |
 | Distributed world and device meshes | `wavelet.trainer.distributed` |
 | Shared monitoring and JSONL readers | `wavelet.monitor` |
+| Read-only run artifact readers and the `/api/runs` dashboard router | `wavelet.dashboard.artifacts`, `wavelet.dashboard.server` |

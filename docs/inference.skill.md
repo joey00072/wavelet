@@ -78,9 +78,23 @@ The vLLM servers expose these debug endpoints:
 - `GET /debug/state`: resolved inference config plus runtime policy state.
 - `POST /score`: fixed-token prefill scoring for OPD/OPSD distillation. Supply
   `model` and `token_ids`; the response contains aligned `prompt_logprobs`.
+- `POST /pause`, `/resume`, `/sleep`, `/wake`: generation and GPU-memory
+  choreography used by the colocate launchers.
+- `POST /load_policy` and `POST /init_broadcaster`: filesystem policy loading
+  (`policy_dir`, `step`) and NCCL broadcaster setup. `/debug/state` reports the
+  loaded policy step and `generation_paused` afterwards.
 
 Use the configured `inference.http.host` and `inference.http.port` or the full
 `inference.http.ports` list when multiple replicas are running.
+
+During a run, the orchestrator's adaptive-concurrency scraper records each
+replica's vLLM Prometheus load as `inference/replica_<n>/kv_cache_usage`,
+`requests_running`, `requests_waiting`, and `preemptions_delta` in
+`orchestrator_metrics.jsonl`. When the server exposes the token counters, the
+scraper also derives `generation_tokens_per_second` and
+`prompt_tokens_per_second` per replica. The dashboard's Infra view charts them
+per replica alongside trainer GPU memory, step timing, and per-node trainer
+throughput: `uv run wavelet dashboard --runs-root outputs`.
 
 ## What To Check
 
