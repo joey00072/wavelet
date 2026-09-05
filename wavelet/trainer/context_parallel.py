@@ -10,7 +10,6 @@ from torch import Tensor
 
 from wavelet.trainer.distributed import ParallelDims
 
-
 _SEQUENCE_FIELDS = {
     "input_ids",
     "attention_mask",

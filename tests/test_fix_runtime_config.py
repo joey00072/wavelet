@@ -150,6 +150,16 @@ def test_context_parallelism_requires_sdpa() -> None:
         )
 
 
+def test_context_parallelism_requires_token_normalization() -> None:
+    with pytest.raises(ValueError, match="loss.normalization='token'"):
+        RLConfig(
+            model={"attn_implementation": "sdpa"},
+            fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
+            data={"seq_len": 128},
+            loss={"normalization": "sequence"},
+        )
+
+
 def test_unimplemented_sft_generation_config_is_rejected() -> None:
     with pytest.raises(ValueError, match="generate"):
         SFTConfig(generate={"prompt": "test", "max_new_tokens": 8})

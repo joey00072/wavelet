@@ -117,8 +117,8 @@ Current distributed scope is experimental:
   selected architecture exposes a `transformers` TP plan
 - EP degrees above 1 are rejected during config loading. CP degrees above 1 use
   the first-stage RL ring SDPA path and require enabled FSDP2, explicit SDPA,
-  micro-batch size 1, and a sequence length divisible by `2 * fsdp.cp`; SFT
-  remains rejected until its token normalization is CP-aware
+  micro-batch size 1, token normalization, and a sequence length divisible by
+  `2 * fsdp.cp`; SFT remains rejected until its token normalization is CP-aware
 - LoRA adapter export from TP-sharded models is not implemented yet
 
 ## RL Framework Shape

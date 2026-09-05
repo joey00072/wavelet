@@ -421,6 +421,12 @@ class TrainerConfig(ConfigModel):
             raise ValueError(
                 "Context parallelism requires model.attn_implementation='sdpa'."
             )
+        loss = getattr(self, "loss", None)
+        if loss is not None and loss.normalization != "token":
+            raise ValueError(
+                "Context parallelism requires loss.normalization='token'; "
+                "sequence normalization is not safe after CP sequence sharding."
+            )
         data = getattr(self, "data", None)
         if data is not None:
             if data.micro_batch_size != 1:

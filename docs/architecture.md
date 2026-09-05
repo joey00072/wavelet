@@ -52,7 +52,9 @@ sequence dimension, and reduces loss denominators over the combined `dp_cp`
 mesh. `fsdp.cp_style` is currently `ring`; Ulysses and expert parallelism are
 not implemented. CP validation also requires a micro-batch size of one and a
 sequence length divisible by `2 * fsdp.cp`; SFT remains rejected until its
-token normalization is CP-aware.
+token normalization is CP-aware. RL CP also requires
+`loss.normalization: token`; sequence normalization would treat a sharded
+sequence fragment as an independent sequence.
 
 This path depends on `torch.distributed.tensor.experimental.context_parallel`
 and should be validated on the target multi-GPU topology; CPU tests cover only
