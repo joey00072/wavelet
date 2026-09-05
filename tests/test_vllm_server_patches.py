@@ -25,6 +25,15 @@ from wavelet.inference import patches as inference_patches
 from wavelet.inference import server
 
 
+def test_chat_token_endpoint_preserves_custom_json_responses() -> None:
+    source = inspect.getsource(server.chat_completions_tokens)
+
+    assert "isinstance(generator, JSONResponse)" in source
+    assert source.index("isinstance(generator, JSONResponse)") < source.index(
+        "StreamingResponse(content=generator"
+    )
+
+
 def test_load_lora_patch_still_addresses_upstream_request_replacement() -> None:
     source = inspect.getsource(OpenAIServingModels.load_lora_adapter)
 

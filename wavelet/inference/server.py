@@ -1170,6 +1170,8 @@ async def chat_completions_tokens(
             message="The model does not support Chat Completions API"
         )
     generator = await handler.create_chat_completion_with_tokens(request, raw_request)
+    if isinstance(generator, JSONResponse):
+        return generator
     if isinstance(generator, ErrorResponse):
         return JSONResponse(
             content=generator.model_dump(),
