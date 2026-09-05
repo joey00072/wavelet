@@ -443,10 +443,13 @@ def test_precomputed_loss_scale_is_localized_before_dp_cp_reduction(
 
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
-    assert trainer._average_data_parallel_loss_scales(
-        {"rl": 4.0, "ce": 0.0, "ref_kl": 0.0},
-        scales_are_cp_replicated=True,
-    )["rl"] == 2.0
+    assert (
+        trainer._average_data_parallel_loss_scales(
+            {"rl": 4.0, "ce": 0.0, "ref_kl": 0.0},
+            scales_are_cp_replicated=True,
+        )["rl"]
+        == 2.0
+    )
 
 
 def test_packed_flash_attention_uses_varlen_position_ids() -> None:

@@ -137,9 +137,9 @@ class ParallelDims:
                 for name in ("dp_replicate", "dp_shard_mod_ep", "cp")
                 if name in names
             ]
-            self._submeshes["dp_cp"] = mesh[
-                tuple(dp_cp_mesh_dim_names)
-            ]._flatten(mesh_dim_name="dp_cp")
+            self._submeshes["dp_cp"] = mesh[tuple(dp_cp_mesh_dim_names)]._flatten(
+                mesh_dim_name="dp_cp"
+            )
 
         self._submeshes["dp"] = mesh[tuple(dp_mesh_dim_names)]._flatten(
             mesh_dim_name="dp"
@@ -198,9 +198,9 @@ class ParallelDims:
             ]._flatten(mesh_dim_name="dp_shard_cp")
         if self.cp_enabled:
             dp_cp_mesh_dim_names = [*dp_mesh_dim_names, "cp"]
-            self._submeshes["dp_cp"] = mesh[
-                tuple(dp_cp_mesh_dim_names)
-            ]._flatten(mesh_dim_name="dp_cp")
+            self._submeshes["dp_cp"] = mesh[tuple(dp_cp_mesh_dim_names)]._flatten(
+                mesh_dim_name="dp_cp"
+            )
         if self.dp_replicate_enabled:
             parent = mesh[tuple(["dp_replicate"] + dp_shard_cp_dim_names)]
             hsdp_tensor = parent.mesh.reshape(self.dp_replicate, -1)

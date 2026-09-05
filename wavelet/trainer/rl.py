@@ -802,10 +802,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             if attention_mask is not None and attention_mask.ndim == 4
             else None
         )
-        with self._context_parallel_batch(
-            batch,
-            extra_buffers=extra_buffers,
-        ), self.act_offload_ctx:
+        with (
+            self._context_parallel_batch(
+                batch,
+                extra_buffers=extra_buffers,
+            ),
+            self.act_offload_ctx,
+        ):
             loss_output = self._forward_rl_loss(batch, attention_mask)
             self._require_finite_loss(loss_output.loss, label="RL loss")
             if self._optimizer_batch_loss_scale is None:
