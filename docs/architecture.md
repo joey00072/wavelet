@@ -156,10 +156,13 @@ already-derived component mask and optional token weights, and return
 `wavelet.transport.queue` owns queue artifacts and lifecycle events.
 Filesystem policy exports use a temporary directory followed by an atomic
 rename and stable marker. Metadata is written beside the model or adapter. NCCL
-transfer uses the same metadata and readiness concepts, but broadcasts named
-tensors after inference workers enter the update collective. NCCL transfers
-pack adjacent tensors into large double-buffered byte tensors, reducing the
-number of collectives while preserving incremental loading on each worker.
+transfer uses the same readiness concept, but sends a layer count followed by
+per-layer metadata after inference workers enter the update collective. Each
+layer is converted to Hugging Face checkpoint names, grouped by dtype, and
+broadcast as one concatenated native tensor per dtype. Workers split those
+buffers and load one layer at a time under vLLM's layerwise reload lifecycle,
+keeping transfer memory bounded by the largest layer rather than the full
+model.
 Full-model filesystem refreshes use vLLM's layerwise reload lifecycle, so each
 layer is processed and copied into its existing kernel storage as its checkpoint
 weights arrive instead of materializing a second processed model at once.

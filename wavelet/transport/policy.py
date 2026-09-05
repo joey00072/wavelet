@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -22,7 +23,6 @@ from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
 )
-from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
 from wavelet.orchestrator.policy_metadata import (
     adapter_artifact_metadata,
@@ -47,7 +47,6 @@ else:
 
 NCCL_READY_MARKER = "NCCL_READY"
 NCCL_UPDATE_INFO_FILENAME = "update_info.json"
-NCCL_PACKED_TRANSFER = True
 NamedTensor = tuple[str, Tensor]
 
 
@@ -124,14 +123,10 @@ def _is_reusable_policy_snapshot(
     return False
 
 
-def _require_vllm_nccl() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
+def _require_vllm_nccl() -> tuple[type[Any], type[Any]]:
     try:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
-        from vllm.distributed.weight_transfer.nccl_engine import (
-            NCCLTrainerSendWeightsArgs,
-            NCCLWeightTransferEngine,
-        )
     except ImportError as exc:
         raise ImportError(
             "NCCL weight broadcast requires vLLM NCCL internals. Install vLLM and "
@@ -140,33 +135,190 @@ def _require_vllm_nccl() -> tuple[type[Any], type[Any], type[Any], type[Any]]:
     return (
         PyNcclCommunicator,
         StatelessProcessGroup,
-        NCCLTrainerSendWeightsArgs,
-        NCCLWeightTransferEngine,
     )
 
 
-def update_info_for_named_tensors(
+_LAYER_KEY_RE = re.compile(
+    r"^(?P<prefix>(?:.+\.)?(?:layers|blocks|h))\."
+    r"(?P<index>\d+)(?:\.|$)"
+)
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _layer_groups(
     named_tensors: Iterable[NamedTensor],
-    *,
-    packed: bool = False,
-) -> dict[str, Any]:
-    names: list[str] = []
-    dtype_names: list[str] = []
-    shapes: list[list[int]] = []
+) -> dict[str, list[tuple[str, Tensor]]]:
+    groups: dict[str, list[tuple[str, Tensor]]] = {}
     for name, tensor in named_tensors:
-        names.append(name)
-        dtype_names.append(str(tensor.dtype).removeprefix("torch."))
-        shapes.append(list(tensor.shape))
+        groups.setdefault(_dtype_name(tensor.dtype), []).append((name, tensor))
+    return groups
+
+
+def _layer_metadata(
+    named_tensors: Iterable[NamedTensor],
+) -> dict[str, list[dict[str, Any]]]:
     return {
-        "names": names,
-        "dtype_names": dtype_names,
-        "shapes": shapes,
-        "packed": packed,
+        dtype_name: [
+            {"name": name, "shape": list(tensor.shape), "numel": tensor.numel()}
+            for name, tensor in tensors
+        ]
+        for dtype_name, tensors in _layer_groups(named_tensors).items()
     }
 
 
-def update_info_for_model(model: nn.Module, *, packed: bool = False) -> dict[str, Any]:
-    return update_info_for_named_tensors(model.state_dict().items(), packed=packed)
+def _partition_state_dict(
+    state_dict: dict[str, Tensor],
+) -> list[dict[str, Tensor]]:
+    """Partition checkpoint tensors into non-layer and transformer-layer groups."""
+    layer_matches = [(name, _LAYER_KEY_RE.match(name)) for name in state_dict]
+    if not any(match is not None for _, match in layer_matches):
+        return [state_dict]
+    layer_indices = {
+        int(match.group("index")) for _, match in layer_matches if match is not None
+    }
+    prefix = next(match.group("prefix") for _, match in layer_matches if match)
+    groups: list[dict[str, Tensor]] = [
+        {
+            name: tensor
+            for name, tensor in state_dict.items()
+            if not name.startswith(f"{prefix}.")
+        }
+    ]
+    for index in range(max(layer_indices) + 1):
+        groups.append(
+            {
+                name: tensor
+                for name, tensor in state_dict.items()
+                if name.startswith(f"{prefix}.{index}.")
+            }
+        )
+    return groups
+
+
+def _model_named_tensors(model: nn.Module) -> dict[str, Tensor]:
+    """Return parameter and buffer references without materializing full state."""
+    from wavelet.trainer.model import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    tensors = dict(unwrapped.named_parameters())
+    tensors.update(dict(unwrapped.named_buffers()))
+    return tensors
+
+
+def _materialize_wire_tensors(
+    model: nn.Module,
+    state_dict: dict[str, Tensor],
+    layer_index: int,
+) -> dict[str, Tensor]:
+    """Gather only this layer's sharded tensors and retain their wire dtype."""
+    from wavelet.trainer.model import unwrap_model
+
+    conversion_model = unwrap_model(model)
+    owner: nn.Module | None = None
+    if layer_index < 0:
+        owner = model
+    else:
+        match = next(
+            (match for name in state_dict if (match := _LAYER_KEY_RE.match(name))),
+            None,
+        )
+        if match is not None:
+            owner = conversion_model.get_submodule(
+                f"{match.group('prefix')}.{layer_index}"
+            )
+
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    except ImportError:
+        FSDP = None  # type: ignore[assignment,misc]
+
+    if FSDP is not None and isinstance(owner, FSDP):
+        with FSDP.summon_full_params(
+            owner,
+            recurse=layer_index >= 0,
+            rank0_only=False,
+            offload_to_cpu=True,
+        ):
+            return {
+                name: tensor.detach().clone().contiguous()
+                for name, tensor in state_dict.items()
+            }
+
+    materialized: dict[str, Tensor] = {}
+    for name, tensor in state_dict.items():
+        full_tensor = getattr(tensor, "full_tensor", None)
+        if callable(full_tensor):
+            tensor = full_tensor()
+        materialized[name] = tensor.detach().contiguous()
+    return materialized
+
+
+def _convert_layer_to_hf(
+    model: nn.Module,
+    state_dict: dict[str, Tensor],
+    layer_index: int,
+) -> dict[str, Tensor]:
+    """Convert one trainer layer to the checkpoint names vLLM consumes."""
+    convert_layer = getattr(model, "convert_layer_to_hf", None)
+    if callable(convert_layer):
+        converted = convert_layer(state_dict, layer_index)
+        return state_dict if converted is None else converted
+    try:
+        from transformers.core_model_loading import revert_weight_conversion
+    except ImportError:
+        return state_dict
+    return revert_weight_conversion(model, state_dict)
+
+
+def _iter_layer_state_dicts(model: nn.Module) -> Iterator[dict[str, Tensor]]:
+    from wavelet.trainer.model import unwrap_model
+
+    conversion_model = unwrap_model(model)
+    tensors = _model_named_tensors(model)
+    for layer_index, layer in enumerate(_partition_state_dict(tensors)):
+        wire_layer = _materialize_wire_tensors(model, layer, layer_index - 1)
+        yield _convert_layer_to_hf(conversion_model, wire_layer, layer_index - 1)
+
+
+def _broadcast_integer(
+    value: int,
+    communicator: Any,
+    *,
+    device: torch.device,
+    source: bool,
+) -> int:
+    integer = torch.tensor(
+        [value if source else 0],
+        dtype=torch.int64,
+        device=device,
+    )
+    communicator.broadcast(integer, src=0)
+    return int(integer.item())
+
+
+def _broadcast_bytes(
+    payload: bytes | None,
+    communicator: Any,
+    *,
+    device: torch.device,
+    source: bool,
+) -> bytes:
+    size = _broadcast_integer(
+        0 if payload is None else len(payload),
+        communicator,
+        device=device,
+        source=source,
+    )
+    buffer = (
+        torch.tensor(list(payload), dtype=torch.uint8, device=device)
+        if source
+        else torch.empty(size, dtype=torch.uint8, device=device)
+    )
+    communicator.broadcast(buffer, src=0)
+    return bytes(buffer.cpu().tolist())
 
 
 def nccl_world_size(inference_world_size: int) -> int:
@@ -187,22 +339,14 @@ class NCCLWeightBroadcaster:
     device: torch.device | str | int = "cuda"
     timeout_seconds: int = 600
     source_rank: int = 0
-    packed: bool = False
     _communicator: Any = field(init=False, repr=False)
     _device: torch.device = field(init=False, repr=False)
     _process_group: Any = field(init=False, repr=False)
-    _send_args_type: type[Any] = field(init=False, repr=False)
-    _transfer_engine_type: type[Any] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("NCCL weight broadcast requires CUDA.")
-        (
-            communicator_type,
-            process_group_type,
-            send_args_type,
-            transfer_engine_type,
-        ) = _require_vllm_nccl()
+        communicator_type, process_group_type = _require_vllm_nccl()
         self._device = torch.device(self.device)
         self._process_group = process_group_type.create(
             host=self.host,
@@ -212,24 +356,46 @@ class NCCLWeightBroadcaster:
             store_timeout=self.timeout_seconds,
         )
         self._communicator = communicator_type(self._process_group, device=self._device)
-        self._send_args_type = send_args_type
-        self._transfer_engine_type = transfer_engine_type
 
     @torch.no_grad()
-    def broadcast_named_tensors(self, named_tensors: Iterable[NamedTensor]) -> None:
+    def broadcast_layers(
+        self,
+        layers: Iterable[dict[str, Tensor]],
+        *,
+        layer_count: int,
+    ) -> None:
         if self.rank != self.source_rank:
             raise RuntimeError("Only the source rank can broadcast model weights.")
-        args = self._send_args_type(
-            group=self._communicator,
-            src=self.source_rank,
-            packed=self.packed,
-            post_iter_func=lambda item: item[1].detach().to(self._device).contiguous(),
+        _broadcast_integer(
+            layer_count,
+            self._communicator,
+            device=self._device,
+            source=True,
         )
-        self._transfer_engine_type.trainer_send_weights(iter(named_tensors), args)
+        for layer in layers:
+            payload = json.dumps(_layer_metadata(layer.items())).encode("utf-8")
+            _broadcast_bytes(
+                payload,
+                self._communicator,
+                device=self._device,
+                source=True,
+            )
+            for dtype_name, tensors in _layer_groups(layer.items()).items():
+                del dtype_name
+                flattened = [
+                    tensor.detach().to(self._device).contiguous().view(-1)
+                    for _, tensor in tensors
+                ]
+                concatenated = torch.cat(flattened)
+                self._communicator.broadcast(concatenated, src=self.source_rank)
+                del concatenated
 
     @torch.no_grad()
     def broadcast_model(self, model: nn.Module) -> None:
-        self.broadcast_named_tensors(model.state_dict().items())
+        self.broadcast_layers(
+            _iter_layer_state_dicts(model),
+            layer_count=len(_partition_state_dict(_model_named_tensors(model))),
+        )
 
 
 def _require_vllm_receiver_nccl() -> tuple[type[object], type[object]]:
@@ -242,18 +408,6 @@ def _require_vllm_receiver_nccl() -> tuple[type[object], type[object]]:
             "run the inference server on CUDA workers."
         ) from exc
     return PyNcclCommunicator, StatelessProcessGroup
-
-
-def _require_vllm_packed_receiver() -> Any:
-    try:
-        from vllm.distributed.weight_transfer.packed_tensor import (
-            packed_broadcast_consumer,
-        )
-    except ImportError as exc:
-        raise ImportError(
-            "Packed NCCL weight updates require vLLM weight-transfer support."
-        ) from exc
-    return packed_broadcast_consumer
 
 
 def _worker_model(worker: object) -> Module:
@@ -345,45 +499,51 @@ class NCCLWeightUpdateWorker(Worker):
         update_info_path = Path(weight_path) / NCCL_UPDATE_INFO_FILENAME
         update_info = json.loads(update_info_path.read_text())
         model = _worker_model(self)
-        if update_info.get("packed", False):
-            state_dict_info = (
-                (name, (shape, getattr(torch, dtype_name)))
-                for name, dtype_name, shape in zip(
-                    update_info["names"],
-                    update_info["dtype_names"],
-                    update_info["shapes"],
-                    strict=True,
-                )
-            )
-            _require_vllm_packed_receiver()(
-                iterator=state_dict_info,
-                group=communicator,
-                src=0,
-                post_unpack_func=model.load_weights,
-            )
-            device = next(model.parameters()).device
-            process_weights_after_loading(model, self.model_runner.model_config, device)
-            return
-
-        stream = (
-            torch.cuda.current_stream(communicator.device)
-            if communicator.device.type == "cuda"
-            else None
-        )
-        for name, dtype_name, shape in zip(
-            update_info["names"],
-            update_info["dtype_names"],
-            update_info["shapes"],
-            strict=True,
-        ):
-            dtype = getattr(torch, dtype_name)
-            weight = torch.empty(shape, dtype=dtype, device=communicator.device)
-            communicator.broadcast(weight, src=0, stream=stream)
-            model.load_weights([(name, weight)])  # type: ignore[arg-type]
-            del weight
+        if update_info.get("protocol") != "layerwise_v1":
+            raise ValueError("Unsupported NCCL weight update protocol.")
 
         device = next(model.parameters()).device
-        process_weights_after_loading(model, self.model_runner.model_config, device)
+        layer_count = _broadcast_integer(
+            0,
+            communicator,
+            device=device,
+            source=False,
+        )
+        with torch.device(device), set_current_vllm_config(self.vllm_config):
+            initialize_layerwise_reload(model)
+            for _ in range(layer_count):
+                metadata = json.loads(
+                    _broadcast_bytes(
+                        None,
+                        communicator,
+                        device=device,
+                        source=False,
+                    ).decode("utf-8")
+                )
+                loaded: list[NamedTensor] = []
+                for dtype_name, entries in metadata.items():
+                    dtype = getattr(torch, dtype_name)
+                    total_numel = sum(int(entry["numel"]) for entry in entries)
+                    concatenated = torch.empty(
+                        total_numel,
+                        dtype=dtype,
+                        device=device,
+                    )
+                    communicator.broadcast(concatenated, src=0)
+                    offset = 0
+                    for entry in entries:
+                        numel = int(entry["numel"])
+                        tensor = concatenated[offset : offset + numel].view(
+                            entry["shape"]
+                        )
+                        loaded.append((entry["name"], tensor))
+                        offset += numel
+                    if offset != total_numel:
+                        raise ValueError(
+                            f"NCCL metadata size mismatch for dtype {dtype_name!r}."
+                        )
+                model.load_weights(loaded)  # type: ignore[arg-type]
+            finalize_layerwise_reload(model, self.model_runner.model_config)
 
 
 class PolicyExportMixin:
@@ -575,21 +735,18 @@ class PolicyExportMixin:
         step_dir = get_policy_step_dir(policy_dir, export_step)
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
         self._prepare_export_directory(tmp_dir, step_dir)
-        state_dict = self._nccl_export_state_dict(export_step)
         if self.world.is_main:
             self._write_nccl_export(
                 tmp_dir,
                 step_dir,
                 export_step=export_step,
-                state_dict=state_dict,
             )
 
-        self.offload_after_refit()
         self._broadcast_nccl_export(
             step_dir,
             export_step=export_step,
-            state_dict=state_dict,
         )
+        self.offload_after_refit()
         if self.world.world_size > 1:
             barrier(self.world)
         if self.world.is_main:
@@ -598,19 +755,15 @@ class PolicyExportMixin:
             barrier(self.world)
         return step_dir
 
-    def _nccl_export_state_dict(
-        self,
-        export_step: int,
-    ) -> dict[str, Tensor] | None:
-        if export_step == 0:
-            return None
-        from wavelet.trainer.model import export_model_for_save
+    def _nccl_export_layers(self) -> Iterator[dict[str, Tensor]]:
+        if self.model is None:
+            raise RuntimeError("Trainer not set up. Call setup() first.")
+        yield from _iter_layer_state_dicts(self.model)
 
-        _, state_dict = export_model_for_save(
-            self.model,
-            state_dict_dtype=torch.bfloat16,
-        )
-        return state_dict
+    def _nccl_export_layer_count(self) -> int:
+        if self.model is None:
+            raise RuntimeError("Trainer not set up. Call setup() first.")
+        return len(_partition_state_dict(_model_named_tensors(self.model)))
 
     def _write_nccl_export(
         self,
@@ -618,13 +771,8 @@ class PolicyExportMixin:
         step_dir: Path,
         *,
         export_step: int,
-        state_dict: dict[str, Tensor] | None,
     ) -> None:
-        named_tensors = [] if state_dict is None else list(state_dict.items())
-        update_info = update_info_for_named_tensors(
-            named_tensors,
-            packed=NCCL_PACKED_TRANSFER,
-        )
+        update_info = {"protocol": "layerwise_v1"}
         (tmp_dir / NCCL_UPDATE_INFO_FILENAME).write_text(json.dumps(update_info))
         self._write_policy_metadata(
             tmp_dir,
@@ -641,14 +789,20 @@ class PolicyExportMixin:
         step_dir: Path,
         *,
         export_step: int,
-        state_dict: dict[str, Tensor] | None,
     ) -> None:
-        if export_step == 0 or not self.world.is_main:
+        if export_step == 0:
             return
-        self._wait_for_nccl_ready(step_dir)
-        if state_dict is None:
-            raise RuntimeError("Missing state dict for NCCL policy broadcast.")
-        self._nccl_broadcaster().broadcast_named_tensors(state_dict.items())
+        layer_count = self._nccl_export_layer_count()
+        layers = self._nccl_export_layers()
+        if self.world.is_main:
+            self._wait_for_nccl_ready(step_dir)
+            self._nccl_broadcaster().broadcast_layers(
+                layers,
+                layer_count=layer_count,
+            )
+        else:
+            for _ in layers:
+                pass
 
     def _record_policy_export(self, export_step: int) -> None:
         append_event_best_effort(
@@ -707,5 +861,4 @@ class PolicyExportMixin:
             ),
             device=device,
             timeout_seconds=self.config.policy_transfer.nccl_timeout_seconds,
-            packed=NCCL_PACKED_TRANSFER,
         )
