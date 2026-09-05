@@ -155,7 +155,9 @@ class RunArtifacts:
                     "_dashboard_error": "The resolved config could not be parsed.",
                     "_error": self._config_error,
                 }
-        return {"_dashboard_error": "No resolved config artifact was found for this run."}
+        return {
+            "_dashboard_error": "No resolved config artifact was found for this run."
+        }
 
     # ---------------------------------------------------------------- metrics
 

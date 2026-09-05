@@ -293,6 +293,7 @@ Custom hooks are synchronous:
 ```python
 def score_rollout(self, record: RLExample) -> RLExample: ...
 
+
 def score_group(self, records: list[RLExample]) -> list[RLExample]: ...
 ```
 

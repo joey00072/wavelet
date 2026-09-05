@@ -27,9 +27,7 @@ class CustomBuildHook(BuildHookInterface):
             )
 
         webui = Path(self.root) / "webui"
-        subprocess.run(
-            [bun, "install", "--frozen-lockfile"], cwd=webui, check=True
-        )
+        subprocess.run([bun, "install", "--frozen-lockfile"], cwd=webui, check=True)
         subprocess.run([bun, "run", "build"], cwd=webui, check=True)
 
         static_dir = webui / "dist"

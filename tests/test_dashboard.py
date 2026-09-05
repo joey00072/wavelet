@@ -164,9 +164,7 @@ def test_config_endpoint_reports_malformed_yaml_without_crashing(
     run = tmp_path / "malformed"
     config_dir = run / "configs"
     config_dir.mkdir(parents=True)
-    (config_dir / "rl.yaml").write_text(
-        "model: [unterminated\n", encoding="utf-8"
-    )
+    (config_dir / "rl.yaml").write_text("model: [unterminated\n", encoding="utf-8")
     (run / "metrics.jsonl").write_text("{}\n", encoding="utf-8")
     client = TestClient(build_dashboard_app(RunRegistry(runs=[run])))
 
