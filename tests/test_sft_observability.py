@@ -85,8 +85,6 @@ def test_sft_log_includes_performance_and_source_progress() -> None:
     output = TrainOutput(
         loss=LossOutput(loss=torch.tensor(1.5)),
         stepped=True,
-        step=3,
-        micro_step=3,
         metrics={
             "perf/tokens_per_second": 128.0,
             "perf/peak_memory_gib": 4.0,

@@ -7,7 +7,7 @@ import { Popover, Segmented, Slider } from "../components/Controls";
 import { Modal } from "../components/Modal";
 import type { SmoothingType } from "../lib/series";
 
-export type ChartPrefs = {
+type ChartPrefs = {
   smoothing: number;
   smoothingType: SmoothingType;
   yMode: "auto" | "zero" | "fixed";
@@ -16,7 +16,7 @@ export type ChartPrefs = {
   xLog: boolean;
   yLog: boolean;
 };
-export type ChartOptions = ChartPrefs & { logScale: boolean; height: number; expanded: boolean };
+type ChartOptions = ChartPrefs & { height: number; expanded: boolean };
 
 /** Props to spread onto a LineChart from a panel's options. */
 export function chartProps(o: ChartOptions) {
@@ -83,7 +83,7 @@ export function ChartCard({
     }
   });
   const prefs: ChartPrefs = { ...defaults, ...(stored ?? {}) };
-  const { smoothing, yLog: logScale } = prefs;
+  const { smoothing } = prefs;
   const update = (patch: Partial<ChartPrefs>) => {
     const next: Partial<ChartPrefs> = { ...(stored ?? {}), ...patch };
     for (const key of Object.keys(next) as Array<keyof ChartPrefs>) {
@@ -221,7 +221,7 @@ export function ChartCard({
             if (Math.hypot(e.clientX - start.x, e.clientY - start.y) < 5) setExpanded(true);
           }}
         >
-          {showTable && table ? table : render({ ...prefs, logScale, height, expanded: false })}
+          {showTable && table ? table : render({ ...prefs, height, expanded: false })}
         </div>
       </figure>
       <Modal
@@ -248,7 +248,7 @@ export function ChartCard({
           </>
         }
       >
-        {showTable && table ? <div className="max-h-[70vh] overflow-auto">{table}</div> : render({ ...prefs, logScale, height: Math.max(360, Math.min(640, window.innerHeight - 260)), expanded: true })}
+        {showTable && table ? <div className="max-h-[70vh] overflow-auto">{table}</div> : render({ ...prefs, height: Math.max(360, Math.min(640, window.innerHeight - 260)), expanded: true })}
         {value !== undefined && <div className="mt-3 text-xs text-muted">latest <span className="tabular font-semibold text-ink">{value}</span></div>}
       </Modal>
     </>

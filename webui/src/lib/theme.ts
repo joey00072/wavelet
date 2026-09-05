@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type Theme = "dark" | "light";
+type Theme = "dark" | "light";
 const KEY = "wavelet.theme";
 
 export function initialTheme(): Theme {

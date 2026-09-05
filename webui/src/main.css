@@ -23,13 +23,6 @@
   --series-7: #4a3aa7;
   --series-8: #e34948;
   --deemph: #b8b7b0;
-  --seq-100: #cde2fb;
-  --seq-300: #6da7ec;
-  --seq-500: #256abf;
-  --seq-700: #0d366b;
-  --div-neg: #d03b3b;
-  --div-mid: #f0efec;
-  --div-pos: #2a78d6;
   --status-good: #087a08;
   --status-warning: #8a5c00;
   --status-serious: #ae4c27;
@@ -58,13 +51,6 @@
   --series-7: #9085e9;
   --series-8: #e66767;
   --deemph: #4a4a47;
-  --seq-100: #184f95;
-  --seq-300: #256abf;
-  --seq-500: #5598e7;
-  --seq-700: #b7d3f6;
-  --div-neg: #e66767;
-  --div-mid: #383835;
-  --div-pos: #3987e5;
   --status-good: #0ca30c;
   --status-warning: #fab219;
   --status-serious: #ec835a;
@@ -98,10 +84,6 @@ body {
 
 .section {
   @apply border-t pt-6;
-  border-color: var(--border);
-}
-
-.hairline {
   border-color: var(--border);
 }
 

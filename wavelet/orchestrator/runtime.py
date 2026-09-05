@@ -639,7 +639,7 @@ def _run_process_launcher(
     return 0
 
 
-def _raise_keyboard_interrupt(signum: int, frame: object) -> None:
+def _raise_keyboard_interrupt(signum: int, _frame: object) -> None:
     # Role processes run in their own sessions, so a SIGTERM to the launcher
     # (systemd, SLURM, ``timeout``) would otherwise orphan every GPU process.
     raise KeyboardInterrupt(f"received signal {signum}")

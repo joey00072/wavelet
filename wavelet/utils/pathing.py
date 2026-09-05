@@ -105,12 +105,6 @@ def write_launch_artifacts(
             shutil.copyfile(source, destination)
 
 
-def resolve_output_dir(base_dir: Path, name: str | None = None) -> Path:
-    if name is not None:
-        return base_dir / name
-    return base_dir
-
-
 def get_config_dir(output_dir: Path) -> Path:
     configs_root = output_dir / "configs"
     latest = configs_root / "latest" / "resolved"

@@ -65,7 +65,6 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
   const rows = usePoll<RolloutRowsResponse>(
     rowsUrl,
     follow && live ? 5000 : 0,
-    [],
     { resourceKey: `${runId}:${step ?? "latest"}` },
   );
   const data = rows.data;
@@ -549,7 +548,6 @@ function RowDetailDrawer({ apiBase, runId, target, onClose, siblings, onOpen }: 
   const detail = usePoll<RowDetail>(
     target ? runUrl(apiBase, runId, `/rollouts/${target.step}/rows/${target.index}`) : null,
     0,
-    [],
     { resourceKey: target ? `${runId}:${target.step}:rollout-detail` : null },
   );
   const row = detail.data;

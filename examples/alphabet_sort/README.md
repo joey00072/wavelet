@@ -99,10 +99,12 @@ local testing, use:
 uv run python -m wavelet rl @ examples/alphabet_sort/rl_fsdp_multi_reward.yaml
 ```
 
-This launches four vLLM replicas on GPUs `0,1,2,3` and a four-rank FSDP trainer
-on GPUs `4,5,6,7`. It uses enforced zero-advantage filtering, 128 rollouts per
-step, packed training, `max_completion_tokens=768`, and `lr=1e-5` for a stable
-multi-GPU alphabet-sort reward run.
+This launches one data-parallel vLLM server with four workers on GPUs `0,1,2,3`
+and a four-rank FSDP trainer on GPUs `4,5,6,7`. Each generation step targets 64
+examples with 8 rollouts each (512 admitted rollouts), with 2x oversampling to
+replace zero-advantage groups. It uses packed training,
+`max_completion_tokens=768`, and `lr=1e-5` for a stable multi-GPU
+alphabet-sort reward run.
 
 The reward recipe also runs verifier evals every 20 exported policy steps and at
 the end of training. Eval metrics are written to `eval_metrics.jsonl`, and raw

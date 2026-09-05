@@ -44,8 +44,9 @@ cd webui && bun run dev --host 0.0.0.0
 
 The UI finds its API automatically. On load it probes, in order, the
 `?api=http://host:port` query parameter, the address remembered from a previous
-visit, the Vite dev default `http://127.0.0.1:8766`, and finally the server that
-served the page, and uses the first one whose `/api/health` answers. A stale
+visit, the Vite dev default at port `8766` on the current browser hostname, and
+finally the server that served the page, and uses the first one whose
+`/api/health` answers. A stale
 address in the URL or in local storage is therefore harmless: opening the
 dashboard's own URL always lands on the current run. `?api=same` forces the
 page's own server; the sidebar field overrides everything for that browser.

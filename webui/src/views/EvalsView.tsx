@@ -125,7 +125,7 @@ function EvalSamples({ apiBase, runId, env, sets, params }: { apiBase: string; r
   const [exampleFilter, setExampleFilter] = useState<"all" | "unsolved" | "partial" | "solved" | "errors">("all");
 
   const url = step !== undefined ? `${runUrl(apiBase, runId, `/evals/${step}/${encodeURIComponent(env)}/rows`)}${qs({ sort: sort.key, order: sort.desc ? "desc" : "asc", offset, limit: PAGE, ...filter })}` : null;
-  const rows = usePoll<EvalRowsResponse>(url, 0, [], {
+  const rows = usePoll<EvalRowsResponse>(url, 0, {
     resourceKey: `${runId}:${env}:${step ?? "none"}`,
   });
   const compareUrl = compareStep !== null ? `${runUrl(apiBase, runId, `/evals/${compareStep}/${encodeURIComponent(env)}/rows`)}?limit=1` : null;
@@ -258,7 +258,6 @@ function EvalDetailDrawer({ apiBase, runId, env, step, index, onClose, examples,
   const detail = usePoll<RowDetail>(
     index !== null && step !== undefined ? runUrl(apiBase, runId, `/evals/${step}/${encodeURIComponent(env)}/rows/${index}`) : null,
     0,
-    [],
     { resourceKey: index !== null && step !== undefined ? `${runId}:${env}:${step}:eval-detail` : null },
   );
   const row = detail.data as (RowDetail & { answer?: unknown; error?: string; metrics?: Record<string, number>; info?: unknown }) | null;

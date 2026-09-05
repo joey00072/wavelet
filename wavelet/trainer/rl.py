@@ -657,10 +657,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             )
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
-    def _estimate_optimizer_batch_loss_scale(self) -> float | None:
-        scales = self._estimate_optimizer_batch_loss_scales()
-        return None if scales is None else scales["rl"]
-
     def _estimate_optimizer_batch_loss_scales(self) -> dict[str, float] | None:
         if self.config.data.num_workers != 0:
             return None
@@ -836,8 +832,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             return TrainOutput(
                 loss=loss_output,
                 stepped=False,
-                step=self.step,
-                micro_step=self._micro_step,
             )
 
         grad_norm = self._apply_optimizer_step()
@@ -847,8 +841,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         return TrainOutput(
             loss=loss_output,
             stepped=True,
-            step=self.step,
-            micro_step=self._micro_step,
             metrics=metrics,
         )
 

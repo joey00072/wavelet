@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-export type Route = {
+type Route = {
   page: "runs" | "run" | "compare";
   runId: string | null;
   view: string;

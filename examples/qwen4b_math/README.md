@@ -7,7 +7,7 @@ It uses:
 
 - `math-env` verifier rollouts
 - AIME 2025 verifier evals every 25 policy steps
-- 64 math examples per step with 8 rollouts each
+- 4 math examples per generation step with 8 rollouts each
 - zero-advantage filtering with 2x oversampling
 - LoRA rank 32 / alpha 64
 - a four-rank FSDP trainer on GPUs `4,5,6,7`
@@ -70,5 +70,5 @@ uv run python -m wavelet rl @ examples/qwen4b_math/rl_int4_2gpu_smoke.yaml
 
 The original 30B recipe uses 32k context, expert parallelism, custom kernels,
 multi-node training, and tensor-parallel inference. This 4B recipe keeps the
-same math/verifier structure but uses 8k context and single-node FSDP settings
-that fit the current Wavelet runtime.
+same 32k math/verifier context but uses single-node FSDP settings that fit the
+current Wavelet runtime.

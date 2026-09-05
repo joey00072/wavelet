@@ -21,7 +21,7 @@ from wavelet.orchestrator.algorithms import (
     score_algorithm_records,
     uses_group_advantages,
 )
-from wavelet.orchestrator.reward import RLRewardScorer
+from wavelet.orchestrator.reward import RLRewardScorer, assistant_text
 from wavelet.orchestrator.schedule import required_policy_step
 from wavelet.transport.queue import (
     FileSystemRolloutSender,
@@ -38,16 +38,6 @@ CustomRolloutFunction = Callable[
 ]
 
 logger = logging.getLogger(__name__)
-
-
-def _assistant_text(messages: list[dict[str, str]] | None) -> str:
-    if messages is None:
-        return ""
-    return "\n".join(
-        str(message.get("content", ""))
-        for message in messages
-        if message.get("role") == "assistant"
-    )
 
 
 class RLOrchestrator:
@@ -434,9 +424,6 @@ class RLOrchestrator:
             group_key=self._group_key,
         )
 
-    def _should_retry_zero_advantage(self, records: list[RLExample]) -> bool:
-        return not self._filter_zero_advantage_records(records)
-
     def _filter_zero_advantage_records(
         self, records: list[RLExample]
     ) -> list[RLExample]:
@@ -459,7 +446,7 @@ class RLOrchestrator:
         dropped_empty = 0
         dropped_untrainable = 0
         for record in records:
-            if not _assistant_text(record.completion).strip():
+            if not assistant_text(record.completion).strip():
                 dropped_empty += 1
                 continue
             if (
@@ -515,13 +502,6 @@ class RLOrchestrator:
             for record in records
             if self._group_key(record) in complete_group_keys
         ]
-
-    def _replace_advantage(
-        self,
-        record: RLExample,
-        advantage: float | None,
-    ) -> RLExample:
-        return replace(record, advantage=advantage)
 
     def _group_key(self, record: RLExample) -> str:
         if record.metadata is not None and "group_key" in record.metadata:

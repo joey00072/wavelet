@@ -433,12 +433,12 @@ def _build_pretrained_model_on_meta(
     return cast(PreTrainedModel, model)
 
 
-def _prepare_quantized_modules(model: PreTrainedModel, config: ModelConfig) -> None:
+def _prepare_quantized_modules(model: PreTrainedModel) -> None:
     compute_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    for module_name in ("embed_tokens", "lm_head", "norm"):
-        for name, module in model.named_modules():
-            if name.endswith(module_name):
-                module.to(compute_dtype)
+    quantized_module_suffixes = ("embed_tokens", "lm_head", "norm")
+    for name, module in model.named_modules():
+        if name.endswith(quantized_module_suffixes):
+            module.to(compute_dtype)
 
 
 def setup_model(
@@ -498,7 +498,7 @@ def setup_model(
         # Embedding and lm_head are NOT 4-bit quantized (full precision), but
         # flash attention expects bfloat16 inputs. Cast them so hidden states
         # start in bfloat16 and the "Casting fp32 inputs" warning disappears.
-        _prepare_quantized_modules(model, config)
+        _prepare_quantized_modules(model)
     if config.fused_lm_head_token_chunk_size != "disabled":
         from wavelet.trainer.losses import maybe_inject_chunked_lm_head
 
@@ -1509,32 +1509,6 @@ def save_lora_adapter_snapshot_from_fsdp(
         is_main_process=is_main_process,
         parallel_dims=parallel_dims,
     )
-
-
-def _save_lora_adapter_snapshot_from_fsdp_full_params(
-    model: FSDP,
-    output_dir: Path,
-    *,
-    is_main_process: bool = True,
-) -> Path:
-    unwrapped = unwrap_model(model)
-    if not isinstance(unwrapped, PeftModel):
-        raise TypeError(
-            "FSDP lightweight policy snapshots require a wrapped PeftModel."
-        )
-    with FSDP.summon_full_params(
-        model,
-        recurse=True,
-        writeback=False,
-        rank0_only=True,
-        offload_to_cpu=True,
-    ):
-        return save_lora_adapter_snapshot(
-            unwrapped,
-            output_dir,
-            state_dict=None,
-            is_main_process=is_main_process,
-        )
 
 
 def _tp_distributed_enabled(parallel_dims: ParallelDims | None) -> bool:

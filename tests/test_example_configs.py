@@ -18,6 +18,11 @@ SFT_CONFIGS = [
     for path in sorted(Path("examples").rglob("*.yaml"))
     if path.name.startswith("sft")
 ]
+EVAL_CONFIGS = [
+    path
+    for path in sorted(Path("examples").rglob("*.yaml"))
+    if path.name.startswith("eval")
+]
 
 
 @pytest.mark.parametrize("path", RL_CONFIGS, ids=str)
@@ -28,6 +33,11 @@ def test_rl_example_config_validates(path: Path) -> None:
 @pytest.mark.parametrize("path", SFT_CONFIGS, ids=str)
 def test_sft_example_config_validates(path: Path) -> None:
     SFTConfig.model_validate(load_yaml(path))
+
+
+@pytest.mark.parametrize("path", EVAL_CONFIGS, ids=str)
+def test_eval_example_config_validates(path: Path) -> None:
+    RLConfig.model_validate(load_yaml(path))
 
 
 def test_wordle_rl_uses_reference_environment_id() -> None:

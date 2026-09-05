@@ -275,7 +275,11 @@ def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch(
 
     monkeypatch.setattr(trainer, "_average_data_parallel_loss_scales", fake_average)
 
-    assert trainer._estimate_optimizer_batch_loss_scale() == 64.0
+    assert trainer._estimate_optimizer_batch_loss_scales() == {
+        "rl": 64.0,
+        "ce": 0.0,
+        "ref_kl": 0.0,
+    }
     assert captured["scales_are_cp_replicated"] is True
 
 
@@ -850,7 +854,9 @@ def test_after_resume_uses_measured_scale_until_dataloader_state_applies() -> No
         return trainer
 
     saved = _trainer()
-    saved._optimizer_batch_loss_scale = saved._estimate_optimizer_batch_loss_scale()
+    saved_scales = saved._estimate_optimizer_batch_loss_scales()
+    assert saved_scales is not None
+    saved._optimizer_batch_loss_scale = saved_scales["rl"]
     assert saved._optimizer_batch_loss_scale == 4.0
     iterator = iter(saved.dataloader)
     next(iterator)
@@ -858,7 +864,9 @@ def test_after_resume_uses_measured_scale_until_dataloader_state_applies() -> No
     state = saved.dataloader.state_dict()
 
     resumed = _trainer()
-    resumed._optimizer_batch_loss_scale = resumed._estimate_optimizer_batch_loss_scale()
+    resumed_scales = resumed._estimate_optimizer_batch_loss_scales()
+    assert resumed_scales is not None
+    resumed._optimizer_batch_loss_scale = resumed_scales["rl"]
     resumed.dataloader.load_state_dict(state)
     # StatefulDataLoader defers dataset state until the next iterator exists,
     # so a static estimate taken here would describe the step-0 batch (4 tokens)
@@ -873,7 +881,9 @@ def test_after_resume_uses_measured_scale_until_dataloader_state_applies() -> No
     assert int(first["loss_mask"].sum()) + int(second["loss_mask"].sum()) == 8
     # After the first resumed optimizer step the cursor has moved and the static
     # estimate describes the following batch again.
-    assert resumed._estimate_optimizer_batch_loss_scale() == 4.0
+    final_scales = resumed._estimate_optimizer_batch_loss_scales()
+    assert final_scales is not None
+    assert final_scales["rl"] == 4.0
 
 
 def test_packed_micro_batch_count_covers_whole_epoch_without_spillover() -> None:

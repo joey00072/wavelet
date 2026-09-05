@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -89,12 +88,6 @@ def discover_runs(roots: list[Path], explicit: list[Path]) -> dict[str, Path]:
             if is_run_dir(child):
                 add(child)
     return found
-
-
-@dataclass(frozen=True, slots=True)
-class RunSummary:
-    id: str
-    path: str
 
 
 class RunArtifacts:
@@ -728,13 +721,6 @@ class RunArtifacts:
             if name and name not in names:
                 names.append(str(name))
         return names
-
-
-def _step_of(row: dict[str, Any], source: str) -> int | float | None:
-    value = row.get("step")
-    if value is None and source == "trainer":
-        value = row.get("progress/step")
-    return _finite(value)
 
 
 def _finite(value: Any) -> int | float | None:

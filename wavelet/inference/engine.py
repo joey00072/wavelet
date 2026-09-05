@@ -762,12 +762,6 @@ import torch
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import RLExample
 from wavelet.data.sft import Example, build_sample
-from wavelet.inference.engine import (
-    extract_vllm_generation_logprobs,
-    extract_vllm_prompt_logprobs,
-    openai_payload_to_vllm_kwargs,
-    vllm_sampling_kwargs,
-)
 from wavelet.inference.policy import PolicyInferenceEngine, RLInference, token_ids
 from wavelet.trainer.model import setup_tokenizer
 from wavelet.utils.monitoring import emit_perf, perf_enabled

@@ -851,28 +851,6 @@ def _coerce_sampling_mask(
     return [[int(token_id) for token_id in ids] for ids in value[:num_trainable_tokens]]
 
 
-def _trim_loss_mask_to_sequence(
-    loss_mask: list[bool],
-    sequence: list[float] | None,
-) -> list[bool]:
-    if sequence is None:
-        return loss_mask
-    trainable_count = sum(loss_mask)
-    if len(sequence) >= trainable_count:
-        return loss_mask
-
-    to_mask = trainable_count - len(sequence)
-    trimmed = list(loss_mask)
-    for index in range(len(trimmed) - 1, -1, -1):
-        if not trimmed[index]:
-            continue
-        trimmed[index] = False
-        to_mask -= 1
-        if to_mask == 0:
-            break
-    return trimmed
-
-
 def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
     if (
         record.input_ids is None

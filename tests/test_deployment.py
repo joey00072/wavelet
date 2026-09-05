@@ -19,4 +19,4 @@ def test_dockerfile_builds_locked_cuda_runtime_as_non_root() -> None:
 def test_docker_context_excludes_secrets_artifacts_and_references() -> None:
     ignored = set(Path(".dockerignore").read_text(encoding="utf-8").splitlines())
 
-    assert {".env", ".env.*", "ref", "outputs", "wandb", "todo_doc.md"} <= ignored
+    assert {".env", ".env.*", "ref", "outputs", "wandb"} <= ignored

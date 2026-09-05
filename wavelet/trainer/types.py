@@ -19,7 +19,4 @@ class TrainOutput:
 
     loss: LossOutput
     stepped: bool
-    step: int
-    micro_step: int
     metrics: dict[str, float] = field(default_factory=dict)
-    skipped: bool = False

@@ -10,10 +10,10 @@ RL on `open-r1/DAPO-Math-17k-Processed` with the same custom tags:
 - `<SOLUTION>`
 - `</SOLUTION>`
 
-The configs are intentionally short-run defaults:
+The configs provide bounded example runs:
 
-- SFT: 20 steps, `2e-5` learning rate
-- RL: 20 steps, `5e-6` learning rate
+- SFT: 100 steps, `3e-5` learning rate
+- RL: 1,000 steps, `6e-5` learning rate
 
 Prepare data:
 

@@ -55,6 +55,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.diagnostics import inference_debug_state
+from wavelet.inference.engine import sampling_mask_required
 from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf
 
@@ -1268,13 +1269,7 @@ def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--trust-remote-code")
     if config.model.chat_template is not None:
         argv.extend(["--chat-template", config.model.chat_template])
-    return_sampling_mask = vllm_config.return_sampling_mask
-    if return_sampling_mask is None:
-        return_sampling_mask = any(
-            sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
-            for _, sampling in config.train_sampling_configs()
-        )
-    if return_sampling_mask:
+    if sampling_mask_required(config):
         argv.append("--return-sampling-mask")
     hf_overrides = {}
     if vllm_config.enable_fp32_lm_head:

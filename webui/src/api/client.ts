@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const STORAGE_KEY = "wavelet.apiBase";
 
@@ -94,10 +94,9 @@ export type PollState<T> = {
   loading: boolean;
   refetching: boolean;
   updatedAt: string | null;
-  refresh: () => void;
 };
 
-export type PollOptions = {
+type PollOptions = {
   /**
    * Stable identity for the resource behind a URL. Query-only changes with the
    * same key retain the current payload while the replacement is fetched.
@@ -109,13 +108,12 @@ export type PollOptions = {
  * Polls a URL. Pass a stable `resourceKey` to retain the previous payload
  * across query-only URL changes, or pass `null` as the URL to disable.
  */
-export function usePoll<T>(url: string | null, intervalMs: number, deps: unknown[] = [], options: PollOptions = {}): PollState<T> {
+export function usePoll<T>(url: string | null, intervalMs: number, options: PollOptions = {}): PollState<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(url !== null);
   const [refetching, setRefetching] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
   const lastUrl = useRef<string | null>(null);
   const lastResourceKey = useRef<string | null>(null);
   const resourceKey = options.resourceKey === undefined ? url : options.resourceKey;
@@ -174,10 +172,9 @@ export function usePoll<T>(url: string | null, intervalMs: number, deps: unknown
       if (timer !== undefined) window.clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url, intervalMs, tick, resourceKey, ...deps]);
+  }, [url, intervalMs, resourceKey]);
 
-  const refresh = useCallback(() => setTick((value) => value + 1), []);
-  return { data, error, loading, refetching, updatedAt, refresh };
+  return { data, error, loading, refetching, updatedAt };
 }
 
 export function runUrl(apiBase: string, runId: string, path: string): string {

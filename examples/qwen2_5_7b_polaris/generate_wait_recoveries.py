@@ -40,7 +40,6 @@ class ContinuationPrefix:
     source_id: str
     question: str
     reference_answer: str
-    source_completion: str
     cut_character_index: int
     cut_separator: str
     recovery_phrase: str
@@ -125,7 +124,6 @@ def build_midpoint_prefixes(
                     source_id=str(row["id"]),
                     question=str(row["question"]),
                     reference_answer=str(row["reference_answer"]),
-                    source_completion=str(row["completion"]),
                     cut_character_index=cut_character_index,
                     cut_separator=cut_separator,
                     recovery_phrase=phrase,

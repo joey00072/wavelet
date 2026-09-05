@@ -25,7 +25,6 @@ webui/dist
 *.pth
 *.safetensors
 *.ckpt
-todo_doc.md
 goal.md
 plan.md
 progress.md

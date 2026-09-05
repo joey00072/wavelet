@@ -191,9 +191,6 @@ def tail_events(events_dir: Path, *, limit: int) -> tuple[list[QueueEvent], int]
     return events, parse_errors
 
 
-logger = logging.getLogger(__name__)
-
-
 RecordT = TypeVar("RecordT")
 
 
@@ -295,11 +292,8 @@ def prune_consumed_rollout_batches(
 
     consumed: list[tuple[int, Path]] = []
     for candidate in queue_dir.iterdir():
-        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
-            continue
-        try:
-            step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
-        except ValueError:
+        step = parse_step(candidate)
+        if step is None:
             continue
         if (candidate / CONSUMED_FILENAME).exists():
             consumed.append((step, candidate))
@@ -481,9 +475,6 @@ def _read_record(path: Path, record_type: type[RecordT]) -> RecordT | None:
     if not isinstance(row, dict):
         raise TypeError(f"Expected object in {path}.")
     return record_type(**row)
-
-
-logger = logging.getLogger(__name__)
 
 
 _COPY_CHUNK_BYTES = 1024 * 1024

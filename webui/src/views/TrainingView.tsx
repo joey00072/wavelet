@@ -35,7 +35,7 @@ const ORCH_PRESETS: Record<string, string[]> = {
   data: ["generation/data/cursor", "generation/data/epoch", "progress/samples", "progress/tokens"],
 };
 
-export type ChartSettings = { xAxis: "step" | "time"; smoothing: number; logScale: boolean; window: number; columns: number; overlay: boolean };
+type ChartSettings = { xAxis: "step" | "time"; smoothing: number; logScale: boolean; window: number; columns: number; overlay: boolean };
 const DEFAULT_SETTINGS: ChartSettings = { xAxis: "step", smoothing: 0, logScale: false, window: 0, columns: 3, overlay: false };
 
 export function useChartSettings(storageKey: string): [ChartSettings, (patch: Partial<ChartSettings>) => void] {

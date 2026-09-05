@@ -271,10 +271,6 @@ class World:
     def is_main(self) -> bool:
         return self.rank == 0
 
-    @property
-    def is_local_main(self) -> bool:
-        return self.local_rank == 0
-
 
 _world: World | None = None
 

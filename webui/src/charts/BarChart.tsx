@@ -5,7 +5,7 @@ import { fmt, fmtAxis } from "../lib/format";
 import { seriesColor } from "../lib/theme";
 import { useMeasure } from "./useMeasure";
 
-export type BarCategory = { label: string; x?: number; values: number[] };
+type BarCategory = { label: string; x?: number; values: number[] };
 
 /**
  * Stacked/grouped column chart. `seriesLabels` names each stack layer in fixed

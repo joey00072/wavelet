@@ -516,9 +516,6 @@ class BaseTrainer:
         self.tokenizer = setup_tokenizer(self.config.model)
 
     def _setup_model(self) -> None:
-        self._setup_model_standard()
-
-    def _setup_model_standard(self) -> None:
         from wavelet.trainer.model import (
             apply_liger_kernel,
             apply_lora,
@@ -1254,8 +1251,6 @@ class SFTTrainer(BaseTrainer):
             return TrainOutput(
                 loss=loss_output,
                 stepped=True,
-                step=self.step,
-                micro_step=self._micro_step,
                 metrics={
                     "loss": float(loss.detach().item()),
                     **moe_metrics,
@@ -1266,8 +1261,6 @@ class SFTTrainer(BaseTrainer):
         return TrainOutput(
             loss=loss_output,
             stepped=False,
-            step=self.step,
-            micro_step=self._micro_step,
         )
 
     def _aggregate_sft_moe_metrics(self) -> dict[str, float]:

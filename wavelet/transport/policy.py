@@ -32,10 +32,10 @@ from wavelet.trainer.distributed import barrier
 from wavelet.transport.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
-    STEP_DIR_PREFIX,
     QueueEvent,
     append_event_best_effort,
     get_policy_step_dir,
+    parse_step,
     resolve_policy_dir,
     utc_now,
 )
@@ -57,11 +57,8 @@ def prune_policy_snapshots(policy_dir: Path, *, keep_last: int | None) -> list[P
 
     snapshots: list[tuple[int, Path]] = []
     for candidate in policy_dir.iterdir():
-        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
-            continue
-        try:
-            step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
-        except ValueError:
+        step = parse_step(candidate)
+        if step is None:
             continue
         if (candidate / STABLE_BATCH_MARKER).exists():
             snapshots.append((step, candidate))
@@ -79,11 +76,8 @@ def prune_policy_snapshots_beyond(policy_dir: Path, *, step: int) -> list[Path]:
         return []
     removed: list[Path] = []
     for candidate in policy_dir.iterdir():
-        if not candidate.is_dir() or not candidate.name.startswith(STEP_DIR_PREFIX):
-            continue
-        try:
-            candidate_step = int(candidate.name.removeprefix(STEP_DIR_PREFIX))
-        except ValueError:
+        candidate_step = parse_step(candidate)
+        if candidate_step is None:
             continue
         if candidate_step > step:
             shutil.rmtree(candidate)

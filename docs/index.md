@@ -63,7 +63,7 @@ rows should match because the example uses a fixed seed.
 For a math SFT-to-RL path:
 
 ```bash
-uv run python examples/unsloth_math/prepare_sft_data.py
+uv run python examples/unsloth_math/prepare_data.py
 uv run python -m wavelet sft @ examples/unsloth_math/sft.yaml
 uv run python -m wavelet rl @ examples/unsloth_math/rl.yaml
 ```
@@ -206,8 +206,8 @@ git diff --check
 For code changes, run a targeted test for the changed behavior, then:
 
 ```bash
-uvx ruff check wavelet tests
-uvx ruff format --check wavelet tests
+uv run ruff check wavelet tests
+uv run ruff format --check wavelet tests
 git diff --check
 ```
 

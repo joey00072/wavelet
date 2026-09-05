@@ -14,7 +14,7 @@ _NUMBER_RE = re.compile(
 )
 
 
-def _assistant_text(messages: list[dict[str, str]] | None) -> str:
+def assistant_text(messages: list[dict[str, str]] | None) -> str:
     if messages is None:
         return ""
     parts = [
@@ -81,12 +81,12 @@ class RLRewardScorer:
             return self._postprocess(float(record.reward))
 
         if self.config.mode == "reference_match":
-            expected = _assistant_text(record.target_completion)
+            expected = assistant_text(record.target_completion)
             if not expected:
                 raise ValueError(
                     "reward.mode='reference_match' requires a target assistant completion."
                 )
-            actual = _assistant_text(record.completion)
+            actual = assistant_text(record.completion)
             score = 1.0 if self._normalize(actual) == self._normalize(expected) else 0.0
             return self._postprocess(score)
 
@@ -115,8 +115,8 @@ class RLRewardScorer:
         return text
 
     def _score_math_format(self, record: RLExample) -> float:
-        response = _assistant_text(record.completion)
-        expected = self._normalize(_assistant_text(record.target_completion))
+        response = assistant_text(record.completion)
+        expected = self._normalize(assistant_text(record.target_completion))
         if not expected:
             raise ValueError(
                 "reward.mode='math_format' requires target_completion/completion "

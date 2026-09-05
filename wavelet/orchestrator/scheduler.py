@@ -162,7 +162,11 @@ from wavelet.orchestrator.envs import (
     evaluate_env_async as evaluate_env_async,
 )
 from wavelet.orchestrator.schedule import rollout_chunk_examples
-from wavelet.orchestrator.sources import RolloutSourceKind, source_kind
+from wavelet.orchestrator.sources import (
+    VERIFIER_ROLLOUT_FUNCTION,
+    RolloutSourceKind,
+    source_kind,
+)
 
 
 class PublishMode(StrEnum):
@@ -1875,7 +1879,11 @@ from wavelet.inference.policy import create_policy_inference_engine
 from wavelet.orchestrator.metrics import log_eval_metrics, log_rollout_metrics
 from wavelet.orchestrator.periodic_logger import PeriodicLogger, pipeline_status
 from wavelet.orchestrator.policy_metadata import policy_metadata
-from wavelet.orchestrator.rollouts import RLOrchestrator, _reusable_rollout_batch
+from wavelet.orchestrator.rollouts import (
+    RLOrchestrator,
+    _count_nonempty_lines,
+    _reusable_rollout_batch,
+)
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
 )
@@ -1915,10 +1923,7 @@ from wavelet.utils.monitoring import emit_perf
 
 
 def _preload_rollout_resources(config: RLConfig) -> None:
-    if (
-        config.orchestrator.custom_rollout_function
-        != "wavelet.orchestrator.verifiers:generate_rollouts"
-    ):
+    if config.orchestrator.custom_rollout_function != VERIFIER_ROLLOUT_FUNCTION:
         return
     try:
         import verifiers as vf
@@ -2970,11 +2975,7 @@ class _VerifierPublisherStrategy:
         )
 
         materialize_started_at = perf_counter()
-        materialized_path = _write_materialized_records(
-            self.orchestrator,
-            records,
-            step=queue_step,
-        )
+        materialized_path = self.orchestrator._write_records(records, step=queue_step)
         materialize_seconds = perf_counter() - materialize_started_at
         publish_started_at = perf_counter()
         environment_cursors, environment_selection_cursor = (
@@ -3198,8 +3199,6 @@ async def _run_verifier_scheduler(
     start_step: int = 0,
     state: OrchestratorRunState | None = None,
 ) -> int:
-    from wavelet.orchestrator.scheduler import VerifierRolloutScheduler
-
     examples_per_step = config.orchestrator.examples_per_step
     token_batch_size = config.orchestrator.token_batch_size
     if examples_per_step is None and token_batch_size is None:
@@ -3529,30 +3528,6 @@ def _resume_curriculum_state(
     return {name: dict(state) for name, state in states.items()}
 
 
-def _write_materialized_records(
-    orchestrator: RLOrchestrator,
-    records: list[RLExample],
-    *,
-    step: int,
-) -> Path:
-    if not records:
-        raise RuntimeError(
-            "Rolling verifier scheduler produced no trainable rollout records."
-        )
-    output_path = orchestrator._resolve_output_path(step=step)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists() and not orchestrator.config.orchestrator.overwrite:
-        raise FileExistsError(
-            f"Rollout file '{output_path}' already exists and overwrite is disabled."
-        )
-    with output_path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            if record.temperatures is None:
-                raise ValueError("Rollout record is missing temperatures.")
-            handle.write(json.dumps(orchestrator._serialize_record(record)) + "\n")
-    return output_path
-
-
 def _publish_step(
     orchestrator: RLOrchestrator,
     rollout_sender: FileSystemRolloutSender,
@@ -3641,11 +3616,6 @@ def _time_materialize_and_publish(
         extra_metrics=orchestrator.consume_rollout_metrics(),
     )
     return step, batch, materialize_seconds, publish_seconds
-
-
-def _count_nonempty_lines(path: Path) -> int:
-    with path.open("r", encoding="utf-8") as handle:
-        return sum(1 for line in handle if line.strip())
 
 
 def _run_final_evals(
@@ -3752,30 +3722,6 @@ def _maybe_run_evals(
     )
 
 
-async def _maybe_run_evals_async(
-    config: RLConfig,
-    orchestrator: RLOrchestrator,
-    *,
-    policy_step: int,
-    rollout_step: int,
-    last_eval_steps: dict[str, int],
-    inference_engine: object | None = None,
-) -> None:
-    envs = select_due_eval_envs(
-        config,
-        policy_step=policy_step,
-        last_eval_steps=last_eval_steps,
-    )
-    await _run_evals_async(
-        config,
-        orchestrator,
-        policy_step=policy_step,
-        rollout_step=rollout_step,
-        envs=envs,
-        inference_engine=inference_engine,
-    )
-
-
 def _run_evals(
     config: RLConfig,
     orchestrator: RLOrchestrator,
@@ -3842,10 +3788,7 @@ async def _run_evals_async(
 
 
 def _validate_eval_supported(config: RLConfig) -> None:
-    if (
-        config.orchestrator.custom_rollout_function
-        != "wavelet.orchestrator.verifiers:generate_rollouts"
-    ):
+    if config.orchestrator.custom_rollout_function != VERIFIER_ROLLOUT_FUNCTION:
         raise ValueError("RL eval is currently supported for verifier rollouts only.")
 
 

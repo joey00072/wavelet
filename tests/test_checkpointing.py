@@ -15,8 +15,12 @@ from wavelet.trainer.trainer import BaseTrainer
 from wavelet.utils.pathing import STABLE_CHECKPOINT_MARKER
 
 
+@pytest.mark.parametrize(
+    ("mode", "use_pinned_memory"),
+    [("async", False), ("async_with_pinned_mem", True)],
+)
 def test_async_checkpoint_uses_threads_without_shared_memory(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, mode: str, use_pinned_memory: bool
 ) -> None:
     model = torch.nn.Linear(2, 2)
     optimizer = torch.optim.AdamW(model.parameters())
@@ -31,7 +35,7 @@ def test_async_checkpoint_uses_threads_without_shared_memory(
         model,
         optimizer,
         None,
-        CheckpointConfig(mode="async", interval=1),
+        CheckpointConfig(mode=mode, interval=1),
         tmp_path,
         world,
     )
@@ -43,13 +47,21 @@ def test_async_checkpoint_uses_threads_without_shared_memory(
         response.set_result(None)
         return response
 
+    def build_stager(options):
+        stager = Mock()
+        stager._config = options
+        return stager
+
     monkeypatch.setattr("wavelet.trainer.ckpt.dcp.async_save", async_save)
+    monkeypatch.setattr("wavelet.trainer.ckpt.DefaultStager", build_stager)
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
 
     assert manager.save(TrainerState(step=1, micro_step=1))
     manager.wait_for_pending_save()
 
     assert str(captured["async_checkpointer_type"].value) == "thread"
     assert captured["async_stager"]._config.use_shared_memory is False
+    assert captured["async_stager"]._config.use_pinned_memory is use_pinned_memory
 
 
 def test_forced_checkpoint_saves_step_between_intervals(monkeypatch, tmp_path) -> None:

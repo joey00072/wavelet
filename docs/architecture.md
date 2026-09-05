@@ -20,8 +20,8 @@ filesystem artifacts carry state between independently restartable processes.
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
 | `wavelet.utils` | Configuration loading and path helpers |
 
-Entrypoints contain no runtime behavior. A new command belongs in
-`wavelet.entrypoints`, while its configuration, lifecycle, and reusable
+Entrypoints own argument parsing and process startup. A new command belongs in
+`wavelet.entrypoints`, while reusable configuration, lifecycle, and runtime
 behavior belong to the subsystem it invokes. Shared rollout scheduling lives in
 `wavelet.orchestrator.scheduler`, verifier clients and evaluation in
 `wavelet.orchestrator.envs`, inference serving in `wavelet.inference.server`,
@@ -328,6 +328,6 @@ Run the repository maintainability check alongside ordinary lint when changing
 control flow:
 
 ```bash
-uvx ruff check wavelet \
+uv run ruff check wavelet \
   --select C901,PLR0911,PLR0912,PLR0915
 ```

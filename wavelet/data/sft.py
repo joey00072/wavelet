@@ -28,12 +28,6 @@ class Example:
     source: str = "dataset"
 
 
-class Stats(TypedDict):
-    samples: dict[str, int]
-    tokens: dict[str, int]
-    skipped: int
-
-
 def _coerce_messages(value: Any, role: str | None) -> list[dict[str, str]]:
     if isinstance(value, str):
         if role is None:
@@ -713,13 +707,6 @@ def collate_batch(
     if include_attention_mask:
         batch_out["attention_mask"] = torch.stack(attention_mask_out)
     return batch_out
-
-
-class Batch(TypedDict):
-    input_ids: Tensor
-    attention_mask: Tensor
-    position_ids: Tensor
-    labels: Tensor
 
 
 @dataclass

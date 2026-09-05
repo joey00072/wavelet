@@ -34,7 +34,6 @@ from wavelet.utils.pathing import (
     get_checkpoint_dir,
     is_stable_checkpoint,
     list_checkpoint_steps,
-    resolve_resume_checkpoint,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,9 +117,6 @@ class CheckpointManager:
         self.world = world
         self.pending_save: PendingAsyncSave | None = None
 
-    def resolve_resume_checkpoint(self, resume_step: int) -> Path:
-        return resolve_resume_checkpoint(self.output_dir, resume_step)
-
     def save(
         self,
         trainer_state: TrainerState,
@@ -130,9 +126,9 @@ class CheckpointManager:
     ) -> bool:
         if self.config is None or self.config.mode == "disabled":
             return False
-        if self.config.interval is None:
-            return False
-        if not force and trainer_state.step % self.config.interval != 0:
+        interval = self.config.interval
+        assert interval is not None
+        if not force and trainer_state.step % interval != 0:
             return False
 
         checkpoint_dir = get_checkpoint_dir(self.output_dir, trainer_state.step)
@@ -156,51 +152,24 @@ class CheckpointManager:
         state_dict = {"app": AppState(self.model, self.optimizer, self.scheduler)}
         no_dist = not torch.distributed.is_initialized()
 
-        if self.config.mode == "async":
-            stager = self._build_async_stager(use_pinned_memory=False)
-            response = dcp.async_save(
-                state_dict=state_dict,
-                storage_writer=writer,
-                async_checkpointer_type=AsyncCheckpointerType.THREAD,
-                async_stager=stager,
-                no_dist=no_dist,
-            )
-            self.pending_save = PendingAsyncSave(
-                step=trainer_state.step,
-                checkpoint_dir=checkpoint_dir,
-                meta=meta,
-                response=response,
-                stager=stager,
-            )
-            self._wait_for_staging(response)
-            return True
-
-        if self.config.mode == "async_with_pinned_mem":
-            stager = self._build_async_stager(use_pinned_memory=True)
-            response = dcp.async_save(
-                state_dict=state_dict,
-                storage_writer=writer,
-                async_checkpointer_type=AsyncCheckpointerType.THREAD,
-                async_stager=stager,
-                no_dist=no_dist,
-            )
-            self.pending_save = PendingAsyncSave(
-                step=trainer_state.step,
-                checkpoint_dir=checkpoint_dir,
-                meta=meta,
-                response=response,
-                stager=stager,
-            )
-            self._wait_for_staging(response)
-            return True
-
-        dcp.save(
+        stager = self._build_async_stager(
+            use_pinned_memory=self.config.mode == "async_with_pinned_mem"
+        )
+        response = dcp.async_save(
             state_dict=state_dict,
             storage_writer=writer,
+            async_checkpointer_type=AsyncCheckpointerType.THREAD,
+            async_stager=stager,
             no_dist=no_dist,
         )
-        self._finalize_checkpoint(checkpoint_dir, meta)
-        self._maybe_clean()
+        self.pending_save = PendingAsyncSave(
+            step=trainer_state.step,
+            checkpoint_dir=checkpoint_dir,
+            meta=meta,
+            response=response,
+            stager=stager,
+        )
+        self._wait_for_staging(response)
         return True
 
     def load(
@@ -347,11 +316,7 @@ class CheckpointManager:
         self._barrier_if_distributed()
 
     def _maybe_clean(self) -> None:
-        if (
-            self.config is None
-            or self.config.keep_last is None
-            or self.config.keep_last < 1
-        ):
+        if self.config is None:
             return
         if not self.world.is_main:
             return
