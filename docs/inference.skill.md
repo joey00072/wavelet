@@ -95,6 +95,8 @@ Use the configured `inference.http.host` and `inference.http.port` or the full
 - `records_with_inference_logprobs`: should equal `records` for RL generation.
 - vLLM `logprobs_mode` must be `processed_logprobs` so behavior logprobs and
   trainer replay use the same temperature-adjusted sampling distribution.
+- The resolved serve command must include `--return-sampling-mask` for training
+  rollouts that use `top_p`, `top_k`, or `min_p`.
 - `tool_call_parser` and `reasoning_parser` default to `auto`; inspect the
   resolved server command for known model-family mappings. An explicit value
   overrides auto-detection and `null` disables the parser.

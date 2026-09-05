@@ -535,6 +535,7 @@ class RLDataConfig(TrainingDataConfig):
     reward_column: str = "reward"
     inference_logprobs_column: str = "inference_logprobs"
     teacher_logprobs_column: str = "teacher_logprobs"
+    sampling_mask_column: str = "sampling_mask"
     temperature_column: str = "temperature"
     ce_weight_column: str = "ce_weight"
     ref_kl_weight_column: str = "ref_kl_weight"
@@ -804,6 +805,7 @@ _MANAGED_VLLM_ARGS = frozenset(
         "port",
         "quantization",
         "reasoning_parser",
+        "return_sampling_mask",
         "tensor_parallel_size",
         "tool_call_parser",
         "trust_remote_code",
@@ -838,6 +840,7 @@ class RLVLLMConfig(ConfigModel):
         description="Request fp32 MoE router logits through Hugging Face overrides.",
     )
     use_generation_logprobs: bool = True
+    return_sampling_mask: bool | None = None
     openai_batch_wait_seconds: float = Field(default=0.01, ge=0.0)
     openai_batch_min_size: int = Field(default=1, ge=1)
     openai_batch_max_wait_seconds: float = Field(default=0.01, ge=0.0)
@@ -1736,13 +1739,18 @@ class RLConfig(TrainerConfig):
             "top_p",
         }
         for env_name, sampling in self.train_sampling_configs():
+            requires_sampling_mask = (
+                sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
+            )
+            if (
+                requires_sampling_mask
+                and self.inference.vllm.return_sampling_mask is False
+            ):
+                raise ValueError(
+                    "RL train sampling with top_p, top_k, or min_p requires "
+                    "inference.vllm.return_sampling_mask=true."
+                )
             unsupported: list[str] = []
-            if sampling.top_p < 1.0:
-                unsupported.append("top_p")
-            if sampling.top_k > 0:
-                unsupported.append("top_k")
-            if sampling.min_p > 0.0:
-                unsupported.append("min_p")
             if sampling.min_tokens > 0:
                 unsupported.append("min_tokens")
             if sampling.repetition_penalty != 1.0:
@@ -1756,10 +1764,9 @@ class RLConfig(TrainerConfig):
                 raise ValueError(
                     f"RL train sampling for '{env_name}' changes the token "
                     f"distribution with {fields}, but Wavelet does not yet replay "
-                    "those transforms in the trainer. Use top_p=1, top_k=-1, "
-                    "min_p=0, min_tokens=0, repetition_penalty=1, and keep "
-                    "distribution controls out of extra_body for correct "
-                    "importance ratios."
+                    "those transforms in the trainer. Use min_tokens=0 and "
+                    "repetition_penalty=1, and keep other distribution controls "
+                    "out of extra_body for correct importance ratios."
                 )
         return self
 

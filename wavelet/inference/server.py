@@ -373,9 +373,17 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 mm_token_counts=mm_token_counts,
             )
         try:
-            return await self.chat_completion_full_generator(
+            final_output = None
+
+            async def capture_output():
+                nonlocal final_output
+                async for output in result_generator:
+                    final_output = output
+                    yield output
+
+            response = await self.chat_completion_full_generator(
                 request,
-                result_generator,
+                capture_output(),
                 request_id,
                 model_name,
                 conversation,
@@ -384,6 +392,19 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 parser=output_parser,
                 mm_token_counts=mm_token_counts,
             )
+            if isinstance(response, ErrorResponse) or final_output is None:
+                return response
+            choices = response.model_dump(mode="json").get("choices", [])
+            for choice, output in zip(choices, final_output.outputs, strict=False):
+                sampling_mask = getattr(output, "sampling_mask", None)
+                sampling_mask = getattr(sampling_mask, "token_ids", sampling_mask)
+                if sampling_mask is not None:
+                    choice["sampling_mask"] = [list(row) for row in sampling_mask]
+            if not any("sampling_mask" in choice for choice in choices):
+                return response
+            payload = response.model_dump(mode="json")
+            payload["choices"] = choices
+            return JSONResponse(content=payload)
         except GenerationError:
             raise
         except ValueError as exc:
@@ -1245,6 +1266,14 @@ def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--trust-remote-code")
     if config.model.chat_template is not None:
         argv.extend(["--chat-template", config.model.chat_template])
+    return_sampling_mask = vllm_config.return_sampling_mask
+    if return_sampling_mask is None:
+        return_sampling_mask = any(
+            sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
+            for _, sampling in config.train_sampling_configs()
+        )
+    if return_sampling_mask:
+        argv.append("--return-sampling-mask")
     hf_overrides = {}
     if vllm_config.enable_fp32_lm_head:
         hf_overrides["head_dtype"] = "float32"

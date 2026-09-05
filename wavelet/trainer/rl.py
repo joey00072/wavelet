@@ -40,6 +40,7 @@ from wavelet.trainer.losses import (
     compute_loss,
     normalization_unit_count,
     selective_log_softmax,
+    selective_log_softmax_with_sampling_mask,
     setup_rl_loss_fn,
 )
 from wavelet.trainer.model import is_fsdp_model, sync_hf_tp_lora_replicated_grads
@@ -63,6 +64,18 @@ from wavelet.utils.config import load_config
 from wavelet.utils.monitoring import emit_perf, setup_config_logger
 
 logger = logging.getLogger(__name__)
+
+
+def _sampling_mask_required(config: RLConfig) -> bool:
+    configured = config.inference.vllm.return_sampling_mask
+    if configured is not None:
+        return configured
+    return any(
+        sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
+        for _, sampling in config.train_sampling_configs()
+    )
+
+
 SUM_SYNCED_METRIC_KEYS = {
     "rollout/count",
     "micro_batch/count",
@@ -1062,9 +1075,33 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             "attention_mask": attention_mask,
             "position_ids": batch["position_ids"],
         }
+        loss_mask = batch.get(
+            "loss_mask",
+            torch.ones_like(batch["target_ids"], dtype=torch.bool),
+        )
+        sampling_mask_ids = batch.get("sampling_mask_ids")
+        sampling_mask_lengths = batch.get("sampling_mask_lengths")
+        if sampling_mask_lengths is None:
+            sampling_mask_lengths = loss_mask.new_zeros(
+                loss_mask.shape, dtype=torch.long
+            )
+        if sampling_mask_ids is None:
+            sampling_mask_ids = loss_mask.new_zeros(
+                (*loss_mask.shape, 0), dtype=torch.long
+            )
+        if _sampling_mask_required(self.config):
+            missing_masks = loss_mask.bool() & (sampling_mask_lengths == 0)
+            if missing_masks.any():
+                raise RuntimeError(
+                    "Sampling-mask replay is required, but a trainable token "
+                    "has no sampling mask."
+                )
+        has_sampling_mask = sampling_mask_lengths.any()
         if self.config.model.fused_lm_head_token_chunk_size != "disabled":
             model_kwargs["labels"] = batch["target_ids"]
             model_kwargs["temperature"] = batch["temperatures"]
+            model_kwargs["sampling_mask_ids"] = sampling_mask_ids
+            model_kwargs["sampling_mask_lengths"] = sampling_mask_lengths
 
         with self._model_forward_context():
             outputs = self.model(**model_kwargs)
@@ -1074,6 +1111,11 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             token_mask=attention_mask,
         )
         if isinstance(outputs, dict) and outputs.get("logprobs") is not None:
+            if has_sampling_mask:
+                raise RuntimeError(
+                    "Sampling-mask replay requires model logits, but the model "
+                    "returned precomputed logprobs."
+                )
             entropy = outputs.get("entropy") if include_entropy else None
             return (
                 outputs["logprobs"].float().contiguous(),
@@ -1082,10 +1124,19 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             )
         logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
         scaled_logits = logits.float() / batch["temperatures"].float().unsqueeze(-1)
-        entropy = compute_entropy(scaled_logits) if include_entropy else None
+        if has_sampling_mask:
+            logprobs, entropy = selective_log_softmax_with_sampling_mask(
+                scaled_logits,
+                batch["target_ids"],
+                sampling_mask_ids,
+                sampling_mask_lengths,
+            )
+        else:
+            logprobs = selective_log_softmax(scaled_logits, batch["target_ids"])
+            entropy = compute_entropy(scaled_logits) if include_entropy else None
         return (
-            selective_log_softmax(scaled_logits, batch["target_ids"]),
-            entropy,
+            logprobs,
+            entropy if include_entropy else None,
             moe_metrics,
         )
 

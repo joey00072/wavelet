@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference.vllm import VLLMPolicyInferenceEngine, _OpenAIBatchRequest
 
@@ -128,6 +130,38 @@ def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
     assert captured_kwargs["fully_sharded_loras"] is True
     assert captured_kwargs["max_lora_rank"] == 32
     assert captured_kwargs["logprobs_mode"] == "processed_logprobs"
+
+
+@pytest.mark.parametrize(
+    ("sampling", "vllm", "expected"),
+    [
+        ({}, {}, False),
+        ({"top_p": 0.9}, {}, True),
+        ({}, {"return_sampling_mask": True}, True),
+    ],
+)
+def test_vllm_setup_passes_sampling_mask_flag(
+    monkeypatch,
+    sampling: dict[str, object],
+    vllm: dict[str, object],
+    expected: bool,
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+    vllm_module = ModuleType("vllm")
+
+    class FakeLLM:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    vllm_module.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setattr("wavelet.inference.vllm.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
+
+    config = RLConfig(inference={"sampling": sampling, "vllm": vllm})
+    VLLMPolicyInferenceEngine(config).setup()
+
+    assert captured_kwargs["return_sampling_mask"] is expected
 
 
 def test_vllm_setup_passes_quantized_load_args(monkeypatch) -> None:

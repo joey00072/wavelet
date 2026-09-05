@@ -538,6 +538,19 @@ def test_inference_server_returns_sampling_distribution_logprobs() -> None:
     argv = _serve_argv(RLConfig())
 
     assert _argv_value(argv, "--logprobs-mode") == "processed_logprobs"
+    assert "--return-sampling-mask" not in argv
+
+
+def test_inference_server_auto_enables_sampling_masks_for_truncated_support() -> None:
+    config = RLConfig(inference={"sampling": {"top_p": 0.9}})
+
+    assert "--return-sampling-mask" in _serve_argv(config)
+
+
+def test_inference_server_allows_explicit_sampling_mask_opt_in() -> None:
+    config = RLConfig(inference={"vllm": {"return_sampling_mask": True}})
+
+    assert "--return-sampling-mask" in _serve_argv(config)
 
 
 def test_inference_server_uses_cuda_graphs_by_default() -> None:
@@ -1201,6 +1214,7 @@ def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
                             {"logprob": -0.2},
                         ]
                     },
+                    "sampling_mask": [[12, 14], [13, 15]],
                 }
             ]
         },
@@ -1212,6 +1226,37 @@ def test_http_openai_response_converts_to_pretokenized_rollout() -> None:
     assert converted.target_ids == [11, 12, 13]
     assert converted.loss_mask == [False, True, True]
     assert converted.inference_logprobs == [-0.1, -0.2]
+    assert converted.sampling_mask == [[12, 14], [13, 15]]
+
+
+def test_http_openai_response_requires_sampling_mask_for_restricted_support() -> None:
+    engine = HTTPPolicyInferenceEngine(RLConfig(inference={"sampling": {"top_k": 20}}))
+    record = RLExample(
+        prompt=[{"role": "user", "content": "x"}],
+        completion=[{"role": "assistant", "content": "expected"}],
+        reward=None,
+        advantage=0.5,
+    )
+
+    with pytest.raises(RuntimeError, match="did not include sampling_mask"):
+        engine._record_from_openai_response(
+            record,
+            prompt_ids=[10, 11],
+            response={
+                "choices": [
+                    {
+                        "message": {"content": "answer"},
+                        "token_ids": [12, 13],
+                        "logprobs": {
+                            "content": [
+                                {"logprob": -0.1},
+                                {"logprob": -0.2},
+                            ]
+                        },
+                    }
+                ]
+            },
+        )
 
 
 def test_http_openai_payload_sets_vllm_request_fields() -> None:

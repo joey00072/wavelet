@@ -13,11 +13,16 @@ class TokenSegment:
     output_loss_mask: list[bool] | None = None
     turn_id: str | None = None
     metadata: dict[str, Any] | None = None
+    output_sampling_mask: list[list[int]] | None = None
 
     def __post_init__(self) -> None:
         prompt_ids = [int(token_id) for token_id in self.prompt_ids]
         output_ids = [int(token_id) for token_id in self.output_ids]
         output_logprobs = [float(value) for value in self.output_logprobs]
+        output_sampling_mask = _coerce_sampling_masks(
+            self.output_sampling_mask,
+            length=len(output_ids),
+        )
         prompt_loss_mask = _coerce_mask(
             self.prompt_loss_mask,
             length=len(prompt_ids),
@@ -38,6 +43,7 @@ class TokenSegment:
         object.__setattr__(self, "prompt_ids", prompt_ids)
         object.__setattr__(self, "output_ids", output_ids)
         object.__setattr__(self, "output_logprobs", output_logprobs)
+        object.__setattr__(self, "output_sampling_mask", output_sampling_mask)
         object.__setattr__(self, "prompt_loss_mask", prompt_loss_mask)
         object.__setattr__(self, "output_loss_mask", output_loss_mask)
 
@@ -50,6 +56,7 @@ class TrajectorySample:
     inference_logprobs: list[float]
     temperatures: list[float]
     turn_ids: list[str | None]
+    sampling_masks: list[list[int] | None]
 
     def as_dict(self) -> dict[str, list[Any]]:
         return {
@@ -59,6 +66,7 @@ class TrajectorySample:
             "inference_logprobs": self.inference_logprobs,
             "temperatures": self.temperatures,
             "turn_ids": self.turn_ids,
+            "sampling_masks": self.sampling_masks,
         }
 
 
@@ -116,12 +124,16 @@ def _sample_from_segment(
     token_ids = segment.prompt_ids + segment.output_ids
     token_mask = list(segment.prompt_loss_mask or []) + output_mask
     logprobs = [0.0] * len(segment.prompt_ids) + segment.output_logprobs
+    sampling_masks = [None] * len(segment.prompt_ids) + (
+        segment.output_sampling_mask or [None] * len(segment.output_ids)
+    )
     turn_ids = [segment.turn_id] * len(token_ids)
     return _shift_tokens(
         token_ids,
         token_mask,
         logprobs,
         turn_ids,
+        sampling_masks,
         temperature=temperature,
     )
 
@@ -140,6 +152,10 @@ def _extend_sample(
     extension_ids = new_prompt_ids + segment.output_ids
     extension_mask = [False] * len(new_prompt_ids) + output_mask
     extension_logprobs = [0.0] * len(new_prompt_ids) + segment.output_logprobs
+    extension_sampling_masks: list[list[int] | None] = [None] * len(new_prompt_ids)
+    extension_sampling_masks.extend(
+        segment.output_sampling_mask or [None] * len(segment.output_ids)
+    )
     extension_turn_ids = [segment.turn_id] * len(extension_ids)
 
     input_ids = list(sample.input_ids)
@@ -148,6 +164,7 @@ def _extend_sample(
     inference_logprobs = list(sample.inference_logprobs)
     temperatures = list(sample.temperatures)
     turn_ids = list(sample.turn_ids)
+    sampling_masks = list(sample.sampling_masks)
 
     if prefix_ids and extension_ids:
         input_ids.append(prefix_ids[-1])
@@ -156,12 +173,14 @@ def _extend_sample(
         inference_logprobs.append(extension_logprobs[0])
         temperatures.append(temperature)
         turn_ids.append(segment.turn_id)
+        sampling_masks.append(extension_sampling_masks[0])
 
     extension = _shift_tokens(
         extension_ids,
         extension_mask,
         extension_logprobs,
         extension_turn_ids,
+        extension_sampling_masks,
         temperature=temperature,
     )
     input_ids.extend(extension.input_ids)
@@ -170,6 +189,7 @@ def _extend_sample(
     inference_logprobs.extend(extension.inference_logprobs)
     temperatures.extend(extension.temperatures)
     turn_ids.extend(extension.turn_ids)
+    sampling_masks.extend(extension.sampling_masks)
     return TrajectorySample(
         input_ids=input_ids,
         target_ids=target_ids,
@@ -177,6 +197,7 @@ def _extend_sample(
         inference_logprobs=inference_logprobs,
         temperatures=temperatures,
         turn_ids=turn_ids,
+        sampling_masks=sampling_masks,
     )
 
 
@@ -185,13 +206,20 @@ def _shift_tokens(
     loss_mask: list[bool],
     logprobs: list[float],
     turn_ids: list[str | None],
+    sampling_masks: list[list[int] | None],
     *,
     temperature: float,
 ) -> TrajectorySample:
-    if not (len(token_ids) == len(loss_mask) == len(logprobs) == len(turn_ids)):
-        raise ValueError("Token ids, masks, logprobs, and turn ids must align.")
+    if not (
+        len(token_ids)
+        == len(loss_mask)
+        == len(logprobs)
+        == len(turn_ids)
+        == len(sampling_masks)
+    ):
+        raise ValueError("Token ids, masks, streams, and turn ids must align.")
     if len(token_ids) < 2:
-        return TrajectorySample([], [], [], [], [], [])
+        return TrajectorySample([], [], [], [], [], [], [])
     return TrajectorySample(
         input_ids=token_ids[:-1],
         target_ids=token_ids[1:],
@@ -199,6 +227,7 @@ def _shift_tokens(
         inference_logprobs=logprobs[1:],
         temperatures=[temperature] * (len(token_ids) - 1),
         turn_ids=turn_ids[1:],
+        sampling_masks=sampling_masks[1:],
     )
 
 
@@ -220,3 +249,26 @@ def _coerce_mask(
     if len(values) != length:
         raise ValueError(f"{field_name} length must be {length}, got {len(values)}.")
     return [bool(value) for value in values]
+
+
+def _coerce_sampling_masks(
+    values: list[list[int]] | None,
+    *,
+    length: int,
+) -> list[list[int]] | None:
+    if values is None:
+        return None
+    if len(values) != length:
+        raise ValueError(
+            "output_sampling_mask length must match output_ids "
+            f"({len(values)} != {length})."
+        )
+    normalized: list[list[int]] = []
+    for row in values:
+        if any(
+            isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
+            for token_id in row
+        ):
+            raise ValueError("output_sampling_mask rows must contain nonnegative IDs.")
+        normalized.append([int(token_id) for token_id in row])
+    return normalized

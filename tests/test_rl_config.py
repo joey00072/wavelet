@@ -295,9 +295,6 @@ def test_tasks_per_minute_requires_verifier_rollout_source() -> None:
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("top_p", 0.9),
-        ("top_k", 20),
-        ("min_p", 0.1),
         ("min_tokens", 2),
         ("repetition_penalty", 1.1),
     ],
@@ -311,8 +308,36 @@ def test_rl_rejects_sampling_transforms_trainer_cannot_replay(
 
 
 @pytest.mark.parametrize(
+    "field_value",
+    [("top_p", 0.9), ("top_k", 20), ("min_p", 0.1)],
+)
+def test_rl_replays_sampling_support_masks(field_value: tuple[str, float]) -> None:
+    field, value = field_value
+    config = RLConfig(inference={"sampling": {field: value}})
+    assert getattr(config.inference.sampling, field) == pytest.approx(value)
+
+
+def test_rl_rejects_disabling_required_sampling_masks() -> None:
+    with pytest.raises(ValueError, match="return_sampling_mask=true"):
+        RLConfig(
+            inference={
+                "sampling": {"top_p": 0.9},
+                "vllm": {"return_sampling_mask": False},
+            }
+        )
+
+
+@pytest.mark.parametrize(
     "field",
-    ["temperature", "seed", "logit_bias", "presence_penalty"],
+    [
+        "temperature",
+        "seed",
+        "logit_bias",
+        "presence_penalty",
+        "top_p",
+        "top_k",
+        "min_p",
+    ],
 )
 def test_rl_rejects_hidden_sampling_transforms_in_extra_body(field: str) -> None:
     with pytest.raises(ValueError, match=f"extra_body.{field}"):
@@ -513,13 +538,13 @@ def test_multiple_training_environments_bound_largest_group() -> None:
 
 
 def test_multiple_training_environments_validate_effective_sampling() -> None:
-    with pytest.raises(ValueError, match="RL train sampling for 'code'.*top_p"):
-        _multi_environment_config(
-            envs=[
-                {"id": "math"},
-                {"id": "code", "sampling": {"top_p": 0.9}},
-            ]
-        )
+    config = _multi_environment_config(
+        envs=[
+            {"id": "math"},
+            {"id": "code", "sampling": {"top_p": 0.9}},
+        ],
+    )
+    assert config.orchestrator.envs[1].sampling.top_p == pytest.approx(0.9)
 
 
 def test_multiple_training_environments_require_compatible_loss_components() -> None:

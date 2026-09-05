@@ -195,6 +195,40 @@ def extract_vllm_generation_logprobs(
     return values
 
 
+def extract_vllm_sampling_mask(
+    sampling_mask: object, token_ids: list[int]
+) -> list[list[int]] | None:
+    """Validate and normalize vLLM's per-token sampling support sets."""
+    if sampling_mask is None:
+        return None
+    rows = getattr(sampling_mask, "token_ids", sampling_mask)
+    rows = list(rows)
+    if len(rows) != len(token_ids):
+        raise ValueError(
+            "vLLM returned a different number of sampling-mask rows and generated "
+            f"tokens ({len(rows)} != {len(token_ids)})."
+        )
+    normalized: list[list[int]] = []
+    for row in rows:
+        if not isinstance(row, list) or any(
+            isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
+            for token_id in row
+        ):
+            raise ValueError("vLLM sampling-mask rows must contain nonnegative IDs.")
+        normalized.append([int(token_id) for token_id in row])
+    return normalized
+
+
+def sampling_mask_required(config: RLConfig) -> bool:
+    configured = config.inference.vllm.return_sampling_mask
+    if configured is not None:
+        return configured
+    return any(
+        sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
+        for _, sampling in config.train_sampling_configs()
+    )
+
+
 def extract_vllm_prompt_logprobs(
     prompt_logprobs: object,
     *,
@@ -484,6 +518,14 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 "OpenAI rollout response did not include completion token ids. "
                 "Ensure the vLLM server supports return_token_ids."
             )
+        sampling_mask = extract_vllm_sampling_mask(
+            choice.get("sampling_mask"), completion_ids
+        )
+        if sampling_mask_required(self.config) and sampling_mask is None:
+            raise RuntimeError(
+                "OpenAI rollout response did not include sampling_mask. Ensure "
+                "the vLLM server uses --return-sampling-mask."
+            )
         return _pretokenized_rollout_record(
             record,
             completion_text=completion_text,
@@ -493,6 +535,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 choice,
                 completion_ids,
             ),
+            sampling_mask=sampling_mask,
             temperature=self.config.inference.sampling.temperature,
         )
 
@@ -633,10 +676,15 @@ def _shift_completion_sample(
     completion_ids: list[int],
     completion_logprobs: list[float],
     temperature: float,
+    sampling_mask: list[list[int]] | None = None,
 ) -> dict[str, list[Any]]:
+    if sampling_mask is not None and len(sampling_mask) != len(completion_ids):
+        raise ValueError("sampling_mask must align with completion_ids.")
     full_ids = prompt_ids + completion_ids
     full_mask = [False] * len(prompt_ids) + [True] * len(completion_ids)
     full_logprobs = [0.0] * len(prompt_ids) + completion_logprobs
+    full_sampling_mask: list[list[int] | None] = [None] * len(prompt_ids)
+    full_sampling_mask.extend(sampling_mask or [None] * len(completion_ids))
     full_temperatures = [temperature] * len(full_ids)
     if len(full_ids) < 2:
         return {
@@ -645,6 +693,7 @@ def _shift_completion_sample(
             "loss_mask": [],
             "inference_logprobs": [],
             "temperatures": [],
+            "sampling_masks": [],
         }
     return {
         "input_ids": full_ids[:-1],
@@ -652,6 +701,7 @@ def _shift_completion_sample(
         "loss_mask": full_mask[1:],
         "inference_logprobs": full_logprobs[1:],
         "temperatures": full_temperatures[1:],
+        "sampling_masks": full_sampling_mask[1:],
     }
 
 
@@ -662,6 +712,7 @@ def _pretokenized_rollout_record(
     prompt_ids: list[int],
     completion_ids: list[int],
     completion_logprobs: list[float],
+    sampling_mask: list[list[int]] | None = None,
     temperature: float,
 ) -> RLExample:
     """Attach the sampled token ids and logprobs so the trainer skips retokenizing."""
@@ -669,6 +720,7 @@ def _pretokenized_rollout_record(
         prompt_ids=prompt_ids,
         completion_ids=completion_ids,
         completion_logprobs=completion_logprobs,
+        sampling_mask=sampling_mask,
         temperature=temperature,
     )
     trainable_indexes = [
@@ -689,6 +741,11 @@ def _pretokenized_rollout_record(
         temperatures=[
             float(sample["temperatures"][index]) for index in trainable_indexes
         ],
+        sampling_mask=(
+            [list(sample["sampling_masks"][index]) for index in trainable_indexes]
+            if sampling_mask is not None
+            else None
+        ),
     )
 
 
@@ -781,6 +838,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "gpu_memory_utilization": vllm_config.gpu_memory_utilization,
             "enforce_eager": vllm_config.enforce_eager,
             "logprobs_mode": "processed_logprobs",
+            "return_sampling_mask": sampling_mask_required(self.config),
             "enable_lora": self.config.lora is not None,
             "max_loras": 1,
             "max_cpu_loras": 1,
@@ -913,6 +971,14 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                     int(token_id)
                     for token_id in (getattr(output, "token_ids", None) or [])
                 ]
+                sampling_mask = extract_vllm_sampling_mask(
+                    getattr(output, "sampling_mask", None), completion_ids
+                )
+                if sampling_mask_required(self.config) and sampling_mask is None:
+                    raise RuntimeError(
+                        "vLLM generation did not return sampling_mask. Ensure the "
+                        "server uses --return-sampling-mask."
+                    )
                 generated_records.append(
                     _pretokenized_rollout_record(
                         record,
@@ -923,6 +989,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                             getattr(output, "logprobs", None),
                             completion_ids,
                         ),
+                        sampling_mask=sampling_mask,
                         temperature=temperature,
                     )
                 )
@@ -1056,6 +1123,14 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 completion_ids,
                 getattr(output, "logprobs", None),
             )
+            sampling_mask = extract_vllm_sampling_mask(
+                getattr(output, "sampling_mask", None), completion_ids
+            )
+            if sampling_mask_required(self.config) and sampling_mask is None:
+                raise RuntimeError(
+                    "vLLM generation did not return sampling_mask. Ensure the "
+                    "server uses --return-sampling-mask."
+                )
             finish_reason = getattr(output, "finish_reason", None) or "stop"
             results.append(
                 {
@@ -1074,6 +1149,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                             "finish_reason": finish_reason,
                             "token_ids": completion_ids,
                             "logprobs": {"content": completion_logprobs},
+                            "sampling_mask": sampling_mask,
                         }
                     ],
                     "usage": {

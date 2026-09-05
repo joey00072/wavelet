@@ -19,6 +19,7 @@ def test_rollout_record_round_trip_preserves_training_fields():
         temperatures=[1.0],
         ce_weight=[0.25],
         ref_kl_weight=[0.75],
+        sampling_mask=[[2, 3]],
         tools=[{"type": "function"}],
         chat_template_kwargs={"reasoning": True},
         metadata={"group_key": "group"},

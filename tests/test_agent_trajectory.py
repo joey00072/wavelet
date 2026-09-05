@@ -77,3 +77,29 @@ def test_merge_token_segments_can_mask_failed_outputs() -> None:
 def test_token_segment_rejects_misaligned_logprobs() -> None:
     with pytest.raises(ValueError, match="output_logprobs"):
         TokenSegment([1], [2, 3], [-0.2])
+
+
+def test_merge_token_segments_preserves_sampling_masks_at_turn_boundaries() -> None:
+    samples = merge_token_segments(
+        [
+            TokenSegment(
+                [1, 2],
+                [3, 4],
+                [-0.3, -0.4],
+                output_sampling_mask=[[3, 8], [4, 9]],
+            ),
+            TokenSegment(
+                [1, 2, 3, 4],
+                [5],
+                [-0.5],
+                output_sampling_mask=[[5, 7]],
+            ),
+        ]
+    )
+
+    assert samples[0].sampling_masks == [
+        None,
+        [3, 8],
+        [4, 9],
+        [5, 7],
+    ]

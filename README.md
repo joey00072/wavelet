@@ -447,11 +447,11 @@ That command will:
 2. Train a LoRA-adapted policy from the generated rollout batches
 3. Save the resulting adapter under `outputs/unsloth_math_rl/adapter`
 
-Training rollouts currently use full-distribution sampling (`top_p: 1`,
-`top_k: -1`, `min_p: 0`, `min_tokens: 0`, and `repetition_penalty: 1`).
-Wavelet rejects truncated, stop-suppressed, or penalty-adjusted training
-sampling—including distribution controls hidden in `extra_body`—because the
-trainer cannot yet replay those transforms when computing importance ratios.
+Training rollouts return vLLM's per-token sampling support set, so `top_p`,
+`top_k`, and `min_p` can be replayed exactly by the trainer. Wavelet still
+rejects stop-suppressed or penalty-adjusted training sampling, including
+`min_tokens`, `repetition_penalty`, and distribution controls hidden in
+`extra_body`, because those transforms are not represented by the support set.
 Missing sampled-token
 logprobs and pre-tokenized source streams with misaligned response-side values
 are rejected instead of being trimmed or replaced with synthetic values.

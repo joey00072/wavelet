@@ -1,13 +1,15 @@
 import pytest
 
-from wavelet.configs.rl_config import RLSamplingConfig
+from wavelet.configs.rl_config import RLConfig, RLSamplingConfig
 from wavelet.inference.engine import (
     VLLMPolicyInferenceEngine,
     extract_vllm_generation_logprobs,
     extract_vllm_prompt_logprobs,
+    extract_vllm_sampling_mask,
     fit_generation_context,
     openai_payload_to_vllm_kwargs,
     openai_sampling_payload,
+    sampling_mask_required,
     vllm_sampling_kwargs,
 )
 
@@ -23,6 +25,29 @@ def test_embedded_vllm_server_rejects_missing_generation_logprobs() -> None:
 @pytest.mark.parametrize("token_key", [7, "7"])
 def test_generation_logprobs_preserve_exact_zero(token_key: int | str) -> None:
     assert extract_vllm_generation_logprobs([{token_key: 0.0}], [7]) == [0.0]
+
+
+def test_sampling_mask_rows_align_with_generated_tokens() -> None:
+    assert extract_vllm_sampling_mask([[1, 7], [2, 8]], [7, 8]) == [
+        [1, 7],
+        [2, 8],
+    ]
+    with pytest.raises(ValueError, match="different number"):
+        extract_vllm_sampling_mask([[1]], [7, 8])
+
+
+def test_sampling_mask_is_required_only_for_restricted_training_support() -> None:
+    assert not sampling_mask_required(RLConfig())
+    assert sampling_mask_required(RLConfig(inference={"sampling": {"top_k": 8}}))
+    assert not sampling_mask_required(
+        RLConfig(
+            inference={
+                "sampling": {"top_k": 8},
+                "vllm": {"return_sampling_mask": False},
+            },
+            orchestrator={"enabled": False},
+        )
+    )
 
 
 @pytest.mark.parametrize("token_key", [7, "7"])

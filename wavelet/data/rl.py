@@ -41,6 +41,7 @@ class RLSample(TypedDict):
     rl_weights: NotRequired[list[float]]
     ce_weights: NotRequired[list[float]]
     ref_kl_weights: NotRequired[list[float]]
+    sampling_masks: NotRequired[list[list[int]]]
     inference_logprobs: NotRequired[list[float]]
     teacher_logprobs: NotRequired[list[float]]
     temperatures: list[float]
@@ -61,6 +62,8 @@ class RLBatch(TypedDict):
     rl_weights: Tensor
     ce_weights: Tensor
     ref_kl_weights: Tensor
+    sampling_mask_ids: Tensor
+    sampling_mask_lengths: Tensor
     rewards: Tensor
     has_inference_logprobs: Tensor
     inference_logprobs: Tensor
@@ -87,6 +90,7 @@ class RLExample:
     temperatures: float | list[float] | None = None
     ce_weight: float | list[float] | None = None
     ref_kl_weight: float | list[float] | None = None
+    sampling_mask: list[list[int]] | None = None
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
@@ -114,6 +118,7 @@ def rl_example_from_payload(payload: dict[str, Any]) -> RLExample:
         temperatures=payload.get("temperatures"),
         ce_weight=payload.get("ce_weight"),
         ref_kl_weight=payload.get("ref_kl_weight"),
+        sampling_mask=payload.get("sampling_mask"),
         tools=payload.get("tools"),
         chat_template_kwargs=payload.get("chat_template_kwargs"),
         metadata=payload.get("metadata"),
@@ -159,6 +164,7 @@ def serialize_rl_record(
         "loss_mask": record.loss_mask,
         config.inference_logprobs_column: record.inference_logprobs,
         config.teacher_logprobs_column: record.teacher_logprobs,
+        config.sampling_mask_column: record.sampling_mask,
         config.tools_column: record.tools,
         config.chat_template_kwargs_column: record.chat_template_kwargs,
         config.metadata_column: record.metadata,
@@ -196,6 +202,7 @@ def deserialize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLEx
         loss_mask=payload.get("loss_mask"),
         inference_logprobs=payload.get(config.inference_logprobs_column),
         teacher_logprobs=payload.get(config.teacher_logprobs_column),
+        sampling_mask=payload.get(config.sampling_mask_column),
         temperatures=temperatures,
         ce_weight=payload.get(config.ce_weight_column),
         ref_kl_weight=payload.get(config.ref_kl_weight_column),
@@ -283,10 +290,14 @@ def pack_samples(
     sorted_samples = sorted(samples, key=lambda sample: -len(sample["input_ids"]))
     bins: list[list[RLSample]] = []
     bin_lengths: list[int] = []
-    bin_streams: list[tuple[bool, bool]] = []
+    bin_streams: list[tuple[bool, bool, bool]] = []
     for sample in sorted_samples:
         sample_len = len(sample["input_ids"])
-        streams = ("inference_logprobs" in sample, "teacher_logprobs" in sample)
+        streams = (
+            "inference_logprobs" in sample,
+            "teacher_logprobs" in sample,
+            "sampling_masks" in sample,
+        )
         for index, current_len in enumerate(bin_lengths):
             if bin_streams[index] == streams and current_len + sample_len <= seq_len:
                 bins[index].append(sample)
@@ -337,6 +348,7 @@ def _merge_samples(
     ref_kl_weights: list[float] = []
     inference_logprobs: list[float] = []
     teacher_logprobs: list[float] = []
+    sampling_masks: list[list[int]] = []
     temperatures: list[float] = []
     rewards = [
         float(sample["reward"]) for sample in samples if sample["reward"] is not None
@@ -344,6 +356,7 @@ def _merge_samples(
     sample_count = sum(int(sample.get("sample_count", 1)) for sample in samples)
     has_inference = all("inference_logprobs" in sample for sample in samples)
     has_teacher = all("teacher_logprobs" in sample for sample in samples)
+    has_sampling_mask = all("sampling_masks" in sample for sample in samples)
     has_ce = any("ce_weights" in sample for sample in samples)
     has_ref_kl = any("ref_kl_weights" in sample for sample in samples)
 
@@ -366,6 +379,8 @@ def _merge_samples(
             inference_logprobs.extend(sample["inference_logprobs"])
         if has_teacher:
             teacher_logprobs.extend(sample["teacher_logprobs"])
+        if has_sampling_mask:
+            sampling_masks.extend(sample["sampling_masks"])
 
     _pad_token_streams(
         input_ids,
@@ -389,6 +404,8 @@ def _merge_samples(
         packed["inference_logprobs"] = inference_logprobs
     if has_teacher:
         packed["teacher_logprobs"] = teacher_logprobs
+    if has_sampling_mask:
+        packed["sampling_masks"] = sampling_masks
     if has_ce:
         packed["ce_weights"] = ce_weights
     if has_ref_kl:
@@ -431,6 +448,8 @@ def _zero_loss_copy(source: RLSample) -> RLSample:
         dummy["inference_logprobs"] = []
     if "teacher_logprobs" in source:
         dummy["teacher_logprobs"] = []
+    if "sampling_masks" in source:
+        dummy["sampling_masks"] = []
     if "ce_weights" in source:
         dummy["ce_weights"] = []
     if "ref_kl_weights" in source:
@@ -497,6 +516,10 @@ def collate_rl_batch(
 ) -> RLBatch:
     """Pad tokenized RL samples and align trainable-only value streams."""
     max_len = max(len(item["input_ids"]) for item in batch)
+    max_sampling_mask_size = max(
+        (len(mask) for item in batch for mask in item.get("sampling_masks", [])),
+        default=0,
+    )
     output: dict[str, list[torch.Tensor]] = {
         "input_ids": [],
         "attention_mask": [],
@@ -508,6 +531,8 @@ def collate_rl_batch(
         "rl_weights": [],
         "ce_weights": [],
         "ref_kl_weights": [],
+        "sampling_mask_ids": [],
+        "sampling_mask_lengths": [],
         "rewards": [],
         "has_inference_logprobs": [],
         "inference_logprobs": [],
@@ -518,7 +543,13 @@ def collate_rl_batch(
     }
 
     for item in batch:
-        _append_sample(output, item, max_len=max_len, pad_token_id=pad_token_id)
+        _append_sample(
+            output,
+            item,
+            max_len=max_len,
+            pad_token_id=pad_token_id,
+            max_sampling_mask_size=max_sampling_mask_size,
+        )
 
     stacked = {key: torch.stack(values) for key, values in output.items()}
     return cast(RLBatch, stacked)
@@ -530,6 +561,7 @@ def _append_sample(
     *,
     max_len: int,
     pad_token_id: int,
+    max_sampling_mask_size: int,
 ) -> None:
     sequence_length = len(item["input_ids"])
     padding = max_len - sequence_length
@@ -540,6 +572,12 @@ def _append_sample(
     rl_weights = item.get("rl_weights")
     ce_weights = item.get("ce_weights")
     ref_kl_weights = item.get("ref_kl_weights")
+    sampling_masks = item.get("sampling_masks")
+    if sampling_masks is not None and len(sampling_masks) != trainable_tokens:
+        raise ValueError(
+            "sampling_masks must align with the number of trainable tokens in "
+            "the sample"
+        )
 
     _validate_trainable_values(
         item["advantages"],
@@ -634,6 +672,25 @@ def _append_sample(
     output["ref_kl_weights"].append(
         torch.tensor(expanded_ref_kl_weights + [0.0] * padding, dtype=torch.float32)
     )
+    mask_ids = torch.zeros(
+        (max_len, max_sampling_mask_size),
+        dtype=torch.long,
+    )
+    mask_lengths = torch.zeros(max_len, dtype=torch.long)
+    if sampling_masks is not None:
+        trainable_index = 0
+        for position, trainable in enumerate(loss_mask):
+            if not trainable:
+                continue
+            mask = sampling_masks[trainable_index]
+            if len(mask) > max_sampling_mask_size:
+                raise ValueError("sampling mask exceeds batch mask capacity")
+            if mask:
+                mask_ids[position, : len(mask)] = torch.tensor(mask, dtype=torch.long)
+                mask_lengths[position] = len(mask)
+            trainable_index += 1
+    output["sampling_mask_ids"].append(mask_ids)
+    output["sampling_mask_lengths"].append(mask_lengths)
     output["rewards"].append(
         torch.tensor(
             float("nan") if item["reward"] is None else float(item["reward"]),
@@ -752,6 +809,48 @@ def _coerce_optional_sequence(
     return [float(value)] * num_trainable_tokens
 
 
+def _validate_sampling_mask(
+    value: list[list[int]] | None,
+    *,
+    num_trainable_tokens: int,
+    truncated: bool,
+) -> None:
+    if value is None:
+        return
+    if len(value) < num_trainable_tokens:
+        raise ValueError(
+            "sampling_mask is shorter than the number of trainable tokens "
+            f"({len(value)} < {num_trainable_tokens})."
+        )
+    if len(value) > num_trainable_tokens and not truncated:
+        raise ValueError(
+            "sampling_mask is longer than the number of trainable tokens "
+            f"({len(value)} > {num_trainable_tokens}); the tokenized completion "
+            "does not align with the source stream."
+        )
+    for token_ids in value[:num_trainable_tokens]:
+        if not isinstance(token_ids, list) or any(
+            not isinstance(token_id, int) or token_id < 0 for token_id in token_ids
+        ):
+            raise ValueError("sampling_mask entries must be lists of nonnegative IDs.")
+
+
+def _coerce_sampling_mask(
+    value: list[list[int]] | None,
+    *,
+    num_trainable_tokens: int,
+    truncated: bool,
+) -> list[list[int]] | None:
+    _validate_sampling_mask(
+        value,
+        num_trainable_tokens=num_trainable_tokens,
+        truncated=truncated,
+    )
+    if value is None:
+        return None
+    return [[int(token_id) for token_id in ids] for ids in value[:num_trainable_tokens]]
+
+
 def _trim_loss_mask_to_sequence(
     loss_mask: list[bool],
     sequence: list[float] | None,
@@ -806,6 +905,11 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
                 f"Pretokenized {field_name} must align with all source "
                 f"trainable tokens ({len(values)} != {source_trainable_tokens})."
             )
+    _validate_sampling_mask(
+        record.sampling_mask,
+        num_trainable_tokens=source_trainable_tokens,
+        truncated=len(record.input_ids) > seq_len,
+    )
 
     input_ids = [int(token_id) for token_id in record.input_ids[:seq_len]]
     target_ids = [int(token_id) for token_id in record.target_ids[:seq_len]]
@@ -860,6 +964,8 @@ def _validate_rl_record_streams(record: RLExample) -> tuple[bool, bool, bool]:
     )
     _validate_numeric_stream(record.ce_weight, field_name="ce_weight")
     _validate_numeric_stream(record.ref_kl_weight, field_name="ref_kl_weight")
+    if record.sampling_mask is not None and not isinstance(record.sampling_mask, list):
+        raise ValueError("sampling_mask must be a list when provided.")
     components = (
         record.advantage is not None or record.reward is not None,
         record.ce_weight is not None,
@@ -944,6 +1050,11 @@ def prepare_rl_sample(
         field_name="ref_kl_weight",
         truncated=truncated,
     )
+    sampling_masks = _coerce_sampling_mask(
+        record.sampling_mask,
+        num_trainable_tokens=num_trainable_tokens,
+        truncated=truncated,
+    )
 
     sample: RLSample = {
         "input_ids": base_sample["input_ids"],
@@ -968,6 +1079,8 @@ def prepare_rl_sample(
         sample["ce_weights"] = ce_weights
     if ref_kl_weights is not None:
         sample["ref_kl_weights"] = ref_kl_weights
+    if sampling_masks is not None:
+        sample["sampling_masks"] = sampling_masks
     return sample
 
 

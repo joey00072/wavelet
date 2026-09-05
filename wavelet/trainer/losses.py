@@ -32,6 +32,41 @@ def selective_log_softmax(logits: Tensor, index: Tensor) -> Tensor:
     return torch.gather(logprobs, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
 
 
+def selective_log_softmax_with_sampling_mask(
+    logits: Tensor,
+    index: Tensor,
+    sampling_mask_ids: Tensor,
+    sampling_mask_lengths: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Compute target logprobs and entropy over vLLM's sampled support sets."""
+    selected = torch.gather(
+        logits.log_softmax(dim=-1), dim=-1, index=index.unsqueeze(-1)
+    ).squeeze(-1)
+    if sampling_mask_ids.shape[-1] == 0 or not sampling_mask_lengths.any():
+        return selected, compute_entropy(logits)
+
+    vocab_size = logits.shape[-1]
+    if (sampling_mask_ids >= vocab_size).any():
+        raise ValueError("sampling mask contains a token outside the model vocabulary")
+    if (sampling_mask_lengths > sampling_mask_ids.shape[-1]).any():
+        raise ValueError("sampling mask length exceeds its padded capacity")
+    support_logits = torch.gather(logits, dim=-1, index=sampling_mask_ids)
+    valid = torch.arange(sampling_mask_ids.shape[-1], device=logits.device).view(
+        1, 1, -1
+    ) < sampling_mask_lengths.unsqueeze(-1)
+    target_present = ((sampling_mask_ids == index.unsqueeze(-1)) & valid).any(dim=-1)
+    if (sampling_mask_lengths > 0).logical_and(~target_present).any():
+        raise ValueError("sampling mask does not contain the target token")
+    support_logits = support_logits.masked_fill(~valid, float("-inf"))
+    support_log_z = torch.logsumexp(support_logits, dim=-1)
+    masked_selected = (
+        torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        - support_log_z
+    )
+    selected = torch.where(sampling_mask_lengths > 0, masked_selected, selected)
+    return selected, compute_entropy(logits)
+
+
 def compute_entropy(logits: Tensor) -> Tensor:
     """Compute per-token categorical entropy without retaining gradients."""
     with torch.no_grad():
@@ -497,6 +532,8 @@ class ChunkedLogprobLmHead(nn.Linear):
         hidden_states: Tensor,
         labels: Tensor | None = None,
         temperature: Tensor | None = None,
+        sampling_mask_ids: Tensor | None = None,
+        sampling_mask_lengths: Tensor | None = None,
     ) -> ChunkedLmHeadOutput:
         if labels is None:
             return {"logits": super().forward(hidden_states)}
@@ -507,6 +544,22 @@ class ChunkedLogprobLmHead(nn.Linear):
         hidden_flat = hidden_states.reshape(batch * seq_len, hidden_size).contiguous()
         labels_flat = labels.reshape(batch * seq_len).contiguous()
         inv_temperature = (1.0 / temperature.reshape(batch * seq_len)).contiguous()
+        if sampling_mask_ids is None:
+            sampling_mask_ids = torch.empty(
+                (batch * seq_len, 0), dtype=torch.long, device=hidden_states.device
+            )
+        else:
+            sampling_mask_ids = sampling_mask_ids.reshape(
+                batch * seq_len, -1
+            ).contiguous()
+        if sampling_mask_lengths is None:
+            sampling_mask_lengths = torch.zeros(
+                batch * seq_len, dtype=torch.long, device=hidden_states.device
+            )
+        else:
+            sampling_mask_lengths = sampling_mask_lengths.reshape(
+                batch * seq_len
+            ).contiguous()
 
         logprobs, entropy = _ChunkedLogprobFn.apply(
             hidden_flat,
@@ -514,6 +567,8 @@ class ChunkedLogprobLmHead(nn.Linear):
             labels_flat,
             inv_temperature,
             self.chunk_size,
+            sampling_mask_ids,
+            sampling_mask_lengths,
         )
         return {
             "logprobs": logprobs.reshape(batch, seq_len),
@@ -532,7 +587,9 @@ def _online_softmax_stats_update(
     old_scale = torch.exp(max_values - new_max)
     exp_logits = torch.exp(logits - new_max.unsqueeze(-1))
     new_sums = sums * old_scale + exp_logits.sum(dim=-1)
-    new_weighted_sums = weighted_sums * old_scale + (exp_logits * logits).sum(dim=-1)
+    new_weighted_sums = weighted_sums * old_scale + (
+        exp_logits * logits.masked_fill(~torch.isfinite(logits), 0.0)
+    ).sum(dim=-1)
     return new_max, new_sums, new_weighted_sums
 
 
@@ -542,6 +599,8 @@ def _validate_chunked_logprob_inputs(
     labels: Tensor,
     inv_temperature: Tensor,
     chunk_size: int,
+    sampling_mask_ids: Tensor,
+    sampling_mask_lengths: Tensor,
 ) -> None:
     if hidden.dim() != 2:
         raise ValueError(f"expected hidden [N, H], got {tuple(hidden.shape)}")
@@ -561,6 +620,32 @@ def _validate_chunked_logprob_inputs(
         raise ValueError("hidden and weight dimensions are incompatible")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+    if sampling_mask_ids.dim() != 2:
+        raise ValueError(
+            f"expected sampling_mask_ids [N, K], got {tuple(sampling_mask_ids.shape)}"
+        )
+    if sampling_mask_lengths.dim() != 1:
+        raise ValueError(
+            "expected sampling_mask_lengths [N], "
+            f"got {tuple(sampling_mask_lengths.shape)}"
+        )
+    if sampling_mask_ids.shape[0] != hidden.shape[0]:
+        raise ValueError("hidden and sampling mask ids must have matching token count")
+    if sampling_mask_lengths.shape[0] != hidden.shape[0]:
+        raise ValueError(
+            "hidden and sampling mask lengths must have matching token count"
+        )
+    if (
+        sampling_mask_ids.dtype != torch.long
+        or sampling_mask_lengths.dtype != torch.long
+    ):
+        raise ValueError("sampling masks must use int64 tensors")
+    if (sampling_mask_lengths < 0).any() or (
+        sampling_mask_lengths > sampling_mask_ids.shape[1]
+    ).any():
+        raise ValueError("sampling mask lengths exceed their padded capacity")
+    if sampling_mask_ids.numel() and (sampling_mask_ids < 0).any():
+        raise ValueError("sampling mask ids must be nonnegative")
 
 
 class _ChunkedLogprobFn(torch.autograd.Function):
@@ -572,6 +657,8 @@ class _ChunkedLogprobFn(torch.autograd.Function):
         labels: Tensor,
         inv_temperature: Tensor,
         chunk_size: int,
+        sampling_mask_ids: Tensor,
+        sampling_mask_lengths: Tensor,
     ) -> tuple[Tensor, Tensor]:
         _validate_chunked_logprob_inputs(
             hidden,
@@ -579,12 +666,17 @@ class _ChunkedLogprobFn(torch.autograd.Function):
             labels,
             inv_temperature,
             chunk_size,
+            sampling_mask_ids,
+            sampling_mask_lengths,
         )
 
         device = hidden.device
         token_count = hidden.shape[0]
         vocab_size = weight.shape[0]
         vocab_chunk_size = min(vocab_size, 8192)
+        masked = sampling_mask_ids.shape[1] > 0 and sampling_mask_lengths.any()
+        if masked and (sampling_mask_ids >= vocab_size).any():
+            raise ValueError("sampling mask contains a token outside the vocabulary")
         logprobs = torch.empty(token_count, device=device, dtype=torch.float32)
         entropy = torch.empty(token_count, device=device, dtype=torch.float32)
         log_z = torch.empty(token_count, device=device, dtype=torch.float32)
@@ -609,6 +701,16 @@ class _ChunkedLogprobFn(torch.autograd.Function):
             target_logits = torch.zeros(
                 chunk_tokens, device=device, dtype=torch.float32
             )
+            mask_logits = (
+                torch.full(
+                    (chunk_tokens, sampling_mask_ids.shape[1]),
+                    float("-inf"),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                if masked
+                else None
+            )
 
             for vocab_start in range(0, vocab_size, vocab_chunk_size):
                 vocab_end = min(vocab_start + vocab_chunk_size, vocab_size)
@@ -626,15 +728,60 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                 if torch.any(in_chunk):
                     indexes = (labels_chunk[in_chunk] - vocab_start).to(torch.long)
                     target_logits[in_chunk] = scaled_logits[in_chunk, indexes]
+                if mask_logits is not None:
+                    mask_ids = sampling_mask_ids[start:end]
+                    mask_valid = torch.arange(mask_ids.shape[1], device=device).view(
+                        1, -1
+                    ) < sampling_mask_lengths[start:end].view(-1, 1)
+                    local_ids = mask_ids - vocab_start
+                    in_chunk_mask = (
+                        mask_valid
+                        & (local_ids >= 0)
+                        & (local_ids < vocab_end - vocab_start)
+                    )
+                    safe_ids = local_ids.clamp(0, vocab_end - vocab_start - 1)
+                    gathered = torch.gather(scaled_logits, 1, safe_ids)
+                    mask_logits = torch.where(in_chunk_mask, gathered, mask_logits)
 
             log_z_chunk = max_values + torch.log(sums)
             log_z[start:end] = log_z_chunk
             logprobs[start:end] = target_logits - log_z_chunk
             entropy[start:end] = log_z_chunk - weighted_sums / sums
 
+            if mask_logits is not None:
+                masked_rows = sampling_mask_lengths[start:end] > 0
+                if masked_rows.any():
+                    support_log_z = torch.logsumexp(mask_logits[masked_rows], dim=-1)
+                    masked_indices = masked_rows.nonzero(as_tuple=True)[0]
+                    log_z[start:end].index_copy_(0, masked_indices, support_log_z)
+                    logprobs[start:end].index_copy_(
+                        0,
+                        masked_indices,
+                        target_logits[masked_rows] - support_log_z,
+                    )
+
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(hidden, weight, labels, inv_temperature, log_z)
+        if masked:
+            target_present = (
+                (sampling_mask_ids == labels.unsqueeze(-1))
+                & (
+                    torch.arange(sampling_mask_ids.shape[1], device=device).view(1, -1)
+                    < sampling_mask_lengths.view(-1, 1)
+                )
+            ).any(dim=-1)
+            if ((sampling_mask_lengths > 0) & ~target_present).any():
+                raise ValueError("sampling mask does not contain the target token")
+        ctx.save_for_backward(
+            hidden,
+            weight,
+            labels,
+            inv_temperature,
+            log_z,
+            sampling_mask_ids,
+            sampling_mask_lengths,
+        )
         ctx.chunk_size = chunk_size
+        ctx.masked = masked
         return logprobs, entropy
 
     @staticmethod
@@ -643,12 +790,21 @@ class _ChunkedLogprobFn(torch.autograd.Function):
             raise RuntimeError("Backward through entropy is not supported.")
         if grad_logprobs is None:
             raise RuntimeError("Chunked logprob backward requires logprob gradients.")
-        hidden, weight, labels, inv_temperature, log_z = ctx.saved_tensors
+        (
+            hidden,
+            weight,
+            labels,
+            inv_temperature,
+            log_z,
+            sampling_mask_ids,
+            sampling_mask_lengths,
+        ) = ctx.saved_tensors
         chunk_size: int = ctx.chunk_size
         needs_grad_hidden, needs_grad_weight = ctx.needs_input_grad[:2]
         token_count = hidden.shape[0]
         vocab_size = weight.shape[0]
         vocab_chunk_size = min(vocab_size, 8192)
+        masked: bool = ctx.masked
 
         grad_hidden = torch.zeros_like(hidden) if needs_grad_hidden else None
         grad_weight = torch.zeros_like(weight) if needs_grad_weight else None
@@ -666,25 +822,96 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                 weight_chunk = weight[vocab_start:vocab_end]
                 logits = hidden_chunk @ weight_chunk.t()
                 scaled_logits = logits.to(torch.float32) * inv_temperature_chunk
-                probs = torch.exp(scaled_logits - log_z_chunk.unsqueeze(-1))
+                full_rows = sampling_mask_lengths[start:end] == 0 if masked else None
+                if full_rows is None or full_rows.any():
+                    rows = slice(None) if full_rows is None else full_rows
+                    full_logits = scaled_logits[rows]
+                    full_hidden = hidden_chunk[rows]
+                    full_labels = labels_chunk[rows]
+                    full_grad = grad_chunk[rows]
+                    full_log_z = log_z_chunk[rows]
+                    full_inv_temperature = inv_temperature_chunk[rows]
+                    probs = torch.exp(full_logits - full_log_z.unsqueeze(-1))
+                    grad_logits = (-full_grad).unsqueeze(-1) * probs
+                    in_chunk = (full_labels >= vocab_start) & (full_labels < vocab_end)
+                    if torch.any(in_chunk):
+                        indexes = (full_labels[in_chunk] - vocab_start).to(torch.long)
+                        grad_logits[in_chunk, indexes] += full_grad[in_chunk]
+                    grad_logits = grad_logits * full_inv_temperature
+                    if grad_hidden is not None:
+                        hidden_grad = grad_logits.to(hidden.dtype) @ weight_chunk
+                        if full_rows is None:
+                            grad_hidden[start:end].add_(hidden_grad)
+                        else:
+                            grad_hidden[start:end].index_add_(
+                                0, full_rows.nonzero(as_tuple=True)[0], hidden_grad
+                            )
+                    if grad_weight is not None:
+                        grad_weight[vocab_start:vocab_end].add_(
+                            grad_logits.to(weight.dtype).t() @ full_hidden
+                        )
 
-                grad_logits = (-grad_chunk).unsqueeze(-1) * probs
-                in_chunk = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
-                if torch.any(in_chunk):
-                    indexes = (labels_chunk[in_chunk] - vocab_start).to(torch.long)
-                    grad_logits[in_chunk, indexes] += grad_chunk[in_chunk]
-                grad_logits = grad_logits * inv_temperature_chunk
+                if masked:
+                    masked_rows = sampling_mask_lengths[start:end] > 0
+                    if masked_rows.any():
+                        mask_ids = sampling_mask_ids[start:end][masked_rows]
+                        mask_valid = torch.arange(
+                            mask_ids.shape[1], device=hidden.device
+                        ).view(1, -1) < sampling_mask_lengths[start:end][
+                            masked_rows
+                        ].view(-1, 1)
+                        local_ids = mask_ids - vocab_start
+                        in_chunk_mask = (
+                            mask_valid
+                            & (local_ids >= 0)
+                            & (local_ids < vocab_end - vocab_start)
+                        )
+                        safe_ids = local_ids.clamp(0, vocab_end - vocab_start - 1)
+                        mask_indicator = torch.zeros_like(scaled_logits[masked_rows])
+                        mask_indicator.scatter_add_(
+                            1, safe_ids, in_chunk_mask.to(mask_indicator.dtype)
+                        )
+                        masked_log_z = log_z_chunk[masked_rows]
+                        masked_probs = (
+                            torch.exp(
+                                scaled_logits[masked_rows] - masked_log_z.unsqueeze(-1)
+                            )
+                            * mask_indicator
+                        )
+                        masked_grad = grad_chunk[masked_rows]
+                        grad_logits = -masked_grad.unsqueeze(-1) * masked_probs
+                        target_mask = (labels_chunk[masked_rows] >= vocab_start) & (
+                            labels_chunk[masked_rows] < vocab_end
+                        )
+                        if target_mask.any():
+                            target_local = (
+                                labels_chunk[masked_rows][target_mask] - vocab_start
+                            ).to(torch.long)
+                            grad_logits[target_mask, target_local] += masked_grad[
+                                target_mask
+                            ]
+                        grad_logits = grad_logits * inv_temperature_chunk[masked_rows]
+                        if grad_hidden is not None:
+                            grad_hidden[start:end].index_add_(
+                                0,
+                                masked_rows.nonzero(as_tuple=True)[0],
+                                grad_logits.to(hidden.dtype) @ weight_chunk,
+                            )
+                        if grad_weight is not None:
+                            grad_weight[vocab_start:vocab_end].add_(
+                                grad_logits.to(weight.dtype).t()
+                                @ hidden_chunk[masked_rows]
+                            )
 
-                if grad_hidden is not None:
-                    grad_hidden[start:end].add_(
-                        grad_logits.to(hidden.dtype) @ weight_chunk
-                    )
-                if grad_weight is not None:
-                    grad_weight[vocab_start:vocab_end].add_(
-                        grad_logits.to(weight.dtype).t() @ hidden_chunk
-                    )
-
-        return grad_hidden, grad_weight, None, None, None
+        return (
+            grad_hidden,
+            grad_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def maybe_inject_chunked_lm_head(model: nn.Module, chunk_size: int | str) -> None:
@@ -724,6 +951,8 @@ def _patch_causal_lm_forward(model: nn.Module) -> None:
         inputs_embeds: Tensor | None = None,
         labels: Tensor | None = None,
         temperature: Tensor | None = None,
+        sampling_mask_ids: Tensor | None = None,
+        sampling_mask_lengths: Tensor | None = None,
         logits_to_keep: int = 0,
         **kwargs: object,
     ) -> ChunkedLmHeadOutput:
@@ -744,6 +973,16 @@ def _patch_causal_lm_forward(model: nn.Module) -> None:
             labels[:, sequence_slice] if labels is not None else None,
             temperature=(
                 temperature[:, sequence_slice] if temperature is not None else None
+            ),
+            sampling_mask_ids=(
+                sampling_mask_ids[:, sequence_slice]
+                if sampling_mask_ids is not None
+                else None
+            ),
+            sampling_mask_lengths=(
+                sampling_mask_lengths[:, sequence_slice]
+                if sampling_mask_lengths is not None
+                else None
             ),
         )
 

@@ -94,6 +94,7 @@ def monkey_patch_chat_completion_logprobs() -> None:
 
     class ChoiceAny(Choice):
         logprobs: Any | None = None
+        sampling_mask: list[list[int]] | None = None
 
     class ChatCompletionAnyLogprobs(ChatCompletion):
         choices: list[ChoiceAny]  # type: ignore[assignment]

@@ -1139,6 +1139,7 @@ def _mark_zero_advantage_records_metric_only(
                 inference_logprobs=[],
                 teacher_logprobs=[] if record.teacher_logprobs is not None else None,
                 temperatures=[],
+                sampling_mask=[] if record.sampling_mask is not None else None,
                 metadata=metadata,
             )
         )
@@ -1282,6 +1283,17 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
         temperatures = [
             float(sample["temperatures"][index]) for index in trainable_indexes
         ]
+        raw_sampling_masks = sample.get("sampling_masks")
+        sampling_mask = None
+        if raw_sampling_masks is not None and any(
+            mask is not None for mask in raw_sampling_masks
+        ):
+            selected_masks = [raw_sampling_masks[index] for index in trainable_indexes]
+            if any(mask is None for mask in selected_masks):
+                raise ValueError(
+                    "Sampling masks must be present for every trainable token."
+                )
+            sampling_mask = [list(mask) for mask in selected_masks if mask is not None]
         metadata = {
             "group_key": group_key,
             "rollout_key": f"{group_key}:{sample_index}",
@@ -1326,6 +1338,7 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 reward=float(output["reward"]),
                 inference_logprobs=inference_logprobs,
                 temperatures=temperatures,
+                sampling_mask=sampling_mask,
                 ce_weight=output.get("ce_weight"),
                 ref_kl_weight=output.get("ref_kl_weight"),
                 metadata=metadata,
@@ -1528,6 +1541,11 @@ def _step_token_segment(
         output_ids=[int(token_id) for token_id in tokens["completion_ids"]],
         output_loss_mask=[bool(value) for value in tokens["completion_mask"]],
         output_logprobs=[float(value) for value in tokens["completion_logprobs"]],
+        output_sampling_mask=(
+            [[int(token_id) for token_id in row] for row in tokens["sampling_mask"]]
+            if tokens.get("sampling_mask") is not None
+            else None
+        ),
         turn_id=str(step.get("turn_id", index)),
     )
 

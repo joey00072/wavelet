@@ -206,6 +206,41 @@ def test_pretokenized_tail_truncation_keeps_aligned_logprob_prefix() -> None:
     assert len(sample["advantages"]) == 8
 
 
+def test_sampling_masks_align_trainable_tokens_and_collate_as_sparse_ids() -> None:
+    record = _record(0, length=4)
+    record.loss_mask = [False, True, False, True]
+    record.inference_logprobs = [-1.0, -2.0]
+    record.temperatures = [1.0, 1.0]
+    record.sampling_mask = [[2, 4], [1, 3, 5]]
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sample["sampling_masks"] == [[2, 4], [1, 3, 5]]
+    batch = collate_rl_batch([sample], pad_token_id=0)
+    assert batch["sampling_mask_ids"].tolist() == [
+        [[0, 0, 0], [2, 4, 0], [0, 0, 0], [1, 3, 5]]
+    ]
+    assert batch["sampling_mask_lengths"].tolist() == [[0, 2, 0, 3]]
+
+
+def test_sampling_masks_must_cover_source_trainable_tokens() -> None:
+    record = _record(0, length=4)
+    record.sampling_mask = [[1], [2]]
+    with pytest.raises(ValueError, match="sampling_mask is shorter"):
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )
+
+
 @pytest.mark.parametrize(
     ("field_name", "value", "message"),
     [
