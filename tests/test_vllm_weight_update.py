@@ -280,3 +280,10 @@ def test_nccl_broadcaster_groups_each_layer_by_dtype() -> None:
     assert calls[-2].tolist() == [1.0, 2.0]
     assert calls[-1].dtype == torch.bfloat16
     assert calls[-1].tolist() == [3.0]
+
+
+def test_nccl_broadcaster_resolves_unindexed_cuda_device(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    assert weight_update._indexed_cuda_device("cuda") == torch.device("cuda:3")
+    assert weight_update._indexed_cuda_device("cuda:1") == torch.device("cuda:1")

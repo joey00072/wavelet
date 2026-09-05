@@ -330,6 +330,13 @@ def nccl_world_size(inference_world_size: int) -> int:
     return inference_world_size + 1
 
 
+def _indexed_cuda_device(device: torch.device | str | int) -> torch.device:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
 @dataclass(slots=True)
 class NCCLWeightBroadcaster:
     host: str
@@ -347,7 +354,7 @@ class NCCLWeightBroadcaster:
         if not torch.cuda.is_available():
             raise RuntimeError("NCCL weight broadcast requires CUDA.")
         communicator_type, process_group_type = _require_vllm_nccl()
-        self._device = torch.device(self.device)
+        self._device = _indexed_cuda_device(self.device)
         self._process_group = process_group_type.create(
             host=self.host,
             port=self.port,
