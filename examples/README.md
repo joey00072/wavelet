@@ -15,7 +15,7 @@ its EP overlay:
 
 ```bash
 uv run wavelet rl @ examples/qwen30b_math/rl_colocate_sleep_smoke.yaml \
-  @ examples/qwen30b_math/rl_ep_smoke.yaml
+  @ examples/qwen30b_math/ep_smoke.overlay.yaml
 ```
 
 Model configs use `matmul_precision: high` by default. Set it to `highest` for
