@@ -1020,6 +1020,7 @@ class BaseTrainer:
             self.output_dir,
             state_dict=state_dict,
             is_main_process=self.world.is_main,
+            parallel_dims=self.parallel_dims,
         )
         if self.world.is_main:
             logger.info("Model saved to %s", self.output_dir)

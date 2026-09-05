@@ -21,7 +21,7 @@ items were explicitly optional and remain intentionally unscheduled:
   are implemented)
 - T5-9 extended dashboard depth
 
-Current verification: `uv run pytest tests -q` reports 1082 passed and 5
+Current verification: `uv run pytest tests -q` reports 1083 passed and 5
 hardware-dependent skips; Ruff lint, Ruff formatting, `git diff --check`, and
 package builds pass. The EP-specific two-process test covers output and gradient
 parity, FSDP2 wrapping, DCP save/load, meta-device loading from split Qwen

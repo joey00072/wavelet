@@ -12,6 +12,64 @@ class _FakePeftModel:
     pass
 
 
+def test_final_tp_lora_save_uses_adapter_gather_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    model = _FakePeftModel()
+    parallel_dims = object()
+    adapter_dir = tmp_path / "adapter"
+    calls: dict[str, object] = {}
+
+    class Tokenizer:
+        def save_pretrained(self, path: Path) -> None:
+            calls["tokenizer_path"] = path
+
+    def save_snapshot(
+        snapshot_model: object,
+        output_dir: Path,
+        *,
+        state_dict: dict[str, torch.Tensor] | None,
+        is_main_process: bool,
+        parallel_dims: object,
+    ) -> Path:
+        calls.update(
+            model=snapshot_model,
+            output_dir=output_dir,
+            state_dict=state_dict,
+            is_main_process=is_main_process,
+            parallel_dims=parallel_dims,
+        )
+        return adapter_dir
+
+    monkeypatch.setattr(lora_utils, "PeftModel", _FakePeftModel)
+    monkeypatch.setattr(
+        lora_utils,
+        "_model_uses_hf_tensor_parallel_lora",
+        lambda _: True,
+    )
+    monkeypatch.setattr(lora_utils, "save_lora_adapter_snapshot", save_snapshot)
+
+    result = lora_utils.save_model(
+        model,
+        Tokenizer(),
+        tmp_path,
+        state_dict={"adapter": torch.ones(1)},
+        is_main_process=True,
+        parallel_dims=parallel_dims,
+    )
+
+    assert result == adapter_dir
+    assert calls == {
+        "model": model,
+        "output_dir": tmp_path,
+        "state_dict": {"adapter": torch.ones(1)},
+        "is_main_process": True,
+        "parallel_dims": parallel_dims,
+        "tokenizer_path": adapter_dir,
+    }
+
+
 def test_fsdp_lora_snapshot_uses_sharded_lora_gather(
     monkeypatch, tmp_path: Path
 ) -> None:

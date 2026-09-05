@@ -121,7 +121,8 @@ Current distributed scope is experimental:
   ring SDPA path and additionally requires explicit SDPA,
   micro-batch size 1, token normalization, and a sequence length divisible by
   `2 * fsdp.cp`; SFT remains rejected until its token normalization is CP-aware
-- LoRA adapter export from TP-sharded models is not implemented yet
+- TP-sharded LoRA adapters are gathered over the TP mesh for policy snapshots
+  and final trainer saves
 
 ## RL Framework Shape
 

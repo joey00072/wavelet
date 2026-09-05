@@ -238,9 +238,10 @@ Lightweight LoRA exports from FSDP gather adapter shards over the `dp_shard_cp`
 group, so every HSDP replica reconstructs the full adapter without duplicate
 shards, and the snapshot includes `lora.modules_to_save` copies alongside the
 LoRA tensors. Only the intended distributed rank writes metadata, stable
-markers, queue
-events, and final directories. Barriers protect visibility across trainer
-ranks; they do not replace stable markers between trainer and inference
+markers, queue events, and final directories. Tensor-parallel LoRA exports
+gather only the adapter factor sharded by each HF TP plan; the same path serves
+policy snapshots and final trainer saves. Barriers protect visibility across
+trainer ranks; they do not replace stable markers between trainer and inference
 processes.
 Rollout manifests and claim/consumed records are required queue state. Their
 write failures stop the run; only duplicate diagnostic events and traces are

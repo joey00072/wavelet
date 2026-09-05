@@ -678,6 +678,7 @@ class PolicyExportMixin:
             tmp_dir,
             state_dict=state_dict,
             is_main_process=self.world.is_main,
+            parallel_dims=self.parallel_dims,
         )
 
     def _prepare_export_directory(self, tmp_dir: Path, step_dir: Path) -> None:

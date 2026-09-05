@@ -838,23 +838,28 @@ def save_model(
     *,
     state_dict: dict[str, torch.Tensor] | None = None,
     is_main_process: bool = True,
+    parallel_dims: ParallelDims | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     if isinstance(model, PeftModel):
-        if getattr(unwrap_model(model), "_tp_size", None) is not None:
-            raise NotImplementedError(
-                "Saving LoRA adapters from a tensor-parallel model is not "
-                "implemented yet."
-            )
-        target = output_dir / "adapter"
-        if state_dict is None:
-            model.save_pretrained(target, is_main_process=is_main_process)
-        else:
-            model.save_pretrained(
-                target,
+        if _model_uses_hf_tensor_parallel_lora(model):
+            target = save_lora_adapter_snapshot(
+                model,
+                output_dir,
                 state_dict=state_dict,
                 is_main_process=is_main_process,
+                parallel_dims=parallel_dims,
             )
+        else:
+            target = output_dir / "adapter"
+            if state_dict is None:
+                model.save_pretrained(target, is_main_process=is_main_process)
+            else:
+                model.save_pretrained(
+                    target,
+                    state_dict=state_dict,
+                    is_main_process=is_main_process,
+                )
         if is_main_process:
             tokenizer.save_pretrained(target)
         return target
