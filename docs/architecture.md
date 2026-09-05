@@ -49,8 +49,8 @@ parallel dispatcher around SDPA. Set `fsdp.enabled: true`, `fsdp.impl: fsdp2`,
 `model.attn_implementation: sdpa`. The RL trainer pads packed rows to a common
 CP-compatible length, shards input/label and per-token RL streams on the
 sequence dimension, and reduces loss denominators over the combined `dp_cp`
-mesh. `fsdp.cp_style` is currently `ring`; Ulysses and expert parallelism are
-not implemented. CP validation also requires a micro-batch size of one and a
+mesh. `fsdp.cp_style` is currently `ring`; Ulysses is not implemented. CP
+validation also requires a micro-batch size of one and a
 sequence length divisible by `2 * fsdp.cp`; SFT remains rejected until its
 token normalization is CP-aware. RL CP also requires
 `loss.normalization: token`; sequence normalization would treat a sharded
@@ -59,6 +59,21 @@ sequence fragment as an independent sequence.
 This path depends on `torch.distributed.tensor.experimental.context_parallel`
 and should be validated on the target multi-GPU topology; CPU tests cover only
 configuration, padding, the buffer-sharding contract, and CP=1 compatibility.
+
+## Expert Parallelism
+
+FSDP2 can shard the expert dimension of Hugging Face Qwen3-MoE and GPT-OSS
+models with `fsdp.ep`. Each token/expert assignment is sent to the EP rank that
+owns the selected expert, evaluated there, and returned to its source rank
+before the weighted contributions are accumulated. The variable-split
+all-to-all operations participate in autograd, so gradients reach both expert
+weights and router scores. Dense parameters continue to use the HSDP mesh;
+expert parameters use EP sharding plus the data-parallel dimensions outside
+the EP group.
+
+The expert count must be divisible by `fsdp.ep`, and EP cannot currently be
+combined with tensor parallelism. Other Hugging Face MoE families fail fast
+until their expert weight layout is explicitly supported.
 
 `optim.cpu_offload: true` keeps native optimizer state in pinned CPU memory
 between updates. Step hooks restore state to each parameter's device only for

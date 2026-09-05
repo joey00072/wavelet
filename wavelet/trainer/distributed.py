@@ -134,7 +134,12 @@ class ParallelDims:
         if self.cp_enabled:
             dp_cp_mesh_dim_names = [
                 name
-                for name in ("dp_replicate", "dp_shard_mod_ep", "cp")
+                for name in (
+                    "dp_replicate",
+                    "dp_shard_mod_ep",
+                    "dp_shard_in_ep",
+                    "cp",
+                )
                 if name in names
             ]
             self._submeshes["dp_cp"] = mesh[tuple(dp_cp_mesh_dim_names)]._flatten(
@@ -146,6 +151,12 @@ class ParallelDims:
         )
         self._submeshes["dp_shard_cp"] = mesh[tuple(dp_shard_cp_dim_names)]._flatten(
             mesh_dim_name="dp_shard_cp"
+        )
+        dp_mod_ep_dim_names = [
+            name for name in ("dp_replicate", "dp_shard_mod_ep") if name in names
+        ]
+        self._submeshes["dp_mod_ep"] = mesh[tuple(dp_mod_ep_dim_names)]._flatten(
+            mesh_dim_name="dp_mod_ep"
         )
         if ep_mesh_dim_names:
             self._submeshes["ep"] = mesh[tuple(ep_mesh_dim_names)]._flatten(

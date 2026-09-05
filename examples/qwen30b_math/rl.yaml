@@ -86,7 +86,7 @@ fsdp:
   backend: nccl
   dp_replicate: 1
   dp_shard: -1
-  # Expert parallelism is not implemented in the current model stack.
+  # Set impl: fsdp2 and raise ep to opt into Qwen3-MoE expert sharding.
   ep: 1
 
 optim:

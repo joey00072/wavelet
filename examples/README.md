@@ -7,6 +7,17 @@ The FSDP examples keep the default `fsdp.impl: fsdp1` compatibility path.
 FSDP2 is opt-in; copy an example and set `impl: fsdp2` when following the
 [migration guide](../docs/fsdp2_migration.md). FSDP2-only reshard controls are
 intentionally omitted from the baseline examples.
+Qwen3-MoE and GPT-OSS recipes can additionally set `fsdp.ep` with FSDP2; the
+expert count must be divisible by that degree. Baseline recipes leave EP at one
+so their world-size assumptions remain unchanged.
+For an eight-rank Qwen3-MoE smoke run, compose the colocated smoke config with
+its EP overlay:
+
+```bash
+uv run wavelet rl @ examples/qwen30b_math/rl_colocate_sleep_smoke.yaml \
+  @ examples/qwen30b_math/rl_ep_smoke.yaml
+```
+
 Model configs use `matmul_precision: high` by default. Set it to `highest` for
 full FP32 matrix multiplication, including on ROCm where reduced float32
 precision can be unsuitable for large-vocabulary softmax calculations.
@@ -47,8 +58,8 @@ uv run torchrun --standalone --nproc-per-node=N \
 Supported Hugging Face Qwen3-MoE and GPT-OSS models emit router load-balance
 metrics during SFT and RL. Set `model.freeze_moe_router: true` to keep routing
 fixed or `model.moe_router_dtype: float32` to run the small router projection
-outside lower-precision autocast. These controls do not enable expert
-parallelism; `fsdp.ep` remains rejected until an HF-native EP design is chosen.
+outside lower-precision autocast. Enabled FSDP2 can additionally shard their
+expert weights with `fsdp.ep`.
 
 Use the shared verifier data helper for environment-backed RL examples:
 

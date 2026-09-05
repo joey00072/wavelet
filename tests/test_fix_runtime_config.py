@@ -113,12 +113,26 @@ def test_fsdp2_accepts_no_reshard_after_forward() -> None:
 
 
 @pytest.mark.parametrize("config_cls", [RLConfig, SFTConfig])
-@pytest.mark.parametrize("field", ["cp", "ep"])
-def test_unsupported_parallel_dimensions_are_rejected_before_runtime(
-    config_cls: type[RLConfig | SFTConfig], field: str
+def test_parallel_dimensions_require_fsdp2(
+    config_cls: type[RLConfig | SFTConfig],
 ) -> None:
-    with pytest.raises(ValueError, match=rf"fsdp\.{field}=2"):
-        config_cls(fsdp={field: 2})
+    for field in ("cp", "ep"):
+        with pytest.raises(ValueError, match=rf"fsdp\.{field}=2"):
+            config_cls(fsdp={field: 2})
+
+
+@pytest.mark.parametrize("config_cls", [RLConfig, SFTConfig])
+def test_fsdp2_expert_parallelism_is_accepted(
+    config_cls: type[RLConfig | SFTConfig],
+) -> None:
+    config = config_cls(fsdp={"enabled": True, "impl": "fsdp2", "ep": 2})
+
+    assert config.fsdp.ep == 2
+
+
+def test_expert_parallelism_rejects_tensor_parallelism() -> None:
+    with pytest.raises(ValueError, match="cannot be combined"):
+        RLConfig(fsdp={"enabled": True, "impl": "fsdp2", "ep": 2, "tp": 2})
 
 
 def test_fsdp2_ring_context_parallelism_is_accepted_for_rl() -> None:

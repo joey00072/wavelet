@@ -1,0 +1,12 @@
+model:
+  meta_device_init: true
+
+fsdp:
+  impl: fsdp2
+  ep: 8
+
+monitor:
+  wandb:
+    name: wavelet-qwen30b-math-ep-smoke
+
+output_dir: outputs/qwen30b_math_rl_ep_smoke

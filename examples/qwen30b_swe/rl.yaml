@@ -75,8 +75,8 @@ fsdp:
   backend: nccl
   dp_replicate: 1
   dp_shard: -1
-  # Expert parallelism is not implemented; context parallelism requires explicit
-  # FSDP2/SDPA settings and is not enabled by this recipe.
+  # Expert and context parallelism require explicit FSDP2 settings and are not
+  # enabled by this baseline recipe.
   cp: 1
   ep: 1
 

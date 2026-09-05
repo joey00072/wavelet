@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from functools import partial
 from pathlib import Path
 from time import perf_counter
@@ -19,9 +20,18 @@ from peft import (
     get_peft_model_state_dict,
     prepare_model_for_kbit_training,
 )
+from safetensors import safe_open
 from safetensors.torch import save_file as save_safetensors
 from torch import nn
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
+from torch.distributed.checkpoint.metadata import (
+    ChunkStorageMetadata,
+    Metadata,
+    MetadataIndex,
+    TensorProperties,
+    TensorStorageMetadata,
+)
+from torch.distributed.checkpoint.planner import LoadPlan, LoadPlanner, ReadItem
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -502,6 +512,189 @@ def setup_model(
     return cast(PreTrainedModel, model)
 
 
+_SPLIT_EXPERT_KEY = re.compile(
+    r"^(?P<prefix>.+\.experts)\.(?P<index>\d+)\."
+    r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+class _WaveletHuggingFaceStorageReader(HuggingFaceStorageReader):
+    """Expose split Qwen expert tensors as their grouped model parameters."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._split_expert_keys: dict[str, dict[int, dict[str, str]]] = {}
+        self._physical_storage: dict[str, Any] = {}
+
+    def read_metadata(self) -> Metadata:
+        metadata = super().read_metadata()
+        assert metadata.storage_data is not None
+        self._physical_storage = {
+            index.fqn: storage for index, storage in metadata.storage_data.items()
+        }
+        for key in metadata.state_dict_metadata:
+            match = _SPLIT_EXPERT_KEY.match(key)
+            if match is None:
+                continue
+            prefix = match.group("prefix")
+            expert_index = int(match.group("index"))
+            projection = match.group("projection")
+            self._split_expert_keys.setdefault(prefix, {}).setdefault(expert_index, {})[
+                projection
+            ] = key
+
+        for prefix, expert_keys in self._split_expert_keys.items():
+            expert_indices = sorted(expert_keys)
+            if expert_indices != list(range(len(expert_indices))):
+                continue
+            required_projections = {"gate_proj", "up_proj", "down_proj"}
+            if any(
+                not required_projections.issubset(expert_keys[index])
+                for index in expert_indices
+            ):
+                continue
+            first = expert_keys[0]
+            gate_metadata = metadata.state_dict_metadata[first["gate_proj"]]
+            down_metadata = metadata.state_dict_metadata[first["down_proj"]]
+            num_experts = len(expert_indices)
+            virtual = {
+                f"{prefix}.gate_up_proj": (
+                    torch.Size(
+                        (
+                            num_experts,
+                            gate_metadata.size[0] * 2,
+                            gate_metadata.size[1],
+                        )
+                    ),
+                    gate_metadata.properties,
+                ),
+                f"{prefix}.down_proj": (
+                    torch.Size(
+                        (
+                            num_experts,
+                            down_metadata.size[0],
+                            down_metadata.size[1],
+                        )
+                    ),
+                    down_metadata.properties,
+                ),
+            }
+            for virtual_key, (size, source_properties) in virtual.items():
+                properties = TensorProperties(dtype=source_properties.dtype)
+                metadata.state_dict_metadata[virtual_key] = TensorStorageMetadata(
+                    properties=properties,
+                    size=size,
+                    chunks=[
+                        ChunkStorageMetadata(
+                            offsets=torch.Size([0] * len(size)),
+                            sizes=size,
+                        )
+                    ],
+                )
+                metadata.storage_data[
+                    MetadataIndex(virtual_key, offset=[0] * len(size))
+                ] = self._physical_storage[first["gate_proj"]]
+        return metadata
+
+    def read_data(
+        self, plan: LoadPlan, planner: LoadPlanner
+    ) -> torch.futures.Future[None]:
+        regular_items: list[ReadItem] = []
+        virtual_items: list[ReadItem] = []
+        for item in plan.items:
+            if self._virtual_expert_parameter(item.storage_index.fqn) is None:
+                regular_items.append(item)
+            else:
+                virtual_items.append(item)
+
+        if regular_items:
+            super().read_data(LoadPlan(regular_items), planner).wait()
+        for item in virtual_items:
+            self._read_virtual_expert_tensor(item, planner)
+        future: torch.futures.Future[None] = torch.futures.Future()
+        future.set_result(None)
+        return future
+
+    def _virtual_expert_parameter(self, key: str) -> tuple[str, str] | None:
+        for suffix in ("gate_up_proj", "down_proj"):
+            if key.endswith(f".experts.{suffix}"):
+                return key.removesuffix(f".{suffix}"), suffix
+        return None
+
+    def _read_virtual_expert_tensor(
+        self,
+        item: ReadItem,
+        planner: LoadPlanner,
+    ) -> None:
+        resolved = self._virtual_expert_parameter(item.storage_index.fqn)
+        if resolved is None:
+            raise AssertionError("Expected a virtual expert parameter.")
+        prefix, parameter_name = resolved
+        expert_keys = self._split_expert_keys[prefix]
+        offsets = tuple(int(value) for value in item.storage_offsets)
+        lengths = tuple(int(value) for value in item.lengths)
+        target = planner.resolve_tensor(item).detach()
+        if target.shape != lengths:
+            raise AssertionError(
+                f"Expert load target has shape {target.shape}, expected {lengths}."
+            )
+
+        expert_start, row_start, column_start = offsets
+        _, row_length, column_length = lengths
+        for target_expert, expert_index in enumerate(
+            range(expert_start, expert_start + lengths[0])
+        ):
+            if parameter_name == "down_proj":
+                key = expert_keys[expert_index]["down_proj"]
+                target[target_expert].copy_(
+                    self._read_safetensor_slice(
+                        key,
+                        (
+                            slice(row_start, row_start + row_length),
+                            slice(column_start, column_start + column_length),
+                        ),
+                    )
+                )
+                continue
+
+            gate_key = expert_keys[expert_index]["gate_proj"]
+            gate_rows = int(self._physical_storage[gate_key].shape[0])
+            row_end = row_start + row_length
+            for projection, projection_start in (
+                ("gate_proj", 0),
+                ("up_proj", gate_rows),
+            ):
+                overlap_start = max(row_start, projection_start)
+                overlap_end = min(row_end, projection_start + gate_rows)
+                if overlap_start >= overlap_end:
+                    continue
+                key = expert_keys[expert_index][projection]
+                target_start = overlap_start - row_start
+                target_end = overlap_end - row_start
+                source_start = overlap_start - projection_start
+                target[target_expert, target_start:target_end].copy_(
+                    self._read_safetensor_slice(
+                        key,
+                        (
+                            slice(
+                                source_start, source_start + target_end - target_start
+                            ),
+                            slice(column_start, column_start + column_length),
+                        ),
+                    )
+                )
+        planner.commit_tensor(item, target)
+
+    def _read_safetensor_slice(
+        self,
+        key: str,
+        slices: tuple[slice, ...],
+    ) -> torch.Tensor:
+        storage = self._physical_storage[key]
+        with safe_open(storage.relative_path, framework="pt") as handle:
+            return handle.get_slice(key)[slices]
+
+
 def load_fsdp2_model_from_hf(
     model: nn.Module,
     config: ModelConfig,
@@ -516,7 +709,7 @@ def load_fsdp2_model_from_hf(
     snapshot_path = Path(config.name)
     if not snapshot_path.exists():
         snapshot_path = Path(snapshot_download(repo_id=config.name, repo_type="model"))
-    reader = HuggingFaceStorageReader(snapshot_path.as_posix())
+    reader = _WaveletHuggingFaceStorageReader(snapshot_path.as_posix())
     checkpoint_keys = set(reader.read_metadata().state_dict_metadata)
 
     meta_state_dict = model.state_dict()
@@ -769,10 +962,6 @@ def _wrap_fsdp2(
 ) -> PreTrainedModel:
     if parallel_dims is None:
         raise RuntimeError("FSDP2 requires initialized parallel dimensions.")
-    if parallel_dims.ep_enabled:
-        raise NotImplementedError(
-            "Expert parallel execution is not wired into the model stack yet."
-        )
     mesh = parallel_dims.get_mesh("hsdp")
     mp_policy = _fsdp2_mixed_precision(model_config)
     offload_policy: OffloadPolicy = (
@@ -792,6 +981,21 @@ def _wrap_fsdp2(
         for module in model.modules()
         if module is not model and type(module) in layer_classes
     ]
+    expert_modules: list[nn.Module] = []
+    if parallel_dims.ep_enabled:
+        from wavelet.trainer.moe import (
+            configure_hf_moe_expert_parallel,
+            hf_moe_experts,
+        )
+
+        configure_hf_moe_expert_parallel(model, parallel_dims)
+        expert_modules = hf_moe_experts(model)
+        expert_shard_kwargs = {
+            **shard_kwargs,
+            "mesh": parallel_dims.get_mesh("dp_mod_ep"),
+        }
+        for experts in expert_modules:
+            fully_shard(experts, **expert_shard_kwargs)
     if model_config.moe_router_dtype == "float32":
         from wavelet.trainer.moe import hf_moe_routers
 

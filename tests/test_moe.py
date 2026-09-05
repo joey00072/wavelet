@@ -4,12 +4,14 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+from transformers import GptOssConfig, Qwen3MoeConfig, Qwen3MoeForCausalLM
+from transformers.models.gpt_oss.modeling_gpt_oss import GptOssExperts
 
 from wavelet.configs.sft import FSDPConfig, ModelConfig, SFTConfig
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.model import _fsdp_mixed_precision
 from wavelet.trainer.moe import (
+    _run_local_experts,
     configure_hf_moe_routers,
     hf_moe_routers,
     moe_load_balance_metrics,
@@ -60,6 +62,33 @@ def test_hf_moe_router_controls_freeze_and_run_gate_in_fp32() -> None:
     }
     assert metrics["moe/max_vio"] >= 0
     assert 0 < metrics["moe/routing_confidence"] <= 1
+
+
+def test_gpt_oss_local_expert_compute_preserves_hf_weight_layout() -> None:
+    experts = GptOssExperts(
+        GptOssConfig(
+            hidden_size=8,
+            intermediate_size=4,
+            num_local_experts=4,
+            num_experts_per_tok=1,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+        )
+    )
+    experts._wavelet_ep_local_experts = 4
+    hidden = torch.randn(6, 8)
+    selected = torch.tensor([0, 3, 1, 2, 0, 3])
+
+    expected = experts(
+        hidden,
+        selected.unsqueeze(-1),
+        torch.ones(6, 1),
+    )
+    actual = _run_local_experts(experts, hidden, selected)
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_moe_metrics_measure_maximum_load_violation() -> None:

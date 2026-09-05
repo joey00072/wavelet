@@ -77,7 +77,7 @@ fsdp:
   backend: nccl
   dp_replicate: 1
   dp_shard: -1
-  # Expert parallelism is not implemented in the current model stack.
+  # EP currently supports Qwen3-MoE and GPT-OSS only.
   ep: 1
 
 optim:

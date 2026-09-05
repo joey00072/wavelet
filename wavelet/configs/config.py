@@ -304,15 +304,18 @@ class FSDPConfig(ConfigModel):
 
     @model_validator(mode="after")
     def validate_supported_parallel_dimensions(self) -> "FSDPConfig":
-        unsupported = [f"fsdp.ep={self.ep}"] if self.ep > 1 else []
+        unsupported = []
+        if self.ep > 1 and (not self.enabled or self.impl != "fsdp2"):
+            unsupported.append(f"fsdp.ep={self.ep}")
+        if self.ep > 1 and self.tp > 1:
+            raise ValueError("fsdp.tp>1 cannot be combined with fsdp.ep>1.")
         if self.cp > 1 and (not self.enabled or self.impl != "fsdp2"):
             unsupported.append(f"fsdp.cp={self.cp}")
         if unsupported:
             settings = ", ".join(unsupported)
             raise ValueError(
                 f"{settings} is unsupported by the current model stack; context "
-                "parallelism requires enabled FSDP2 and expert parallel degrees "
-                "must remain 1."
+                "and expert parallelism require enabled FSDP2."
             )
         return self
 

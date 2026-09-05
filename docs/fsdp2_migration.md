@@ -57,14 +57,17 @@ are not gathered for an adapter snapshot.
 | Hugging Face tensor parallel plus DP sharding | Supported where the model has a TP plan | Wrapper composition is present; GPU validation pending |
 | QLoRA | Replicated DDP only | FSDP remains rejected by preflight |
 | Context parallelism | Rejected | Ring SDPA prototype; requires `fsdp.cp`, `fsdp.impl=fsdp2`, and explicit SDPA |
-| Expert parallelism | Rejected | Rejected until its model kernels are implemented |
+| Expert parallelism | Rejected | Qwen3-MoE and GPT-OSS expert sharding with autograd-aware token dispatch |
 | `colocate_sleep` CPU movement | Supported FSDP1 path | Validation pending |
 
-For Qwen3-MoE and GPT-OSS, FP32 router modules are sharded separately so the
+For Qwen3-MoE and GPT-OSS, `fsdp.ep` divides experts into contiguous shards and
+routes selected token/expert pairs to their owning rank with variable-split
+all-to-all collectives. The expert count must divide evenly by the EP degree,
+and tensor parallelism cannot currently be combined with EP. FP32 router
+modules are sharded separately so the
 block-level mixed-precision policy does not downcast them. FSDP1 likewise
 exempts their router class from its mixed-precision policy. This preserves the
-`model.moe_router_dtype: float32` contract; it does not implement expert
-parallel token dispatch.
+`model.moe_router_dtype: float32` contract.
 
 With `model.meta_device_init: true`, FSDP2 constructs supported Hugging Face
 models on the meta device, applies LoRA and wrapper transforms, materializes
@@ -88,6 +91,7 @@ restoration, and a lightweight LoRA safetensors export:
 
 ```bash
 uv run pytest tests/integration/test_fsdp2_checkpoint.py -q
+uv run pytest tests/integration/test_expert_parallel.py -q
 ```
 
 Before moving a production configuration from FSDP1, also run preflight and a
