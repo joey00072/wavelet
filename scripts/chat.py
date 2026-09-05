@@ -39,7 +39,7 @@ def _request_json(
             f"Could not reach inference server at {url}: {exc.reason}"
         ) from exc
     if not isinstance(result, dict):
-        raise RuntimeError("Inference server returned a non-object JSON response.")
+        raise TypeError("Inference server returned a non-object JSON response.")
     return result
 
 
@@ -55,7 +55,7 @@ def _resolve_model(base_url: str, *, api_key: str | None, timeout: float) -> str
         raise RuntimeError("Inference server returned no models from /v1/models.")
     model = models[0]
     if not isinstance(model, dict) or not isinstance(model.get("id"), str):
-        raise RuntimeError("Inference server returned an invalid model listing.")
+        raise TypeError("Inference server returned an invalid model listing.")
     return model["id"]
 
 
@@ -66,7 +66,7 @@ def _completion_text(response: dict[str, Any]) -> str:
     choice = choices[0]
     message = choice.get("message") if isinstance(choice, dict) else None
     if not isinstance(message, dict):
-        raise RuntimeError("Chat completion response did not contain a message.")
+        raise TypeError("Chat completion response did not contain a message.")
     content = message.get("content")
     if isinstance(content, str) and content:
         return content
