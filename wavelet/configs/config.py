@@ -288,6 +288,7 @@ class FSDPConfig(ConfigModel):
     dp_replicate: int = Field(default=1, ge=1)
     dp_shard: int = -1
     cp: int = Field(default=1, ge=1)
+    cp_style: Literal["ring"] = "ring"
     tp: int = Field(default=1, ge=1)
     ep: int = Field(default=1, ge=1)
     cpu_offload: bool = False
@@ -303,16 +304,15 @@ class FSDPConfig(ConfigModel):
 
     @model_validator(mode="after")
     def validate_supported_parallel_dimensions(self) -> "FSDPConfig":
-        unsupported = [
-            f"fsdp.{name}={degree}"
-            for name, degree in (("cp", self.cp), ("ep", self.ep))
-            if degree > 1
-        ]
+        unsupported = [f"fsdp.ep={self.ep}"] if self.ep > 1 else []
+        if self.cp > 1 and (not self.enabled or self.impl != "fsdp2"):
+            unsupported.append(f"fsdp.cp={self.cp}")
         if unsupported:
             settings = ", ".join(unsupported)
             raise ValueError(
                 f"{settings} is unsupported by the current model stack; context "
-                "and expert parallel degrees must remain 1."
+                "parallelism requires enabled FSDP2 and expert parallel degrees "
+                "must remain 1."
             )
         return self
 
@@ -414,6 +414,26 @@ class TrainerConfig(ConfigModel):
         return self
 
     @model_validator(mode="after")
+    def validate_context_parallel(self):
+        if self.fsdp.cp <= 1:
+            return self
+        if self.model.attn_implementation != "sdpa":
+            raise ValueError(
+                "Context parallelism requires model.attn_implementation='sdpa'."
+            )
+        data = getattr(self, "data", None)
+        if data is not None:
+            if data.micro_batch_size != 1:
+                raise ValueError("Micro batch size must be 1 when CP is enabled")
+            divisor = 2 * self.fsdp.cp
+            if data.seq_len % divisor != 0:
+                raise ValueError(
+                    "Sequence length must be divisible by 2 * CP degree when CP "
+                    "is enabled."
+                )
+        return self
+
+    @model_validator(mode="after")
     def validate_checkpoint_config(self):
         if self.ckpt is None:
             return self
@@ -477,6 +497,11 @@ class SFTConfig(TrainerConfig):
 
     @model_validator(mode="after")
     def validate_pack_function(self) -> "SFTConfig":
+        if self.fsdp.cp > 1:
+            raise ValueError(
+                "Context parallelism is currently supported for RLConfig only; "
+                "SFT token normalization is not CP-aware."
+            )
         if self.fsdp.cp > 1 and self.data.pack_function != "cat":
             raise ValueError("Packing function must be 'cat' when CP is enabled")
         if (

@@ -674,7 +674,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         """Return per-component denominators for averaged DP gradients."""
         components = ("rl", "ce", "ref_kl")
         _, data_world_size = self._data_partition()
-        if data_world_size == 1:
+        cp_world_size = self.parallel_dims.cp if self.parallel_dims is not None else 1
+        normalization_world_size = data_world_size * cp_world_size
+        if normalization_world_size == 1:
             return {
                 component: max(float(local_loss_scales[component]), 1.0)
                 for component in components
@@ -695,7 +697,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             dtype=torch.float64,
             device=self.world.device,
         )
-        dp_group = self.parallel_dims.get_mesh("dp").get_group()
+        reduction_mesh = "dp_cp" if cp_world_size > 1 else "dp"
+        dp_group = self.parallel_dims.get_mesh(reduction_mesh).get_group()
         torch.distributed.all_reduce(
             loss_scales,
             op=torch.distributed.ReduceOp.SUM,
@@ -705,7 +708,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         # Dividing each local loss by the average token count therefore yields
         # a global sum divided by the global token count after gradient sync.
         return {
-            component: max(float(scale) / data_world_size, 1.0)
+            component: max(float(scale) / normalization_world_size, 1.0)
             for component, scale in zip(
                 components,
                 loss_scales.tolist(),
@@ -764,7 +767,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             estimated_scales = self._average_data_parallel_loss_scales(local_scales)
             self._set_optimizer_batch_loss_scales(estimated_scales)
 
-        with self.act_offload_ctx:
+        extra_buffers = (
+            [(attention_mask, 2)]
+            if attention_mask is not None and attention_mask.ndim == 4
+            else None
+        )
+        with self._context_parallel_batch(
+            batch,
+            extra_buffers=extra_buffers,
+        ), self.act_offload_ctx:
             loss_output = self._forward_rl_loss(batch, attention_mask)
             self._require_finite_loss(loss_output.loss, label="RL loss")
             if self._optimizer_batch_loss_scale is None:

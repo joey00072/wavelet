@@ -773,11 +773,6 @@ def _wrap_fsdp2(
         raise NotImplementedError(
             "Expert parallel execution is not wired into the model stack yet."
         )
-    if parallel_dims.cp_enabled:
-        raise NotImplementedError(
-            "Context parallel execution is not wired into the attention stack yet."
-        )
-
     mesh = parallel_dims.get_mesh("hsdp")
     mp_policy = _fsdp2_mixed_precision(model_config)
     offload_policy: OffloadPolicy = (

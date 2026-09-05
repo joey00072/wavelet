@@ -336,6 +336,53 @@ def test_loss_scale_uses_global_token_mean_for_averaged_dp_gradients(
     assert trainer._average_data_parallel_loss_scale(4.0) == 6.0
 
 
+def test_loss_scale_uses_dp_cp_for_context_parallel_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        local_world_size=2,
+        device=torch.device("cpu"),
+    )
+    dp_cp_group = object()
+
+    class _Mesh:
+        def get_group(self) -> object:
+            return dp_cp_group
+
+    class _ParallelDims:
+        dp_replicate = 1
+        dp_shard = 1
+        cp = 2
+        tp = 1
+        ep = 1
+
+        def get_mesh(self, name: str) -> _Mesh:
+            assert name == "dp_cp"
+            return _Mesh()
+
+    trainer.parallel_dims = _ParallelDims()  # type: ignore[assignment]
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def fake_all_reduce(
+        tensor: torch.Tensor,
+        *,
+        op: object,
+        group: object,
+    ) -> None:
+        assert op == torch.distributed.ReduceOp.SUM
+        assert group is dp_cp_group
+        assert tensor.tolist() == [4.0, 0.0, 0.0]
+        tensor.add_(torch.tensor([4.0, 0.0, 0.0]))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    assert trainer._average_data_parallel_loss_scale(4.0) == 4.0
+
+
 def test_packed_flash_attention_uses_varlen_position_ids() -> None:
     attention_mask = torch.ones((1, 5), dtype=torch.long)
     position_ids = torch.tensor([[0, 1, 2, 0, 1]], dtype=torch.long)

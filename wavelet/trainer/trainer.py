@@ -26,6 +26,10 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from wavelet.configs.sft import SFTConfig
 from wavelet.data.sft import Example, load_records, setup_dataloader, setup_dataset
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
+from wavelet.trainer.context_parallel import (
+    context_parallel_batch,
+    prepare_context_parallel_batch,
+)
 from wavelet.trainer.debug import DEBUG_MODEL_NAME
 from wavelet.trainer.distributed import (
     ParallelDims,
@@ -880,10 +884,27 @@ class BaseTrainer:
     def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if self.world is None:
             raise RuntimeError("World not set up")
-        return {
+        prepared = {
             key: value.to(self.world.device, non_blocking=True)
             for key, value in batch.items()
         }
+        return prepare_context_parallel_batch(
+            prepared,
+            self.parallel_dims,
+            configured_seq_len=self.config.data.seq_len,
+        )
+
+    def _context_parallel_batch(
+        self,
+        batch: dict[str, torch.Tensor],
+        *,
+        extra_buffers: list[tuple[torch.Tensor, int]] | None = None,
+    ) -> contextlib.AbstractContextManager:
+        return context_parallel_batch(
+            batch,
+            self.parallel_dims,
+            extra_buffers=extra_buffers,
+        )
 
     def _maybe_checkpoint(self) -> None:
         if self.ckpt_manager is None:
@@ -1098,7 +1119,8 @@ class SFTTrainer(BaseTrainer):
                         break
                     assert raw_batch is not None
                     batch = self._prepare_batch(raw_batch)
-                    loss_output = self._forward_loss(batch)
+                    with self._context_parallel_batch(batch):
+                        loss_output = self._forward_loss(batch)
                     token_count = (batch["labels"] != -100).sum()
                     if token_count.item() == 0:
                         continue
@@ -1169,7 +1191,7 @@ class SFTTrainer(BaseTrainer):
                 torch.cuda.reset_peak_memory_stats()
         self._step_model_tokens += int(batch["input_ids"].numel())
 
-        with self.act_offload_ctx:
+        with self._context_parallel_batch(batch), self.act_offload_ctx:
             loss_output = self._forward_loss(batch)
             loss = loss_output.loss
 

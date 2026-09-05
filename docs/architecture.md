@@ -40,6 +40,24 @@ non-reentrant checkpointing. `mode: full` recomputes the whole selected block;
 recomputing other operations. Set the block to `null` to disable checkpointing.
 Smart GC remains a separate full-checkpoint owner and rejects selective or
 frequency overrides instead of double-wrapping layers.
+
+## Context Parallelism
+
+First-stage context parallelism uses PyTorch's experimental ring context
+parallel dispatcher around SDPA. Set `fsdp.enabled: true`, `fsdp.impl: fsdp2`,
+`fsdp.cp` to the number of context ranks, and
+`model.attn_implementation: sdpa`. The RL trainer pads packed rows to a common
+CP-compatible length, shards input/label and per-token RL streams on the
+sequence dimension, and reduces loss denominators over the combined `dp_cp`
+mesh. `fsdp.cp_style` is currently `ring`; Ulysses and expert parallelism are
+not implemented. CP validation also requires a micro-batch size of one and a
+sequence length divisible by `2 * fsdp.cp`; SFT remains rejected until its
+token normalization is CP-aware.
+
+This path depends on `torch.distributed.tensor.experimental.context_parallel`
+and should be validated on the target multi-GPU topology; CPU tests cover only
+configuration, padding, the buffer-sharding contract, and CP=1 compatibility.
+
 `optim.cpu_offload: true` keeps native optimizer state in pinned CPU memory
 between updates. Step hooks restore state to each parameter's device only for
 the optimizer update, then immediately offload it again; state-dict hooks keep

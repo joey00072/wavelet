@@ -66,7 +66,8 @@ fsdp:
   backend: nccl
   dp_replicate: 1
   dp_shard: -1
-  # Context and expert parallelism are not implemented in the current model stack.
+  # Expert parallelism is not implemented; context parallelism requires explicit
+  # FSDP2/SDPA settings and is not enabled by this recipe.
   cp: 1
   ep: 1
 

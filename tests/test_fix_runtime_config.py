@@ -121,6 +121,35 @@ def test_unsupported_parallel_dimensions_are_rejected_before_runtime(
         config_cls(fsdp={field: 2})
 
 
+def test_fsdp2_ring_context_parallelism_is_accepted_for_rl() -> None:
+    config = RLConfig(
+        model={"attn_implementation": "sdpa"},
+        fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
+        data={"seq_len": 128, "micro_batch_size": 1},
+    )
+
+    assert config.fsdp.cp == 2
+    assert config.fsdp.cp_style == "ring"
+
+
+def test_context_parallelism_is_rejected_for_sft() -> None:
+    with pytest.raises(ValueError, match="supported for RLConfig only"):
+        SFTConfig(
+            model={"attn_implementation": "sdpa"},
+            fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
+            data={"pack_function": "cat", "seq_len": 128},
+        )
+
+
+def test_context_parallelism_requires_sdpa() -> None:
+    with pytest.raises(ValueError, match="attn_implementation='sdpa'"):
+        RLConfig(
+            model={"attn_implementation": "auto"},
+            fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
+            data={"seq_len": 128},
+        )
+
+
 def test_unimplemented_sft_generation_config_is_rejected() -> None:
     with pytest.raises(ValueError, match="generate"):
         SFTConfig(generate={"prompt": "test", "max_new_tokens": 8})

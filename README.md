@@ -115,8 +115,10 @@ Current distributed scope is experimental:
   beside the policy artifact for later parity checks
 - tensor-parallel model loading/saving now works for full-model paths when the
   selected architecture exposes a `transformers` TP plan
-- EP and CP degrees above 1 are rejected during config loading because they are
-  not yet wired into the model kernels or attention stack
+- EP degrees above 1 are rejected during config loading. CP degrees above 1 use
+  the first-stage RL ring SDPA path and require enabled FSDP2, explicit SDPA,
+  micro-batch size 1, and a sequence length divisible by `2 * fsdp.cp`; SFT
+  remains rejected until its token normalization is CP-aware
 - LoRA adapter export from TP-sharded models is not implemented yet
 
 ## RL Framework Shape
@@ -561,8 +563,10 @@ decoupled weight decay without allocating momentum or variance state.
 FSDP1 does not expose a configurable `reshard_after_forward` policy, so setting
 that key to `false` is rejected instead of being accepted without affecting the
 wrapper. Select `fsdp.impl: fsdp2` to control that policy directly.
-Likewise, `fsdp.cp` and `fsdp.ep` values above 1 are rejected before GPU setup;
-the current model stack only supports data and tensor parallel dimensions.
+Likewise, `fsdp.ep` values above 1 are rejected before GPU setup. `fsdp.cp`
+values above 1 are supported by the first-stage ring SDPA path only with
+enabled FSDP2, explicit SDPA, micro-batch size 1, and a sequence length
+divisible by `2 * fsdp.cp`.
 SFT sample generation has no trainer implementation, so a `generate` block is
 also rejected; use the inference commands after training instead.
 SFT packing accepts only the implemented `pad` and `cat` modes; the former

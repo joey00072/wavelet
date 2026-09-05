@@ -56,7 +56,8 @@ are not gathered for an adapter snapshot.
 | Meta-device Hugging Face load | Low-memory `from_pretrained` hint | Direct safetensors-to-DTensor loading for full model and fresh LoRA |
 | Hugging Face tensor parallel plus DP sharding | Supported where the model has a TP plan | Wrapper composition is present; GPU validation pending |
 | QLoRA | Replicated DDP only | FSDP remains rejected by preflight |
-| Context or expert parallelism | Rejected | Rejected until their model kernels are implemented |
+| Context parallelism | Rejected | Ring SDPA prototype; requires `fsdp.cp`, `fsdp.impl=fsdp2`, and explicit SDPA |
+| Expert parallelism | Rejected | Rejected until its model kernels are implemented |
 | `colocate_sleep` CPU movement | Supported FSDP1 path | Validation pending |
 
 For Qwen3-MoE and GPT-OSS, FP32 router modules are sharded separately so the
