@@ -76,10 +76,6 @@ export function shortId(value: string | null | undefined, max = 28): string {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
-export function metricLabel(key: string): string {
-  return key.replace(/^(train|eval|generation|fate|progress|perf|optim|time|kl|dppo)\//, (m) => m);
-}
-
 /** Compact tick labels: at most three significant digits. */
 export function fmtAxis(value: number): string {
   if (!Number.isFinite(value)) return "–";

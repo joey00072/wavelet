@@ -140,5 +140,3 @@ export function PipelineView({ apiBase, runId, summary }: { apiBase: string; run
     </div>
   );
 }
-
-export type { TimelineStep };

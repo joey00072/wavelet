@@ -19,7 +19,7 @@ function dot(className: string): ReactElement {
   return <span aria-hidden className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-current ${className}`} />;
 }
 
-export function statusSpec(status: string): { icon: ReactElement; className: string; tone: "good" | "warning" | "serious" | "critical" | null } {
+function statusSpec(status: string): { icon: ReactElement; className: string; tone: "good" | "warning" | "serious" | "critical" | null } {
   switch (status) {
     case "running":
       return { icon: dot("text-good live-dot"), className: "text-good", tone: "good" };

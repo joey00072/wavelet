@@ -41,7 +41,7 @@ export type RunSummary = {
   logs: LogEntry[];
 };
 
-export type QueueSummary = {
+type QueueSummary = {
   ready_count: number;
   claimed_count: number;
   consumed_count: number;
@@ -56,7 +56,7 @@ export type QueueSummary = {
   event_parse_error_count: number;
 };
 
-export type LogEntry = { name: string; bytes: number; modified_at: string };
+type LogEntry = { name: string; bytes: number; modified_at: string };
 
 export type MetricKeys = Record<string, Array<{ key: string; count: number }>>;
 
@@ -76,7 +76,7 @@ export type Series = {
   parse_errors?: number;
 };
 
-export type NodeStats = { name: string } & Record<string, number | string>;
+type NodeStats = { name: string } & Record<string, number | string>;
 export type RankStats = {
   rank: number;
   local_rank: number;
@@ -97,7 +97,7 @@ export type Nodes = {
   world: { rank: number; world_size: number; local_world_size?: number; device: string } | null;
 };
 
-export type EvalHistoryRow = {
+type EvalHistoryRow = {
   step: number | null;
   policy_step: number | null;
   timestamp: string | null;
@@ -110,7 +110,7 @@ export type Evals = {
   sets: Array<{ step: number; env: string; path: string; bytes: number }>;
 };
 
-export type NumericStats = {
+type NumericStats = {
   count: number;
   min: number | null;
   max: number | null;
@@ -118,7 +118,7 @@ export type NumericStats = {
   std: number | null;
 };
 
-export type Histogram = { bins: number[]; counts: number[]; min: number | null; max: number | null };
+type Histogram = { bins: number[]; counts: number[]; min: number | null; max: number | null };
 
 export type RolloutRow = {
   row_index: number;
@@ -275,7 +275,7 @@ export type RowDetail = Json & {
   arrays?: Record<string, { length: number; true_count?: number; min?: number; max?: number; mean?: number; sum?: number }>;
 };
 
-export type QueueItem = {
+type QueueItem = {
   queue_step: number;
   status: string;
   stable: boolean;

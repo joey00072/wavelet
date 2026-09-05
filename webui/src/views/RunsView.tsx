@@ -161,7 +161,7 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
   );
 }
 
-export function headlineEval(run: RunSummary): { key: string; value: number } | null {
+function headlineEval(run: RunSummary): { key: string; value: number } | null {
   const row = run.latest.eval;
   if (!row) return null;
   const candidates = Object.entries(row).filter(([k, v]) => /^eval\/[^/]+\/(avg@\d+|pass@1)$/.test(k) && typeof v === "number") as Array<[string, number]>;

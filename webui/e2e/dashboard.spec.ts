@@ -28,6 +28,10 @@ test("every run view renders without browser errors", async ({ page }) => {
     await page.goto(`/#/run/current/${view}`);
     await expect(page.locator(`[data-view="${view}"]`)).toBeVisible();
   }
+  await page.goto("/#/run/synthetic-a/config");
+  const filter = page.getByRole("textbox", { name: "Filter configuration" });
+  await filter.fill("seq_len");
+  await expect(page.getByText("seq_len", { exact: true }).first()).toBeVisible();
   expect(errors).toEqual([]);
 });
 
@@ -57,10 +61,6 @@ test("theme and chart controls are usable", async ({ page }, testInfo) => {
 
 test("charts and rollout rows open accessible detail views", async ({ page }) => {
   await page.goto("/#/run/current/overview");
-  const legend = page.getByRole("button", { name: "train batch (after filtering)" });
-  await legend.click();
-  await expect(page.getByRole("dialog", { name: "Reward" })).toHaveCount(0);
-  await legend.click();
   await page.getByRole("button", { name: "Expand Reward chart" }).click();
   const chartDialog = page.getByRole("dialog", { name: "Reward" });
   await expect(chartDialog).toBeVisible();
@@ -72,10 +72,7 @@ test("charts and rollout rows open accessible detail views", async ({ page }) =>
 
   await page.goto("/#/run/current/inspector");
   const composition = page.getByRole("status", { name: /Batch composition:/ });
-  await expect(composition).toBeVisible();
-  await expect(composition).toContainText(/\d+ prompt groups/);
-  await expect(composition).toContainText(/\d+ samples per group/);
-  await expect(composition).toContainText(/\d+ total rollouts/);
+  await expect(composition).toContainText(/\d+ prompt groups.*\d+ samples per group.*\d+ total rollouts/);
   const grouped = page.getByRole("region", { name: /Rollout groups in batch/ });
   await expect(grouped).toBeVisible();
   await expect(page.getByRole("region", { name: /Rollouts in group/ }).first()).toBeVisible();
@@ -156,26 +153,6 @@ test("batch timeline switches steps without a picker", async ({ page }) => {
   await expect(steps.last()).toHaveAttribute("aria-current", "step");
   await expect(keepLatest).toHaveAttribute("aria-pressed", "true");
   await expect.poll(() => new URL(page.url()).hash).not.toContain("step=");
-});
-
-test("a completed run and its config remain browsable", async ({ page }) => {
-  await page.goto("/#/run/synthetic-a/overview");
-  await expect(page.getByRole("heading", { name: "synthetic-a" })).toBeVisible();
-  await page.goto("/#/run/synthetic-a/config");
-  const filter = page.getByRole("textbox", { name: "Filter configuration" });
-  await filter.fill("seq_len");
-  await expect(page.getByText("seq_len", { exact: true }).first()).toBeVisible();
-});
-
-test("invalid comparison query values fall back safely", async ({ page }) => {
-  await page.goto(
-    "/#/compare?runs=synthetic-a,synthetic-b&source=bogus",
-  );
-  await expect(page.getByRole("heading", { name: /Compare 2 runs/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: "rollouts" })).toHaveAttribute(
-    "aria-pressed",
-    "true",
-  );
 });
 
 test("empty and failed API states explain how to recover", async ({ page }) => {

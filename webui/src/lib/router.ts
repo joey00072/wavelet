@@ -7,7 +7,7 @@ export type Route = {
   params: URLSearchParams;
 };
 
-export const RUN_VIEWS = [
+const RUN_VIEWS = [
   "overview",
   "training",
   "rollouts",
@@ -19,7 +19,7 @@ export const RUN_VIEWS = [
 ] as const;
 export type RunView = (typeof RUN_VIEWS)[number];
 
-export function parseRoute(hash: string): Route {
+function parseRoute(hash: string): Route {
   const cleaned = hash.replace(/^#\/?/, "");
   const [pathPart, queryPart = ""] = cleaned.split("?");
   const params = new URLSearchParams(queryPart);

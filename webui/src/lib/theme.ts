@@ -22,7 +22,7 @@ export function useTheme(): [Theme, (theme: Theme) => void] {
   return [theme, setTheme];
 }
 
-export const SERIES_VARS = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => `var(--series-${i})`);
+const SERIES_VARS = [1, 2, 3, 4, 5, 6, 7, 8].map((i) => `var(--series-${i})`);
 
 export function seriesColor(index: number): string {
   // Fixed order, never cycled: past slot 8 series fold into the de-emphasis gray.

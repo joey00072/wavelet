@@ -78,15 +78,3 @@ function Leaf({ value, other, inline = false, diff = null }: { value: unknown; o
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-
-export function flattenJson(value: unknown, prefix = ""): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (isObject(value)) {
-    for (const [key, child] of Object.entries(value)) Object.assign(out, flattenJson(child, prefix ? `${prefix}.${key}` : key));
-  } else if (Array.isArray(value)) {
-    out[prefix] = JSON.stringify(value);
-  } else {
-    out[prefix] = value;
-  }
-  return out;
-}

@@ -6,7 +6,7 @@ export function useSummary(apiBase: string, runId: string | null, intervalMs = 3
 }
 
 /** Default cap on points per series; the server bucket-averages beyond it. */
-export const SERIES_POINTS = 1500;
+const SERIES_POINTS = 1500;
 
 export function useSeries(apiBase: string, runId: string | null, source: "trainer" | "orchestrator" | "eval", keys: string[], limit = 0, intervalMs = 5000, points = SERIES_POINTS): PollState<Series> {
   const url = runId && keys.length > 0 ? `${runUrl(apiBase, runId, "/series")}${qs({ source, keys: keys.join(","), limit, points })}` : null;

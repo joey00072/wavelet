@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 const STORAGE_KEY = "wavelet.apiBase";
 
 /** Candidate API bases in priority order: explicit query, remembered, build default, same origin. */
-export function apiBaseCandidates(): string[] {
+function apiBaseCandidates(): string[] {
   const params = new URLSearchParams(window.location.search);
   const candidates: string[] = [];
   if (params.has("api")) {
@@ -55,7 +55,7 @@ export function normalizeApiBase(value: string): string {
   return value.trim().replace(/\/$/, "");
 }
 
-export class ApiError extends Error {
+class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
     super(message);

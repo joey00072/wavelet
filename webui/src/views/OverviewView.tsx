@@ -169,7 +169,7 @@ function pointsOf(steps: Array<number | null>, values: Array<number | null> | un
   return steps.flatMap((s, i) => (s !== null && values[i] !== null && values[i] !== undefined ? [{ x: s, y: values[i] as number }] : []));
 }
 
-export function Findings({ findings, runId }: { findings: Finding[]; runId: string }) {
+function Findings({ findings, runId }: { findings: Finding[]; runId: string }) {
   return (
     <div className="flex flex-col">
       <div className="title mb-3">Health checks</div>

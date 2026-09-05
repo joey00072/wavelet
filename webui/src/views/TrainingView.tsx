@@ -94,7 +94,7 @@ export function ChartSettingsMenu({ settings, onChange, showLayout = true }: { s
 
 const NONE = "-";
 
-export function MetricExplorer({ apiBase, runId, source, params, defaultKeys, title, live }: { apiBase: string; runId: string; source: "trainer" | "orchestrator"; params: URLSearchParams; defaultKeys: string[]; title: string; live: boolean }) {
+function MetricExplorer({ apiBase, runId, source, params, defaultKeys, title, live }: { apiBase: string; runId: string; source: "trainer" | "orchestrator"; params: URLSearchParams; defaultKeys: string[]; title: string; live: boolean }) {
   const keys = useMetricKeys(apiBase, runId);
   const external = usePoll<ExternalStatus[]>(runUrl(apiBase, runId, "/external"), live ? 15000 : 0);
   const externalReady = (external.data ?? []).filter((e) => e.status === "ready").map((e) => e.source);
@@ -186,7 +186,7 @@ export function MetricExplorer({ apiBase, runId, source, params, defaultKeys, ti
             <button type="button" className="btn btn-active ml-auto" onClick={() => setPicking(false)}>Done</button>
           </div>
           <div className="min-h-0 flex-1">
-            <MetricPicker keys={available} selected={selected} onToggle={toggle} onClear={() => setSelected([])} />
+            <MetricPicker keys={available} selected={selected} onToggle={toggle} />
           </div>
         </div>
       </Drawer>

@@ -32,7 +32,7 @@ type Filters = {
 const EMPTY_FILTERS: Filters = { env: "", group_key: "", min_reward: "", max_reward: "", truncated: "", stop_condition: "", advantage: "", has_error: "", search: "" };
 
 /** Group keys may be JSON blobs from verifier environments; show the identifying part. */
-export function groupLabel(key: string | null | undefined): string {
+function groupLabel(key: string | null | undefined): string {
   if (!key) return "–";
   if (key.startsWith("{")) {
     try {

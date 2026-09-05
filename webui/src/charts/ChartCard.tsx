@@ -31,7 +31,7 @@ const SMOOTHING_TYPES: Array<{ value: SmoothingType; label: string }> = [
 ];
 
 /** Bounded or non-negative metric families read better from zero than auto-fitted. */
-export function defaultYModeFor(title: string): ChartPrefs["yMode"] {
+function defaultYModeFor(title: string): ChartPrefs["yMode"] {
   return /reward|rate|ratio|frac|is_truncated|avg@|pass@|pass\^|mfu|accuracy|solve|admission|usage|kv_cache|entropy|loss|grad_norm|tokens|len|seconds|time\//i.test(title) ? "zero" : "auto";
 }
 type Children = ReactNode | ((options: ChartOptions) => ReactNode);

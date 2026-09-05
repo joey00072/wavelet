@@ -37,7 +37,7 @@ export function seriesToLines(
   });
 }
 
-export function ema(points: Point[], alphaComplement: number): Point[] {
+function ema(points: Point[], alphaComplement: number): Point[] {
   // alphaComplement in [0, 1): 0 = no smoothing, 0.9 = heavy.
   if (points.length === 0 || alphaComplement <= 0) return points;
   const out: Point[] = [];
@@ -58,7 +58,7 @@ export function firstTime(timestamps: Array<string | null>): number | null {
   return null;
 }
 
-export function elapsedMinutes(stamp: string | null | undefined, start: number | null): number | null {
+function elapsedMinutes(stamp: string | null | undefined, start: number | null): number | null {
   if (!stamp || start === null) return null;
   const time = new Date(stamp).getTime();
   if (Number.isNaN(time)) return null;
@@ -85,14 +85,6 @@ export function trailingMean(
   const tail = finite.slice(-window);
   if (tail.length === 0) return null;
   return tail.reduce((sum, value) => sum + value, 0) / tail.length;
-}
-
-export function firstFinite(values: Array<number | null> | undefined): number | null {
-  if (!values) return null;
-  for (const value of values) {
-    if (value !== null && Number.isFinite(value)) return value;
-  }
-  return null;
 }
 
 export function num(row: MetricRow | null | undefined, key: string): number | null {
@@ -189,7 +181,7 @@ export function smooth(points: Point[], type: SmoothingType, amount: number): Po
   }
 }
 
-export function timeWeightedEma(points: Point[], amount: number): Point[] {
+function timeWeightedEma(points: Point[], amount: number): Point[] {
   const xs = points.map((p) => p.x);
   const span = Math.max(1e-9, xs[xs.length - 1] - xs[0]);
   const meanGap = span / Math.max(1, points.length - 1);
@@ -208,7 +200,7 @@ export function timeWeightedEma(points: Point[], amount: number): Point[] {
   return out;
 }
 
-export function runningMean(points: Point[], window: number): Point[] {
+function runningMean(points: Point[], window: number): Point[] {
   const half = Math.floor(window / 2);
   return points.map((p, i) => {
     const lo = Math.max(0, i - half);
@@ -219,7 +211,7 @@ export function runningMean(points: Point[], window: number): Point[] {
   });
 }
 
-export function gaussian(points: Point[], sigma: number): Point[] {
+function gaussian(points: Point[], sigma: number): Point[] {
   const radius = Math.ceil(sigma * 3);
   return points.map((p, i) => {
     let weight = 0;

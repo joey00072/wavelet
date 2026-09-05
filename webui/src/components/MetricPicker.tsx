@@ -3,7 +3,7 @@ import { Search } from "lucide-react";
 
 import { groupKeys } from "../lib/series";
 
-export function MetricPicker({ keys, selected, onToggle }: { keys: string[]; selected: string[]; onToggle: (key: string) => void; onClear?: () => void }) {
+export function MetricPicker({ keys, selected, onToggle }: { keys: string[]; selected: string[]; onToggle: (key: string) => void }) {
   const [query, setQuery] = useState("");
   const groups = useMemo(() => {
     const filtered = query ? keys.filter((k) => k.toLowerCase().includes(query.toLowerCase())) : keys;
