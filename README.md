@@ -6,6 +6,10 @@
 
 Minimal post-training scaffolding for SFT and RL experiments.
 
+Wavelet supports Python 3.11 and 3.12. Its inference stack targets vLLM 0.28
+and Torch 2.13; Linux x86-64 and AArch64 installs use vLLM's published ABI3
+wheels.
+
 After `uv sync`, run the installed CLI as `uv run wavelet <command>`. The
 module form, `uv run python -m wavelet <command>`, remains supported.
 Pass multiple `@ config.yaml` arguments to compose configs from left to right,

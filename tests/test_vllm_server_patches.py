@@ -7,16 +7,18 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 from vllm.entrypoints.openai import api_server
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
 from vllm.exceptions import VLLMValidationError
+from vllm.lora.lora_model import LoRAModel
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import (
     LRUCacheWorkerLoRAManager,
     WorkerLoRAManager,
 )
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.v1.engine.core import DPEngineCoreProc
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.inference import patches as inference_patches
@@ -149,22 +151,32 @@ def test_lru_patch_still_addresses_path_changes_without_load_inplace() -> None:
 def test_skip_warning_patch_still_suppresses_upstream_module_warnings() -> None:
     source = inspect.getsource(WorkerLoRAManager._load_adapter)
 
-    assert "logger.warning_once" in source
-    assert "is_supported_lora_module" in source
+    if "moe_ep_spec" in inspect.signature(LoRAModel.from_local_checkpoint).parameters:
+        assert "expected_lora_modules" in source
+        assert "logger.warning_once" not in source
+    else:
+        assert "logger.warning_once" in source
+        assert "is_supported_lora_module" in source
 
 
 def test_pin_memory_patch_controls_both_vllm_import_sites(monkeypatch) -> None:
-    from vllm.lora import lora_model, model_manager
+    from vllm.lora import lora_model, lora_weights, model_manager
 
-    original_lora = lora_model.is_pin_memory_available
-    original_manager = model_manager.is_pin_memory_available
-    monkeypatch.setattr(lora_model, "is_pin_memory_available", original_lora)
-    monkeypatch.setattr(model_manager, "is_pin_memory_available", original_manager)
+    modules = (lora_model, lora_weights, model_manager)
+    for module in modules:
+        if hasattr(module, "is_pin_memory_available"):
+            original = module.is_pin_memory_available
+            monkeypatch.setattr(module, "is_pin_memory_available", original)
+        if hasattr(module, "PIN_MEMORY"):
+            monkeypatch.setattr(module, "PIN_MEMORY", True)
 
     server._patch_lora_cpu_pin_memory()
 
-    assert lora_model.is_pin_memory_available() is False
-    assert model_manager.is_pin_memory_available() is False
+    for module in modules:
+        if hasattr(module, "is_pin_memory_available"):
+            assert module.is_pin_memory_available() is False
+        if hasattr(module, "PIN_MEMORY"):
+            assert module.PIN_MEMORY is False
 
 
 def test_tool_parser_patch_silences_upstream_parser_logger(monkeypatch) -> None:
@@ -178,23 +190,80 @@ def test_tool_parser_patch_silences_upstream_parser_logger(monkeypatch) -> None:
     assert hermes_tool_parser.logger.level == CRITICAL
 
 
-def test_fp32_lm_head_helper_uses_fp32_matmul_output(monkeypatch) -> None:
-    hidden_states = torch.ones((1, 2, 3), dtype=torch.bfloat16)
-    weight = torch.ones((4, 3), dtype=torch.bfloat16)
-    bias = torch.arange(4, dtype=torch.bfloat16)
-    calls: list[torch.dtype | None] = []
+def test_vllm_028_owns_fp32_projection_and_dp_pause_protocol() -> None:
+    projection_source = inspect.getsource(LogitsProcessor._apply_head)
+    pause_source = inspect.getsource(DPEngineCoreProc._has_global_unfinished_reqs)
+    resume = DPEngineCoreProc.resume_scheduler
 
-    def mm(left, right, *, out_dtype=None):  # type: ignore[no-untyped-def]
-        calls.append(out_dtype)
-        return left.float() @ right.float()
+    inference_patches.transformers_v5_compat()
 
-    monkeypatch.setattr(torch, "mm", mm)
+    assert "self.head_dtype" in projection_source
+    assert "pending_pause" in pause_source
+    assert DPEngineCoreProc.resume_scheduler is resume
 
-    logits = inference_patches._fp32_lm_head_logits(hidden_states, weight, bias)
 
-    assert calls == [torch.float32]
-    assert logits.shape == (1, 2, 4)
-    assert logits.dtype == torch.float32
+def test_chat_token_endpoint_builds_vllm_028_output_parser() -> None:
+    calls = []
+
+    class Parser:
+        def __init__(self, tokenizer, tools, **kwargs) -> None:
+            calls.append((tokenizer, tools, kwargs))
+
+    serving = SimpleNamespace(
+        parser_cls=Parser,
+        model_config="model-config",
+        _effective_chat_template_kwargs=lambda request: {
+            "thinking": request.include_reasoning,
+        },
+    )
+    request = SimpleNamespace(tools=["tool"], include_reasoning=True)
+
+    parser, template_kwargs = server.OpenAIServingChatWithTokens._output_parser(
+        serving,
+        request,
+        "tokenizer",
+    )
+
+    assert isinstance(parser, Parser)
+    assert template_kwargs == {"thinking": True}
+    assert calls == [
+        (
+            "tokenizer",
+            ["tool"],
+            {
+                "chat_template_kwargs": {"thinking": True},
+                "model_config": "model-config",
+            },
+        )
+    ]
+
+
+def test_chat_token_endpoint_tracks_vllm_028_reasoning_state() -> None:
+    parser = SimpleNamespace(
+        reasoning_parser=object(),
+        is_reasoning_end=lambda token_ids: token_ids == [1, 2],
+    )
+    request = SimpleNamespace(include_reasoning=True, _grammar_from_parser=False)
+    serving = SimpleNamespace(parser_cls=object())
+
+    ended = server.OpenAIServingChatWithTokens._reasoning_ended(
+        serving,
+        request,
+        parser,
+        [1, 2],
+    )
+
+    assert ended is True
+    request.include_reasoning = False
+    assert (
+        server.OpenAIServingChatWithTokens._reasoning_ended(
+            serving,
+            request,
+            parser,
+            [],
+        )
+        is True
+    )
 
 
 def test_build_app_patch_is_required_for_wavelet_router_and_state() -> None:

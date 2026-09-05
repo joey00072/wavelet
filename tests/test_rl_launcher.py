@@ -580,8 +580,21 @@ def test_inference_server_passes_quantized_load_args() -> None:
 def test_inference_server_enables_fp32_projection_and_router_by_default() -> None:
     argv = _serve_argv(RLConfig())
 
-    assert _argv_value(argv, "--additional-config") == '{"fp32_lm_head":true}'
-    assert _argv_value(argv, "--hf-overrides") == ('{"moe_router_dtype":"float32"}')
+    assert _argv_value(argv, "--hf-overrides") == (
+        '{"head_dtype":"float32","moe_router_dtype":"float32"}'
+    )
+
+
+def test_vllm_028_parser_accepts_wavelet_serve_arguments(monkeypatch) -> None:
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    args = inference_server._serve_args(RLConfig())
+
+    assert args.hf_overrides == {
+        "head_dtype": "float32",
+        "moe_router_dtype": "float32",
+    }
 
 
 def test_inference_server_allows_disabling_fp32_inference_controls() -> None:
@@ -596,7 +609,6 @@ def test_inference_server_allows_disabling_fp32_inference_controls() -> None:
 
     argv = _serve_argv(config)
 
-    assert "--additional-config" not in argv
     assert "--hf-overrides" not in argv
 
 

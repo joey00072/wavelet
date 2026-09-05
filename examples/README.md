@@ -82,7 +82,10 @@ overrides.
 
 Some verifier packages are Python 3.12-only. Use `uv run --python 3.12
 --extra envs ...` for the examples that require `wiki-search`, `code-env`,
-`logic-env`, `mini-swe-agent-plus`, or `deepdive`.
+`logic-env` or `deepdive`. The legacy SWE configs that name
+`mini-swe-agent-plus` require that environment to be supplied separately; its
+former Environments Hub wheel is no longer published and is therefore not part
+of the reproducible `envs` extra.
 
 The canonical named-algorithm example is `examples/reverse_text/rl.yaml`. Its
 `algo` block can be changed to `type: max_rl` to use mean-normalized MaxRL

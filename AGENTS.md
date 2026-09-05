@@ -44,7 +44,7 @@ Guidance for coding agents working in this repository.
 
 ## Tooling Baseline
 
-- Python version: `>=3.11` (from `pyproject.toml`).
+- Python version: `>=3.11,<3.13` (from `pyproject.toml`).
 - Use `uv` for environment and command execution.
 - Run commands from repository root: `/home/joey/workspace/wavelet`.
 - Prefer deterministic CLI invocations that can run in CI.

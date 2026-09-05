@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -19,6 +20,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import Field
 from starlette.datastructures import State
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.generate.base.serving import (
+    GenerateBaseServing as OpenAIServing,
+)
 from vllm.entrypoints.openai.api_server import init_app_state
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
@@ -31,18 +35,21 @@ from vllm.entrypoints.openai.cli_args import (
 )
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
+    GenerationError,
     RequestResponseMetadata,
 )
-from vllm.entrypoints.openai.engine.serving import GenerationError, OpenAIServing
 from vllm.entrypoints.openai.models.serving import (
     OpenAIServingModels,
     create_error_response,
 )
-from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
-from vllm.entrypoints.utils import get_max_tokens, load_aware_call, with_cancellation
+from vllm.entrypoints.serve.utils.api_utils import (
+    get_max_tokens,
+    load_aware_call,
+    validate_json_request,
+    with_cancellation,
+)
 from vllm.exceptions import VLLMValidationError
-from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -219,6 +226,32 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 request = fitted_request
         return request, await self.render_chat_request(request)
 
+    def _output_parser(self, request, tokenizer) -> tuple[Any | None, dict]:
+        chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        parser = (
+            None
+            if self.parser_cls is None
+            else self.parser_cls(
+                tokenizer,
+                request.tools,
+                chat_template_kwargs=chat_template_kwargs,
+                model_config=self.model_config,
+            )
+        )
+        return parser, chat_template_kwargs
+
+    def _reasoning_ended(
+        self,
+        request,
+        parser,
+        prompt_token_ids: list[int],
+    ) -> bool | None:
+        if not request.include_reasoning or request._grammar_from_parser:
+            return True
+        if parser is None or parser.reasoning_parser is None:
+            return None
+        return parser.is_reasoning_end(prompt_token_ids)
+
     async def _token_generators(
         self,
         request: ChatCompletionRequestWithTokens,
@@ -227,7 +260,8 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         request_id: str,
         raw_request: Request | None,
         lora_request,
-        reasoning_parser: ReasoningParser | None,
+        output_parser,
+        chat_template_kwargs: dict,
     ) -> list[Any]:
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
         generators = []
@@ -253,6 +287,7 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 prompt_len,
                 self.default_sampling_params,
                 self.override_max_tokens,
+                truncate_prompt_tokens=request.truncate_prompt_tokens,
             )
             if request.use_beam_search:
                 sampling_params: SamplingParams | BeamSearchParams = (
@@ -284,12 +319,13 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                     params=sampling_params,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
+                    session_id=self._get_session_id(request, raw_request),
                 )
             else:
-                reasoning_ended = (
-                    reasoning_parser.is_reasoning_end(prompt_token_ids or [])
-                    if reasoning_parser
-                    else None
+                reasoning_ended = self._reasoning_ended(
+                    request,
+                    output_parser,
+                    prompt_token_ids or [],
                 )
                 generator = self.engine_client.generate(
                     engine_prompt,
@@ -297,9 +333,16 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                     sub_request_id,
                     lora_request=lora_request,
                     trace_headers=trace_headers,
-                    priority=request.priority,
+                    priority=self._get_priority(request, raw_request),
                     data_parallel_rank=data_parallel_rank,
+                    session_id=self._get_session_id(request, raw_request),
                     reasoning_ended=reasoning_ended,
+                    reasoning_parser_kwargs={
+                        "chat_template_kwargs": chat_template_kwargs,
+                    }
+                    if output_parser is not None
+                    and output_parser.reasoning_parser is not None
+                    else None,
                 )
             generators.append(generator)
         return generators
@@ -313,7 +356,9 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         conversation,
         tokenizer,
         request_metadata,
-        reasoning_parser,
+        output_parser,
+        chat_template_kwargs,
+        mm_token_counts,
     ):
         if request.stream:
             return self.chat_completion_stream_generator(
@@ -324,7 +369,8 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 conversation,
                 tokenizer,
                 request_metadata,
-                reasoning_parser,
+                chat_template_kwargs=chat_template_kwargs,
+                mm_token_counts=mm_token_counts,
             )
         try:
             return await self.chat_completion_full_generator(
@@ -335,7 +381,8 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 conversation,
                 tokenizer,
                 request_metadata,
-                reasoning_parser,
+                parser=output_parser,
+                mm_token_counts=mm_token_counts,
             )
         except GenerationError:
             raise
@@ -354,17 +401,11 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
         )
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
-        reasoning_parser: ReasoningParser | None = None
         try:
-            if self.reasoning_parser_cls:
-                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request.chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
-                reasoning_parser = self.reasoning_parser_cls(
-                    tokenizer,
-                    chat_template_kwargs=chat_template_kwargs,
-                )
+            output_parser, chat_template_kwargs = self._output_parser(
+                request,
+                tokenizer,
+            )
         except RuntimeError as exc:
             return self.create_error_response(str(exc))
 
@@ -373,6 +414,12 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
             return rendered
         conversation, engine_prompts = rendered
         engine_prompts[0]["prompt_token_ids"] = request.tokens
+        mm_token_counts = {
+            modality: sum(placeholder.length for placeholder in placeholders)
+            for modality, placeholders in engine_prompts[0]
+            .get("mm_placeholders", {})
+            .items()
+        }
         request_id = (
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
@@ -396,7 +443,8 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 request_id=request_id,
                 raw_request=raw_request,
                 lora_request=lora_request,
-                reasoning_parser=reasoning_parser,
+                output_parser=output_parser,
+                chat_template_kwargs=chat_template_kwargs,
             )
         except ValueError as exc:
             return self.create_error_response(exc)
@@ -411,7 +459,9 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
             conversation,
             tokenizer,
             request_metadata,
-            reasoning_parser,
+            output_parser,
+            chat_template_kwargs,
+            mm_token_counts,
         )
 
 
@@ -642,13 +692,16 @@ def _log_lora_add_adapter_perf(
 
 
 def _patch_lora_cpu_pin_memory() -> None:
-    from vllm.lora import lora_model, model_manager
+    from vllm.lora import lora_model, lora_weights, model_manager
 
     def pin_memory_unavailable() -> bool:
         return False
 
-    lora_model.is_pin_memory_available = pin_memory_unavailable
-    model_manager.is_pin_memory_available = pin_memory_unavailable
+    for module in (lora_model, lora_weights, model_manager):
+        if hasattr(module, "is_pin_memory_available"):
+            module.is_pin_memory_available = pin_memory_unavailable
+        if hasattr(module, "PIN_MEMORY"):
+            module.PIN_MEMORY = False
 
 
 def _patch_noisy_tool_parser_errors() -> None:
@@ -667,6 +720,9 @@ def _patch_skip_lora_module_warnings() -> None:
     from vllm.lora.request import LoRARequest
     from vllm.lora.utils import get_adapter_absolute_path
     from vllm.lora.worker_manager import WorkerLoRAManager
+
+    if "moe_ep_spec" in inspect.signature(LoRAModel.from_local_checkpoint).parameters:
+        return
 
     def patched_load_adapter(
         self: WorkerLoRAManager,
@@ -1189,18 +1245,16 @@ def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--trust-remote-code")
     if config.model.chat_template is not None:
         argv.extend(["--chat-template", config.model.chat_template])
+    hf_overrides = {}
     if vllm_config.enable_fp32_lm_head:
-        argv.extend(
-            [
-                "--additional-config",
-                json.dumps({"fp32_lm_head": True}, separators=(",", ":")),
-            ]
-        )
+        hf_overrides["head_dtype"] = "float32"
     if vllm_config.enable_fp32_router_logits:
+        hf_overrides["moe_router_dtype"] = "float32"
+    if hf_overrides:
         argv.extend(
             [
                 "--hf-overrides",
-                json.dumps({"moe_router_dtype": "float32"}, separators=(",", ":")),
+                json.dumps(hf_overrides, separators=(",", ":")),
             ]
         )
 
