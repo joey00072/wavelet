@@ -496,48 +496,12 @@ class SFTConfig(TrainerConfig):
     max_steps: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
-    def validate_pack_function(self) -> "SFTConfig":
+    def validate_context_parallel_unsupported(self) -> "SFTConfig":
         if self.fsdp.cp > 1:
             raise ValueError(
                 "Context parallelism is currently supported for RLConfig only; "
                 "SFT token normalization is not CP-aware."
             )
-        if self.fsdp.cp > 1 and self.data.pack_function != "cat":
-            raise ValueError("Packing function must be 'cat' when CP is enabled")
-        if (
-            self.fsdp.cp > 1
-            and self.val is not None
-            and self.val.data.pack_function != "cat"
-        ):
-            raise ValueError(
-                "Validation packing function must be 'cat' when CP is enabled"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_cp_seq_len(self):
-        if self.fsdp.cp > 1 and self.data.seq_len % self.fsdp.cp != 0:
-            raise ValueError("Sequence length must be divisible by CP degree")
-        if (
-            self.fsdp.cp > 1
-            and self.val is not None
-            and self.val.data.seq_len % self.fsdp.cp != 0
-        ):
-            raise ValueError(
-                "Validation sequence length must be divisible by CP degree"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_cp_micro_batch_size(self):
-        if self.fsdp.cp > 1 and self.data.micro_batch_size != 1:
-            raise ValueError("Micro batch size must be 1 when CP is enabled")
-        if (
-            self.fsdp.cp > 1
-            and self.val is not None
-            and self.val.data.micro_batch_size != 1
-        ):
-            raise ValueError("Validation micro batch size must be 1 when CP is enabled")
         return self
 
 

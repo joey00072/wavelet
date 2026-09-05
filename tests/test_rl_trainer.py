@@ -230,7 +230,9 @@ def test_orchestrated_rl_checkpoint_excludes_transient_dataloader() -> None:
     assert trainer._checkpoint_dataloader() is None
 
 
-def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch() -> None:
+def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     config = RLConfig(data={"batch_size": 32, "micro_batch_size": 16, "seq_len": 8})
     trainer = RLTrainer(config)
     trainer.world = World(
@@ -261,7 +263,20 @@ def test_unpacked_loss_scale_counts_every_example_in_optimizer_batch() -> None:
         data_config=config.data,
     )
 
+    captured: dict[str, bool] = {}
+
+    def fake_average(
+        scales: dict[str, float | int],
+        *,
+        scales_are_cp_replicated: bool = False,
+    ) -> dict[str, float]:
+        captured["scales_are_cp_replicated"] = scales_are_cp_replicated
+        return {name: float(value) for name, value in scales.items()}
+
+    monkeypatch.setattr(trainer, "_average_data_parallel_loss_scales", fake_average)
+
     assert trainer._estimate_optimizer_batch_loss_scale() == 64.0
+    assert captured["scales_are_cp_replicated"] is True
 
 
 def test_optimizer_batch_scales_count_each_loss_component_independently() -> None:
@@ -381,6 +396,57 @@ def test_loss_scale_uses_dp_cp_for_context_parallel_gradients(
     monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
 
     assert trainer._average_data_parallel_loss_scale(4.0) == 4.0
+
+
+def test_precomputed_loss_scale_is_localized_before_dp_cp_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.world = World(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        local_world_size=2,
+        device=torch.device("cpu"),
+    )
+    dp_cp_group = object()
+
+    class _Mesh:
+        def get_group(self) -> object:
+            return dp_cp_group
+
+    class _ParallelDims:
+        dp_replicate = 1
+        dp_shard = 1
+        cp = 2
+        tp = 1
+        ep = 1
+
+        def get_mesh(self, name: str) -> _Mesh:
+            assert name == "dp_cp"
+            return _Mesh()
+
+    trainer.parallel_dims = _ParallelDims()  # type: ignore[assignment]
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+
+    def fake_all_reduce(
+        tensor: torch.Tensor,
+        *,
+        op: object,
+        group: object,
+    ) -> None:
+        assert op == torch.distributed.ReduceOp.SUM
+        assert group is dp_cp_group
+        # The full-row estimate is 4. CP-localize it before reduction.
+        assert tensor.tolist() == [2.0, 0.0, 0.0]
+        tensor.add_(torch.tensor([2.0, 0.0, 0.0]))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    assert trainer._average_data_parallel_loss_scales(
+        {"rl": 4.0, "ce": 0.0, "ref_kl": 0.0},
+        scales_are_cp_replicated=True,
+    )["rl"] == 2.0
 
 
 def test_packed_flash_attention_uses_varlen_position_ids() -> None:

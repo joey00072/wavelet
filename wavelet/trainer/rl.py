@@ -652,7 +652,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             local_optimizer_batch_size,
             rl_normalization=self.config.loss.normalization,
         )
-        return self._average_data_parallel_loss_scales(local_loss_scales)
+        return self._average_data_parallel_loss_scales(
+            local_loss_scales,
+            scales_are_cp_replicated=True,
+        )
 
     def _set_optimizer_batch_loss_scales(
         self,
@@ -670,8 +673,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def _average_data_parallel_loss_scales(
         self,
         local_loss_scales: dict[str, float | int],
+        *,
+        scales_are_cp_replicated: bool = False,
     ) -> dict[str, float]:
-        """Return per-component denominators for averaged DP gradients."""
+        """Return denominators for gradients averaged over DP and CP ranks.
+
+        Dataset estimates and pre-forward component counts are computed from
+        full sequence rows, so every CP rank sees the same value. Dynamic
+        counts are collected after CP sharding and must pass through unchanged.
+        """
         components = ("rl", "ce", "ref_kl")
         _, data_world_size = self._data_partition()
         cp_world_size = self.parallel_dims.cp if self.parallel_dims is not None else 1
@@ -693,7 +703,11 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             )
 
         loss_scales = torch.tensor(
-            [float(local_loss_scales[component]) for component in components],
+            [
+                float(local_loss_scales[component])
+                / (cp_world_size if scales_are_cp_replicated else 1)
+                for component in components
+            ],
             dtype=torch.float64,
             device=self.world.device,
         )
@@ -764,7 +778,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 )
                 for component in local_scales:
                     local_scales[component] += int(remaining_scales[component])
-            estimated_scales = self._average_data_parallel_loss_scales(local_scales)
+            estimated_scales = self._average_data_parallel_loss_scales(
+                local_scales,
+                scales_are_cp_replicated=True,
+            )
             self._set_optimizer_batch_loss_scales(estimated_scales)
 
         extra_buffers = (
