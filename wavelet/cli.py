@@ -23,6 +23,10 @@ PUBLIC_COMMANDS = {
         "wavelet.tools.benchmark",
         "Run and compare training performance benchmarks",
     ),
+    "dashboard": (
+        "wavelet.entrypoints.dashboard",
+        "Serve the read-only run dashboard over run directories",
+    ),
     "rl-trainer": ("wavelet.entrypoints.rl_trainer", "Run RL trainer"),
     "rl-orchestrator": ("wavelet.entrypoints.rl_orchestrator", "Run RL orchestrator"),
     "rl-inference": (
@@ -36,6 +40,10 @@ PUBLIC_COMMANDS = {
 }
 
 INTERNAL_COMMANDS = {
+    "synth-run": (
+        "wavelet.dashboard.synth",
+        "Write a synthetic run directory for dashboard development",
+    ),
     "native-inference-server": (
         "wavelet.entrypoints.native_inference_server",
         "Run native vLLM inference server",

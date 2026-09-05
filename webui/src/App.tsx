@@ -1,378 +1,255 @@
-import { useEffect, useState } from "react";
-import { createRoot } from "react-dom/client";
-import { Moon, Server, Sun, Wifi, WifiOff } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactElement } from "react";
+import { Activity, BarChart3, Cpu, FileJson, FlaskConical, GitCompare, History, Moon, Radio, Search, Sun, Waves, Workflow } from "lucide-react";
 
-import {
-  EVENT_LIMIT,
-  EVAL_METRIC_LIMIT,
-  METRIC_LIMIT,
-  POLL_MS,
-  ROLLOUT_INSPECT_POLL_MS,
-  fetchJson,
-  initialApiBase,
-  initialTheme,
-  normalizeApiBase,
-} from "./api";
-import { type ActiveView, ViewTabs } from "./components/Tabs";
-import type {
-  EvalMetricRow,
-  MetricRow,
-  RolloutEvent,
-  RolloutInspection,
-  RolloutSnapshot,
-  RunState,
-  Theme,
-} from "./types";
+import { normalizeApiBase, persistApiBase, probeApiBase, resolveApiBase } from "./api/client";
+import { StatusBadge } from "./components/Badge";
+import { Popover } from "./components/Controls";
+import { fmtAge } from "./lib/format";
+import { CURRENT_RUN, navigate, routeHref, useRoute, type RunView } from "./lib/router";
+import { useTheme } from "./lib/theme";
+import { CompareView } from "./views/CompareView";
+import { ConfigView } from "./views/ConfigView";
+import { EvalsView } from "./views/EvalsView";
+import { InfraView } from "./views/InfraView";
+import { InspectorView } from "./views/InspectorView";
 import { OverviewView } from "./views/OverviewView";
-import { RolloutsView } from "./views/RolloutsView";
-import { formatTime } from "./utils/format";
-import {
-  eventCounts,
-  latestMetric,
-  metricStep,
-  pipelineInventory,
-  rateForEvents,
-  rateForMetrics,
-} from "./utils/metrics";
-import {
-  ROLLOUT_BUFFER_LIMIT,
-  SAVED_ROLLOUT_LIMIT,
-  appendBufferedSnapshot,
-  makeRolloutSnapshot,
-  prependSnapshot,
-} from "./utils/rolloutSnapshots";
-import "./main.css";
+import { PipelineView } from "./views/PipelineView";
+import { RunsView, useRuns } from "./views/RunsView";
+import { RolloutMetricsView, TrainingView } from "./views/TrainingView";
+import { useSummary } from "./views/useRunData";
 
-function viewFromHash(): ActiveView {
-  return window.location.hash === "#rollouts" ? "rollouts" : "overview";
-}
+const NAV: Array<{ view: RunView; label: string; icon: ReactElement; hint: string }> = [
+  { view: "overview", label: "Overview", icon: <Activity className="h-3.5 w-3.5" />, hint: "health, reward, eval, key trainer signals" },
+  { view: "training", label: "Trainer", icon: <BarChart3 className="h-3.5 w-3.5" />, hint: "every trainer metric" },
+  { view: "rollouts", label: "Generation", icon: <Waves className="h-3.5 w-3.5" />, hint: "rollout generation metrics" },
+  { view: "inspector", label: "Inspector", icon: <Search className="h-3.5 w-3.5" />, hint: "browse, sort, filter rollouts" },
+  { view: "evals", label: "Evals", icon: <FlaskConical className="h-3.5 w-3.5" />, hint: "fixed-policy evaluation" },
+  { view: "pipeline", label: "Pipeline", icon: <Workflow className="h-3.5 w-3.5" />, hint: "queue, policy, lifecycle" },
+  { view: "infra", label: "Infra", icon: <Cpu className="h-3.5 w-3.5" />, hint: "GPU, disk, inference load, logs" },
+  { view: "config", label: "Config", icon: <FileJson className="h-3.5 w-3.5" />, hint: "resolved config and diff" },
+];
 
-function App() {
-  const [apiBase, setApiBase] = useState(initialApiBase);
-  const [apiInput, setApiInput] = useState(initialApiBase);
-  const [theme, setTheme] = useState<Theme>(initialTheme);
-  const [activeView, setActiveView] = useState<ActiveView>(viewFromHash);
-  const [state, setState] = useState<RunState | null>(null);
-  const [metrics, setMetrics] = useState<MetricRow[]>([]);
-  const [evalMetrics, setEvalMetrics] = useState<EvalMetricRow[]>([]);
-  const [events, setEvents] = useState<RolloutEvent[]>([]);
-  const [rolloutInspection, setRolloutInspection] = useState<RolloutInspection | null>(null);
-  const [rolloutInspectionError, setRolloutInspectionError] = useState<string | null>(null);
-  const [rolloutInspectionAt, setRolloutInspectionAt] = useState<string | null>(null);
-  const [rolloutInspectRefresh, setRolloutInspectRefresh] = useState(0);
-  const [rolloutAutoFollow, setRolloutAutoFollow] = useState(
-    () => window.localStorage.getItem("wavelet.rollouts.autoFollow") !== "false",
-  );
-  const [rolloutSnapshots, setRolloutSnapshots] = useState<RolloutSnapshot[]>([]);
-  const [savedRolloutSnapshots, setSavedRolloutSnapshots] = useState<RolloutSnapshot[]>([]);
-  const [selectedRolloutSnapshotId, setSelectedRolloutSnapshotId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [lastFetchAt, setLastFetchAt] = useState<string | null>(null);
+export function App() {
+  const [apiBase, setApiBase] = useState<string | null>(null);
+  const [apiInput, setApiInput] = useState("");
+  const [theme, setTheme] = useTheme();
+  const route = useRoute();
+  const runs = useRuns(apiBase ?? "");
+  const runId = route.runId;
+  const summary = useSummary(apiBase ?? "", apiBase === null ? null : runId, 3000);
+  const current = runId ? summary.data : null;
+  const runIsLive = current?.status === "running";
+  const runIds = useMemo(() => (runs.data ?? []).map((r) => r.id), [runs.data]);
+  const currentRun = useMemo(() => (runs.data ?? []).find((r) => r.is_current) ?? null, [runs.data]);
+  const viewingCurrent = runId === CURRENT_RUN || (currentRun !== null && runId === currentRun.id);
+  const primaryRunLabel = currentRun?.status === "running" ? "Current" : "Recent";
 
   useEffect(() => {
-    window.localStorage.setItem("wavelet.apiBase", apiBase);
-  }, [apiBase]);
-
-  useEffect(() => {
-    window.localStorage.setItem("wavelet.theme", theme);
-    document.documentElement.classList.toggle("dark", theme === "dark");
-  }, [theme]);
-
-  useEffect(() => {
-    window.localStorage.setItem("wavelet.rollouts.autoFollow", String(rolloutAutoFollow));
-  }, [rolloutAutoFollow]);
-
-  useEffect(() => {
-    const onHashChange = () => setActiveView(viewFromHash());
-    window.addEventListener("hashchange", onHashChange);
-    return () => window.removeEventListener("hashchange", onHashChange);
+    let cancelled = false;
+    resolveApiBase().then((base) => {
+      if (cancelled) return;
+      setApiBase(base);
+      setApiInput(base);
+    });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    let timer: number | undefined;
-    let controller: AbortController | undefined;
-    const poll = async () => {
-      controller = new AbortController();
-      try {
-        const [nextState, nextMetrics, nextEvalMetrics, nextEvents] = await Promise.all([
-          fetchJson<RunState>(`${apiBase}/state`, controller.signal),
-          fetchJson<MetricRow[]>(`${apiBase}/metrics?limit=${METRIC_LIMIT}`, controller.signal),
-          fetchJson<EvalMetricRow[]>(
-            `${apiBase}/eval-metrics?limit=${EVAL_METRIC_LIMIT}`,
-            controller.signal,
-          ),
-          fetchJson<RolloutEvent[]>(`${apiBase}/events?limit=${EVENT_LIMIT}`, controller.signal),
-        ]);
-        if (!cancelled) {
-          setState(nextState);
-          setMetrics(nextMetrics);
-          setEvalMetrics(nextEvalMetrics);
-          setEvents(nextEvents);
-          setError(null);
-          setLastFetchAt(new Date().toISOString());
-        }
-      } catch (caught) {
-        if (!cancelled) {
-          setError(caught instanceof Error ? caught.message : String(caught));
-        }
-      } finally {
-        if (!cancelled) {
-          timer = window.setTimeout(poll, POLL_MS);
-        }
-      }
-    };
-    poll();
-    return () => {
-      cancelled = true;
-      controller?.abort();
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
+    if (apiBase !== null) persistApiBase(apiBase);
   }, [apiBase]);
 
+  // Self-heal: if the chosen API stops answering but another candidate works, move over.
   useEffect(() => {
-    if (activeView !== "rollouts") return;
+    if (!runs.error || apiBase === null) return;
     let cancelled = false;
-    let timer: number | undefined;
-    let controller: AbortController | undefined;
-    const poll = async () => {
-      controller = new AbortController();
-      try {
-        const seed = Math.floor(Date.now() / ROLLOUT_INSPECT_POLL_MS);
-        const nextInspection = await fetchJson<RolloutInspection>(
-          `${apiBase}/rollouts/inspect?random_count=3&seed=${seed}&max_scan_rows=5000`,
-          controller.signal,
-        );
-        if (!cancelled) {
-          const capturedAt = new Date().toISOString();
-          setRolloutInspection(nextInspection);
-          setRolloutInspectionError(null);
-          setRolloutInspectionAt(capturedAt);
-          setRolloutSnapshots((s) => appendBufferedSnapshot(s, nextInspection, capturedAt));
-        }
-      } catch (caught) {
-        if (!cancelled) {
-          setRolloutInspectionError(caught instanceof Error ? caught.message : String(caught));
-        }
-      } finally {
-        if (!cancelled) {
-          timer = window.setTimeout(poll, ROLLOUT_INSPECT_POLL_MS);
+    (async () => {
+      for (const candidate of apiBase === "" ? [] : [""]) {
+        if (await probeApiBase(candidate)) {
+          if (!cancelled) {
+            setApiBase(candidate);
+            setApiInput(candidate);
+          }
+          return;
         }
       }
-    };
-    poll();
+    })();
     return () => {
       cancelled = true;
-      controller?.abort();
-      if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [activeView, apiBase, rolloutInspectRefresh]);
+  }, [runs.error, apiBase]);
 
-  const latest = latestMetric(metrics);
-  const counts = eventCounts(events);
-  const consumedRate = rateForMetrics(metrics);
-  const publishedRate = rateForEvents(events, "published");
-  const submittedRate = rateForEvents(events, "submitted");
-  const step = metricStep(latest);
-  const inventory = pipelineInventory(state, events, metrics);
-  const selectedRolloutSnapshot = [...savedRolloutSnapshots, ...rolloutSnapshots].find(
-    (s) => s.id === selectedRolloutSnapshotId,
-  );
-  const displayedRolloutInspection = rolloutAutoFollow
-    ? rolloutInspection
-    : selectedRolloutSnapshot?.inspection ?? rolloutInspection;
-  const displayedRolloutInspectionAt = rolloutAutoFollow
-    ? rolloutInspectionAt
-    : selectedRolloutSnapshot?.captured_at ?? rolloutInspectionAt;
-  const progress =
-    state && step !== null && state.target_step > 0
-      ? Math.min(100, Math.max(0, (step / state.target_step) * 100))
-      : 0;
+  useEffect(() => {
+    const shown = current?.id ?? runId;
+    document.title = shown ? `${shown} · Wavelet` : "Wavelet Dashboard";
+  }, [runId, current?.id]);
 
-  const applyApiBase = () => {
-    const next = normalizeApiBase(apiInput);
-    if (next) {
-      setApiBase(next);
-      setSelectedRolloutSnapshotId(null);
-      setRolloutSnapshots([]);
-      setSavedRolloutSnapshots([]);
-    }
+  const applyApi = () => setApiBase(normalizeApiBase(apiInput));
+  const useSameOrigin = () => {
+    setApiBase("");
+    setApiInput("");
+    const url = new URL(window.location.href);
+    url.searchParams.delete("api");
+    window.history.replaceState(null, "", url.toString());
   };
-
-  const selectView = (view: ActiveView) => {
-    setActiveView(view);
-    const base = `${window.location.pathname}${window.location.search}`;
-    window.history.replaceState(null, "", view === "rollouts" ? `${base}#rollouts` : base);
-  };
-
-  const setAutoFollowRollouts = (follow: boolean) => {
-    if (follow) {
-      setRolloutAutoFollow(true);
-      setSelectedRolloutSnapshotId(null);
-      return;
-    }
-    setRolloutAutoFollow(false);
-    if (rolloutInspection?.available) {
-      const snapshot = makeRolloutSnapshot(rolloutInspection, new Date().toISOString(), "reader");
-      setRolloutSnapshots((s) => prependSnapshot(s, snapshot, ROLLOUT_BUFFER_LIMIT));
-      setSelectedRolloutSnapshotId(snapshot.id);
-    }
-  };
-
-  const selectRolloutSnapshot = (snapshotId: string) => {
-    setRolloutAutoFollow(false);
-    setSelectedRolloutSnapshotId(snapshotId);
-  };
-
-  const saveCurrentRolloutSnapshot = () => {
-    if (!displayedRolloutInspection?.available) return;
-    const snapshot = makeRolloutSnapshot(displayedRolloutInspection, new Date().toISOString(), "saved");
-    setSavedRolloutSnapshots((s) => prependSnapshot(s, snapshot, SAVED_ROLLOUT_LIMIT));
-    setRolloutAutoFollow(false);
-    setSelectedRolloutSnapshotId(snapshot.id);
-  };
+  const showEvals = current ? current.eval_envs.length > 0 || Boolean(current.latest.eval) : true;
 
   return (
-    <div className="min-h-screen bg-[#f8fafc] text-slate-900 dark:bg-[#0a0a0f] dark:text-slate-100">
-      <div className="mx-auto flex max-w-[1440px] min-h-screen">
-
-        {/* ── Sidebar ── */}
-        <aside className="hidden w-56 shrink-0 flex-col border-r border-slate-200 dark:border-white/[0.06] lg:flex">
-          <div className="sticky top-0 flex flex-col gap-6 p-5">
-            {/* Brand */}
-            <div className="flex items-center gap-2.5">
-              <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-slate-900 dark:bg-white">
-                <Server className="h-3.5 w-3.5 text-white dark:text-slate-900" />
+    <div className="flex min-h-screen">
+      <a className="skip-link" href="#main-content">Skip to dashboard content</a>
+      <aside className="hidden w-56 shrink-0 flex-col lg:flex">
+        <div className="sticky top-0 flex h-screen flex-col gap-6 px-4 py-5">
+          <a href={routeHref({ page: "runs" })} className="flex items-center gap-2 px-1">
+            <span className="flex h-7 w-7 items-center justify-center rounded-xl bg-ink text-surface"><Waves className="h-4 w-4" /></span>
+            <span className="text-sm font-semibold tracking-tight">Wavelet</span>
+          </a>
+          <div>
+            <div className="eyebrow mb-1 px-3">{primaryRunLabel} run</div>
+            <a href={routeHref({ page: "run", runId: CURRENT_RUN, view: "overview" })} className={`block px-3 py-1 transition-colors ${viewingCurrent ? "" : "opacity-80 hover:opacity-100"}`}>
+              <div className="flex items-center gap-1.5 text-[13px] font-semibold text-ink">
+                <Radio className={`h-3.5 w-3.5 shrink-0 ${currentRun?.status === "running" ? "live-dot text-good" : "text-muted"}`} />
+                <span className="line-clamp-2 break-all leading-tight" title={currentRun?.id}>{currentRun?.id ?? (runs.data ? "no runs found" : "…")}</span>
               </div>
-              <span className="text-sm font-semibold tracking-tight">Wavelet RL</span>
-            </div>
-
-            {/* Nav */}
-            <ViewTabs activeView={activeView} onChange={selectView} layout="vertical" />
-
-            {/* Status block */}
-            <div className="rounded-lg border border-slate-200 p-3 dark:border-white/[0.06]">
-              <div className="flex items-center justify-between">
-                <span className="text-xs text-slate-500 dark:text-slate-400">{state?.status ?? "waiting"}</span>
-                {error ? (
-                  <span className="flex items-center gap-1 text-xs text-red-500">
-                    <WifiOff className="h-3 w-3" /> offline
-                  </span>
-                ) : (
-                  <span className="flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
-                    <span className="live-dot h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                    live
-                  </span>
-                )}
-              </div>
-              <div className="mt-2.5 h-1 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-white/[0.08]">
-                <div className="progress-bar h-full rounded-full" style={{ width: `${progress}%` }} />
-              </div>
-              <div className="mt-1.5 flex justify-between text-[11px] text-slate-500 dark:text-slate-400">
-                <span>step {step ?? "–"}</span>
-                <span>{progress.toFixed(0)}%</span>
-              </div>
-            </div>
-
-            {/* Controls */}
-            <div className="flex flex-col gap-2">
-              <div className="flex overflow-hidden rounded-md border border-slate-200 dark:border-white/[0.06]">
-                <input
-                  id="api-base-input"
-                  value={apiInput}
-                  onChange={(e) => setApiInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && applyApiBase()}
-                  className="min-w-0 flex-1 bg-transparent px-2.5 py-1.5 text-xs text-slate-900 outline-none placeholder:text-slate-500 dark:text-slate-100"
-                  placeholder="API base URL"
-                  aria-label="State API base URL"
-                />
-                <button
-                  type="button"
-                  id="connect-btn"
-                  onClick={applyApiBase}
-                  className="border-l border-slate-200 px-2.5 text-xs font-medium text-slate-600 hover:bg-slate-50 dark:border-white/[0.06] dark:text-slate-300 dark:hover:bg-white/[0.04]"
-                >
-                  Go
-                </button>
-              </div>
-              <button
-                type="button"
-                id="theme-toggle"
-                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-                className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-xs text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-white/[0.04]"
-                aria-label="Toggle theme"
-              >
-                {theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-                {theme === "dark" ? "Light mode" : "Dark mode"}
-              </button>
-              <div className="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-                {error ? <WifiOff className="h-3 w-3 shrink-0 text-red-400" /> : <Wifi className="h-3 w-3 shrink-0" />}
-                <span className="truncate">{error ? error : `Updated ${formatTime(lastFetchAt)}`}</span>
-              </div>
-            </div>
+              {currentRun && (
+                <div className="tabular mt-1 flex items-center justify-between text-[11px] text-muted">
+                  <StatusBadge status={currentRun.status} reason={currentRun.status_reason} />
+                  <span>step {currentRun.trainer_step === null ? "–" : currentRun.trainer_step + 1}{currentRun.target_step ? ` / ${currentRun.target_step}` : ""}</span>
+                </div>
+              )}
+            </a>
           </div>
-        </aside>
-
-        {/* ── Main ── */}
-        <main className="min-w-0 flex-1 px-4 py-6 sm:px-6 lg:px-8">
-          {/* Page title */}
-          <div className="mb-6 flex items-start justify-between gap-4">
-            <div>
-              <h1 className="text-lg font-semibold tracking-tight">
-                {activeView === "rollouts" ? "Rollout Inspector" : "Training Overview"}
-              </h1>
-              <p className="mt-0.5 text-sm text-slate-500 dark:text-slate-400">
-                {activeView === "rollouts"
-                  ? "Sampled completions without disturbing the training loop."
-                  : "Training progress, queue flow, policy state, and throughput."}
-              </p>
+          {runId && (
+            <div className="min-h-0 flex-1">
+              {!viewingCurrent && current && (
+                <div className="mb-3 px-3 text-[11px] text-ink2">
+                  <div className="flex items-center gap-1.5 font-medium text-ink"><History className="h-3 w-3" /> older run</div>
+                  <div className="truncate" title={current.id}>{current.id}</div>
+                </div>
+              )}
+              <nav className="flex flex-col gap-0.5" aria-label="Run views">
+                {NAV.filter((item) => item.view !== "evals" || showEvals).map((item) => (
+                  <NavLink key={item.view} active={route.view === item.view} href={routeHref({ page: "run", runId, view: item.view })} icon={item.icon} label={item.label} hint={item.hint} />
+                ))}
+              </nav>
             </div>
-            <div className="flex shrink-0 items-center gap-2 lg:hidden">
-              <ViewTabs activeView={activeView} onChange={selectView} layout="horizontal" />
-            </div>
-          </div>
-
-          {activeView === "overview" ? (
-            <OverviewView
-              state={state}
-              latest={latest}
-              events={events}
-              metrics={metrics}
-              evalMetrics={evalMetrics}
-              counts={counts}
-              inventory={inventory}
-              step={step}
-              progress={progress}
-              publishedRate={publishedRate}
-              submittedRate={submittedRate}
-              consumedRate={consumedRate}
-            />
-          ) : (
-            <RolloutsView
-              state={state}
-              events={events}
-              counts={counts}
-              inventory={inventory}
-              inspection={displayedRolloutInspection}
-              liveInspection={rolloutInspection}
-              inspectionError={rolloutInspectionError}
-              inspectionUpdatedAt={displayedRolloutInspectionAt}
-              autoFollow={rolloutAutoFollow}
-              bufferedSnapshots={rolloutSnapshots}
-              savedSnapshots={savedRolloutSnapshots}
-              selectedSnapshotId={selectedRolloutSnapshotId}
-              onSetAutoFollow={setAutoFollowRollouts}
-              onRefreshInspection={() => setRolloutInspectRefresh((v) => v + 1)}
-              onSelectSnapshot={selectRolloutSnapshot}
-              onSaveSnapshot={saveCurrentRolloutSnapshot}
-            />
           )}
-        </main>
-      </div>
+          <nav className="flex flex-col gap-0.5 pt-1" aria-label="Global">
+            <NavLink active={route.page === "runs"} href={routeHref({ page: "runs" })} icon={<History className="h-3.5 w-3.5" />} label={`Runs${runs.data?.length ? ` (${runs.data.length})` : ""}`} />
+            <NavLink active={route.page === "compare"} href={routeHref({ page: "compare", params: route.page === "compare" ? route.params : undefined })} icon={<GitCompare className="h-3.5 w-3.5" />} label="Compare" />
+          </nav>
+          <div className="mt-auto flex items-center justify-between">
+            <Popover
+              align="left"
+              placement="top"
+              width={300}
+              trigger={(open) => (
+                <button type="button" className={`btn !px-2 ${open ? "btn-active" : ""}`} title="Connection">
+                  {runs.error ? <span className="inline-block h-2 w-2 rounded-full bg-critical" /> : <span className="live-dot inline-block h-2 w-2 rounded-full bg-good" />}
+                  <span className="text-[11px]">{runs.error ? "offline" : `${runs.data?.length ?? 0} runs`}</span>
+                </button>
+              )}
+            >
+              <div className="space-y-2">
+                <div className="eyebrow">API base</div>
+                <div className="flex items-center gap-1">
+                  <input className="input min-w-0 flex-1" value={apiInput} onChange={(e) => setApiInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyApi()} placeholder="same origin" aria-label="API base URL" />
+                  <button type="button" className="btn btn-active" onClick={applyApi}>Go</button>
+                </div>
+                <p className="text-[10.5px] leading-relaxed text-muted">{apiBase ? `Reading from ${apiBase}.` : "Reading from the server that served this page."} Leave blank to use this server; the address is remembered by the browser.</p>
+                {runs.error && <div className="text-[11px] text-critical">{runs.error}</div>}
+              </div>
+            </Popover>
+            <button type="button" className="btn !px-1.5 !py-1" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="Toggle theme">{theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}</button>
+          </div>
+        </div>
+      </aside>
+
+      <main id="main-content" className="min-w-0 flex-1 px-4 py-4 sm:px-5 lg:px-10 lg:py-6">
+        <div className="sticky top-0 z-30 -mx-4 -mt-4 mb-5 border-b border-edge bg-surface/95 px-4 py-2.5 backdrop-blur lg:hidden">
+          <div className="flex items-center gap-1">
+            <a href={routeHref({ page: "runs" })} className="mr-auto flex items-center gap-2 py-1 text-sm font-semibold" aria-label="Wavelet runs">
+              <span className="flex h-7 w-7 items-center justify-center rounded-xl bg-ink text-surface"><Waves className="h-4 w-4" /></span>
+              <span className="hidden min-[360px]:inline">Wavelet</span>
+            </a>
+            <a href={routeHref({ page: "run", runId: CURRENT_RUN, view: "overview" })} className="btn" aria-label={`${primaryRunLabel} run`}><Radio className="h-3.5 w-3.5" /><span className="hidden min-[360px]:inline">{primaryRunLabel}</span></a>
+            <a href={routeHref({ page: "runs" })} className="btn" aria-label="All runs"><History className="h-3.5 w-3.5" /><span className="hidden min-[360px]:inline">Runs</span></a>
+            <a href={routeHref({ page: "compare", params: route.page === "compare" ? route.params : undefined })} className="btn !px-2" aria-label="Compare runs" title="Compare runs"><GitCompare className="h-3.5 w-3.5" /></a>
+            <button type="button" className="btn !px-2" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}>{theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}</button>
+          </div>
+          {runId && (
+            <div className="mt-2 flex items-center gap-2">
+              <select className="select min-w-0 flex-1" aria-label="Run view" value={route.view} onChange={(e) => navigate({ page: "run", runId, view: e.target.value })}>
+                {NAV.filter((item) => item.view !== "evals" || showEvals).map((item) => <option key={item.view} value={item.view}>{item.label}</option>)}
+              </select>
+              <Popover
+                width={300}
+                trigger={(open) => (
+                  <button type="button" className={`btn !px-2 ${open ? "btn-active" : ""}`} aria-label="API connection" title="API connection">
+                    <span className={`inline-block h-2 w-2 rounded-full ${runs.error ? "bg-critical" : "bg-good"}`} />
+                  </button>
+                )}
+              >
+                <div className="space-y-2">
+                  <div className="eyebrow">API base</div>
+                  <div className="flex items-center gap-1">
+                    <input className="input min-w-0 flex-1" value={apiInput} onChange={(e) => setApiInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyApi()} placeholder="same origin" aria-label="API base URL" />
+                    <button type="button" className="btn btn-active" onClick={applyApi}>Go</button>
+                  </div>
+                  <p className="text-[11px] leading-relaxed text-muted">{apiBase ? `Reading from ${apiBase}.` : "Reading from this server."}</p>
+                  {runs.error && <div className="text-[11px] text-critical">{runs.error}</div>}
+                </div>
+              </Popover>
+            </div>
+          )}
+        </div>
+        {apiBase === null && <div className="animate-enter text-xs text-muted">Connecting…</div>}
+        <div key={`${route.page}:${runId ?? ""}:${route.view}`} className="animate-enter" data-page={route.page} data-view={route.view}>
+        {apiBase !== null && runs.error && (
+          <div className="mb-6 max-w-2xl space-y-2 text-sm">
+            <div className="font-semibold text-critical">Cannot reach the API at {apiBase || window.location.origin}</div>
+            <div className="text-xs text-muted">{runs.error}. Start <code>wavelet dashboard</code> on the training host, or point the sidebar field at a running state server.</div>
+            {apiBase !== "" && <button type="button" className="btn btn-active" onClick={useSameOrigin}>Use this server's API ({window.location.origin})</button>}
+          </div>
+        )}
+        {apiBase !== null && route.page === "runs" && <RunsView apiBase={apiBase} runs={runs.data} error={runs.error} />}
+        {apiBase !== null && route.page === "compare" && <CompareView apiBase={apiBase} runs={runs.data ?? []} params={route.params} />}
+        {apiBase !== null && route.page === "run" && runId && (
+          <>
+            {summary.error && (
+              <div className="mb-3 rounded-md px-4 py-2.5 text-xs text-critical" style={{ background: "color-mix(in srgb, var(--status-critical) 12%, transparent)" }}>
+                {runId === CURRENT_RUN && summary.error.startsWith("Unknown run") ? "No run directories found under the configured roots." : summary.error}{" "}
+                <a className="underline" href={routeHref({ page: "runs" })}>All runs</a>
+              </div>
+            )}
+            {!viewingCurrent && current && currentRun && (
+              <div className="mb-3 flex flex-wrap items-center gap-2 rounded-md px-4 py-2.5 text-xs text-ink2" style={{ background: "color-mix(in srgb, var(--status-warning) 14%, transparent)" }}>
+                <History className="h-3.5 w-3.5 text-warn" />
+                Viewing older run <span className="font-medium text-ink">{current.id}</span>.
+                <a className="underline" href={routeHref({ page: "run", runId: CURRENT_RUN, view: route.view })}>Go to {primaryRunLabel.toLowerCase()} run {currentRun.id}</a>
+              </div>
+            )}
+            {route.view === "overview" && <OverviewView apiBase={apiBase} runId={runId} summary={current} />}
+            {route.view === "training" && <TrainingView apiBase={apiBase} runId={runId} params={route.params} live={runIsLive} />}
+            {route.view === "rollouts" && <RolloutMetricsView apiBase={apiBase} runId={runId} params={route.params} live={runIsLive} />}
+            {route.view === "inspector" && <InspectorView apiBase={apiBase} runId={runId} params={route.params} live={runIsLive} />}
+            {route.view === "evals" && <EvalsView apiBase={apiBase} runId={runId} params={route.params} trainerStep={current?.trainer_step ?? null} live={runIsLive} />}
+            {route.view === "pipeline" && <PipelineView apiBase={apiBase} runId={runId} summary={current} />}
+            {route.view === "infra" && <InfraView apiBase={apiBase} runId={runId} summary={current} />}
+            {route.view === "config" && <ConfigView apiBase={apiBase} runId={runId} otherRuns={runIds.filter((id) => id !== current?.id)} />}
+          </>
+        )}
+        </div>
+      </main>
     </div>
   );
 }
 
-document.documentElement.classList.toggle("dark", initialTheme() === "dark");
-
-createRoot(document.getElementById("root") as HTMLElement).render(<App />);
+function NavLink({ active, href, icon, label, hint }: { active: boolean; href: string; icon: ReactElement; label: string; hint?: string }) {
+  return (
+    <a href={href} title={hint} className={`nav-link ${active ? "nav-link-active" : ""}`} aria-current={active ? "page" : undefined}>
+      {icon}
+      {label}
+    </a>
+  );
+}

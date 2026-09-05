@@ -55,6 +55,8 @@ temp/
 node_modules/
 webui/node_modules/
 webui/dist/
+webui/test-results/
+webui/playwright-report/
 
 # External reference checkouts and local notes
 ref/

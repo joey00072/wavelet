@@ -82,16 +82,20 @@ Both 7B recipes use `launcher.mode: colocate`. The smoke config uses QLoRA and a
 In each case vLLM and the trainer share GPU 0. Check available memory before
 launching and lower the configured cap if another process is using the device.
 
-The RL config enables the state server on port 8765. Start the dashboard in a
-second terminal:
+The RL config enables the orchestrator state server on port 8765. Watch the run
+in a second terminal with the read-only dashboard, which also works after the
+run finishes:
 
 ```bash
-cd webui
-bun install
-bun run dev --host 0.0.0.0
+cd webui && bun install && bun run build && cd ..
+uv run wavelet dashboard --runs-root outputs --port 8766
 ```
 
-Open `http://<host>:5173/?api=http://<host>:8765`.
+Open `http://<host>:8766/`. To read the live state server directly instead,
+open the dashboard with `?api=http://<host>:8765`. The Inspector view sorts and
+filters rollouts by reward, advantage, and truncation; the Evals view tracks
+`avg@k` and `pass@k` per policy step. See the
+[dashboard guide](../../webui/README.md).
 
 The smaller `rl.yaml` example instead uses process mode and assigns vLLM to GPU
 0 and the trainer to GPU 1. Adjust the selected config's `launcher` block before

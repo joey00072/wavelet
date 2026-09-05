@@ -6,5 +6,12 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     port: 5173,
+    proxy: {
+      // Same-origin API in development: the Python dashboard runs beside Vite.
+      "/api": {
+        target: process.env.WAVELET_API ?? "http://127.0.0.1:8766",
+        changeOrigin: true,
+      },
+    },
   },
 });

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from wavelet.configs.config import RLConfig
+from wavelet.dashboard.server import RunRegistry, register_run_routes
 from wavelet.monitor import (
     RolloutStateEventsMixin,
     _file_exceeds_rows,
@@ -254,6 +255,7 @@ def _build_state_app(
     fastapi: Any,
     query: Any,
     cors_middleware: Any,
+    http_exception: Any,
 ) -> Any:
     config = state._config.orchestrator.state_server
     app = fastapi(title="Wavelet Orchestrator State", version="1.0")
@@ -337,6 +339,9 @@ def _build_state_app(
             max_text_chars=max_text_chars,
         )
 
+    output_dir = state._config.output_dir
+    registry = RunRegistry(live={output_dir.name: output_dir})
+    register_run_routes(app, registry, http_exception=http_exception, query=query)
     return app
 
 
@@ -357,7 +362,7 @@ class StateServerHandle:
             return
         try:
             import uvicorn
-            from fastapi import FastAPI, Query
+            from fastapi import FastAPI, HTTPException, Query
             from fastapi.middleware.cors import CORSMiddleware
         except ImportError as exc:
             raise RuntimeError(
@@ -369,6 +374,7 @@ class StateServerHandle:
             fastapi=FastAPI,
             query=Query,
             cors_middleware=CORSMiddleware,
+            http_exception=HTTPException,
         )
 
         uvicorn_config = uvicorn.Config(

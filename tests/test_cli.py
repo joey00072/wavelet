@@ -27,6 +27,8 @@ def test_cli_usage_does_not_eagerly_import_entrypoints(monkeypatch, capsys) -> N
     assert "debug" in output
     assert "evals" in output
     assert "inference-server" in output
+    assert "dashboard" in output
+    assert "synth-run" not in output
     assert "inference-debug" not in output
     assert "orchestrator-debug" not in output
     assert "rl-vllm-server" not in output
