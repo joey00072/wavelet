@@ -15,6 +15,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--examples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--preserve-order",
+        action="store_true",
+        help=(
+            "Keep the verifier taskset's source order. Use this with an unshuffled "
+            "Wavelet data config for task-for-task reference comparisons."
+        ),
+    )
     parser.add_argument("--env-id", default="primeintellect/alphabet-sort")
     parser.add_argument("--min-turns", type=int, default=3)
     parser.add_argument("--max-turns", type=int, default=5)
@@ -48,7 +56,7 @@ def main() -> int:
         ) from exc
 
     env = vf.load_environment(args.env_id, **env_args(args))
-    dataset = env.get_dataset(seed=args.seed)
+    dataset = env.get_dataset(seed=None if args.preserve_order else args.seed)
     rows = []
     for index, example in enumerate(dataset):
         if args.examples is not None and index >= args.examples:

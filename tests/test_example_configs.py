@@ -301,6 +301,7 @@ def test_reverse_text_int4_4b_tracks_reward_eval_shape() -> None:
         Path("examples/alphabet_sort/rl_colocate_sleep.yaml"),
         Path("examples/alphabet_sort/rl_fsdp_multi.yaml"),
         Path("examples/alphabet_sort/rl_fsdp_multi_reward.yaml"),
+        Path("examples/alphabet_sort/rl_8b_long.yaml"),
     ],
     ids=str,
 )
@@ -314,3 +315,24 @@ def test_alphabet_sort_rl_uses_reference_environment_id(path: Path) -> None:
             for env in config.eval.env
             if env.name == "alphabet-sort"
         )
+
+
+def test_alphabet_sort_8b_long_config_preserves_source_task_order() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/alphabet_sort/rl_8b_long.yaml"))
+    )
+
+    assert config.model.name == "Qwen/Qwen3-8B"
+    assert config.data.shuffle is False
+    assert config.data.batch_size == 256
+    assert config.orchestrator.examples_per_step == 16
+    assert config.orchestrator.rollouts_per_example == 16
+    assert config.orchestrator.rollout_chunk_examples == 16
+    assert config.orchestrator.filter_zero_advantage is True
+    assert config.orchestrator.max_async_level == 3
+    assert config.algo.normalize_advantages is False
+    assert config.algo.epsilon == pytest.approx(1.0e-12)
+    assert config.loss.type == "ipo"
+    assert config.lora is not None
+    assert config.lora.optimization_dtype == "float32"
+    assert config.max_steps == 100_000

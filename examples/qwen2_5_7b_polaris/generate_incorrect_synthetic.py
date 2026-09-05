@@ -119,7 +119,7 @@ def has_numbered_reasoning(completion: str) -> bool:
 
 
 def verify_math_answer(response: str, answer: str, timeout_seconds: int) -> bool:
-    """Use the exact verifier helper used by Prime's MathRubric."""
+    """Use the exact verifier helper used by the upstream MathRubric."""
     from verifiers.rubrics.math_rubric import verify_response
 
     reward, _elapsed = verify_response(

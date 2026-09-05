@@ -27,6 +27,22 @@ Generate verifier examples:
 uv run python examples/alphabet_sort/prepare_rl_data.py
 ```
 
+For a task-for-task reference comparison, preserve the verifier taskset's source
+order and use the 8B long-run config, which deliberately disables Wavelet's
+dataset shuffle:
+
+```bash
+uv run python examples/alphabet_sort/prepare_rl_data.py \
+  --preserve-order \
+  --output outputs/alphabet_sort_data/rl_train_source_order.jsonl
+uv run python -m wavelet rl @ examples/alphabet_sort/rl_8b_long.yaml
+```
+
+`rl_8b_long.yaml` uses Qwen3-8B, 256-rollout GRPO/IPO, a rank-32 FP32 LoRA
+optimizer, a one-inference/one-trainer GPU layout, and source task order. It is
+a 100,000-step long-run recipe; use a CLI `--max_steps` override for a short
+validation.
+
 Each row stores one verifier dataset example. During RL, Wavelet calls
 `wavelet.orchestrator.verifiers:generate_rollouts`, which runs
 `orchestrator.rollouts_per_example` verifier rollouts per example.

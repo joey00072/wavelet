@@ -1,0 +1,182 @@
+model:
+  name: "Qwen/Qwen3-8B"
+  torch_dtype: bfloat16
+  attn_implementation: auto
+  load_in_4bit: false
+  activation_checkpointing:
+    mode: full
+  matmul_precision: high
+
+data:
+  source: local
+  path: outputs/alphabet_sort_data/rl_train_source_order.jsonl
+  batch_size: 256
+  micro_batch_size: 1
+  pack_sequences: true
+  pad_to_multiple_of: 1
+  seq_len: 2048
+  shuffle: false
+  seed: 42
+
+loss:
+  type: ipo
+  ipo_epsilon: 0.1
+  kl_tau: 0.001
+  adv_tau: 1.0
+
+algo:
+  type: grpo
+  normalize_advantages: false
+  epsilon: 1.0e-12
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: primeintellect/alphabet-sort
+  verifier_env_args:
+    min_turns: 3
+    max_turns: 5
+    power_per_turn: false
+  verifier_model: Qwen/Qwen3-8B
+  verifier_client_type: openai_chat_completions_token
+  examples_per_step: 16
+  rollouts_per_example: 16
+  # Publish one constant 256-trace trainer batch per update. Generation
+  # still runs in 128-request waves because max_inflight_rollouts is 128.
+  rollout_chunk_examples: 16
+  max_inflight_rollouts: 128
+  filter_zero_advantage: true
+  zero_advantage_max_retries: 128
+  # The validated reference run observed policy lag 0-2; Wavelet's level
+  # includes the current policy, so level 3 permits the same bounded lag.
+  max_async_level: 3
+  max_off_policy_steps: 8
+  state_server:
+    enabled: true
+    host: 0.0.0.0
+    port: 8765
+
+transport:
+  type: filesystem
+  poll_interval_seconds: 0.05
+  cleanup_consumed: true
+  keep_last_consumed: 8
+
+eval:
+  interval: 10
+  num_examples: 16
+  rollouts_per_example: 16
+  eval_base_model: true
+  final_eval: true
+  keep_last_rollout_sets: 2
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 768
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  env:
+    - id: primeintellect/alphabet-sort
+      name: alphabet-sort
+      args:
+        min_turns: 3
+        max_turns: 5
+        power_per_turn: false
+
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 1.0
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 768
+    do_sample: true
+    num_generations: 1
+    seed: null
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: false
+  vllm:
+    server_backend: openai
+    gpu_memory_utilization: 0.9
+    max_model_len: 2048
+    enforce_eager: false
+    max_lora_rank: 32
+  http:
+    port: 8000
+    request_timeout_seconds: 900.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+  poll_interval_seconds: 0.05
+  keep_last: 8
+
+ckpt:
+  mode: async
+  interval: 100
+  keep_last: 2
+
+optim:
+  type: adamw
+  implementation: for-loop
+  lr: 1e-5
+  weight_decay: 0.01
+
+scheduler:
+  type: constant
+
+lora:
+  rank: 32
+  alpha: 64.0
+  dropout: 0.0
+  optimization_dtype: float32
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - experts
+    - fc1_latent_proj
+    - fc2_latent_proj
+
+max_grad_norm: 1.0
+max_steps: 100000
+seed: 42
+
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 10
+    sample_ratio: 0.25
+    max_samples: 8
+  wandb:
+    enabled: false
+
+launcher:
+  mode: process
+  backend: local
+  inference_num_replicas: 1
+  inference_cuda_visible_devices: "0"
+  trainer_num_processes: 1
+  trainer_cuda_visible_devices: "1"
+
+output_dir: outputs/alphabet_sort_8b_long
+clean_output_dir: true

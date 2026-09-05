@@ -16,7 +16,7 @@ all-correct and all-wrong groups so the trainer receives mixed groups. Useful
 groups remain buffered across bounded retry attempts while rejected groups are
 replaced.
 
-AIME 2024 evaluation uses the pinned 30-problem source from Prime's environment,
+AIME 2024 evaluation uses the pinned 30-problem upstream environment source,
 eight rollouts per problem, and the same strict response parser and math
 verifier. Run the zero-step config first to establish the untrained baseline;
 it starts no trainer process.
@@ -47,10 +47,11 @@ reward-hacking inspection.
 `generate_incorrect_synthetic.py` selects 100 deterministic, unique Polaris
 problems from the hard `1/8` bucket after AIME 2024 decontamination. It samples
 eight responses per prompt from a loaded policy adapter. Responses that violate
-the exact `<think>...</think><answer>...</answer>` contract or pass Prime's math
-verifier are discarded. Reasoning that contains line-start list markers `1.`,
-`2.`, and `3.` is also discarded. Only valid-format, non-numbered incorrect
-solutions are written to `incorrect.jsonl`. `summary.json` contains aggregate
+the exact `<think>...</think><answer>...</answer>` contract or pass the
+upstream math verifier are discarded. Reasoning that contains line-start list
+markers `1.`, `2.`, and `3.` is also discarded. Only valid-format,
+non-numbered incorrect solutions are written to `incorrect.jsonl`.
+`summary.json` contains aggregate
 rejection counts without retaining rejected completions.
 
 With a Wavelet inference server running, generate from a stable adapter using:

@@ -39,7 +39,7 @@ uv run torchrun --standalone --nproc-per-node=N \
 
 | Example | Status | Notes |
 | --- | --- | --- |
-| `alphabet_sort` | working | 4B LoRA RL. |
+| `alphabet_sort` | working | 4B LoRA RL plus a 2-GPU Qwen3-8B long-run recipe. |
 | `equation_builder` | working | Local 3–5 number `+`/`-` environment; 0.6B LoRA plus 7B QLoRA smoke and BF16 LoRA long-run configs with rollout auditing. |
 | `reverse_text` | working | 0.6B LoRA RL plus SFT with periodic validation loss; includes a 2-GPU INT4 QLoRA 4B experiment. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
