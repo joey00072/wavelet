@@ -1,6 +1,6 @@
 # Deployment
 
-Wavelet provides a CUDA 12.8 image for single-node SFT and RL
+Wavelet provides a CUDA 13.0 image for single-node SFT and RL
 runs. The image installs the locked Python 3.12 environment, including the
 matching prebuilt FlashAttention wheel, and retains the CUDA toolkit because
 vLLM and attention backends may compile kernels at runtime.

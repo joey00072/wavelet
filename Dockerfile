@@ -1,9 +1,9 @@
 ARG UV_VERSION=0.11.17
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
-# The locked Linux dependencies use CUDA 12 wheels. Keep the toolkit available
+# The locked Linux dependencies use CUDA 13 wheels. Keep the toolkit available
 # at runtime because vLLM and attention kernels may compile code on first use.
-FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG USER_ID=1000
@@ -37,7 +37,7 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 WORKDIR /opt/wavelet
 
 # Resolve third-party packages in a source-independent cache layer. The
-# prebuilt FlashAttention wheel is matched to Python 3.12, CUDA 12.8, and the
+# prebuilt FlashAttention wheel is matched to Python 3.12, CUDA 13.0, and the
 # PyTorch version in uv.lock.
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --python /usr/bin/python3.12 --locked --no-dev \

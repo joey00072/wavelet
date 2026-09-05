@@ -6,7 +6,7 @@ from pathlib import Path
 def test_dockerfile_builds_locked_cuda_runtime_as_non_root() -> None:
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
 
-    assert "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04" in dockerfile
+    assert "nvidia/cuda:13.0.2-cudnn-devel-ubuntu24.04" in dockerfile
     assert "FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv" in dockerfile
     assert "COPY --from=uv /uv /uvx /usr/local/bin/" in dockerfile
     assert dockerfile.count("uv sync --python /usr/bin/python3.12 --locked") == 2
