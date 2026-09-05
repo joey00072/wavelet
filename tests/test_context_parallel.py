@@ -20,6 +20,8 @@ def test_context_parallel_batch_padding_preserves_packed_streams() -> None:
         "labels": torch.tensor([[7, 8, -100]]),
         "loss_mask": torch.tensor([[True, True, False]]),
         "temperatures": torch.tensor([[0.5, 0.5, 1.0]]),
+        "sampling_mask_ids": torch.tensor([[[4, 9], [5, 0], [0, 0]]]),
+        "sampling_mask_lengths": torch.tensor([[2, 1, 0]]),
         "rewards": torch.tensor([1.0]),
     }
 
@@ -32,6 +34,9 @@ def test_context_parallel_batch_padding_preserves_packed_streams() -> None:
     assert padded["labels"][0, -1].item() == -100
     assert padded["loss_mask"][0, -1].item() is False
     assert padded["temperatures"][0, -1].item() == 1.0
+    assert padded["sampling_mask_ids"].shape == (1, 8, 2)
+    assert padded["sampling_mask_ids"][0, -1].tolist() == [0, 0]
+    assert padded["sampling_mask_lengths"][0, -1].item() == 0
     assert padded["rewards"].shape == (1,)
 
 

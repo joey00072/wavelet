@@ -21,6 +21,8 @@ _SEQUENCE_FIELDS = {
     "rl_weights",
     "ce_weights",
     "ref_kl_weights",
+    "sampling_mask_ids",
+    "sampling_mask_lengths",
     "inference_logprobs",
     "teacher_logprobs",
     "temperatures",
