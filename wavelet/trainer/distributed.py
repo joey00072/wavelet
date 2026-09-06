@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import cached_property
 
@@ -10,6 +11,7 @@ import torch
 import torch.distributed as dist
 from torch._utils import _get_available_device_type
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DTensor
 
 DEFAULT_DEVICE_TYPE = _get_available_device_type() or "cuda"
 
@@ -280,6 +282,48 @@ def distributed_uses_cuda() -> bool:
 
 def world_is_distributed(world: World | None) -> bool:
     return world is not None and world.world_size > 1
+
+
+@torch.no_grad()
+def clip_grad_norm_across_meshes_(
+    parameters: Iterable[torch.Tensor],
+    max_norm: float,
+) -> torch.Tensor:
+    """Clip one model whose gradients may live on different DTensor meshes."""
+    grouped: dict[int | None, list[torch.Tensor]] = {}
+    for parameter in parameters:
+        grad = parameter.grad
+        if grad is None:
+            continue
+        mesh_key = id(grad.device_mesh) if isinstance(grad, DTensor) else None
+        grouped.setdefault(mesh_key, []).append(parameter)
+
+    if not grouped:
+        return torch.tensor(0.0)
+    if len(grouped) == 1:
+        return torch.nn.utils.clip_grad_norm_(
+            next(iter(grouped.values())),
+            max_norm,
+        )
+
+    group_norms: list[torch.Tensor] = []
+    for group in grouped.values():
+        norm = torch.nn.utils.get_total_norm(
+            [parameter.grad for parameter in group],
+            norm_type=2.0,
+        )
+        if isinstance(norm, DTensor):
+            norm = norm.full_tensor()
+        group_norms.append(norm)
+
+    target_device = group_norms[0].device
+    total_norm = torch.linalg.vector_norm(
+        torch.stack([norm.to(target_device) for norm in group_norms]),
+        ord=2.0,
+    )
+    for group in grouped.values():
+        torch.nn.utils.clip_grads_with_norm_(group, max_norm, total_norm)
+    return total_norm
 
 
 def get_world() -> World:

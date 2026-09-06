@@ -36,6 +36,19 @@ DEFAULT_LORA_TARGET_MODULES = [
     "fc2_latent_proj",
 ]
 
+VLLM_LORA_RANK_CAPACITIES = (8, 16, 32, 64, 128, 256, 320, 512)
+
+
+def resolve_vllm_lora_rank_capacity(rank: int) -> int:
+    """Return the smallest vLLM LoRA capacity that can serve ``rank``."""
+    for capacity in VLLM_LORA_RANK_CAPACITIES:
+        if rank <= capacity:
+            return capacity
+    raise ValueError(
+        f"LoRA rank {rank} exceeds vLLM's maximum supported rank capacity "
+        f"of {VLLM_LORA_RANK_CAPACITIES[-1]}."
+    )
+
 
 class LoRAConfig(ConfigModel):
     rank: int = Field(default=16, ge=1)
@@ -853,7 +866,13 @@ class RLVLLMConfig(ConfigModel):
     data_parallel_size_local: int | None = Field(default=None, ge=1)
     data_parallel_rpc_port: int | None = Field(default=None, ge=1, le=65535)
     enforce_eager: bool = False
-    max_lora_rank: int | None = Field(default=None, ge=1)
+    max_lora_rank: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Maximum LoRA rank capacity; rounded up to a value supported by vLLM."
+        ),
+    )
     fully_sharded_loras: bool = False
     trust_remote_code: bool | None = None
     dtype: Literal["auto", "float32", "float16", "bfloat16"] | None = None
@@ -1577,6 +1596,17 @@ class RLConfig(TrainerConfig):
         if not isinstance(value, dict):
             return value
         return _normalize_opd_teacher_config(_normalize_algorithm_config(value))
+
+    @model_validator(mode="after")
+    def resolve_vllm_lora_capacity(self) -> "RLConfig":
+        requested = self.inference.vllm.max_lora_rank
+        if self.lora is not None:
+            requested = max(requested or 0, self.lora.rank)
+        if requested is not None:
+            self.inference.vllm.max_lora_rank = resolve_vllm_lora_rank_capacity(
+                requested
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_environment_algorithms(self) -> "RLConfig":

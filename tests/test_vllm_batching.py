@@ -132,6 +132,28 @@ def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
     assert captured_kwargs["logprobs_mode"] == "processed_logprobs"
 
 
+def test_vllm_setup_rounds_lora_rank_to_supported_capacity(monkeypatch) -> None:
+    captured_kwargs: dict[str, object] = {}
+    vllm_module = ModuleType("vllm")
+
+    class FakeLLM:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    vllm_module.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setattr("wavelet.inference.engine.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
+
+    engine = VLLMPolicyInferenceEngine(
+        RLConfig(lora={"rank": 4, "target_modules": ["q_proj"]})
+    )
+
+    engine.setup()
+
+    assert captured_kwargs["max_lora_rank"] == 8
+
+
 @pytest.mark.parametrize(
     ("sampling", "vllm", "expected"),
     [

@@ -18,6 +18,11 @@ def test_vllm_http_is_default_inference_mode() -> None:
     assert config.inference.mode == "vllm_http"
 
 
+def test_vllm_lora_rank_above_server_capacity_is_rejected() -> None:
+    with pytest.raises(ValueError, match="maximum supported rank capacity"):
+        RLConfig(lora={"rank": 513})
+
+
 def test_sampling_max_tokens_maps_to_max_completion_tokens() -> None:
     config = RLConfig(inference={"sampling": {"max_tokens": 17}})
 

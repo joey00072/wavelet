@@ -588,6 +588,14 @@ def test_inference_server_enables_fully_sharded_loras() -> None:
     assert _argv_value(argv, "--max-lora-rank") == "32"
 
 
+def test_inference_server_rounds_lora_rank_to_vllm_capacity() -> None:
+    config = RLConfig(lora={"rank": 4, "target_modules": ["q_proj"]})
+
+    argv = _serve_argv(config)
+
+    assert _argv_value(argv, "--max-lora-rank") == "8"
+
+
 def test_inference_server_passes_quantized_load_args() -> None:
     config = RLConfig(
         inference={

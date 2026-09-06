@@ -43,6 +43,7 @@ from wavelet.trainer.distributed import (
     ParallelDims,
     World,
     all_ranks_true,
+    clip_grad_norm_across_meshes_,
     distributed_uses_cuda,
     get_world,
     set_world,
@@ -983,6 +984,11 @@ class BaseTrainer:
         clip_grad_norm = getattr(self.model, "clip_grad_norm_", None)
         if callable(clip_grad_norm):
             clipped = clip_grad_norm(self.config.max_grad_norm)
+        elif self.parallel_dims is not None and self.parallel_dims.ep_enabled:
+            clipped = clip_grad_norm_across_meshes_(
+                self.model.parameters(),
+                self.config.max_grad_norm,
+            )
         else:
             clipped = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
@@ -1236,8 +1242,9 @@ class SFTTrainer(BaseTrainer):
         self._micro_step += 1
         if self._micro_step % self.accumulation_steps == 0:
             sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
-            if self.config.max_grad_norm > 0:
-                self._clip_grad_norm()
+            grad_norm = (
+                self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
+            )
             self.optimizer.step()
             self.scheduler.step()
             self.optimizer.zero_grad(set_to_none=True)
@@ -1248,6 +1255,11 @@ class SFTTrainer(BaseTrainer):
                 stepped=True,
                 metrics={
                     "loss": float(loss.detach().item()),
+                    **(
+                        {"optim/grad_norm": grad_norm}
+                        if grad_norm is not None
+                        else {}
+                    ),
                     **moe_metrics,
                     **self._finish_step_performance_metrics(),
                 },

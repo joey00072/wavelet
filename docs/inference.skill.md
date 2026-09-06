@@ -110,6 +110,9 @@ change them only from observed KV, queue, preemption, and turnover metrics.
   server. The public RL path uses HTTP serving for continuous batching.
 - `inference.vllm.max_model_len`: unset lets vLLM use the model-native context;
   set it explicitly only when the serving context should be capped.
+- `inference.vllm.max_lora_rank`: unset inherits the adapter rank. Wavelet rounds
+  either value up to the smallest capacity accepted by vLLM (8, 16, 32, 64,
+  128, 256, 320, or 512) and rejects ranks above 512 during config validation.
 - `server_backend`: `openai` should expose `/v1/chat/completions/tokens`.
 - `policy_step`: must match the expected trainer export after policy load.
 - `generation_paused`: should be false outside a full-model or collective

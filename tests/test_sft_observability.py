@@ -118,3 +118,22 @@ def test_sft_performance_counts_global_data_parallel_tokens(monkeypatch) -> None
     assert metrics["perf/peak_memory_gib"] == pytest.approx(0.0)
     assert trainer._step_started_at is None
     assert trainer._step_model_tokens == 0
+
+
+def test_sft_train_step_reports_gradient_norm() -> None:
+    trainer = SFTTrainer(SFTConfig())
+    model = torch.nn.Linear(1, 1, bias=False)
+    trainer.model = model  # type: ignore[assignment]
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer.scheduler = SimpleNamespace(step=Mock())  # type: ignore[assignment]
+    trainer._forward_loss = lambda _batch: LossOutput(  # type: ignore[method-assign]
+        loss=model.weight.square().sum()
+    )
+    trainer._clip_grad_norm = Mock(return_value=1.25)  # type: ignore[method-assign]
+    trainer._finish_step_performance_metrics = Mock(  # type: ignore[method-assign]
+        return_value={}
+    )
+
+    output = trainer._train_step({"input_ids": torch.ones((1, 1), dtype=torch.long)})
+
+    assert output.metrics["optim/grad_norm"] == pytest.approx(1.25)

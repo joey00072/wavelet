@@ -37,6 +37,7 @@ from wavelet.orchestrator.schedule import (
     rollout_chunk_examples,
     target_steps,
 )
+from wavelet.trainer.distributed import ParallelDims
 from wavelet.transport.queue import (
     get_step_dir,
     resolve_policy_dir,
@@ -1835,7 +1836,54 @@ def _launcher_checks(config: RLConfig) -> list[PreflightCheck]:
 
     checks.append(_rollout_reward_mode_check(config))
     checks.extend(_device_group_checks(config))
+    checks.append(_trainer_parallel_topology_check(config, world_size=world_size))
     return checks
+
+
+def _trainer_parallel_topology_check(
+    config: RLConfig,
+    *,
+    world_size: int,
+) -> PreflightCheck:
+    trainer_world_size = (
+        world_size
+        if config.launcher.mode == "integrated"
+        else config.launcher.trainer_num_processes
+    )
+    fsdp = config.fsdp
+    try:
+        dims = (
+            ParallelDims(
+                dp_replicate=fsdp.dp_replicate,
+                dp_shard=fsdp.dp_shard,
+                cp=fsdp.cp,
+                tp=fsdp.tp,
+                ep=fsdp.ep,
+                world_size=trainer_world_size,
+            )
+            if fsdp.enabled
+            else ParallelDims(world_size=trainer_world_size)
+        )
+    except ValueError as exc:
+        return PreflightCheck(
+            "trainer_parallel_topology",
+            "error",
+            str(exc),
+            {"trainer_world_size": trainer_world_size},
+        )
+    return PreflightCheck(
+        "trainer_parallel_topology",
+        "ok",
+        "Trainer parallel dimensions match the trainer world size.",
+        {
+            "trainer_world_size": trainer_world_size,
+            "dp_replicate": dims.dp_replicate,
+            "dp_shard": dims.dp_shard,
+            "cp": dims.cp,
+            "tp": dims.tp,
+            "ep": dims.ep,
+        },
+    )
 
 
 def _rollout_reward_mode_check(config: RLConfig) -> PreflightCheck:

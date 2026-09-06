@@ -109,8 +109,9 @@ uv run torchrun --standalone --nproc-per-node=2 \
   -m wavelet rl-trainer @ outputs/my_run/configs/rl_trainer.yaml
 ```
 
-The preflight command reports resolved role commands, device placement, missing
-data, port conflicts, and incompatible settings before an expensive launch.
+The preflight command reports resolved role commands, device placement, trainer
+parallel-mesh sizing, missing data, port conflicts, and incompatible settings
+before an expensive launch.
 
 ## Documentation
 

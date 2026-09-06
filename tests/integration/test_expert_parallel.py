@@ -13,7 +13,11 @@ from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
 from wavelet.configs.sft import FSDPConfig, ModelConfig
 from wavelet.trainer.ckpt import AppState
-from wavelet.trainer.distributed import ParallelDims, World
+from wavelet.trainer.distributed import (
+    ParallelDims,
+    World,
+    clip_grad_norm_across_meshes_,
+)
 from wavelet.trainer.model import load_fsdp2_model_from_hf, maybe_wrap_fsdp, setup_model
 from wavelet.trainer.moe import (
     configure_hf_moe_expert_parallel,
@@ -118,6 +122,9 @@ def _expert_parallel_worker(
         loss = sharded_model(input_ids=input_ids, labels=input_ids).loss
         assert torch.isfinite(loss)
         loss.backward()
+        grad_norm = clip_grad_norm_across_meshes_(sharded_model.parameters(), 1.0)
+        assert torch.isfinite(grad_norm)
+        assert grad_norm > 0
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         dcp.save(

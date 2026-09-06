@@ -364,6 +364,26 @@ def test_preflight_resolves_process_commands(tmp_path, monkeypatch) -> None:
     assert report["paths"]["policy_dir"] == str(tmp_path / "run" / "policies")
 
 
+def test_preflight_rejects_trainer_parallel_world_size_mismatch(tmp_path) -> None:
+    config = RLConfig(
+        data={"source": "local", "path": _write_local_data(tmp_path)},
+        output_dir=tmp_path / "run",
+        reward={"mode": "math_format"},
+        fsdp={"enabled": True, "impl": "fsdp2", "dp_shard": 1, "ep": 1},
+        launcher={"mode": "process", "trainer_num_processes": 2},
+    )
+
+    report = build_preflight_report(config)
+
+    topology = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "trainer_parallel_topology"
+    )
+    assert topology["status"] == "error"
+    assert "world_size(2)" in topology["message"]
+
+
 def test_checkpoint_output_dir_does_not_replace_run_output_dir(
     tmp_path, monkeypatch
 ) -> None:
