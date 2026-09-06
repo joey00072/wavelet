@@ -73,9 +73,7 @@ class DebugTokenizer(PreTrainedTokenizer):
         token_ids_0: list[int],
         token_ids_1: list[int] | None = None,
     ) -> list[int]:
-        if token_ids_1 is None:
-            return list(token_ids_0)
-        return [*token_ids_0, *token_ids_1]
+        return [*token_ids_0, *(token_ids_1 or [])]
 
     def save_vocabulary(
         self,

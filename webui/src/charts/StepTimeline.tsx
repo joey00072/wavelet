@@ -26,7 +26,8 @@ export function StepTimeline({ steps, policies, maxRows = 16 }: { steps: Timelin
   const t1 = Math.max(...times);
   const span = Math.max(t1 - t0, 1000);
   const plotW = width - margin.left - margin.right;
-  const sx = (iso: string | undefined) => (iso ? margin.left + ((new Date(iso).getTime() - t0) / span) * plotW : null);
+  const tx = (time: number) => margin.left + ((time - t0) / span) * plotW;
+  const sx = (iso: string | undefined) => (iso ? tx(new Date(iso).getTime()) : null);
   const height = margin.top + rows.length * ROW_H + margin.bottom;
   const relevantPolicies = policies.filter((p) => {
     if (!p.exported_at) return false;
@@ -40,8 +41,8 @@ export function StepTimeline({ steps, policies, maxRows = 16 }: { steps: Timelin
       <svg width={width} height={height} role="img" aria-label="Queue and policy lifecycle timeline" onPointerLeave={() => setHover(null)}>
         {ticks.map((t) => (
           <g key={t}>
-            <line x1={margin.left + ((t - t0) / span) * plotW} x2={margin.left + ((t - t0) / span) * plotW} y1={margin.top} y2={height - margin.bottom} stroke="var(--grid)" />
-            <text x={margin.left + ((t - t0) / span) * plotW} y={height - 7} textAnchor="middle" fontSize={10} fill="var(--ink-muted)" className="tabular">
+            <line x1={tx(t)} x2={tx(t)} y1={margin.top} y2={height - margin.bottom} stroke="var(--grid)" />
+            <text x={tx(t)} y={height - 7} textAnchor="middle" fontSize={10} fill="var(--ink-muted)" className="tabular">
               {new Date(t).toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })}
             </text>
           </g>
@@ -50,11 +51,7 @@ export function StepTimeline({ steps, policies, maxRows = 16 }: { steps: Timelin
           const x0 = sx(p.exported_at);
           const x1 = sx(p.loaded_at ?? p.received_at ?? p.exported_at);
           if (x0 === null) return null;
-          return (
-            <g key={p.policy_step}>
-              <rect x={x0} y={4} width={Math.max(2, (x1 ?? x0) - x0)} height={8} rx={2} fill={seriesColor(2)} />
-            </g>
-          );
+          return <g key={p.policy_step}><rect x={x0} y={4} width={Math.max(2, (x1 ?? x0) - x0)} height={8} rx={2} fill={seriesColor(2)} /></g>;
         })}
         <text x={margin.left - 6} y={11} textAnchor="end" fontSize={9} fill="var(--ink-muted)">policy</text>
         {rows.map((s, i) => {
@@ -90,9 +87,9 @@ export function StepTimeline({ steps, policies, maxRows = 16 }: { steps: Timelin
         </div>
       )}
       <div className="mt-1 flex flex-wrap gap-x-3 px-1 text-[11px] text-ink2">
-        <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-sm" style={{ background: seriesColor(0) }} />published → claimed</span>
-        <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-sm" style={{ background: seriesColor(1) }} />claimed → consumed</span>
-        <span className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-sm" style={{ background: seriesColor(2) }} />policy export → load</span>
+        {["published → claimed", "claimed → consumed", "policy export → load"].map((label, i) => (
+          <span key={label} className="flex items-center gap-1.5"><span className="inline-block h-2 w-2 rounded-sm" style={{ background: seriesColor(i) }} />{label}</span>
+        ))}
       </div>
     </div>
   );

@@ -53,10 +53,8 @@ from the per-rank micro-batch count the trainer expects. SFT messages with
 `step_loss_mask: 0` is honored regardless of whether the chat template supports
 assistant token masks.
 
-Existing imports from `wavelet.data.rl_dataset`, `rl_types`, `rl_collation`, and
-`rl_packing` remain supported as compatibility wrappers. New code should import
-the canonical RL surface from `wavelet.data.rl`; use `wavelet.data.sft` for SFT
-records, tokenization, collation, and datasets.
+Import the RL surface from `wavelet.data.rl` and the SFT records, tokenization,
+collation, and datasets from `wavelet.data.sft`.
 
 ## Pretokenized RL Rows
 

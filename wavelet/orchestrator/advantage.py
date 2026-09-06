@@ -99,18 +99,11 @@ def truncation_penalized_rewards(
 
 
 def output_completion_token_count(output: dict[str, Any]) -> int:
-    return _output_completion_token_count(output)
+    return _output_token_total(output, "completion_ids")
 
 
 def output_input_token_count(output: dict[str, Any]) -> int:
-    total = 0
-    for step in output.get("trajectory") or []:
-        if not isinstance(step, dict):
-            continue
-        tokens = step.get("tokens") or {}
-        if isinstance(tokens, dict):
-            total += len(tokens.get("prompt_ids") or [])
-    return total
+    return _output_token_total(output, "prompt_ids")
 
 
 def output_tool_response_token_count(output: dict[str, Any]) -> int:
@@ -201,13 +194,13 @@ def _record_is_truncated(record: RLExample) -> bool:
     return isinstance(rollout, dict) and bool(rollout.get("is_truncated"))
 
 
-def _output_completion_token_count(output: dict[str, Any]) -> int:
+def _output_token_total(output: dict[str, Any], key: str) -> int:
+    """Sum the ``key`` token lists across every trajectory step of an output."""
     total = 0
     for step in output.get("trajectory") or []:
         if not isinstance(step, dict):
             continue
         tokens = step.get("tokens") or {}
-        if not isinstance(tokens, dict):
-            continue
-        total += len(tokens.get("completion_ids") or [])
+        if isinstance(tokens, dict):
+            total += len(tokens.get(key) or [])
     return total

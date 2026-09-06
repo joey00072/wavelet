@@ -9,8 +9,8 @@ import pytest
 import torch
 from torch import nn
 
-import wavelet.inference.vllm_weight_update as weight_update
-from wavelet.utils.policy_transfer import NCCL_UPDATE_INFO_FILENAME
+import wavelet.transport.policy as weight_update
+from wavelet.transport.policy import NCCL_UPDATE_INFO_FILENAME
 
 
 class _DummyModel(nn.Module):

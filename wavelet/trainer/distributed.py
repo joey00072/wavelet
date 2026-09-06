@@ -17,12 +17,7 @@ DEFAULT_DEVICE_TYPE = _get_available_device_type() or "cuda"
 def _mesh_device_type() -> str:
     if not dist.is_available() or not dist.is_initialized():
         return DEFAULT_DEVICE_TYPE
-    backend = str(dist.get_backend()).lower()
-    # Hybrid backends report "cpu:gloo,cuda:nccl"; any NCCL/CUDA component
-    # means the model and mesh live on CUDA.
-    if "nccl" in backend or "cuda" in backend:
-        return "cuda"
-    return "cpu"
+    return "cuda" if distributed_uses_cuda() else "cpu"
 
 
 @dataclass
@@ -163,17 +158,25 @@ class ParallelDims:
                 mesh_dim_name="ep"
             )
 
-        if self.dp_replicate_enabled:
-            parent = mesh[tuple(["dp_replicate"] + dp_shard_cp_dim_names)]
-            hsdp_tensor = parent.mesh.reshape(self.dp_replicate, -1)
-            self._submeshes["hsdp"] = DeviceMesh(
-                device_type,
-                hsdp_tensor,
-                mesh_dim_names=("dp_replicate", "dp_shard_cp"),
-            )
-        else:
-            self._submeshes["hsdp"] = self._submeshes["dp_shard_cp"]
+        self._register_hsdp_submesh(mesh, device_type, dp_shard_cp_dim_names)
         return mesh
+
+    def _register_hsdp_submesh(
+        self,
+        mesh: DeviceMesh,
+        device_type: str,
+        dp_shard_cp_dim_names: list[str],
+    ) -> None:
+        if not self.dp_replicate_enabled:
+            self._submeshes["hsdp"] = self._submeshes["dp_shard_cp"]
+            return
+        parent = mesh[tuple(["dp_replicate"] + dp_shard_cp_dim_names)]
+        hsdp_tensor = parent.mesh.reshape(self.dp_replicate, -1)
+        self._submeshes["hsdp"] = DeviceMesh(
+            device_type,
+            hsdp_tensor,
+            mesh_dim_names=("dp_replicate", "dp_shard_cp"),
+        )
 
     def _build_mesh_without_ep(self) -> DeviceMesh:
         device_type = _mesh_device_type()
@@ -212,16 +215,7 @@ class ParallelDims:
             self._submeshes["dp_cp"] = mesh[tuple(dp_cp_mesh_dim_names)]._flatten(
                 mesh_dim_name="dp_cp"
             )
-        if self.dp_replicate_enabled:
-            parent = mesh[tuple(["dp_replicate"] + dp_shard_cp_dim_names)]
-            hsdp_tensor = parent.mesh.reshape(self.dp_replicate, -1)
-            self._submeshes["hsdp"] = DeviceMesh(
-                device_type,
-                hsdp_tensor,
-                mesh_dim_names=("dp_replicate", "dp_shard_cp"),
-            )
-        else:
-            self._submeshes["hsdp"] = self._submeshes["dp_shard_cp"]
+        self._register_hsdp_submesh(mesh, device_type, dp_shard_cp_dim_names)
         if self.tp_enabled:
             self._submeshes["tp"] = mesh["tp"]
         return mesh
@@ -276,10 +270,16 @@ _world: World | None = None
 
 
 def distributed_uses_cuda() -> bool:
-    if not torch.distributed.is_initialized():
+    if not dist.is_initialized():
         return torch.cuda.is_available()
-    backend = str(torch.distributed.get_backend()).lower()
+    # Hybrid backends report "cpu:gloo,cuda:nccl"; any NCCL/CUDA component
+    # means the model and mesh live on CUDA.
+    backend = str(dist.get_backend()).lower()
     return "nccl" in backend or "cuda" in backend
+
+
+def world_is_distributed(world: World | None) -> bool:
+    return world is not None and world.world_size > 1
 
 
 def get_world() -> World:
@@ -318,12 +318,37 @@ def set_world(world: World) -> None:
     _world = world
 
 
+def collective_device(world: World) -> torch.device:
+    """Device for small flag tensors in collectives (CUDA only under NCCL)."""
+    if distributed_uses_cuda() and world.device.type == "cuda":
+        return world.device
+    return torch.device("cpu")
+
+
 def barrier(world: World | None = None) -> None:
-    if not torch.distributed.is_initialized():
+    if not dist.is_initialized():
         return
     if world is None:
         world = get_world()
-    if distributed_uses_cuda() and world.device.type == "cuda":
-        torch.distributed.barrier(device_ids=[world.local_rank])
+    if collective_device(world).type == "cuda":
+        dist.barrier(device_ids=[world.local_rank])
     else:
-        torch.distributed.barrier()
+        dist.barrier()
+
+
+def _all_reduce_flag(flag: bool, op: dist.ReduceOp, device: torch.device) -> bool:
+    if not dist.is_initialized():
+        return flag
+    tensor = torch.tensor(int(flag), dtype=torch.int64, device=device)
+    dist.all_reduce(tensor, op=op)
+    return bool(tensor.item())
+
+
+def all_ranks_true(flag: bool, *, device: torch.device) -> bool:
+    """Return True only if every rank passed True (no-op without a process group)."""
+    return _all_reduce_flag(flag, dist.ReduceOp.MIN, device)
+
+
+def any_rank_true(flag: bool, *, device: torch.device) -> bool:
+    """Return True if any rank passed True (no-op without a process group)."""
+    return _all_reduce_flag(flag, dist.ReduceOp.MAX, device)

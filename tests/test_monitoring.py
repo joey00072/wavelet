@@ -8,8 +8,7 @@ from collections import namedtuple
 
 from wavelet import wandb_overview
 from wavelet.configs.sft import WandbConfig
-from wavelet.monitor import read_jsonl
-from wavelet.utils.monitoring import RunMonitor
+from wavelet.monitor import RunMonitor, read_jsonl
 
 
 class _FakeRun:

@@ -3,8 +3,8 @@ import json
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.orchestrator.queue import FileSystemRolloutSender
 from wavelet.orchestrator.state_server import OrchestratorRunState
+from wavelet.transport.queue import FileSystemRolloutSender
 
 
 def test_orchestrator_state_tracks_rollout_and_policy_updates(tmp_path) -> None:

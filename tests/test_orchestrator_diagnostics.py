@@ -4,14 +4,14 @@ import json
 from dataclasses import replace
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample
-from wavelet.entrypoints.rl_debug import main as debug_main
-from wavelet.orchestrator.diagnostics import (
+from wavelet.data.rl import RLExample
+from wavelet.debug import (
     orchestrator_debug_state,
     probe_orchestrator,
     sample_orchestrator_records,
     with_orchestrator_limits,
 )
+from wavelet.entrypoints.rl_debug import main as debug_main
 
 
 def _example(index: int) -> RLExample:
@@ -63,7 +63,7 @@ def test_orchestrator_debug_state_exposes_schedule() -> None:
 
 def test_orchestrator_probe_times_boundaries(monkeypatch) -> None:
     monkeypatch.setattr(
-        "wavelet.orchestrator.diagnostics.load_rl_records",
+        "wavelet.debug.load_rl_records",
         lambda _config: [_example(index) for index in range(4)],
     )
     config = RLConfig(
@@ -93,7 +93,7 @@ def test_orchestrator_probe_times_boundaries(monkeypatch) -> None:
 
 def test_sample_orchestrator_records_reports_available(monkeypatch) -> None:
     monkeypatch.setattr(
-        "wavelet.orchestrator.diagnostics.load_rl_records",
+        "wavelet.debug.load_rl_records",
         lambda _config: [_example(index) for index in range(3)],
     )
     config = RLConfig(orchestrator={"examples_per_step": 2})

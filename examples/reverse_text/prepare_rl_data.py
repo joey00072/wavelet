@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from typing import Any
+
+from wavelet.tools.verifier_data import import_verifiers, verifier_rows, write_jsonl
 
 
 def parse_args() -> argparse.Namespace:
@@ -19,46 +19,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _example_id(payload: dict[str, Any], index: int) -> Any:
-    return payload.get("example_id", payload.get("id", index))
-
-
 def main() -> int:
     args = parse_args()
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise SystemExit(
-            "The Reverse Text example uses verifier environments. "
-            "Install them with `uv sync --extra verifiers --extra envs`."
-        ) from exc
-
+    vf = import_verifiers()
     env = vf.load_environment(args.env_id)
     dataset = env.get_dataset(seed=args.seed)
-    rows = []
-    for index, example in enumerate(dataset):
-        if args.examples is not None and index >= args.examples:
-            break
-        payload = dict(example)
-        payload.setdefault("example_id", _example_id(payload, index))
-        rows.append(
-            {
-                "prompt": payload["prompt"],
-                "completion": "",
-                "metadata": {
-                    "verifier_example": payload,
-                    "example_id": payload["example_id"],
-                },
-            }
-        )
-
+    rows = verifier_rows(dataset, limit=args.examples, id_keys=("id",))
     if not rows:
         raise RuntimeError("Reverse Text verifier dataset returned no examples.")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row) + "\n")
+    write_jsonl(args.output, rows)
     print(f"Wrote {len(rows)} verifier examples to {args.output}")
     return 0
 

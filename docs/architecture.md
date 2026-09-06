@@ -15,7 +15,6 @@ filesystem artifacts carry state between independently restartable processes.
 | `wavelet.transport` | Filesystem rollout queues and filesystem/NCCL policy transfer |
 | `wavelet.inference` | Native and vLLM policy inference, HTTP clients, policy loading, and diagnostics |
 | `wavelet.trainer` | Model/LoRA and distributed setup, RL/SFT training, losses, optimization, and checkpointing |
-| `wavelet.distributed` | Compatibility imports for distributed APIs now owned by `wavelet.trainer.distributed` |
 | `wavelet.dashboard` | Read-only run artifact readers, the `/api/runs` router for the dashboard and live state server, W&B/Trackio history providers, and synthetic runs |
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
 | `wavelet.utils` | Configuration loading and path helpers |
@@ -26,8 +25,8 @@ behavior belong to the subsystem it invokes. Shared rollout scheduling lives in
 `wavelet.orchestrator.scheduler`, verifier clients and evaluation in
 `wavelet.orchestrator.envs`, inference serving in `wavelet.inference.server`,
 and trainer behavior in `wavelet.trainer.trainer` and `wavelet.trainer.rl`.
-Historical module paths are retained as thin compatibility aliases where user
-code may still import them.
+The only retained alias is `wavelet.orchestrator.verifiers`, which backs the
+public `wavelet.orchestrator.verifiers:generate_rollouts` config value.
 Trainer process-group initialization uses `dist_timeout_seconds` from the SFT
 or RL config. It defaults to 1800 seconds and can be increased for slow or
 multi-node rendezvous without changing code.
@@ -180,8 +179,8 @@ state server at the transition that actually occurred.
 
 `wavelet.data.sft` owns source loading, message normalization, tokenization,
 collation, and SFT datasets. `wavelet.data.rl` owns RL records, serialization,
-packing, collation, and datasets. Historical fine-grained imports remain
-supported; see the [data pipeline guide](data_pipeline.md). Serialized
+packing, collation, and datasets; see the
+[data pipeline guide](data_pipeline.md). Serialized
 `RLExample` payloads are the boundary between rollout generation, HTTP
 inference, queues, diagnostics, and training.
 

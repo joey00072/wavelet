@@ -93,20 +93,35 @@ def _run_role_subprocess(
 ) -> int:
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     with Path(log_path).open("a", encoding="utf-8") as log_file:
-        command_args = _role_command(
-            command,
-            config_path,
-            torchrun_nproc_per_node=torchrun_nproc_per_node,
-        )
-        process = subprocess.Popen(
-            command_args,
+        process = _spawn_role_process(
+            _role_command(
+                command,
+                config_path,
+                torchrun_nproc_per_node=torchrun_nproc_per_node,
+            ),
             cwd=cwd,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
+            log_file=log_file,
             env=_role_env(cuda_visible_devices, env_vars),
-            start_new_session=True,
         )
         return _wait_for_role_process(process)
+
+
+def _spawn_role_process(
+    command_args: list[str],
+    *,
+    cwd: str | Path,
+    log_file: TextIO,
+    env: dict[str, str],
+) -> subprocess.Popen:
+    """Start a role in its own session with stdout/stderr appended to ``log_file``."""
+    return subprocess.Popen(
+        command_args,
+        cwd=cwd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=True,
+    )
 
 
 def _wait_for_role_process(
@@ -151,17 +166,15 @@ def _start_local_role(
     log_file = _log_path(output_dir, spec.log_name, log_dir=log_dir).open(
         "a", encoding="utf-8"
     )
-    process = subprocess.Popen(
+    process = _spawn_role_process(
         _role_command(
             spec.command,
             spec.config_path,
             torchrun_nproc_per_node=spec.torchrun_nproc_per_node,
         ),
         cwd=Path.cwd(),
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
+        log_file=log_file,
         env=_role_env(spec.cuda_visible_devices, spec.env_vars),
-        start_new_session=True,
     )
     return process, log_file
 
@@ -206,7 +219,7 @@ class RayRoleHandle:
             self.ray.cancel(self.ref, force=True)
 
     def close(self) -> None:
-        return None
+        pass
 
 
 class LocalRoleLauncher:
@@ -223,7 +236,7 @@ class LocalRoleLauncher:
         return LocalRoleHandle(spec, process, log_file)
 
     def close(self) -> None:
-        return None
+        pass
 
 
 class RayRoleLauncher:

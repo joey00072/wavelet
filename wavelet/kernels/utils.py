@@ -4,11 +4,6 @@ import torch
 from torch import Tensor
 
 
-def QUANT_STATE(W: Tensor):
-    """Return the bitsandbytes quant_state for a 4-bit weight, or None."""
-    return getattr(W, "quant_state", None)
-
-
 @torch.inference_mode()
 def fast_dequantize(W: Tensor, quant_state=None, out: Tensor | None = None) -> Tensor:
     """Dequantize a bitsandbytes NF4 weight tensor to bf16/fp16.

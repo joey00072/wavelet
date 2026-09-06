@@ -18,13 +18,14 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import (
     PackedRLDataset,
     RLDataset,
-    _normalize_rl_record,
     _pretokenized_sample,
     count_nonempty_jsonl_rows,
+    deserialize_rl_record,
     setup_rl_dataloader,
     setup_rl_dataset,
 )
 from wavelet.data.sft import Example, build_sample
+from wavelet.monitor import emit_perf, setup_config_logger
 from wavelet.orchestrator.schedule import (
     chunks_per_step as _chunks_per_step,
 )
@@ -33,8 +34,14 @@ from wavelet.orchestrator.schedule import (
     target_steps as _target_steps,
 )
 from wavelet.trainer.ckpt import TrainerState
-from wavelet.trainer.distributed import barrier
+from wavelet.trainer.distributed import (
+    all_ranks_true,
+    any_rank_true,
+    barrier,
+    world_is_distributed,
+)
 from wavelet.trainer.losses import (
+    TRUST_REGION_METRIC_KEYS,
     component_normalization_unit_counts,
     compute_entropy,
     compute_loss,
@@ -43,16 +50,15 @@ from wavelet.trainer.losses import (
     selective_log_softmax_with_sampling_mask,
     setup_rl_loss_fn,
 )
-from wavelet.trainer.model import is_fsdp_model, sync_hf_tp_lora_replicated_grads
-from wavelet.trainer.moe import moe_load_balance_metrics
-from wavelet.trainer.perf import training_flop_metrics
-from wavelet.trainer.telemetry import (
-    gather_rank_telemetry,
-    node_metrics,
-    rank_rows,
-    sample_rank_telemetry,
+from wavelet.trainer.model import (
+    TORCH_DTYPES,
+    is_fsdp_model,
+    save_lora_adapter_snapshot_from_fsdp,
+    sync_hf_tp_lora_replicated_grads,
+    unwrap_model,
 )
-from wavelet.trainer.trainer import BaseTrainer
+from wavelet.trainer.moe import moe_load_balance_metrics
+from wavelet.trainer.trainer import BaseTrainer, _mean, _reduce_by_key
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.transport.policy import (
     PolicyExportMixin,
@@ -67,28 +73,18 @@ from wavelet.transport.queue import (
     validate_rollout_manifest,
 )
 from wavelet.utils.config import load_config
-from wavelet.utils.monitoring import emit_perf, setup_config_logger
 
 logger = logging.getLogger(__name__)
 
 
-SUM_SYNCED_METRIC_KEYS = {
+# Count-like metrics are summed across micro-batches and ranks; others average.
+SUMMED_METRIC_KEYS = {
     "rollout/count",
     "micro_batch/count",
     "tokens/train",
     "tokens/model",
 }
-ZERO_LOSS_METRIC_KEYS = (
-    "mismatch_kl",
-    "masked_mismatch_kl",
-    "unmasked_mismatch_kl",
-    "is_masked",
-    "is_masked_low",
-    "is_masked_high",
-    "policy_loss",
-    "kl_loss",
-    "advantage_mean",
-)
+ZERO_LOSS_METRIC_KEYS = TRUST_REGION_METRIC_KEYS
 TRAIN_METRIC_ALIASES = {
     "loss": "train/loss",
     "policy_loss": "train/policy_loss",
@@ -228,20 +224,11 @@ def _packed_training_attention_mask(
     return _packed_causal_attention_mask(attention_mask, position_ids)
 
 
-def _torch_dtype_from_name(name: str) -> torch.dtype | None:
-    if name == "bfloat16":
-        return torch.bfloat16
-    if name == "float16":
-        return torch.float16
-    if name == "float32":
-        return torch.float32
-    return None
-
-
 class RLTrainer(PolicyExportMixin, BaseTrainer):
+    config: RLConfig
+
     def __init__(self, config: RLConfig) -> None:
         super().__init__(config)
-        self.config = config
         self._accumulated_micro_batches = 0
         self._reward_accum: list[float] = []
         self._rollout_metric_accum: list[dict[str, float]] = []
@@ -254,16 +241,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._loaded_micro_batch_count = 0
         self._rollout_batch_loaded = False
         self._step_compute_seconds = 0.0
-        self._step_model_tokens = 0
-        self._run_closed = False
         self._rl_loss_fn = setup_rl_loss_fn(config.loss)
         self._init_policy_transport()
 
     def _setup_data(self) -> None:
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer must be set up before data")
-        if self.world is None:
-            raise RuntimeError("World must be set up before data")
+        self._require_world()
         if self.config.data.pack_sequences:
             self.accumulation_steps = 1
         else:
@@ -316,8 +300,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         return self.dataloader
 
     def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
+        monitor = self._require_monitor()
         if self.step % self.config.log.log_every != 0:
             return
         metrics = output.metrics
@@ -326,9 +309,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         metrics["progress/step"] = float(self.step)
         metrics["progress/micro_step"] = float(self._micro_step)
         metrics.update(self._progress_metrics())
-        self.monitor.log(
-            metrics, self.step, ranks=getattr(self, "_latest_rank_telemetry", None)
-        )
+        monitor.log(metrics, self.step, ranks=self._latest_rank_telemetry)
         mismatch_kl = metrics.get(
             "mismatch_kl",
             metrics.get("ref_kl/unmasked_mismatch_kl", 0.0),
@@ -348,8 +329,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         optimizer_batch_size = rollout_count
         pack_sequences = self.config.data.pack_sequences
         if self.world is not None and not pack_sequences:
-            _, data_world_size = self._data_partition()
-            global_micro_batch = self.config.data.micro_batch_size * data_world_size
+            global_micro_batch = self._global_micro_batch_size()
             remainder = rollout_count % global_micro_batch
             if remainder:
                 optimizer_batch_size = rollout_count - remainder
@@ -447,14 +427,14 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def is_main_process(self) -> bool:
         return self.world is None or self.world.is_main
 
+    def _global_micro_batch_size(self) -> int:
+        _, data_world_size = self._data_partition()
+        return self.config.data.micro_batch_size * data_world_size
+
     def _current_micro_batch_count(self, optimizer_batch_size: int) -> int:
         if isinstance(self.dataset, PackedRLDataset):
             return self._packed_dataloader_batch_count()
-        if self.world is None:
-            raise RuntimeError("World must be set up before computing micro-batches")
-        _, data_world_size = self._data_partition()
-        global_micro_batch = self.config.data.micro_batch_size * data_world_size
-        return max(optimizer_batch_size // global_micro_batch, 1)
+        return max(optimizer_batch_size // self._global_micro_batch_size(), 1)
 
     def _packed_dataloader_batch_count(self) -> int:
         if not isinstance(self.dataset, PackedRLDataset):
@@ -469,8 +449,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def train_loaded_rollouts_once(self) -> dict[str, float] | None:
         if self.dataloader is None:
             raise RuntimeError("Trainer dataloader is not set up.")
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
+        self._require_monitor()
         if self._run_closed:
             raise RuntimeError("Trainer run has already been finalized.")
 
@@ -542,7 +521,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if self.tokenizer is None:
             raise RuntimeError("Tokenizer must be set up before sample logging.")
 
-        record = _normalize_rl_record(payload, self.config.data)
+        record = deserialize_rl_record(payload, self.config.data)
         tokenized = _pretokenized_sample(record, self.config.data.seq_len)
         if tokenized is None:
             tokenized = build_sample(
@@ -617,8 +596,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             return
         if self.model is None:
             raise RuntimeError("Model must be set up before validating RL data")
-        from wavelet.trainer.model import unwrap_model
-
         missing_references = any(
             record.inference_logprobs is None
             and (
@@ -639,10 +616,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             )
 
     def _setup_accumulation_steps(self) -> None:
-        if self.world is None:
-            raise RuntimeError("World must be set up before accumulation steps")
         _, data_world_size = self._data_partition()
-        global_micro_batch = self.config.data.micro_batch_size * data_world_size
+        global_micro_batch = self._global_micro_batch_size()
         if self.config.data.batch_size % global_micro_batch != 0:
             raise ValueError(
                 "RL data.batch_size is the global optimizer batch size and must be "
@@ -755,7 +730,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             batch["position_ids"],
         )
         if attention_mask is not None and attention_mask.is_floating_point():
-            mask_dtype = _torch_dtype_from_name(self.config.model.torch_dtype)
+            mask_dtype = TORCH_DTYPES.get(self.config.model.torch_dtype)
             if mask_dtype is not None:
                 attention_mask = attention_mask.to(dtype=mask_dtype)
 
@@ -829,7 +804,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             )
 
         grad_norm = self._apply_optimizer_step()
-        metrics = self._finalize_optimizer_metrics(grad_norm)
+        metrics = self._complete_optimizer_step(grad_norm)
         self._step_compute_seconds += perf_counter() - micro_step_started_at
         metrics.update(self._finish_step_performance_metrics())
         return TrainOutput(
@@ -839,50 +814,22 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         )
 
     def _finish_step_performance_metrics(self) -> dict[str, float]:
-        elapsed = max(self._step_compute_seconds, 1e-9)
-        global_tokens = self._step_model_tokens * self._data_parallel_world_size()
-        peak_memory_gib = (
-            torch.cuda.max_memory_reserved() / 1024**3
-            if torch.cuda.is_available()
-            else 0.0
-        )
         compute_dtype = self._model_compute_dtype
         if (
             self.world is not None
             and self.world.device.type == "cuda"
             and self.config.model.torch_dtype == "float32"
         ):
+            # float32 models run under bf16 autocast on CUDA.
             compute_dtype = torch.bfloat16
-        metrics = {
-            "perf/tokens_per_second": global_tokens / elapsed,
-            "perf/peak_memory_gib": peak_memory_gib,
-        }
-        metrics.update(
-            training_flop_metrics(
-                flops_per_token=self._model_flops_per_token,
-                model_tokens=global_tokens,
-                elapsed_seconds=elapsed,
-                world_size=self.world.world_size if self.world is not None else 1,
-                dtype=compute_dtype,
-            )
+        metrics = self._step_performance_metrics(
+            local_tokens=self._step_model_tokens,
+            elapsed=self._step_compute_seconds,
+            dtype=compute_dtype,
         )
-        metrics.update(self._gather_node_metrics(elapsed))
         self._step_compute_seconds = 0.0
         self._step_model_tokens = 0
         return metrics
-
-    def _gather_node_metrics(self, elapsed: float) -> dict[str, float]:
-        world_size = self.world.world_size if self.world is not None else 1
-        replication = max(world_size // max(self._data_parallel_world_size(), 1), 1)
-        sample = sample_rank_telemetry(
-            self.world,
-            tokens=self._step_model_tokens,
-            seconds=elapsed,
-            replication=replication,
-        )
-        ranks = gather_rank_telemetry(sample, self.world)
-        self._latest_rank_telemetry = rank_rows(ranks)
-        return node_metrics(ranks)
 
     def _forward_rl_loss(
         self,
@@ -895,8 +842,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         )
         if not batch["loss_mask"].bool().any():
             loss = trainer_logprobs.sum() * 0.0
-            metrics = self._zero_loss_metrics(loss)
-            metrics.update(moe_metrics)
+            zero = loss.detach() * 0.0
+            metrics = {**dict.fromkeys(ZERO_LOSS_METRIC_KEYS, zero), **moe_metrics}
             return LossOutput(loss=loss, metrics=metrics)
         rl_weights, ce_weights, ref_kl_weights = self._component_weights(batch)
         output = compute_loss(
@@ -943,13 +890,11 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         batch: dict[str, Tensor],
         loss_output: LossOutput,
     ) -> None:
-        reward_mean = self._reward_mean(
-            batch["rewards"],
-            sample_counts=batch.get("sample_counts"),
-        )
+        rollout_metrics = self._batch_rollout_metrics(batch)
+        reward_mean = rollout_metrics.get("reward/all/mean")
         if reward_mean is not None:
             self._reward_accum.append(reward_mean)
-        self._rollout_metric_accum.append(self._batch_rollout_metrics(batch))
+        self._rollout_metric_accum.append(rollout_metrics)
         self._train_loss_accum.append(float(loss_output.loss.detach().item()))
         self._train_metric_accum.append(
             {
@@ -966,7 +911,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 )
             )
         self._apply_gradient_accumulation_loss_scale()
-        self._sync_tensor_parallel_lora_grads()
+        sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
         grad_norm = self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
         self.optimizer.step()
         self.scheduler.step()
@@ -976,14 +921,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._dynamic_loss_scale_local = 0.0
         return grad_norm
 
-    def _finalize_optimizer_metrics(self, grad_norm: float | None) -> dict[str, float]:
+    def _complete_optimizer_step(self, grad_norm: float | None) -> dict[str, float]:
+        """Aggregate, sync, and reset the metrics accumulated for one optimizer step."""
         if self._gradient_accumulation_loss_scale is not None:
             logged_loss = sum(self._train_loss_accum) / max(
                 self._gradient_accumulation_loss_scale,
                 1.0,
             )
         elif self._optimizer_batch_loss_scale is None:
-            logged_loss = sum(self._train_loss_accum) / len(self._train_loss_accum)
+            logged_loss = _mean(self._train_loss_accum)
         else:
             logged_loss = sum(self._train_loss_accum)
         metrics = {"loss": logged_loss}
@@ -991,7 +937,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._train_loss_accum.clear()
         self._train_metric_accum.clear()
         if self._reward_accum:
-            metrics["reward_mean"] = sum(self._reward_accum) / len(self._reward_accum)
+            metrics["reward_mean"] = _mean(self._reward_accum)
             self._reward_accum.clear()
         if self._rollout_metric_accum:
             metrics.update(self._aggregate_rollout_metrics(self._rollout_metric_accum))
@@ -1007,11 +953,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._gradient_accumulation_loss_scale = None
         return metrics
 
-    def _sync_tensor_parallel_lora_grads(self) -> None:
-        if self.model is None:
-            raise RuntimeError("Trainer not set up")
-        sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
-
     def _apply_gradient_accumulation_loss_scale(self) -> None:
         if self._gradient_accumulation_loss_scale is None:
             return
@@ -1021,10 +962,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         for parameter in self.model.parameters():
             if parameter.grad is not None:
                 parameter.grad.div_(scale)
-
-    def _zero_loss_metrics(self, loss: Tensor) -> dict[str, Tensor]:
-        zero = loss.detach() * 0.0
-        return {key: zero for key in ZERO_LOSS_METRIC_KEYS}
 
     def _inference_logprobs(
         self, batch: dict[str, Tensor], attention_mask: Tensor | None
@@ -1039,8 +976,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         if not missing_required.any():
             inference_logprobs[~has_inference] = 0.0
             return inference_logprobs
-
-        from wavelet.trainer.model import unwrap_model
 
         model = unwrap_model(self.model)
         disable_adapter = getattr(model, "disable_adapter", None)
@@ -1251,60 +1186,25 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     ) -> dict[str, float]:
         if not micro_metrics:
             return {}
-        aggregated: dict[str, float] = {}
-        all_keys = set().union(*(metrics.keys() for metrics in micro_metrics))
-        for key in all_keys:
-            if key.startswith("_"):
-                continue
-            values = [metrics[key] for metrics in micro_metrics if key in metrics]
-            if not values:
-                continue
-            aggregated[key] = self._aggregate_rollout_metric_value(
-                key,
-                values,
-                micro_metrics,
-                aggregated,
-            )
-        self._add_aggregate_advantage_stats(aggregated, micro_metrics)
-        return aggregated
-
-    @staticmethod
-    def _aggregate_rollout_metric_value(
-        key: str,
-        values: list[float],
-        micro_metrics: list[dict[str, float]],
-        aggregated: dict[str, float],
-    ) -> float:
-        if key.endswith("/max"):
-            return max(values)
-        if key.endswith("/min"):
-            return min(values)
-        if key == "reward/all/mean":
+        aggregated = _reduce_by_key(
+            micro_metrics,
+            self._reduce_metric_values,
+            keep=lambda key: not key.startswith("_"),
+        )
+        # Reward means are weighted by rollout count; keep the partial sums so
+        # the cross-rank sync can re-weight them again.
+        with_reward = [m for m in micro_metrics if "reward/all/mean" in m]
+        if with_reward:
             weighted_sum = sum(
-                metrics[key] * metrics.get("rollout/count", 1.0)
-                for metrics in micro_metrics
-                if key in metrics
+                m["reward/all/mean"] * m.get("rollout/count", 1.0) for m in with_reward
             )
-            total_weight = sum(
-                metrics.get("rollout/count", 1.0)
-                for metrics in micro_metrics
-                if key in metrics
-            )
+            total_weight = sum(m.get("rollout/count", 1.0) for m in with_reward)
             aggregated["_reward_weighted_sum"] = weighted_sum
             aggregated["_reward_weight"] = total_weight
-            return (
-                weighted_sum / total_weight
-                if total_weight > 0
-                else sum(values) / len(values)
-            )
-        if key in {
-            "tokens/train",
-            "tokens/model",
-            "rollout/count",
-            "micro_batch/count",
-        }:
-            return sum(values)
-        return sum(values) / len(values)
+            if total_weight > 0:
+                aggregated["reward/all/mean"] = weighted_sum / total_weight
+        self._add_aggregate_advantage_stats(aggregated, micro_metrics)
+        return aggregated
 
     @staticmethod
     def _add_aggregate_advantage_stats(
@@ -1327,22 +1227,17 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self,
         micro_metrics: list[dict[str, float]],
     ) -> dict[str, float]:
-        if not micro_metrics:
-            return {}
-        aggregated: dict[str, float] = {}
-        all_keys = set().union(*(metrics.keys() for metrics in micro_metrics))
-        for key in all_keys:
-            values = [metrics[key] for metrics in micro_metrics if key in metrics]
-            if values:
-                if key in {"_entropy_sum", "_entropy_count"}:
-                    aggregated[key] = sum(values)
-                elif key == "entropy/min":
-                    aggregated[key] = min(values)
-                elif key == "entropy/max":
-                    aggregated[key] = max(values)
-                else:
-                    aggregated[key] = sum(values) / len(values)
-        return aggregated
+        return _reduce_by_key(micro_metrics, self._reduce_train_metric_values)
+
+    @staticmethod
+    def _reduce_train_metric_values(key: str, values: list[float]) -> float:
+        if key in {"_entropy_sum", "_entropy_count"}:
+            return sum(values)
+        if key == "entropy/min":
+            return min(values)
+        if key == "entropy/max":
+            return max(values)
+        return _mean(values)
 
     def _standard_metric_aliases(self, metrics: dict[str, float]) -> dict[str, float]:
         aliases = {
@@ -1359,20 +1254,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         return aliases
 
     def _maybe_no_sync(self) -> contextlib.AbstractContextManager[None]:
-        if self.world is None or self.world.world_size <= 1:
-            return contextlib.nullcontext()
         will_step = self._accumulated_micro_batches + 1 >= self.accumulation_steps
-        if will_step:
-            return contextlib.nullcontext()
         no_sync = getattr(self.model, "no_sync", None)
-        if not callable(no_sync):
+        if not world_is_distributed(self.world) or will_step or not callable(no_sync):
             return contextlib.nullcontext()
         return no_sync()
 
     def _sync_metrics(self, metrics: dict[str, float]) -> dict[str, float]:
         if (
-            self.world is None
-            or self.world.world_size <= 1
+            not world_is_distributed(self.world)
             or not torch.distributed.is_initialized()
         ):
             return metrics
@@ -1393,18 +1283,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         *,
         rank: int,
     ) -> list[dict[str, float] | None] | None:
-        if self.world is None:
-            raise RuntimeError("World must be set up before metric synchronization")
-
-        if rank == 0:
-            gathered = [None for _ in range(self.world.world_size)]
-        else:
-            gathered = None
-        torch.distributed.gather_object(
-            metric_payload,
-            gathered,
-            dst=0,
-        )
+        world_size = self._require_world().world_size
+        gathered = [None for _ in range(world_size)] if rank == 0 else None
+        torch.distributed.gather_object(metric_payload, gathered, dst=0)
         return gathered
 
     def _reduce_gathered_metrics(
@@ -1413,23 +1294,18 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     ) -> dict[str, float]:
         if gathered is None:
             raise RuntimeError("Metric synchronization returned no gathered metrics.")
-        synced: dict[str, float] = {}
         contributors = [item for item in gathered if item]
-        keys = sorted({key for item in contributors for key in item})
-        for key in keys:
-            values = [float(item[key]) for item in contributors if key in item]
-            if values:
-                synced[key] = self._reduce_metric_values(key, values)
-        return synced
+        return _reduce_by_key(contributors, self._reduce_metric_values, ordered=True)
 
-    def _reduce_metric_values(self, key: str, values: list[float]) -> float:
+    @staticmethod
+    def _reduce_metric_values(key: str, values: list[float]) -> float:
         if key.endswith("/max"):
             return max(values)
         if key.endswith("/min"):
             return min(values)
-        if key.startswith("_") or key in SUM_SYNCED_METRIC_KEYS:
+        if key.startswith("_") or key in SUMMED_METRIC_KEYS:
             return sum(values)
-        return sum(values) / len(values)
+        return _mean(values)
 
     def _broadcast_synced_metrics(
         self,
@@ -1460,9 +1336,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             return
         if self.model is None or self.tokenizer is None:
             return
-
-        from wavelet.trainer.model import save_lora_adapter_snapshot_from_fsdp
-
         if (
             self.config.lora is not None
             and self.config.policy_transfer.lightweight_lora
@@ -1479,9 +1352,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 logger.info(f"Model saved to {self.output_dir}")
             return
         super()._save_model()
-
-
-_StreamingChunkAccumulator = RolloutChunkAccumulator
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1602,7 +1472,7 @@ def _run_streaming_rollout_training(
         )
     chunks_per_step = _chunks_per_step(config)
     min_loadable_rows = _min_loadable_rollout_rows(config, trainer)
-    accumulator = _StreamingChunkAccumulator()
+    accumulator = RolloutChunkAccumulator()
 
     while trainer.step < target_step:
         loop_started_at = perf_counter()
@@ -1741,13 +1611,11 @@ def _validate_rollout_batch(
 ) -> None:
     """Reject rollout data whose manifest disagrees with trainer state."""
     expected_queue_step = batch.step if chunk_index is not None else trainer_step
-    expected_optimizer_step = trainer_step
-
     minimum_policy_step = required_policy_step(config, trainer_step)
     validate_rollout_manifest(
         batch,
         queue_step=expected_queue_step,
-        optimizer_step=expected_optimizer_step,
+        optimizer_step=trainer_step,
         chunk_index=chunk_index,
         rows=row_count,
         minimum_policy_step=minimum_policy_step,
@@ -1757,7 +1625,7 @@ def _validate_rollout_batch(
 
 def _configure_streaming_accumulation(
     trainer: RLTrainer,
-    accumulator: _StreamingChunkAccumulator,
+    accumulator: RolloutChunkAccumulator,
     *,
     chunks_per_step: int,
 ) -> None:
@@ -1831,14 +1699,9 @@ def _log_step_perf_metrics(
 def _validate_distributed_step_sync(trainer: RLTrainer, stepped: bool) -> None:
     if not torch.distributed.is_initialized():
         return
-    if trainer.world is None:
-        raise RuntimeError("World must be set up before distributed step sync.")
-    flag = torch.tensor(int(stepped), device=trainer.world.device)
-    min_flag = flag.clone()
-    max_flag = flag.clone()
-    torch.distributed.all_reduce(min_flag, op=torch.distributed.ReduceOp.MIN)
-    torch.distributed.all_reduce(max_flag, op=torch.distributed.ReduceOp.MAX)
-    if int(min_flag.item()) != int(max_flag.item()):
+    device = trainer._require_world().device
+    # Ranks agree exactly when "all stepped" and "any stepped" coincide.
+    if all_ranks_true(stepped, device=device) != any_rank_true(stepped, device=device):
         raise RuntimeError(
             "Distributed trainer ranks disagreed on optimizer-step completion for "
             "the current rollout chunk. Increase orchestrator.rollout_chunk_examples "
@@ -1890,7 +1753,7 @@ def _combined_rollout_path(
             for _ in range(target_rows - written):
                 output.write(json.dumps(_dummy_rollout_row(config, first_row)) + "\n")
         tmp_path.replace(path)
-    if world is not None and world.world_size > 1:
+    if world_is_distributed(world):
         barrier(world)
     return path
 

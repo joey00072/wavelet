@@ -20,7 +20,7 @@ from wavelet.configs.rl_config import (
     SFTDistillAlgorithmConfig,
     TruncationLengthPenaltyConfig,
 )
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 from wavelet.orchestrator.algorithms import (
     BaseAlgorithm,
     GRPOAlgorithm,

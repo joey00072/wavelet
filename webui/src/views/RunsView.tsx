@@ -9,6 +9,7 @@ import { Empty, ErrorNote } from "../components/KeyValue";
 import { fmt, fmtAge, fmtInt, modelLabel, shortId } from "../lib/format";
 import { CURRENT_RUN, navigate } from "../lib/router";
 import { num } from "../lib/series";
+import { toggleInSet } from "../lib/sets";
 
 export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunSummary[] | null; error: string | null }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -17,6 +18,8 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
   const current = useMemo(() => (runs ?? []).find((r) => r.is_current) ?? null, [runs]);
   const older = useMemo(() => (runs ?? []).filter((r) => !r.is_current), [runs]);
   const primaryRunLabel = current?.status === "running" ? "current" : "recent";
+  const ordered = current ? [current, ...older] : older;
+  const open = (id: string) => navigate({ page: "run", runId: id, view: "overview" });
 
   useEffect(() => {
     let cancelled = false;
@@ -42,13 +45,7 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
     };
   }, [apiBase, ids.join("|")]);
 
-  const toggle = (id: string) =>
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  const toggle = (id: string) => setSelected((prev) => toggleInSet(prev, id));
 
   return (
     <div className="space-y-8">
@@ -61,7 +58,7 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
           </div>
           <StatusBadge status={current.status} reason={current.status_reason} />
           <span className="tabular text-xs text-ink2">step {current.trainer_step === null ? "–" : current.trainer_step + 1}{current.target_step ? ` / ${current.target_step}` : ""}</span>
-          <span className="tabular text-xs text-ink2">reward {fmt(num(current.latest.orchestrator, "reward/all/mean") ?? num(current.latest.trainer, "reward/all/mean"), 3)}</span>
+          <span className="tabular text-xs text-ink2">reward {fmt(latestReward(current), 3)}</span>
           <Sparkline points={trends[current.id] ?? []} />
           <span className="text-xs text-muted">{fmtAge(current.updated_at)}</span>
           <ArrowRight className="ml-auto h-4 w-4 text-muted" />
@@ -79,20 +76,19 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
       <ErrorNote error={error} />
       {runs && runs.length === 0 && <Empty title="No runs found" hint="Start the dashboard with --runs-root pointing at your outputs directory, or pass run directories explicitly." />}
       <div className="section space-y-1 md:hidden">
-        {(current ? [current, ...older] : older).map((run) => {
-          const reward = num(run.latest.orchestrator, "reward/all/mean") ?? num(run.latest.trainer, "reward/all/mean");
+        {ordered.map((run) => {
           const evalEntry = headlineEval(run);
           return (
             <article key={run.id} className="flex items-start gap-3 border-b border-edge py-3 last:border-0">
               <input type="checkbox" className="mt-1 h-4 w-4 shrink-0 accent-[var(--series-1)]" checked={selected.has(run.id)} onChange={() => toggle(run.id)} aria-label={`Select ${run.id}`} />
-              <button type="button" className="min-w-0 flex-1 text-left" onClick={() => navigate({ page: "run", runId: run.id, view: "overview" })}>
+              <button type="button" className="min-w-0 flex-1 text-left" onClick={() => open(run.id)}>
                 <span className="flex items-start justify-between gap-2">
                   <span className="min-w-0 truncate text-sm font-medium text-ink">{run.id}</span>
                   <StatusBadge status={run.status} reason={run.status_reason} />
                 </span>
                 <span className="mt-1 grid grid-cols-3 gap-2 text-[11px] text-muted">
                   <span className="tabular">step <span className="text-ink2">{run.trainer_step === null ? "–" : run.trainer_step + 1}</span></span>
-                  <span className="tabular">reward <span className="text-ink2">{fmt(reward, 3)}</span></span>
+                  <span className="tabular">reward <span className="text-ink2">{fmt(latestReward(run), 3)}</span></span>
                   <span className="tabular">eval <span className="text-ink2">{evalEntry ? fmt(evalEntry.value, 3) : "–"}</span></span>
                 </span>
                 <span className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
@@ -123,14 +119,13 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
             </tr>
           </thead>
           <tbody>
-            {(current ? [current, ...older] : older).map((run) => {
-              const reward = num(run.latest.orchestrator, "reward/all/mean") ?? num(run.latest.trainer, "reward/all/mean");
+            {ordered.map((run) => {
               const evalEntry = headlineEval(run);
               return (
-                <tr key={run.id} className="tr-hover cursor-pointer border-b border-edge last:border-0" onClick={() => navigate({ page: "run", runId: run.id, view: "overview" })} onKeyDown={(event) => {
+                <tr key={run.id} className="tr-hover cursor-pointer border-b border-edge last:border-0" onClick={() => open(run.id)} onKeyDown={(event) => {
                   if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
                     event.preventDefault();
-                    navigate({ page: "run", runId: run.id, view: "overview" });
+                    open(run.id);
                   }
                 }} tabIndex={0}>
                   <td className="td" onClick={(e) => e.stopPropagation()}>
@@ -143,7 +138,7 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
                   <td className="td"><StatusBadge status={run.status} reason={run.status_reason} /></td>
                   <td className="td tabular text-right">{run.trainer_step === null ? "–" : `${run.trainer_step + 1}${run.target_step ? ` / ${run.target_step}` : ""}`}</td>
                   <td className="td"><Sparkline points={trends[run.id] ?? []} /></td>
-                  <td className="td tabular text-right">{fmt(reward, 3)}</td>
+                  <td className="td tabular text-right">{fmt(latestReward(run), 3)}</td>
                   <td className="td tabular text-right" title={evalEntry?.key}>{evalEntry ? fmt(evalEntry.value, 3) : "–"}</td>
                   <td className="td" title={run.model ?? undefined}>{shortId(modelLabel(run.model), 30)}</td>
                   <td className="td">{run.envs.length ? run.envs.join(", ") : run.eval_envs.join(", ") || "–"}</td>
@@ -159,6 +154,10 @@ export function RunsView({ apiBase, runs, error }: { apiBase: string; runs: RunS
       {runs && runs.length > 0 && <p className="text-[11px] text-muted">{fmtInt(runs.length)} run(s). Data refreshes every few seconds; completed runs are read from disk.</p>}
     </div>
   );
+}
+
+function latestReward(run: RunSummary): number | null {
+  return num(run.latest.orchestrator, "reward/all/mean") ?? num(run.latest.trainer, "reward/all/mean");
 }
 
 function headlineEval(run: RunSummary): { key: string; value: number } | null {

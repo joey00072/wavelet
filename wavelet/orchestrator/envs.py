@@ -211,7 +211,7 @@ def evaluate_env(
     inference_engine: Any | None = None,
 ) -> dict[str, float]:
     return asyncio.run(
-        _evaluate_env_async(
+        evaluate_env_async(
             orchestrator,
             env_config,
             step=step,
@@ -222,23 +222,6 @@ def evaluate_env(
 
 
 async def evaluate_env_async(
-    orchestrator: RLOrchestrator,
-    env_config: RLEvalEnvConfig,
-    *,
-    step: int,
-    policy_step: int,
-    inference_engine: Any | None = None,
-) -> dict[str, float]:
-    return await _evaluate_env_async(
-        orchestrator,
-        env_config,
-        step=step,
-        policy_step=policy_step,
-        inference_engine=inference_engine,
-    )
-
-
-async def _evaluate_env_async(
     orchestrator: RLOrchestrator,
     env_config: RLEvalEnvConfig,
     *,
@@ -433,30 +416,30 @@ def _eval_metrics(
     metrics[f"{prefix}/no_response/mean"] = sum(no_responses) / len(no_responses)
     if set(rewards).issubset({0.0, 1.0}):
         by_example: dict[str, list[float]] = {}
-        for output in outputs:
-            by_example.setdefault(str(output.get("example_id")), []).append(
-                float(output.get("reward", 0.0))
-            )
-        pass_metrics: dict[str, list[float]] = {}
-        for group_rewards in by_example.values():
-            for key, value in pass_at_k(group_rewards).items():
-                pass_metrics.setdefault(key, []).append(value)
-        for key, values in pass_metrics.items():
-            metrics[f"{prefix}/{key}"] = sum(values) / len(values)
         effective_by_example: dict[str, list[float]] = {}
         for output in outputs:
-            if "reward" not in output:
-                continue
-            effective_by_example.setdefault(str(output.get("example_id")), []).append(
-                float(output["reward"])
+            example_id = str(output.get("example_id"))
+            by_example.setdefault(example_id, []).append(
+                float(output.get("reward", 0.0))
             )
-        effective_pass_metrics: dict[str, list[float]] = {}
-        for group_rewards in effective_by_example.values():
-            for key, value in pass_at_k(group_rewards).items():
-                effective_pass_metrics.setdefault(key, []).append(value)
-        for key, values in effective_pass_metrics.items():
-            metrics[f"{prefix}/effective/{key}"] = sum(values) / len(values)
+            if "reward" in output:
+                effective_by_example.setdefault(example_id, []).append(
+                    float(output["reward"])
+                )
+        for key, value in _mean_pass_at_k(by_example).items():
+            metrics[f"{prefix}/{key}"] = value
+        for key, value in _mean_pass_at_k(effective_by_example).items():
+            metrics[f"{prefix}/effective/{key}"] = value
     return metrics
+
+
+def _mean_pass_at_k(rewards_by_example: dict[str, list[float]]) -> dict[str, float]:
+    """Average each pass@k metric over the per-example reward groups."""
+    pass_metrics: dict[str, list[float]] = {}
+    for group_rewards in rewards_by_example.values():
+        for key, value in pass_at_k(group_rewards).items():
+            pass_metrics.setdefault(key, []).append(value)
+    return {key: sum(values) / len(values) for key, values in pass_metrics.items()}
 
 
 def _completion_len(output: dict[str, Any]) -> float:
@@ -543,7 +526,7 @@ def _verifier_clients(
     client_type: str | None = None,
     client_label: str = "verifier",
 ) -> list[Any]:
-    teacher = config.teacher if algorithm_loss_component(config.algo) == "ce" else None
+    teacher = _ce_teacher(config)
     api_key_var = (
         teacher.api_key_var
         if teacher is not None
@@ -569,9 +552,17 @@ def _verifier_clients(
     return clients
 
 
+def _ce_teacher(config):
+    """Return the teacher config when CE distillation routes requests to it."""
+    if algorithm_loss_component(config.algo) == "ce":
+        return config.teacher
+    return None
+
+
 def _verifier_base_urls(config) -> list[str]:
-    if algorithm_loss_component(config.algo) == "ce" and config.teacher is not None:
-        base_url = config.teacher.base_url.rstrip("/")
+    teacher = _ce_teacher(config)
+    if teacher is not None:
+        base_url = teacher.base_url.rstrip("/")
         return [base_url if base_url.endswith("/v1") else f"{base_url}/v1"]
     base_urls = config.orchestrator.verifier_base_url
     if base_urls is None:
@@ -584,8 +575,9 @@ def _verifier_base_urls(config) -> list[str]:
 
 
 def _verifier_model(config, inference_engine: Any | None = None) -> str:
-    if algorithm_loss_component(config.algo) == "ce" and config.teacher is not None:
-        return config.teacher.name
+    teacher = _ce_teacher(config)
+    if teacher is not None:
+        return teacher.name
     policy_model_name = getattr(inference_engine, "policy_model_name", None)
     if isinstance(policy_model_name, str) and policy_model_name:
         return policy_model_name
@@ -600,8 +592,9 @@ def _verifier_extra_env_kwargs(config) -> dict[str, Any]:
             config.orchestrator.verifier_max_total_completion_tokens
         ),
     }
-    if algorithm_loss_component(config.algo) == "ce" and config.teacher is not None:
-        kwargs["timeout_seconds"] = config.teacher.timeout_seconds
+    teacher = _ce_teacher(config)
+    if teacher is not None:
+        kwargs["timeout_seconds"] = teacher.timeout_seconds
     elif config.orchestrator.verifier_timeout_seconds is not None:
         kwargs["timeout_seconds"] = config.orchestrator.verifier_timeout_seconds
     return kwargs
@@ -905,7 +898,7 @@ async def _run_group(
                     "run_group()."
                 )
             group_inputs = [vf.RolloutInput(**example) for _ in range(rollout_count)]
-            result = list(
+            results = list(
                 await run_group(
                     group_inputs,
                     client=client,
@@ -916,29 +909,21 @@ async def _run_group(
                 )
             )
             if failure_stats is not None:
-                for _ in range(max(0, rollout_count - len(result))):
+                for _ in range(max(0, rollout_count - len(results))):
                     failure_stats.record("MissingRollout")
-            outputs = _successful_rollout_outputs(
-                result,
-                failure_stats=failure_stats,
-            )
-            _stamp_verifier_example(outputs, example)
-            _stamp_group_id(outputs, group_id)
-            _assign_group_advantages(outputs, algorithm_config=algorithm_config)
-            return outputs
-
-        tasks = [
-            env.run_rollout(
-                vf.RolloutInput(**example),
-                client=client,
-                model=model,
-                sampling_args=sampling_args,
-                max_retries=max_retries,
-                state_columns=["trajectory", "sampling_args"],
-            )
-            for _ in range(rollout_count)
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            tasks = [
+                env.run_rollout(
+                    vf.RolloutInput(**example),
+                    client=client,
+                    model=model,
+                    sampling_args=sampling_args,
+                    max_retries=max_retries,
+                    state_columns=["trajectory", "sampling_args"],
+                )
+                for _ in range(rollout_count)
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
         outputs = _successful_rollout_outputs(
             results,
             failure_stats=failure_stats,
@@ -1050,10 +1035,6 @@ def _successful_rollout_outputs(
     return outputs
 
 
-def _assign_completed_group_advantages(outputs: list[dict[str, Any]], config) -> None:
-    _assign_group_advantages(outputs, algorithm_config=config.algo)
-
-
 def _completed_group_outputs(
     task: asyncio.Task[list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
@@ -1115,14 +1096,24 @@ def _algorithm_record_from_output(output: dict[str, Any]) -> RLExample:
         ),
         reward=float(output["reward"]),
         metadata={
-            "completion_token_count": output_completion_token_count(output),
-            "input_token_count": output_input_token_count(output),
-            "tool_response_token_count": output_tool_response_token_count(output),
-            "turn_count": len(output.get("trajectory") or []),
+            **_output_token_metadata(output),
             "is_truncated": bool(output.get("is_truncated")),
         },
         source=str(output.get("env_name") or output.get("task") or "verifier"),
     )
+
+
+def _output_token_metadata(output: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "completion_token_count": output_completion_token_count(output),
+        "input_token_count": output_input_token_count(output),
+        "tool_response_token_count": output_tool_response_token_count(output),
+        "turn_count": len(output.get("trajectory") or []),
+    }
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _has_trainable_advantage(
@@ -1158,16 +1149,6 @@ def _is_usable_training_group(
         outputs,
         filter_zero_advantage=filter_zero_advantage,
         advantage_epsilon=advantage_epsilon,
-    )
-
-
-def _is_complete_training_group(
-    outputs: list[dict[str, Any]],
-    *,
-    expected_rollouts: int,
-) -> bool:
-    return len(outputs) == expected_rollouts and all(
-        _has_trainable_trajectory(output) for output in outputs
     )
 
 
@@ -1385,10 +1366,7 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
             "rollout_key": f"{group_key}:{sample_index}",
             "stop_condition": output.get("stop_condition"),
             "is_truncated": output.get("is_truncated"),
-            "completion_token_count": output_completion_token_count(output),
-            "input_token_count": output_input_token_count(output),
-            "tool_response_token_count": output_tool_response_token_count(output),
-            "turn_count": len(output.get("trajectory") or []),
+            **_output_token_metadata(output),
             "_wavelet_rollout_count": 1 if sample_index == 0 else 0,
             **rollout_task_harness_metadata(
                 output,
@@ -1397,23 +1375,24 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
             ),
         }
         group_size = output.get("_wavelet_group_size")
-        if isinstance(group_size, int) and not isinstance(group_size, bool):
+        if _is_int(group_size):
             metadata["_wavelet_group_size"] = group_size
         if isinstance(output.get("_wavelet_verifier_example"), dict):
             metadata["verifier_example"] = dict(output["_wavelet_verifier_example"])
-        record_cursor = output.get("_wavelet_record_cursor")
-        if isinstance(record_cursor, int) and not isinstance(record_cursor, bool):
-            metadata["verifier_record_cursor"] = record_cursor
-        policy_step = output.get("_wavelet_policy_step")
-        if isinstance(policy_step, int) and not isinstance(policy_step, bool):
-            metadata["policy_step"] = policy_step
-        policy_end_step = output.get("_wavelet_policy_end_step")
-        if isinstance(policy_end_step, int) and not isinstance(policy_end_step, bool):
-            metadata["policy_end_step"] = policy_end_step
+        for output_key, metadata_key in (
+            ("_wavelet_record_cursor", "verifier_record_cursor"),
+            ("_wavelet_policy_step", "policy_step"),
+            ("_wavelet_policy_end_step", "policy_end_step"),
+        ):
+            value = output.get(output_key)
+            if _is_int(value):
+                metadata[metadata_key] = value
         records.append(
             RLExample(
                 prompt=_mask_prompt_history(first_step.get("prompt") or []),
-                completion=_messages(last_step.get("completion") or []),
+                completion=[
+                    dict(message) for message in last_step.get("completion") or []
+                ],
                 target_completion=None,
                 input_ids=sample["input_ids"],
                 target_ids=sample["target_ids"],
@@ -1634,10 +1613,6 @@ def _step_token_segment(
         ),
         turn_id=str(step.get("turn_id", index)),
     )
-
-
-def _messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [dict(message) for message in messages]
 
 
 def _mask_prompt_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

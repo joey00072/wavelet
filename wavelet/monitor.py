@@ -10,7 +10,7 @@ import re
 import shutil
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,6 +20,7 @@ from typing import Any
 import torch
 
 from wavelet.configs.config import RLConfig, SFTConfig, WandbConfig
+from wavelet.dashboard.jsonl import read_json as _read_json  # noqa: F401
 from wavelet.orchestrator.rollout_metadata import (
     error_metric_name,
     metadata_harness_name,
@@ -49,7 +50,7 @@ logger = logging.getLogger(__name__)
 _TAIL_READ_BLOCK_BYTES = 64 * 1024
 
 
-def _state_timestamp() -> str:
+def _utc_timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
@@ -337,7 +338,7 @@ class RunMonitor:
 
         if self.write_run_metadata:
             metadata = {
-                "started_at": self._timestamp(),
+                "started_at": _utc_timestamp(),
                 "pid": os.getpid(),
                 "output_dir": str(self.output_dir),
                 "world": {
@@ -371,7 +372,7 @@ class RunMonitor:
 
         row = dict(metrics)
         row["step"] = step
-        row["timestamp"] = self._timestamp()
+        row["timestamp"] = _utc_timestamp()
         row.update(self._resource_metrics())
         row, nonfinite_keys = _sanitize_metric_row(row)
         for key in sorted(nonfinite_keys - self._warned_nonfinite_metric_keys):
@@ -421,7 +422,7 @@ class RunMonitor:
         if not self._should_write() or not self.write_events:
             return
         record = {
-            "timestamp": self._timestamp(),
+            "timestamp": _utc_timestamp(),
             "event": name,
             "step": step,
             "payload": payload or {},
@@ -432,7 +433,7 @@ class RunMonitor:
         if not self._should_write() or not samples:
             return
 
-        timestamp = self._timestamp()
+        timestamp = _utc_timestamp()
         rows = [{"timestamp": timestamp, "step": step, **sample} for sample in samples]
         self._append_sample_history(rows)
 
@@ -523,27 +524,9 @@ class RunMonitor:
         }
 
     def _disk_metrics(self) -> dict[str, Any]:
-        usage = shutil.disk_usage(_existing_path(self.output_dir))
-        metrics: dict[str, Any] = {
-            "disk_total_bytes": usage.total,
-            "disk_used_bytes": usage.used,
-            "disk_free_bytes": usage.free,
-            "disk_free_ratio": usage.free / usage.total if usage.total else 0.0,
-        }
+        metrics = _usage_metrics("disk", self.output_dir)
         if self.checkpoint_dir is not None:
-            checkpoint_usage = shutil.disk_usage(_existing_path(self.checkpoint_dir))
-            metrics.update(
-                {
-                    "checkpoint_disk_total_bytes": checkpoint_usage.total,
-                    "checkpoint_disk_used_bytes": checkpoint_usage.used,
-                    "checkpoint_disk_free_bytes": checkpoint_usage.free,
-                    "checkpoint_disk_free_ratio": (
-                        checkpoint_usage.free / checkpoint_usage.total
-                        if checkpoint_usage.total
-                        else 0.0
-                    ),
-                }
-            )
+            metrics.update(_usage_metrics("checkpoint_disk", self.checkpoint_dir))
         return metrics
 
     def _write_heartbeat(
@@ -557,7 +540,7 @@ class RunMonitor:
         if not self.write_heartbeat:
             return
         payload: dict[str, Any] = {
-            "timestamp": self._timestamp(),
+            "timestamp": _utc_timestamp(),
             "pid": os.getpid(),
             "status": status,
             "step": step,
@@ -636,39 +619,13 @@ class RunMonitor:
         )
         self._write_wandb_run_id(canonical_run_id)
         if create_online_overview:
-            self._create_wandb_overview(run_config, shared_kwargs)
-
-    def _create_wandb_overview(
-        self,
-        run_config: dict[str, Any] | None,
-        shared_kwargs: dict[str, Any] | None,
-    ) -> None:
-        if self.wandb.mode != "online" or not self.wandb.create_overview:
-            return
-        if shared_kwargs is not None and os.environ.get(
-            "WANDB_SHARED_LABEL"
-        ) != os.environ.get("WANDB_SHARED_PRIMARY", "orchestrator"):
-            return
-        entity = getattr(self._wandb_run, "entity", None)
-        project = getattr(self._wandb_run, "project", None)
-        if not isinstance(entity, str) or not isinstance(project, str):
-            logger.warning("Cannot create W&B overview without entity and project.")
-            return
-        try:
-            from wavelet.wandb_overview import ensure_overview_view, overview_inputs
-
-            flavor, train_envs, eval_envs = overview_inputs(run_config)
-            url = ensure_overview_view(
-                entity,
-                project,
-                flavor=flavor,
-                train_envs=train_envs,
-                eval_envs=eval_envs,
+            _maybe_create_wandb_overview(
+                self._wandb_run,
+                run_config,
+                wandb_config=self.wandb,
+                shared_kwargs=shared_kwargs,
+                warn_missing_identity=True,
             )
-            if url is not None:
-                logger.info("Created W&B overview view: %s", url)
-        except Exception:
-            logger.warning("Failed to create W&B overview view.", exc_info=True)
 
     def _read_wandb_run_id(self) -> str | None:
         if not self.wandb_run_id_file.exists():
@@ -701,8 +658,15 @@ class RunMonitor:
             aliases.setdefault("scheduler/lr", row["optim/lr"])
         return aliases
 
-    def _timestamp(self) -> str:
-        return datetime.now(UTC).isoformat()
+
+def _usage_metrics(prefix: str, path: Path) -> dict[str, Any]:
+    usage = shutil.disk_usage(_existing_path(path))
+    return {
+        f"{prefix}_total_bytes": usage.total,
+        f"{prefix}_used_bytes": usage.used,
+        f"{prefix}_free_bytes": usage.free,
+        f"{prefix}_free_ratio": usage.free / usage.total if usage.total else 0.0,
+    }
 
 
 def _existing_path(path: Path) -> Path:
@@ -968,20 +932,8 @@ def _append_rollout_trace(
     queue_step: int | None,
     optimizer_step: int | None,
 ) -> None:
-    task_names = sorted(
-        {
-            name
-            for row in rows
-            if (name := metadata_task_name(_metadata(row))) is not None
-        }
-    )
-    harness_names = sorted(
-        {
-            name
-            for row in rows
-            if (name := metadata_harness_name(_metadata(row))) is not None
-        }
-    )
+    task_names = _metadata_names(rows, metadata_task_name)
+    harness_names = _metadata_names(rows, metadata_harness_name)
     append_trace_event_best_effort(
         config.output_dir,
         make_trace_event(
@@ -1004,6 +956,15 @@ def _append_rollout_trace(
     )
 
 
+def _metadata_names(
+    rows: list[dict[str, Any]],
+    extract: Callable[[dict[str, Any]], str | None],
+) -> list[str]:
+    return sorted(
+        {name for row in rows if (name := extract(_metadata(row))) is not None}
+    )
+
+
 def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
     rows = inputs.rows
     grouped = _group_by_example(rows)
@@ -1013,7 +974,11 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         max(seq_len - decode_len, 0)
         for seq_len, decode_len in zip(seq_lens, decode_lens, strict=True)
     ]
-    advantages = [_float_or_none(row.get("advantage")) for row in rows]
+    advantage_values = [
+        value
+        for row in rows
+        if (value := _float_or_none(row.get("advantage"))) is not None
+    ]
     metrics: dict[str, float] = {
         "progress/tokens": float(sum(seq_lens)),
         "progress/prefill_tokens": float(sum(prefill_lens)),
@@ -1062,7 +1027,6 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
                 include_min=include_min,
             )
         )
-    advantage_values = [value for value in advantages if value is not None]
     metrics.update(series_stats("advantage/all", advantage_values))
     _add_group_metrics(
         metrics,
@@ -1358,38 +1322,13 @@ def _wandb_log(
                 _WANDB_RUN = wandb.init(**init_kwargs)
             wandb.define_metric("step")
             wandb.define_metric("*", step_metric="step")
-            if (
-                wandb_config.mode == "online"
-                and wandb_config.create_overview
-                and (
-                    shared_kwargs is None
-                    or os.environ.get("WANDB_SHARED_LABEL")
-                    == os.environ.get("WANDB_SHARED_PRIMARY", "orchestrator")
-                )
-            ):
-                try:
-                    from wavelet.wandb_overview import (
-                        ensure_overview_view,
-                        overview_inputs,
-                    )
-
-                    entity = getattr(_WANDB_RUN, "entity", None)
-                    project = getattr(_WANDB_RUN, "project", None)
-                    if isinstance(entity, str) and isinstance(project, str):
-                        flavor, train_envs, eval_envs = overview_inputs(
-                            config.model_dump(mode="json", exclude_none=True)
-                        )
-                        url = ensure_overview_view(
-                            entity,
-                            project,
-                            flavor=flavor,
-                            train_envs=train_envs,
-                            eval_envs=eval_envs,
-                        )
-                        if url is not None:
-                            logger.info("Created W&B overview view: %s", url)
-                except Exception:
-                    logger.warning("Failed to create W&B overview view.", exc_info=True)
+            _maybe_create_wandb_overview(
+                _WANDB_RUN,
+                config.model_dump(mode="json", exclude_none=True),
+                wandb_config=wandb_config,
+                shared_kwargs=shared_kwargs,
+                warn_missing_identity=False,
+            )
         row: dict[str, float] = {**metrics, "_timestamp": time.time()}
         if step is None:
             _define_wandb_time_metrics(
@@ -1402,6 +1341,44 @@ def _wandb_log(
         _WANDB_RUN.log(row)
     except Exception as exc:  # noqa: BLE001  # pragma: no cover
         logger.warning("Failed to log orchestrator metrics to W&B: %s", exc)
+
+
+def _maybe_create_wandb_overview(
+    run: Any,
+    run_config: dict[str, Any] | None,
+    *,
+    wandb_config: WandbConfig,
+    shared_kwargs: dict[str, Any] | None,
+    warn_missing_identity: bool,
+) -> None:
+    """Create the curated W&B overview once per online run when configured."""
+    if wandb_config.mode != "online" or not wandb_config.create_overview:
+        return
+    if shared_kwargs is not None and os.environ.get(
+        "WANDB_SHARED_LABEL"
+    ) != os.environ.get("WANDB_SHARED_PRIMARY", "orchestrator"):
+        return
+    entity = getattr(run, "entity", None)
+    project = getattr(run, "project", None)
+    if not isinstance(entity, str) or not isinstance(project, str):
+        if warn_missing_identity:
+            logger.warning("Cannot create W&B overview without entity and project.")
+        return
+    try:
+        from wavelet.wandb_overview import ensure_overview_view, overview_inputs
+
+        flavor, train_envs, eval_envs = overview_inputs(run_config)
+        url = ensure_overview_view(
+            entity,
+            project,
+            flavor=flavor,
+            train_envs=train_envs,
+            eval_envs=eval_envs,
+        )
+        if url is not None:
+            logger.info("Created W&B overview view: %s", url)
+    except Exception:
+        logger.warning("Failed to create W&B overview view.", exc_info=True)
 
 
 def finish_orchestrator_wandb() -> None:
@@ -1439,13 +1416,17 @@ def _grouped_means(
     grouped: dict[tuple[str, str], list[dict[str, Any]]],
     value_fn,
 ) -> list[float]:
-    values: list[float] = []
-    for rows in grouped.values():
-        row_values = [_float_or_none(value_fn(row)) for row in rows]
-        numeric = [value for value in row_values if value is not None]
-        if numeric:
-            values.append(float(mean(numeric)))
-    return values
+    return [
+        float(mean(numeric))
+        for rows in grouped.values()
+        if (
+            numeric := [
+                value
+                for row in rows
+                if (value := _float_or_none(value_fn(row))) is not None
+            ]
+        )
+    ]
 
 
 def _grouped_rollout_means(
@@ -1478,8 +1459,9 @@ def _solve_rates(
         configured_group_sizes = {
             value
             for row in rows
-            for value in [_metadata(row).get("_wavelet_group_size")]
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+            if isinstance(value := _metadata(row).get("_wavelet_group_size"), int)
+            and not isinstance(value, bool)
+            and value > 0
         }
         expected_rollouts = (
             configured_group_sizes.pop()
@@ -1579,7 +1561,7 @@ def _fate_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
             trainable_tokens == 0,
             metadata.get("_wavelet_filtered_rollout"),
             metadata.get("_wavelet_dummy_rollout"),
-            _has_error(row),
+            _row_error(row) is not None,
             metadata.get("is_truncated"),
             isinstance(row.get("inference_logprobs"), list),
             isinstance(row.get("teacher_logprobs"), list),
@@ -1597,10 +1579,6 @@ def _fate_metrics(prefix: str, counts: dict[str, int]) -> dict[str, float]:
         if name != "produced":
             metrics[f"{prefix}/{name}_rate"] = float(count / total)
     return metrics
-
-
-def _has_error(row: dict[str, Any]) -> bool:
-    return _row_error(row) is not None
 
 
 def _row_error(row: dict[str, Any]) -> object | None:
@@ -1629,17 +1607,7 @@ def _bool_metric(value: object) -> float:
     return float(bool(value))
 
 
-# Shared run-state JSON and rollout inspection readers.
-def _read_json(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
+# Shared rollout inspection readers.
 def _iter_jsonl_dicts(
     path: Path, *, limit: int
 ) -> Iterator[tuple[int, dict[str, Any]]]:
@@ -1897,7 +1865,7 @@ class RolloutStateEventsMixin:
             "queue_step": queue_step,
             "optimizer_step": optimizer_step,
             "chunk_index": chunk_index,
-            "timestamp": _state_timestamp(),
+            "timestamp": _utc_timestamp(),
         }
         if path is not None:
             item["path"] = path
@@ -1916,4 +1884,4 @@ class RolloutStateEventsMixin:
                 -self._config.orchestrator.state_server.max_events :
             ]
             self._state["rollouts"].update(rollout_patch)
-            self._state["updated_at"] = _state_timestamp()
+            self._state["updated_at"] = _utc_timestamp()

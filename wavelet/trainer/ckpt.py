@@ -28,7 +28,12 @@ from torch.optim.lr_scheduler import LRScheduler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from wavelet.configs.sft import CheckpointConfig
-from wavelet.trainer.distributed import World, barrier, distributed_uses_cuda
+from wavelet.trainer.distributed import (
+    World,
+    all_ranks_true,
+    barrier,
+    collective_device,
+)
 from wavelet.utils.pathing import (
     STABLE_CHECKPOINT_MARKER,
     get_checkpoint_dir,
@@ -306,14 +311,14 @@ class CheckpointManager:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             (checkpoint_dir / "meta.json").write_text(json.dumps(meta))
             (checkpoint_dir / STABLE_CHECKPOINT_MARKER).touch()
-        self._barrier_if_distributed()
+        barrier(self.world)
 
     def _reset_checkpoint_dir(self, checkpoint_dir: Path) -> None:
         if self.world.is_main:
             if checkpoint_dir.exists():
                 shutil.rmtree(checkpoint_dir)
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self._barrier_if_distributed()
+        barrier(self.world)
 
     def _maybe_clean(self) -> None:
         if self.config is None:
@@ -357,15 +362,10 @@ class CheckpointManager:
         a rank that observes its own upload as done may not assume the others
         have finished too.
         """
-        done = self._is_response_done(response)
-        if not torch.distributed.is_initialized():
-            return done
-        device = torch.device("cpu")
-        if distributed_uses_cuda() and self.world.device.type == "cuda":
-            device = self.world.device
-        flag = torch.tensor(int(done), dtype=torch.int64, device=device)
-        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
-        return bool(flag.item())
+        return all_ranks_true(
+            self._is_response_done(response),
+            device=collective_device(self.world),
+        )
 
     def _wait_for_response(
         self,
@@ -401,7 +401,3 @@ class CheckpointManager:
                 use_non_blocking_copy=accelerator_available,
             )
         )
-
-    def _barrier_if_distributed(self) -> None:
-        if torch.distributed.is_initialized():
-            barrier(self.world)

@@ -51,7 +51,8 @@ def _is_fusable_lora_linear(proj: object) -> bool:
 
 def _iter_decoder_layers(model: PreTrainedModel):
     """Yield each transformer decoder layer (the sub-model layers list)."""
-    # Unwrap PeftModel → base model → model → layers
+    # Unwrap PeftModel.base_model → LoraModel.model → CausalLM.model; each
+    # getattr is a no-op when the attribute is absent, so plain models work too.
     base = model
     for attr in ("base_model", "model", "model"):
         base = getattr(base, attr, base)
@@ -242,22 +243,18 @@ def patch_fused_o(model: PreTrainedModel) -> bool:
     from wavelet.kernels.lora import LoRA_W
     from wavelet.kernels.utils import get_lora_parameters
 
+    def _make_forward(proj):
+        def fused_forward(x):
+            W, W_quant, A, B, S = get_lora_parameters(proj)
+            return LoRA_W.apply(x, W, W_quant, A, B, S)
+
+        return fused_forward
+
     patched = 0
     for layer in _iter_decoder_layers(model):
-        attn = getattr(layer, "self_attn", None)
-        if attn is None:
-            continue
-        o_proj = getattr(attn, "o_proj", None)
+        o_proj = getattr(getattr(layer, "self_attn", None), "o_proj", None)
         if not _is_fusable_lora_linear(o_proj):
             continue
-
-        def _make_forward(proj):
-            def fused_forward(x):
-                W, W_quant, A, B, S = get_lora_parameters(proj)
-                return LoRA_W.apply(x, W, W_quant, A, B, S)
-
-            return fused_forward
-
         o_proj.forward = _make_forward(o_proj)
         patched += 1
 

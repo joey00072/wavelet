@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.debug import build_preflight_report
 from wavelet.entrypoints.rl_debug import main as debug_main
-from wavelet.orchestrator.preflight import build_preflight_report
 
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
 
@@ -19,7 +19,7 @@ def _write_local_data(tmp_path: Path) -> Path:
 def test_preflight_reports_unavailable_cuda_device(tmp_path, monkeypatch) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight._available_gpu_indices",
+        "wavelet.debug._available_gpu_indices",
         lambda: {"0"},
     )
     config = RLConfig(
@@ -338,7 +338,7 @@ def test_preflight_reports_custom_algorithm_constructor_error(tmp_path) -> None:
 def test_preflight_resolves_process_commands(tmp_path, monkeypatch) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight._available_gpu_indices",
+        "wavelet.debug._available_gpu_indices",
         lambda: {"0", "1"},
     )
     config = RLConfig(
@@ -369,7 +369,7 @@ def test_checkpoint_output_dir_does_not_replace_run_output_dir(
 ) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight._available_gpu_indices",
+        "wavelet.debug._available_gpu_indices",
         lambda: {"0"},
     )
     run_dir = tmp_path / "run"
@@ -416,7 +416,7 @@ def test_preflight_cli_returns_nonzero_for_errors(tmp_path, capsys) -> None:
 def test_preflight_reports_qlora_without_lora(tmp_path, monkeypatch) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        "wavelet.debug.importlib.util.find_spec",
         lambda name: object() if name == "bitsandbytes" else None,
     )
     config = RLConfig(
@@ -445,7 +445,7 @@ def test_preflight_reports_missing_bitsandbytes_for_qlora(
 ) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        "wavelet.debug.importlib.util.find_spec",
         lambda name: None if name == "bitsandbytes" else object(),
     )
     config = RLConfig(
@@ -470,7 +470,7 @@ def test_preflight_requires_flash_attention_when_explicit(
 ) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        "wavelet.debug.importlib.util.find_spec",
         lambda name: None if name == "flash_attn" else object(),
     )
     config = RLConfig(
@@ -498,7 +498,7 @@ def test_preflight_warns_for_quantized_inference_without_qlora(
 ) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight._available_gpu_indices",
+        "wavelet.debug._available_gpu_indices",
         lambda: {"0"},
     )
     config = RLConfig(
@@ -523,7 +523,7 @@ def test_preflight_warns_for_quantized_inference_without_qlora(
 def test_preflight_reports_qlora_topology_errors(tmp_path, monkeypatch) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        "wavelet.debug.importlib.util.find_spec",
         lambda name: object() if name == "bitsandbytes" else None,
     )
     config = RLConfig(
@@ -546,7 +546,7 @@ def test_preflight_reports_qlora_topology_errors(tmp_path, monkeypatch) -> None:
 def test_qlora_check_json_contract_is_stable(tmp_path, monkeypatch) -> None:
     data_path = _write_local_data(tmp_path)
     monkeypatch.setattr(
-        "wavelet.orchestrator.preflight.importlib.util.find_spec",
+        "wavelet.debug.importlib.util.find_spec",
         lambda name: object() if name == "bitsandbytes" else None,
     )
     report = build_preflight_report(

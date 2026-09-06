@@ -6,10 +6,10 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.scheduler import (
     IntegratedRolloutScheduler,
     PublishMode,
-    _ChunkPublisherStrategy,
+    _NativeChunkPublisher,
     _resume_optimizer_step,
     _reusable_rollout_batch,
-    _SchedulerStateMachine,
+    _BatchedPublisher,
     resolve_rollout_schedule,
 )
 from wavelet.orchestrator.sources import RolloutSourceKind
@@ -108,8 +108,8 @@ def test_integrated_scheduler_runs_one_ordered_cycle_per_step() -> None:
 
 
 def test_scheduler_strategies_share_queue_to_optimizer_step_mapping() -> None:
-    batched = object.__new__(_SchedulerStateMachine)
-    chunked = object.__new__(_ChunkPublisherStrategy)
+    batched = object.__new__(_BatchedPublisher)
+    chunked = object.__new__(_NativeChunkPublisher)
     chunked.chunks_per_step = 3
 
     assert batched._rollout_step(4) == 4
@@ -196,7 +196,7 @@ def test_process_scheduler_rejects_checkpoint_after_target_step(tmp_path) -> Non
 
 def test_chunk_scheduler_initializes_in_resumed_queue_step_space(tmp_path) -> None:
     config = RLConfig(output_dir=tmp_path)
-    context = _ChunkPublisherStrategy(
+    context = _NativeChunkPublisher(
         config=config,
         orchestrator=Mock(),
         inference_engine=Mock(),

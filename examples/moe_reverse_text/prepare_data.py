@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
 from pathlib import Path
 from typing import Any
+
+from wavelet.tools.verifier_data import import_verifiers, verifier_rows, write_jsonl
 
 ALPHABET = "abcdefghijklmnopqrstuvwxyz"
 SYSTEM_PROMPT = (
@@ -32,10 +33,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--env-id", default="reverse-text")
     return parser.parse_args()
-
-
-def _example_id(payload: dict[str, Any], index: int) -> Any:
-    return payload.get("example_id", payload.get("id", index))
 
 
 def _random_text(rng: random.Random) -> str:
@@ -67,43 +64,12 @@ def build_sft_rows(*, examples: int, seed: int) -> list[dict[str, object]]:
     return rows
 
 
-def build_rl_rows(*, examples: int, seed: int, env_id: str) -> list[dict[str, object]]:
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise SystemExit(
-            "The MoE Reverse Text example uses verifier environments. "
-            "Install them with `uv sync --extra verifiers --extra envs`."
-        ) from exc
-
-    env = vf.load_environment(env_id)
-    dataset = env.get_dataset(seed=seed)
-    rows: list[dict[str, object]] = []
-    for index, example in enumerate(dataset):
-        if index >= examples:
-            break
-        payload = dict(example)
-        payload.setdefault("example_id", _example_id(payload, index))
-        rows.append(
-            {
-                "prompt": payload["prompt"],
-                "completion": "",
-                "metadata": {
-                    "verifier_example": payload,
-                    "example_id": payload["example_id"],
-                },
-            }
-        )
+def build_rl_rows(*, examples: int, seed: int, env_id: str) -> list[dict[str, Any]]:
+    env = import_verifiers().load_environment(env_id)
+    rows = verifier_rows(env.get_dataset(seed=seed), limit=examples, id_keys=("id",))
     if not rows:
         raise RuntimeError("Reverse Text verifier dataset returned no examples.")
     return rows
-
-
-def write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row) + "\n")
 
 
 def main() -> int:

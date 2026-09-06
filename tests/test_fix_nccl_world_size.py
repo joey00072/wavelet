@@ -85,8 +85,8 @@ def _init_worker(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
         policy_module,
-        "_require_vllm_receiver_nccl",
-        lambda: (_FakeCommunicator, _FakeProcessGroup),
+        "_require_vllm_nccl",
+        lambda message: (_FakeCommunicator, _FakeProcessGroup),
     )
     worker = NCCLWeightUpdateWorker()
     worker.device = torch.device("cuda", local_rank)

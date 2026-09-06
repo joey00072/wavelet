@@ -121,9 +121,7 @@ class ExternalSource:
             logger.warning("External source %s failed: %s", self.name, exc)
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"
-                if self._fetched_at is None:
-                    self._fetched_at = None
-                else:
+                if self._fetched_at is not None:
                     self._fetched_at = _now()
             return
         with self._lock:

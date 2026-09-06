@@ -1,7 +1,8 @@
 import type { Point } from "../lib/series";
 import { extent } from "../lib/series";
 
-export function Sparkline({ points, width = 96, height = 26, colorVar = "var(--series-1)" }: { points: Point[]; width?: number; height?: number; colorVar?: string }) {
+export function Sparkline({ points, width = 96 }: { points: Point[]; width?: number }) {
+  const height = 26;
   const finite = points.filter((p) => Number.isFinite(p.y));
   if (finite.length < 2) return <svg width={width} height={height} />;
   const xe = extent(finite.map((p) => p.x))!;
@@ -13,7 +14,7 @@ export function Sparkline({ points, width = 96, height = 26, colorVar = "var(--s
   return (
     <svg width={width} height={height} aria-hidden>
       <path d={path} fill="none" stroke="var(--deemph)" strokeWidth={1.5} strokeLinejoin="round" />
-      <circle cx={sx(last.x)} cy={sy(last.y)} r={3} fill={colorVar} stroke="var(--surface-1)" strokeWidth={1.5} />
+      <circle cx={sx(last.x)} cy={sy(last.y)} r={3} fill="var(--series-1)" stroke="var(--surface-1)" strokeWidth={1.5} />
     </svg>
   );
 }

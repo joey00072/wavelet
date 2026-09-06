@@ -131,7 +131,7 @@ def compact_rollout_row(
     rollout = (
         metadata.get("rollout") if isinstance(metadata.get("rollout"), dict) else {}
     )
-    compact = {
+    return {
         "row_index": row_index,
         "reward": _numeric(row, "reward"),
         "advantage": _numeric(row, "advantage"),
@@ -162,7 +162,6 @@ def compact_rollout_row(
         "prompt": _clip(_message_text(row.get("prompt")), max_text_chars),
         "completion": _clip(_message_text(row.get("completion")), max_text_chars),
     }
-    return compact
 
 
 def compact_eval_row(

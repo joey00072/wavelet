@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -238,22 +239,8 @@ class RunArtifacts:
         trainer = self.metric_table("trainer").last_row or {}
         orchestrator = self.metric_table("orchestrator").last_row or {}
         heartbeat = read_json(self.output_dir / "heartbeat.json") or {}
-        nodes: dict[str, dict[str, Any]] = {}
-        for key, value in trainer.items():
-            match = _NODE_KEY.match(key)
-            if match is None or not isinstance(value, int | float):
-                continue
-            nodes.setdefault(match.group("node"), {"name": match.group("node")})[
-                match.group("metric")
-            ] = value
-        replicas: dict[str, dict[str, Any]] = {}
-        for key, value in orchestrator.items():
-            match = _REPLICA_KEY.match(key)
-            if match is None or not isinstance(value, int | float):
-                continue
-            replicas.setdefault(
-                match.group("replica"), {"name": match.group("replica")}
-            )[match.group("metric")] = value
+        nodes = _grouped_metrics(trainer, _NODE_KEY, "node")
+        replicas = _grouped_metrics(orchestrator, _REPLICA_KEY, "replica")
         ranks = heartbeat.get("ranks")
         return {
             "step": _int_or_none(trainer.get("step")),
@@ -271,7 +258,7 @@ class RunArtifacts:
     def evals(self) -> dict[str, Any]:
         rows = self.metric_rows("eval")
         sets = self.eval_sets()
-        envs: dict[str, dict[str, int]] = {}
+        envs: dict[str, set[str]] = {}
         history: list[dict[str, Any]] = []
         for row in rows:
             per_env: dict[str, dict[str, float]] = {}
@@ -282,7 +269,7 @@ class RunArtifacts:
                 env = match.group("env")
                 metric = match.group("metric")
                 per_env.setdefault(env, {})[metric] = float(value)
-                envs.setdefault(env, {})[metric] = envs.get(env, {}).get(metric, 0) + 1
+                envs.setdefault(env, set()).add(metric)
             history.append(
                 {
                     "step": _int_or_none(row.get("step")),
@@ -292,7 +279,7 @@ class RunArtifacts:
                 }
             )
         for entry in sets:
-            envs.setdefault(str(entry["env"]), {})
+            envs.setdefault(str(entry["env"]), set())
         return {
             "envs": [
                 {"name": name, "metrics": sorted(metrics)}
@@ -511,7 +498,8 @@ class RunArtifacts:
     # ---------------------------------------------------------------- lifecycle
 
     def timeline(self, *, limit: int) -> dict[str, Any]:
-        events = self._jsonl.rows(self.output_dir / "events" / QUEUE_EVENT_FILENAME)
+        events_path = self.output_dir / "events" / QUEUE_EVENT_FILENAME
+        events = self._jsonl.rows(events_path)
         queue_steps: dict[int, dict[str, Any]] = {}
         policies: dict[int, dict[str, Any]] = {}
         for event in events:
@@ -575,12 +563,8 @@ class RunArtifacts:
             "queue_steps": ordered_steps[-limit:],
             "policies": ordered_policies[-limit:],
             "event_count": len(events),
-            "parse_errors": self._jsonl.parse_errors(
-                self.output_dir / "events" / QUEUE_EVENT_FILENAME
-            ),
-            "dropped_events": self._jsonl.dropped(
-                self.output_dir / "events" / QUEUE_EVENT_FILENAME
-            ),
+            "parse_errors": self._jsonl.parse_errors(events_path),
+            "dropped_events": self._jsonl.dropped(events_path),
         }
 
     def run_events(self, *, limit: int) -> list[dict[str, Any]]:
@@ -723,6 +707,20 @@ class RunArtifacts:
         return names
 
 
+def _grouped_metrics(
+    row: dict[str, Any], pattern: re.Pattern[str], group: str
+) -> dict[str, dict[str, Any]]:
+    """Collect ``<group>/<name>/<metric>`` numeric keys into per-name rows."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for key, value in row.items():
+        match = pattern.match(key)
+        if match is None or not isinstance(value, int | float):
+            continue
+        name = match.group(group)
+        grouped.setdefault(name, {"name": name})[match.group("metric")] = value
+    return grouped
+
+
 def _finite(value: Any) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
@@ -737,15 +735,13 @@ def _int_or_none(value: Any) -> int | None:
 
 
 def _count_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for row in rows:
-        value = row.get(key)
-        label = "none" if value is None else str(value)
-        counts[label] = counts.get(label, 0) + 1
+    counts = Counter(
+        "none" if (value := row.get(key)) is None else str(value) for row in rows
+    )
     return dict(sorted(counts.items()))
 
 
-def _timestamp(value: object) -> datetime | None:
+def _parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -758,8 +754,8 @@ def _timestamp(value: object) -> datetime | None:
 
 
 def _seconds_between(start: str | None, end: str | None) -> float | None:
-    start_time = _timestamp(start)
-    end_time = _timestamp(end)
+    start_time = _parse_timestamp(start)
+    end_time = _parse_timestamp(end)
     if start_time is None or end_time is None:
         return None
     delta = end_time - start_time
@@ -773,7 +769,7 @@ def _latest_timestamp(
         parsed
         for row in rows
         if row
-        for parsed in [_timestamp(row.get("timestamp"))]
+        for parsed in [_parse_timestamp(row.get("timestamp"))]
         if parsed is not None
     ]
     if stamps:
@@ -799,7 +795,7 @@ def _derive_status(
     status = str(heartbeat.get("status") or "unknown")
     stamp = heartbeat.get("timestamp")
     if status == "running" and isinstance(stamp, str):
-        parsed = _timestamp(stamp)
+        parsed = _parse_timestamp(stamp)
         age = None if parsed is None else (datetime.now(UTC) - parsed).total_seconds()
         if age is not None and age > HEARTBEAT_STALE_SECONDS:
             return "stale", f"heartbeat is {int(age)}s old"

@@ -1,7 +1,7 @@
 import torch
 
 from wavelet.configs.sft import SchedulerConfig
-from wavelet.trainer.scheduler import setup_scheduler
+from wavelet.trainer.optim import setup_scheduler
 
 
 def test_constant_scheduler_honors_warmup_then_holds_lr() -> None:

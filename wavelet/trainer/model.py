@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from functools import partial
 from pathlib import Path
@@ -76,6 +77,13 @@ from wavelet.trainer.debug import (
     build_debug_tokenizer,
 )
 from wavelet.trainer.distributed import ParallelDims, World
+from wavelet.trainer.losses import maybe_inject_chunked_lm_head
+from wavelet.trainer.moe import (
+    configure_hf_moe_expert_parallel,
+    hf_moe_experts,
+    hf_moe_routers,
+)
+from wavelet.trainer.types import LORA_STATE_ATTRS, lora_adapter_name_from_key
 
 logger = logging.getLogger(__name__)
 
@@ -99,14 +107,15 @@ def pre_download_model(model_name: str) -> Path | None:
     return downloaded
 
 
+TORCH_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
+
 def resolve_dtype(name: str) -> torch.dtype | str:
-    mapping = {
-        "auto": "auto",
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    return mapping[name]
+    return "auto" if name == "auto" else TORCH_DTYPES[name]
 
 
 def prepare_kbit_model(
@@ -184,57 +193,40 @@ def apply_liger_kernel(loss_impl: str, model_name: str) -> None:
     if loss_impl not in ("liger", "liger_fused"):
         return
     try:
-        from liger_kernel.transformers.monkey_patch import (
-            apply_liger_kernel_to_llama,
-            apply_liger_kernel_to_mistral,
-            apply_liger_kernel_to_qwen2,
-            apply_liger_kernel_to_qwen3,
-        )
+        from liger_kernel.transformers import monkey_patch
 
+        patches = {
+            name: getattr(monkey_patch, name) for _, name in _LIGER_MODEL_PATCHES
+        }
         name_lower = model_name.lower()
-        fused_ce = loss_impl == "liger_fused"
-        if "qwen3" in name_lower or "qwen-3" in name_lower:
-            apply_liger_kernel_to_qwen3(
-                rope=True,
-                rms_norm=True,
-                swiglu=True,
-                cross_entropy=False,
-                fused_linear_cross_entropy=fused_ce,
-            )
-        elif "qwen2" in name_lower or "qwen-2" in name_lower:
-            apply_liger_kernel_to_qwen2(
-                rope=True,
-                rms_norm=True,
-                swiglu=True,
-                cross_entropy=False,
-                fused_linear_cross_entropy=fused_ce,
-            )
-        elif "llama" in name_lower:
-            apply_liger_kernel_to_llama(
-                rope=True,
-                rms_norm=True,
-                swiglu=True,
-                cross_entropy=False,
-                fused_linear_cross_entropy=fused_ce,
-            )
-        elif "mistral" in name_lower:
-            apply_liger_kernel_to_mistral(
-                rope=True,
-                rms_norm=True,
-                swiglu=True,
-                cross_entropy=False,
-                fused_linear_cross_entropy=fused_ce,
-            )
+        for markers, patch_name in _LIGER_MODEL_PATCHES:
+            if any(marker in name_lower for marker in markers):
+                patches[patch_name](
+                    rope=True,
+                    rms_norm=True,
+                    swiglu=True,
+                    cross_entropy=False,
+                    fused_linear_cross_entropy=loss_impl == "liger_fused",
+                )
+                break
         else:
             raise ValueError(
                 f"Liger kernel not yet mapped for model '{model_name}'. "
                 "Add it to apply_liger_kernel() or use loss_impl='torch'."
             )
-    except ImportError as exc:
+    except (ImportError, AttributeError) as exc:
         raise ImportError(
             "Liger kernel support requires the installed 'liger-kernel' package, "
             "but importing it failed."
         ) from exc
+
+
+_LIGER_MODEL_PATCHES = (
+    (("qwen3", "qwen-3"), "apply_liger_kernel_to_qwen3"),
+    (("qwen2", "qwen-2"), "apply_liger_kernel_to_qwen2"),
+    (("llama",), "apply_liger_kernel_to_llama"),
+    (("mistral",), "apply_liger_kernel_to_mistral"),
+)
 
 
 def _best_attn_implementation() -> str:
@@ -500,8 +492,6 @@ def setup_model(
         # start in bfloat16 and the "Casting fp32 inputs" warning disappears.
         _prepare_quantized_modules(model)
     if config.fused_lm_head_token_chunk_size != "disabled":
-        from wavelet.trainer.losses import maybe_inject_chunked_lm_head
-
         maybe_inject_chunked_lm_head(model, config.fused_lm_head_token_chunk_size)
     if config.adapter_path is not None:
         model = PeftModel.from_pretrained(
@@ -769,11 +759,7 @@ def _tied_checkpoint_keys(model: nn.Module) -> set[str]:
     if not getattr(model.config, "tie_word_embeddings", False):
         return set()
     tied = getattr(model, "_tied_weights_keys", None)
-    if isinstance(tied, dict):
-        return set(tied)
-    if isinstance(tied, (list, set, tuple)):
-        return set(tied)
-    return set()
+    return set(tied) if isinstance(tied, (dict, list, set, tuple)) else set()
 
 
 def _validate_meta_model_buffers(
@@ -841,38 +827,19 @@ def save_model(
     parallel_dims: ParallelDims | None = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    if isinstance(model, PeftModel):
-        if _model_uses_hf_tensor_parallel_lora(model):
-            target = save_lora_adapter_snapshot(
-                model,
-                output_dir,
-                state_dict=state_dict,
-                is_main_process=is_main_process,
-                parallel_dims=parallel_dims,
-            )
-        else:
-            target = output_dir / "adapter"
-            if state_dict is None:
-                model.save_pretrained(target, is_main_process=is_main_process)
-            else:
-                model.save_pretrained(
-                    target,
-                    state_dict=state_dict,
-                    is_main_process=is_main_process,
-                )
-        if is_main_process:
-            tokenizer.save_pretrained(target)
-        return target
-
-    target = output_dir / "model"
-    if state_dict is None:
-        model.save_pretrained(target, is_main_process=is_main_process)
-    else:
-        model.save_pretrained(
-            target,
+    is_peft = isinstance(model, PeftModel)
+    if is_peft and _model_uses_hf_tensor_parallel_lora(model):
+        target = save_lora_adapter_snapshot(
+            model,
+            output_dir,
             state_dict=state_dict,
             is_main_process=is_main_process,
+            parallel_dims=parallel_dims,
         )
+    else:
+        target = output_dir / ("adapter" if is_peft else "model")
+        extra = {} if state_dict is None else {"state_dict": state_dict}
+        model.save_pretrained(target, is_main_process=is_main_process, **extra)
     if is_main_process:
         tokenizer.save_pretrained(target)
     return target
@@ -924,8 +891,6 @@ def maybe_wrap_fsdp(
             transformer_auto_wrap_policy,
             transformer_layer_cls=layer_classes,
         )
-
-    from wavelet.trainer.moe import hf_moe_routers
 
     fp32_router_classes = tuple(
         {type(router) for router in hf_moe_routers(model)}
@@ -986,24 +951,15 @@ def _wrap_fsdp2(
         for module in model.modules()
         if module is not model and type(module) in layer_classes
     ]
-    expert_modules: list[nn.Module] = []
     if parallel_dims.ep_enabled:
-        from wavelet.trainer.moe import (
-            configure_hf_moe_expert_parallel,
-            hf_moe_experts,
-        )
-
         configure_hf_moe_expert_parallel(model, parallel_dims)
-        expert_modules = hf_moe_experts(model)
         expert_shard_kwargs = {
             **shard_kwargs,
             "mesh": parallel_dims.get_mesh("dp_mod_ep"),
         }
-        for experts in expert_modules:
+        for experts in hf_moe_experts(model):
             fully_shard(experts, **expert_shard_kwargs)
     if model_config.moe_router_dtype == "float32":
-        from wavelet.trainer.moe import hf_moe_routers
-
         fp32_shard_kwargs = {
             **shard_kwargs,
             "mp_policy": MixedPrecisionPolicy(
@@ -1019,18 +975,26 @@ def _wrap_fsdp2(
     return cast(PreTrainedModel, model)
 
 
-def _fsdp2_mixed_precision(model_config: ModelConfig) -> MixedPrecisionPolicy:
+def _mixed_precision_dtypes(
+    model_config: ModelConfig,
+) -> tuple[torch.dtype, torch.dtype] | None:
+    """Return (param_dtype, reduce_dtype) for FSDP mixed precision, or None."""
     dtype = resolve_dtype(model_config.torch_dtype)
     if not isinstance(dtype, torch.dtype):
-        return MixedPrecisionPolicy()
+        return None
     if not torch.cuda.is_available() and dtype is not torch.float32:
-        return MixedPrecisionPolicy()
+        return None
     if dtype is torch.float32 and torch.cuda.is_available():
-        return MixedPrecisionPolicy(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-        )
-    return MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=dtype)
+        return torch.bfloat16, torch.float32
+    return dtype, dtype
+
+
+def _fsdp2_mixed_precision(model_config: ModelConfig) -> MixedPrecisionPolicy:
+    dtypes = _mixed_precision_dtypes(model_config)
+    if dtypes is None:
+        return MixedPrecisionPolicy()
+    param_dtype, reduce_dtype = dtypes
+    return MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
 
 
 def maybe_wrap_ddp(
@@ -1054,16 +1018,14 @@ def maybe_wrap_ddp(
             "sharded/hybrid layouts."
         )
 
-    if world.device.type == "cuda":
-        if not model_config.load_in_4bit:
-            model = cast(PreTrainedModel, model.to(world.device))
-        return cast(
-            PreTrainedModel,
-            DDP(model, device_ids=[world.local_rank], output_device=world.local_rank),
-        )
     if not model_config.load_in_4bit:
         model = cast(PreTrainedModel, model.to(world.device))
-    return cast(PreTrainedModel, DDP(model))
+    ddp_kwargs: dict[str, object] = (
+        {"device_ids": [world.local_rank], "output_device": world.local_rank}
+        if world.device.type == "cuda"
+        else {}
+    )
+    return cast(PreTrainedModel, DDP(model, **ddp_kwargs))
 
 
 def _quantized_device_map(distributed: bool) -> str | dict[str, int]:
@@ -1103,15 +1065,7 @@ def export_model_for_save(
         )
 
     if isinstance(model, FSDPModule):
-        gathered = get_model_state_dict(
-            model,
-            options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-        )
-        state_dict = {
-            key: value
-            for key, value in gathered.items()
-            if isinstance(value, torch.Tensor)
-        }
+        state_dict = _fsdp2_full_state_dict(model)
     else:
         config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, config):
@@ -1119,6 +1073,24 @@ def export_model_for_save(
     if state_dict_dtype is not None:
         state_dict = _state_dict_to_save_dtype(state_dict, state_dict_dtype)
     return unwrap_model(model), state_dict
+
+
+def _fsdp2_full_state_dict(
+    model: FSDPModule,
+    *,
+    ignore_frozen_params: bool = False,
+) -> dict[str, torch.Tensor]:
+    gathered = get_model_state_dict(
+        model,
+        options=StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=True,
+            ignore_frozen_params=ignore_frozen_params,
+        ),
+    )
+    return {
+        key: value for key, value in gathered.items() if isinstance(value, torch.Tensor)
+    }
 
 
 def is_fsdp_model(model: nn.Module) -> bool:
@@ -1279,10 +1251,8 @@ def _fsdp_mixed_precision(
     *,
     module_classes_to_ignore: tuple[type[nn.Module], ...] = (),
 ) -> MixedPrecision | None:
-    dtype = resolve_dtype(model_config.torch_dtype)
-    if not isinstance(dtype, torch.dtype):
-        return None
-    if not torch.cuda.is_available() and dtype is not torch.float32:
+    dtypes = _mixed_precision_dtypes(model_config)
+    if dtypes is None:
         return None
     kwargs: dict[str, object] = {}
     if module_classes_to_ignore:
@@ -1290,17 +1260,11 @@ def _fsdp_mixed_precision(
         kwargs["_module_classes_to_ignore"] = tuple(
             dict.fromkeys((*default_ignored, *module_classes_to_ignore))
         )
-    if dtype is torch.float32 and torch.cuda.is_available():
-        return MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-            buffer_dtype=torch.bfloat16,
-            **kwargs,
-        )
+    param_dtype, reduce_dtype = dtypes
     return MixedPrecision(
-        param_dtype=dtype,
-        reduce_dtype=dtype,
-        buffer_dtype=dtype,
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        buffer_dtype=param_dtype,
         **kwargs,
     )
 
@@ -1317,9 +1281,6 @@ def _fsdp_sharding_strategy(
     if parallel_dims.dp_shard_enabled:
         return ShardingStrategy.FULL_SHARD
     return ShardingStrategy.NO_SHARD
-
-
-LORA_STATE_ATTRS = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
 
 
 TP_REPLICATED_LORA_ATTRS = {
@@ -1377,25 +1338,27 @@ def prepare_hf_tp_lora_for_training(
         return
 
     tp_mesh = parallel_dims.get_mesh("tp")
-    for module in _hf_tp_lora_modules(model, "rowwise"):
+
+    def _hook(
+        _module: nn.Module,
+        _inputs: tuple[object, ...],
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return all_reduce_forward(output, tp_mesh)
+
+    for module, tp_plan in _hf_tp_lora_modules_with_plan(model):
+        if tp_plan != "rowwise":
+            continue
         for child in _lora_children(
             module,
             "lora_B",
             "lora_embedding_B",
             adapter_name=_single_module_lora_adapter_name(module),
         ):
-            if not _needs_lora_allreduce_hook(child):
+            if not isinstance(child, nn.Module) or getattr(
+                child, "_wavelet_tp_lora_allreduce_hook", False
+            ):
                 continue
-
-            def _hook(
-                _module: nn.Module,
-                _inputs: tuple[object, ...],
-                output: torch.Tensor,
-                *,
-                mesh=tp_mesh,
-            ) -> torch.Tensor:
-                return all_reduce_forward(output, mesh)
-
             child.register_forward_hook(_hook)
             child._wavelet_tp_lora_allreduce_hook = True
 
@@ -1483,19 +1446,7 @@ def save_lora_adapter_snapshot_from_fsdp(
         )
 
     if isinstance(model, FSDPModule):
-        gathered = get_model_state_dict(
-            model,
-            options=StateDictOptions(
-                full_state_dict=True,
-                cpu_offload=True,
-                ignore_frozen_params=True,
-            ),
-        )
-        state_dict = {
-            key: value
-            for key, value in gathered.items()
-            if isinstance(value, torch.Tensor)
-        }
+        state_dict = _fsdp2_full_state_dict(model, ignore_frozen_params=True)
     else:
         state_dict = _gather_fsdp_lora_state_dict(
             cast(FSDP, model),
@@ -1518,22 +1469,6 @@ def _tp_distributed_enabled(parallel_dims: ParallelDims | None) -> bool:
         and torch.distributed.is_available()
         and torch.distributed.is_initialized()
     )
-
-
-def _needs_lora_allreduce_hook(child: object) -> bool:
-    return isinstance(child, nn.Module) and not getattr(
-        child,
-        "_wavelet_tp_lora_allreduce_hook",
-        False,
-    )
-
-
-def _hf_tp_lora_modules(model: nn.Module, *plans: str) -> list[nn.Module]:
-    return [
-        module
-        for module, tp_plan in _hf_tp_lora_modules_with_plan(model)
-        if tp_plan in plans
-    ]
 
 
 def _hf_tp_lora_modules_with_plan(model: nn.Module) -> list[tuple[nn.Module, str]]:
@@ -1565,26 +1500,19 @@ def _lora_children(
     *attrs: str,
     adapter_name: str | None = None,
 ) -> list[object]:
+    """Return the adapter children (or the sole adapter) under the given attrs."""
     children: list[object] = []
     for attr in attrs:
         container = getattr(module, attr, None)
         if container is None:
             continue
-        if isinstance(container, dict):
-            children.extend(
-                [container[adapter_name]]
-                if adapter_name is not None and adapter_name in container
-                else container.values()
-            )
-        elif hasattr(container, "values"):
-            values = (
-                [container[adapter_name]]
-                if adapter_name is not None and adapter_name in container
-                else list(container.values())
-            )
-            children.extend(values)
-        else:
+        # PEFT stores adapters in ModuleDict/ParameterDict (not dict subclasses).
+        if not hasattr(container, "values"):
             children.append(container)
+        elif adapter_name is not None and adapter_name in container:
+            children.append(container[adapter_name])
+        else:
+            children.extend(container.values())
     return children
 
 
@@ -1618,19 +1546,13 @@ def _cast_lora_dtypes(model: nn.Module, lora_dtype: torch.dtype) -> None:
     adapter_name = (
         _single_peft_adapter_name(model) if isinstance(model, PeftModel) else None
     )
-    for _, wrapped in model.named_modules():
+    for wrapped in model.modules():
         if not _is_lora_wrapped(wrapped):
             continue
-        for attr in ("lora_A", "lora_B"):
-            container = getattr(wrapped, attr, None)
-            if container:
-                children = (
-                    [container[adapter_name]]
-                    if adapter_name is not None and adapter_name in container
-                    else list(container.values())
-                )
-                for child in children:
-                    child.to(dtype=lora_dtype)
+        for child in _lora_children(
+            wrapped, "lora_A", "lora_B", adapter_name=adapter_name
+        ):
+            child.to(dtype=lora_dtype)
 
 
 def _model_uses_hf_tensor_parallel_lora(model: PeftModel) -> bool:
@@ -1823,7 +1745,7 @@ def _gather_fsdp_lora_state_dict(
     for name, shape in expected_shapes.items():
         parts = _state_parts(gathered, name)
         flat = torch.cat(parts, dim=0)
-        expected_numel = _numel_from_shape(shape)
+        expected_numel = math.prod(shape)
         if flat.numel() != expected_numel:
             raise RuntimeError(
                 "FSDP LoRA gather produced the wrong size for "
@@ -1845,13 +1767,6 @@ def _state_parts(
     if not parts:
         raise RuntimeError(f"LoRA state gather found no shards for {key}.")
     return parts
-
-
-def _numel_from_shape(shape: tuple[int, ...]) -> int:
-    numel = 1
-    for dim in shape:
-        numel *= dim
-    return numel
 
 
 def _mesh_process_group(
@@ -1903,7 +1818,7 @@ def _single_module_lora_adapter_name(module: nn.Module) -> str | None:
     names: set[str] = set()
     for attr in LORA_STATE_ATTRS:
         container = getattr(module, attr, None)
-        if isinstance(container, dict) or hasattr(container, "keys"):
+        if hasattr(container, "keys"):
             names.update(str(name) for name in container)
     if len(names) > 1:
         raise RuntimeError(
@@ -1916,20 +1831,8 @@ def _single_module_lora_adapter_name(module: nn.Module) -> str | None:
 def _lora_state_key_matches_adapter(key: str, adapter_name: str | None) -> bool:
     if adapter_name is None:
         return True
-    key_adapter_name = _lora_state_key_adapter_name(key)
+    key_adapter_name = lora_adapter_name_from_key(key)
     return key_adapter_name is None or key_adapter_name == adapter_name
-
-
-def _lora_state_key_adapter_name(key: str) -> str | None:
-    for attr in LORA_STATE_ATTRS:
-        marker = f".{attr}."
-        if marker not in key:
-            continue
-        suffix = key.split(marker, 1)[1]
-        if "." not in suffix:
-            return None
-        return suffix.split(".", 1)[0]
-    return None
 
 
 def _is_lora_wrapped(module: nn.Module) -> bool:
@@ -1961,20 +1864,10 @@ def _align_lora_dtypes(model: nn.Module) -> None:
             continue
         target_dtype = base_weight.dtype
         target_device = base_weight.device
-        for attr in LORA_STATE_ATTRS:
-            container = getattr(module, attr, None)
-            if container is None:
-                continue
-            children = (
-                [container[adapter_name]]
-                if adapter_name is not None and adapter_name in container
-                else list(container.values())
-            )
-            for child in children:
-                if isinstance(child, nn.Module):
-                    child.to(device=target_device, dtype=target_dtype)
-                elif isinstance(child, nn.Parameter):
-                    child.data = child.data.to(
-                        device=target_device,
-                        dtype=target_dtype,
-                    )
+        for child in _lora_children(
+            module, *LORA_STATE_ATTRS, adapter_name=adapter_name
+        ):
+            if isinstance(child, nn.Module):
+                child.to(device=target_device, dtype=target_dtype)
+            elif isinstance(child, nn.Parameter):
+                child.data = child.data.to(device=target_device, dtype=target_dtype)

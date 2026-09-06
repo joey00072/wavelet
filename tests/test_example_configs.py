@@ -34,6 +34,7 @@ def test_rl_and_eval_example_config_validates(path: Path) -> None:
 def test_sft_example_config_validates(path: Path) -> None:
     SFTConfig.model_validate(load_yaml(path))
 
+
 def test_wordle_rl_uses_reference_environment_id() -> None:
     config = RLConfig.model_validate(load_yaml(Path("examples/wordle/rl.yaml")))
 

@@ -10,12 +10,12 @@ import pytest
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import SFTConfig, WandbConfig
+from wavelet.monitor import RunMonitor
 from wavelet.orchestrator import launcher as launcher_module
 from wavelet.orchestrator.runtime import (
     _raise_keyboard_interrupt,
     _role_config_payload,
 )
-from wavelet.utils.monitoring import RunMonitor
 from wavelet.utils.pathing import validate_output_dir
 from wavelet.utils.serialization import load_yaml
 

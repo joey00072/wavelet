@@ -4,7 +4,6 @@ import { Activity, BarChart3, Cpu, FileJson, FlaskConical, GitCompare, History, 
 import { normalizeApiBase, persistApiBase, probeApiBase, resolveApiBase } from "./api/client";
 import { StatusBadge } from "./components/Badge";
 import { Popover } from "./components/Controls";
-import { fmtAge } from "./lib/format";
 import { CURRENT_RUN, navigate, routeHref, useRoute, type RunView } from "./lib/router";
 import { useTheme } from "./lib/theme";
 import { CompareView } from "./views/CompareView";
@@ -94,6 +93,20 @@ export function App() {
     window.history.replaceState(null, "", url.toString());
   };
   const showEvals = current ? current.eval_envs.length > 0 || Boolean(current.latest.eval) : true;
+  const navItems = NAV.filter((item) => item.view !== "evals" || showEvals);
+  const toggleTheme = () => setTheme(theme === "dark" ? "light" : "dark");
+  const themeIcon = theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />;
+  const apiPanel = (note: ReactElement) => (
+    <div className="space-y-2">
+      <div className="eyebrow">API base</div>
+      <div className="flex items-center gap-1">
+        <input className="input min-w-0 flex-1" value={apiInput} onChange={(e) => setApiInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyApi()} placeholder="same origin" aria-label="API base URL" />
+        <button type="button" className="btn btn-active" onClick={applyApi}>Go</button>
+      </div>
+      {note}
+      {runs.error && <div className="text-[11px] text-critical">{runs.error}</div>}
+    </div>
+  );
 
   return (
     <div className="flex min-h-screen">
@@ -128,7 +141,7 @@ export function App() {
                 </div>
               )}
               <nav className="flex flex-col gap-0.5" aria-label="Run views">
-                {NAV.filter((item) => item.view !== "evals" || showEvals).map((item) => (
+                {navItems.map((item) => (
                   <NavLink key={item.view} active={route.view === item.view} href={routeHref({ page: "run", runId, view: item.view })} icon={item.icon} label={item.label} hint={item.hint} />
                 ))}
               </nav>
@@ -150,17 +163,9 @@ export function App() {
                 </button>
               )}
             >
-              <div className="space-y-2">
-                <div className="eyebrow">API base</div>
-                <div className="flex items-center gap-1">
-                  <input className="input min-w-0 flex-1" value={apiInput} onChange={(e) => setApiInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyApi()} placeholder="same origin" aria-label="API base URL" />
-                  <button type="button" className="btn btn-active" onClick={applyApi}>Go</button>
-                </div>
-                <p className="text-[10.5px] leading-relaxed text-muted">{apiBase ? `Reading from ${apiBase}.` : "Reading from the server that served this page."} Leave blank to use this server; the address is remembered by the browser.</p>
-                {runs.error && <div className="text-[11px] text-critical">{runs.error}</div>}
-              </div>
+              {apiPanel(<p className="text-[10.5px] leading-relaxed text-muted">{apiBase ? `Reading from ${apiBase}.` : "Reading from the server that served this page."} Leave blank to use this server; the address is remembered by the browser.</p>)}
             </Popover>
-            <button type="button" className="btn !px-1.5 !py-1" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="Toggle theme">{theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}</button>
+            <button type="button" className="btn !px-1.5 !py-1" onClick={toggleTheme} aria-label="Toggle theme">{themeIcon}</button>
           </div>
         </div>
       </aside>
@@ -175,12 +180,12 @@ export function App() {
             <a href={routeHref({ page: "run", runId: CURRENT_RUN, view: "overview" })} className="btn" aria-label={`${primaryRunLabel} run`}><Radio className="h-3.5 w-3.5" /><span className="hidden min-[360px]:inline">{primaryRunLabel}</span></a>
             <a href={routeHref({ page: "runs" })} className="btn" aria-label="All runs"><History className="h-3.5 w-3.5" /><span className="hidden min-[360px]:inline">Runs</span></a>
             <a href={routeHref({ page: "compare", params: route.page === "compare" ? route.params : undefined })} className="btn !px-2" aria-label="Compare runs" title="Compare runs"><GitCompare className="h-3.5 w-3.5" /></a>
-            <button type="button" className="btn !px-2" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}>{theme === "dark" ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}</button>
+            <button type="button" className="btn !px-2" onClick={toggleTheme} aria-label={`Use ${theme === "dark" ? "light" : "dark"} theme`}>{themeIcon}</button>
           </div>
           {runId && (
             <div className="mt-2 flex items-center gap-2">
               <select className="select min-w-0 flex-1" aria-label="Run view" value={route.view} onChange={(e) => navigate({ page: "run", runId, view: e.target.value })}>
-                {NAV.filter((item) => item.view !== "evals" || showEvals).map((item) => <option key={item.view} value={item.view}>{item.label}</option>)}
+                {navItems.map((item) => <option key={item.view} value={item.view}>{item.label}</option>)}
               </select>
               <Popover
                 width={300}
@@ -190,15 +195,7 @@ export function App() {
                   </button>
                 )}
               >
-                <div className="space-y-2">
-                  <div className="eyebrow">API base</div>
-                  <div className="flex items-center gap-1">
-                    <input className="input min-w-0 flex-1" value={apiInput} onChange={(e) => setApiInput(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applyApi()} placeholder="same origin" aria-label="API base URL" />
-                    <button type="button" className="btn btn-active" onClick={applyApi}>Go</button>
-                  </div>
-                  <p className="text-[11px] leading-relaxed text-muted">{apiBase ? `Reading from ${apiBase}.` : "Reading from this server."}</p>
-                  {runs.error && <div className="text-[11px] text-critical">{runs.error}</div>}
-                </div>
+                {apiPanel(<p className="text-[11px] leading-relaxed text-muted">{apiBase ? `Reading from ${apiBase}.` : "Reading from this server."}</p>)}
               </Popover>
             </div>
           )}

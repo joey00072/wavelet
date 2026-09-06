@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wavelet.orchestrator.queue import (
+from wavelet.transport.queue import (
     ClaimRecord,
     ConsumedRecord,
     RolloutManifest,

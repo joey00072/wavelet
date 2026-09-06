@@ -36,6 +36,8 @@ export function OverviewView({ apiBase, runId, summary }: { apiBase: string; run
   const rewardDelta = windowDelta(rewardSeries, 5);
   const rewardPoints = pointsOf(rewardFromOrchestrator ? orch.data?.steps ?? [] : trainer.data?.steps ?? [], rewardSeries);
   const lag = num(latestO, "policy/lag");
+  const loss = numAny(latestT, ["train/loss", "loss"]);
+  const solveNone = numAny(latestO, ["generation/solve_none/rate", "solve_none/all"]);
   const evalHeadline = evalKeys[0] ? lastFinite(evals.data?.series[evalKeys[0]]) : null;
   const evalDelta = evalKeys[0] ? windowDelta(evals.data?.series[evalKeys[0]], 1) : null;
   const evalIsRate = Boolean(evalKeys[0] && /\/(pass@\d+|pass\^\d+)$/.test(evalKeys[0]));
@@ -89,7 +91,7 @@ export function OverviewView({ apiBase, runId, summary }: { apiBase: string; run
         <StatTile label="Train reward" number={rewardMean} format={(v) => fmt(v, 3)} delta={rewardDelta === null ? null : `${rewardDelta >= 0 ? "+" : ""}${fmt(rewardDelta, 3)}`} deltaGood={rewardDelta === null ? null : rewardDelta >= 0} trend={rewardPoints} sub="last 5 vs first 5 steps" />
         <StatTile label={evalKeys[0] ? `Eval ${evalKeys[0].split("/").pop()}` : "Eval"} number={evalHeadline} format={(v) => evalIsRate ? fmtPct(v) : fmt(v, 3)} delta={evalDelta === null ? null : `${evalDelta >= 0 ? "+" : ""}${evalIsRate ? fmtPct(evalDelta) : fmt(evalDelta, 3)}`} deltaGood={evalDelta === null ? null : evalDelta >= 0} sub={summary.eval_step === null ? "no evals yet" : `${evalKeys[0]?.split("/")[1] ?? ""} · policy ${summary.eval_step}`} />
         <StatTile label="Entropy" number={num(latestT, "entropy/mean")} format={(v) => fmt(v, 3)} sub={`kl mismatch ${fmt(num(latestT, "kl/mismatch"), 4)}`} tone={(num(latestT, "entropy/mean") ?? 1) < 0.05 ? "warning" : null} />
-        <StatTile label="Truncated" number={num(latestO, "is_truncated/all/mean")} format={(v) => fmtPct(v)} sub={`${fmtInt(num(latestO, "decode_len/all/mean"))} tokens mean · solve none ${fmtPct(num(latestO, "generation/solve_none/rate") ?? num(latestO, "solve_none/all"))}`} tone={(num(latestO, "is_truncated/all/mean") ?? 0) > 0.25 ? "warning" : null} />
+        <StatTile label="Truncated" number={num(latestO, "is_truncated/all/mean")} format={(v) => fmtPct(v)} sub={`${fmtInt(num(latestO, "decode_len/all/mean"))} tokens mean · solve none ${fmtPct(solveNone)}`} tone={(num(latestO, "is_truncated/all/mean") ?? 0) > 0.25 ? "warning" : null} />
       </div>
 
       <div className="section grid gap-x-10 gap-y-8 lg:grid-cols-3">
@@ -109,11 +111,11 @@ export function OverviewView({ apiBase, runId, summary }: { apiBase: string; run
         </div>
       )}
 
-      <Disclosure id="overview.trainer" title="Trainer signals" summary={`loss ${fmt(num(latestT, "train/loss") ?? num(latestT, "loss"), 4)} · grad norm ${fmt(num(latestT, "optim/grad_norm"), 3)} · lr ${fmt(num(latestT, "optim/lr") ?? num(latestT, "lr"), 2)} · ${fmtInt(numAny(latestT, TOKENS_PER_SECOND_KEYS))} tok/s`} className="section">
+      <Disclosure id="overview.trainer" title="Trainer signals" summary={`loss ${fmt(loss, 4)} · grad norm ${fmt(num(latestT, "optim/grad_norm"), 3)} · lr ${fmt(num(latestT, "optim/lr") ?? num(latestT, "lr"), 2)} · ${fmtInt(numAny(latestT, TOKENS_PER_SECOND_KEYS))} tok/s`} className="section">
         <div className="mb-6 grid grid-cols-2 gap-x-8 gap-y-6 md:grid-cols-4">
-          <StatTile label="Loss" number={num(latestT, "train/loss") ?? num(latestT, "loss")} format={(v) => fmt(v, 4)} sub={`policy ${fmt(num(latestT, "train/policy_loss"), 4)}`} />
+          <StatTile label="Loss" number={loss} format={(v) => fmt(v, 4)} sub={`policy ${fmt(num(latestT, "train/policy_loss"), 4)}`} />
           <StatTile label="Grad norm" number={num(latestT, "optim/grad_norm")} format={(v) => fmt(v, 3)} sub={`lr ${fmt(num(latestT, "optim/lr"), 2)}`} />
-          <StatTile label="Solve none" number={num(latestO, "generation/solve_none/rate") ?? num(latestO, "solve_none/all")} format={(v) => fmtPct(v)} sub={`solve all ${fmtPct(num(latestO, "generation/solve_all/rate") ?? num(latestO, "solve_all/all"))}`} />
+          <StatTile label="Solve none" number={solveNone} format={(v) => fmtPct(v)} sub={`solve all ${fmtPct(num(latestO, "generation/solve_all/rate") ?? num(latestO, "solve_all/all"))}`} />
           <StatTile label="Throughput" number={numAny(latestT, TOKENS_PER_SECOND_KEYS)} format={(v) => fmtInt(v)} sub={`tok/s · step ${fmtSeconds(numAny(latestO, STEP_SECONDS_KEYS) ?? numAny(latestT, STEP_SECONDS_KEYS))}`} />
         </div>
       <div className="grid gap-x-10 gap-y-8 md:grid-cols-2 xl:grid-cols-3">
@@ -191,9 +193,9 @@ function Findings({ findings, runId }: { findings: Finding[]; runId: string }) {
   );
 }
 
+const FINDING_ICONS = { critical: [OctagonAlert, "text-critical"], serious: [AlertTriangle, "text-serious"], warning: [Info, "text-warn"], good: [CheckCircle2, "text-good"] } as const;
+
 function FindingIcon({ level }: { level: Finding["level"] }) {
-  if (level === "critical") return <OctagonAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-critical" />;
-  if (level === "serious") return <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-serious" />;
-  if (level === "warning") return <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warn" />;
-  return <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0 text-good" />;
+  const [Icon, color] = FINDING_ICONS[level];
+  return <Icon className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${color}`} />;
 }

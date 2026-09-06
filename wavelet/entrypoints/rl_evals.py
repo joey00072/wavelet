@@ -7,9 +7,8 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.monitor import finish_orchestrator_wandb, setup_config_logger
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.scheduler import _run_evals_async
+from wavelet.orchestrator.sources import VERIFIER_ROLLOUT_FUNCTION
 from wavelet.utils.config import load_config
-
-_VERIFIER_ROLLOUT_FUNCTION = "wavelet.orchestrator.verifiers:generate_rollouts"
 
 
 def _standalone_config(config: RLConfig) -> RLConfig:
@@ -17,7 +16,7 @@ def _standalone_config(config: RLConfig) -> RLConfig:
     if config.eval is None or not config.eval.env:
         raise ValueError("Standalone evals require at least one eval.env entry.")
     orchestrator = config.orchestrator.model_copy(
-        update={"custom_rollout_function": _VERIFIER_ROLLOUT_FUNCTION}
+        update={"custom_rollout_function": VERIFIER_ROLLOUT_FUNCTION}
     )
     return config.model_copy(update={"orchestrator": orchestrator, "max_steps": 0})
 

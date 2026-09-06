@@ -33,6 +33,25 @@ HF_MOE_EXPERT_CLASS_NAMES = frozenset(
 )
 
 
+def _all_to_all_single(
+    tensor: Tensor,
+    *,
+    output_splits: tuple[int, ...],
+    input_splits: tuple[int, ...],
+    group: ProcessGroup,
+) -> Tensor:
+    """Variable-split all-to-all along dim 0 (no autograd)."""
+    output = tensor.new_empty((sum(output_splits), *tensor.shape[1:]))
+    dist.all_to_all_single(
+        output,
+        tensor.contiguous(),
+        output_split_sizes=list(output_splits),
+        input_split_sizes=list(input_splits),
+        group=group,
+    )
+    return output
+
+
 class _AllToAll(torch.autograd.Function):
     """Autograd-aware variable-split all-to-all for routed token tensors."""
 
@@ -47,26 +66,19 @@ class _AllToAll(torch.autograd.Function):
         ctx.output_splits = output_splits
         ctx.input_splits = input_splits
         ctx.group = group
-        output = tensor.new_empty((sum(output_splits), *tensor.shape[1:]))
-        dist.all_to_all_single(
-            output,
-            tensor.contiguous(),
-            output_split_sizes=list(output_splits),
-            input_split_sizes=list(input_splits),
+        return _all_to_all_single(
+            tensor,
+            output_splits=output_splits,
+            input_splits=input_splits,
             group=group,
         )
-        return output
 
     @staticmethod
     def backward(ctx: Any, grad_output: Tensor) -> tuple[Tensor, None, None, None]:
-        grad_input = grad_output.new_empty(
-            (sum(ctx.input_splits), *grad_output.shape[1:])
-        )
-        dist.all_to_all_single(
-            grad_input,
-            grad_output.contiguous(),
-            output_split_sizes=list(ctx.input_splits),
-            input_split_sizes=list(ctx.output_splits),
+        grad_input = _all_to_all_single(
+            grad_output,
+            output_splits=ctx.input_splits,
+            input_splits=ctx.output_splits,
             group=ctx.group,
         )
         return grad_input, None, None, None
@@ -80,24 +92,6 @@ def _all_to_all(
     group: ProcessGroup,
 ) -> Tensor:
     return _AllToAll.apply(tensor, output_splits, input_splits, group)
-
-
-def _all_to_all_indices(
-    tensor: Tensor,
-    *,
-    output_splits: tuple[int, ...],
-    input_splits: tuple[int, ...],
-    group: ProcessGroup,
-) -> Tensor:
-    output = tensor.new_empty((sum(output_splits), *tensor.shape[1:]))
-    dist.all_to_all_single(
-        output,
-        tensor.contiguous(),
-        output_split_sizes=list(output_splits),
-        input_split_sizes=list(input_splits),
-        group=group,
-    )
-    return output
 
 
 def hf_moe_routers(model: nn.Module) -> list[nn.Module]:
@@ -207,7 +201,7 @@ def _expert_parallel_forward(
         input_splits=send_counts,
         group=group,
     )
-    routed_experts = _all_to_all_indices(
+    routed_experts = _all_to_all_single(
         flat_experts[order].remainder(local_experts),
         output_splits=receive_counts,
         input_splits=send_counts,

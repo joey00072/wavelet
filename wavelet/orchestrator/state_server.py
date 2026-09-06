@@ -89,27 +89,26 @@ class OrchestratorRunState(RolloutStateEventsMixin):
             )
 
     def update(self, **patch: Any) -> None:
-        with self._lock:
-            self._state.update(patch)
-            self._state["updated_at"] = _now()
+        self._patch(None, **patch)
 
     def update_rollouts(self, **patch: Any) -> None:
-        with self._lock:
-            self._state["rollouts"].update(patch)
-            self._state["updated_at"] = _now()
+        self._patch("rollouts", **patch)
 
     def update_policy(self, **patch: Any) -> None:
+        self._patch("policy", **patch)
+
+    def _patch(self, section: str | None, **patch: Any) -> None:
         with self._lock:
-            self._state["policy"].update(patch)
+            target = self._state if section is None else self._state[section]
+            target.update(patch)
             self._state["updated_at"] = _now()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             snapshot = json.loads(json.dumps(self._state))
         queue_report = self.queue_snapshot(detail=False, limit=0)
-        if queue_report is not None:
-            snapshot["queue_summary"] = queue_report.get("summary")
-            snapshot["queue_rates"] = queue_report.get("rates")
+        snapshot["queue_summary"] = queue_report.get("summary")
+        snapshot["queue_rates"] = queue_report.get("rates")
         return snapshot
 
     def queue_snapshot(
@@ -117,7 +116,7 @@ class OrchestratorRunState(RolloutStateEventsMixin):
         *,
         detail: bool,
         limit: int,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         try:
             queue_dir = resolve_queue_dir(
                 self._config.output_dir, self._config.transport
@@ -286,14 +285,7 @@ def _build_state_app(
         detail: bool = query(default=False),
         limit: int = query(default=100, ge=0, le=1000),
     ) -> dict[str, Any]:
-        snapshot = state.queue_snapshot(detail=detail, limit=limit)
-        return snapshot or {
-            "summary": None,
-            "policy": None,
-            "rates": None,
-            "errors": {"queue_snapshot": "unavailable"},
-            "items": [],
-        }
+        return state.queue_snapshot(detail=detail, limit=limit)
 
     @app.get("/config")
     async def run_config() -> dict[str, Any]:

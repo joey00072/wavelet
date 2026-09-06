@@ -2,18 +2,20 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronRight, RefreshCw } from "lucide-react";
 
 import { qs, runUrl, usePoll } from "../api/client";
-import type { RolloutBatch, RolloutGroup, RolloutRow, RolloutRowsResponse, RowDetail } from "../api/types";
+import type { RolloutBatch, RolloutGroup, RolloutRow, RolloutRowsResponse } from "../api/types";
 import { HistogramChart } from "../charts/BarChart";
 import { ChartCard } from "../charts/ChartCard";
 import { Tag } from "../components/Badge";
 import { Field, Segmented, Toolbar } from "../components/Controls";
-import { DataTable, Pager, type Column } from "../components/DataTable";
+import { DataTable, Pager, toggleSort, type Column, type Sort } from "../components/DataTable";
 import { Drawer } from "../components/Drawer";
 import { Disclosure } from "../components/Disclosure";
 import { Empty, ErrorNote, KeyValue } from "../components/KeyValue";
 import { Transcript } from "../components/Transcript";
 import { fmt, fmtAge, fmtBytes, fmtInt, fmtPct, shortId } from "../lib/format";
 import { updateParams } from "../lib/router";
+import { toggleInSet } from "../lib/sets";
+import { useRowDetail } from "./useRunData";
 
 const PAGE = 50;
 
@@ -52,7 +54,7 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
   const follow = params.get("step") === null;
   const stepParam = params.get("step");
   const step = stepParam !== null ? Number(stepParam) : null;
-  const [sort, setSort] = useState<{ key: string; desc: boolean }>({ key: "reward", desc: true });
+  const [sort, setSort] = useState<Sort>({ key: "reward", desc: true });
   const [offset, setOffset] = useState(0);
   const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
   const [mode, setMode] = useState<"rows" | "groups">("groups");
@@ -74,7 +76,7 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
   };
   const onSort = (key: string) => {
     setOffset(0);
-    setSort((prev) => (prev.key === key ? { key, desc: !prev.desc } : { key, desc: true }));
+    setSort((prev) => toggleSort(prev, key));
   };
   const setFilter = (key: keyof Filters, value: string) => {
     setOffset(0);
@@ -121,14 +123,23 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
     setExpandedGroups(first ? new Set([first]) : new Set());
   }, [data?.queue_step]);
 
-  const multiEnv = Object.keys(data?.stats?.envs ?? {}).length > 1;
+  const envNames = Object.keys(data?.stats?.envs ?? {});
+  const multiEnv = envNames.length > 1;
+  const envField = (
+    <Field label="env">
+      <select className="select" value={filters.env} onChange={(e) => setFilter("env", e.target.value)}>
+        <option value="">all</option>
+        {envNames.map((env) => <option key={env} value={env}>{env}</option>)}
+      </select>
+    </Field>
+  );
   const columns: Column<RolloutRow>[] = [
     { key: "row_index", label: "#", sortable: true, render: (r) => <span className="tabular text-muted">{r.row_index}</span>, width: "3rem" },
     { key: "reward", label: "Reward", sortable: true, align: "right", render: (r) => <RewardCell value={r.reward} /> },
-    { key: "advantage", label: "Adv", sortable: true, align: "right", render: (r) => <span className={r.advantage === null ? "text-muted" : r.advantage > 0 ? "text-[var(--success-text)]" : r.advantage < 0 ? "text-critical" : "text-muted"}>{fmt(r.advantage, 3)}</span> },
+    { key: "advantage", label: "Adv", sortable: true, align: "right", render: (r) => <AdvantageCell value={r.advantage} /> },
     { key: "completion_token_count", label: "Tokens", sortable: true, align: "right", render: (r) => fmtInt(r.completion_token_count) },
     { key: "logprob_mean", label: "Logp mean", sortable: true, align: "right", title: "mean inference logprob over trainable tokens", render: (r) => fmt(r.logprob_mean, 3) },
-    { key: "is_truncated", label: "Stop", sortable: true, render: (r) => (r.is_truncated ? <Tag tone="warning">truncated</Tag> : <span className="text-muted">{r.stop_condition ?? "stop"}</span>) },
+    { key: "is_truncated", label: "Stop", sortable: true, render: (r) => <StopCell row={r} /> },
     { key: "group_key", label: "Group", sortable: true, render: (r) => <button type="button" className="hover:underline" onClick={(e) => { e.stopPropagation(); setFilter("group_key", r.group_key ?? ""); setMode("rows"); }}>{groupLabel(r.group_key)}</button> },
     ...(multiEnv ? [{ key: "env", label: "Env", sortable: true, render: (r: RolloutRow) => r.env ?? "–" } as Column<RolloutRow>] : []),
     { key: "policy_step", label: "Policy", sortable: true, align: "right", render: (r) => r.policy_step ?? "–" },
@@ -159,8 +170,8 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
           <BatchStepRail batches={batches.data ?? []} currentStep={currentStep} follow={follow} onSelect={selectStep} />
           <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink2">
             <span className={data?.stable ? "text-[var(--success-text)]" : "text-warn"}>{data?.stable ? "stable" : selectedBatch?.status ?? "loading"}</span>
-            <span className="tabular"><span className="text-muted">optimizer </span>{String((data?.manifest as { optimizer_step?: number } | null)?.optimizer_step ?? selectedBatch?.optimizer_step ?? "–")}</span>
-            <span className="tabular"><span className="text-muted">policy </span>{String((data?.manifest as { policy_step?: number } | null)?.policy_step ?? selectedBatch?.policy_step ?? "–")}</span>
+            <span className="tabular"><span className="text-muted">optimizer </span>{String(data?.manifest?.optimizer_step ?? selectedBatch?.optimizer_step ?? "–")}</span>
+            <span className="tabular"><span className="text-muted">policy </span>{String(data?.manifest?.policy_step ?? selectedBatch?.policy_step ?? "–")}</span>
             <span className="tabular"><span className="text-muted">rollouts </span>{fmtInt(data?.total ?? selectedBatch?.rows)}</span>
             <span className="tabular"><span className="text-muted">reward </span>{fmt(data?.stats?.reward.mean ?? selectedBatch?.reward_mean, 4)}{data?.stats ? ` ± ${fmt(data.stats.reward.std, 4)}` : ""}</span>
             {rows.refetching && <span className="inline-flex items-center gap-1 text-muted"><RefreshCw className="h-3 w-3 animate-spin" /> updating</span>}
@@ -202,9 +213,9 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
                   ["Advantage std", fmt(data.stats?.advantage.std, 3)],
                   ["Truncated", `${data.stats?.truncated ?? 0} (${fmtPct((data.stats?.truncated ?? 0) / Math.max(data.total, 1), 0)})`],
                   ["Errors", String(data.stats?.errors ?? 0)],
-                  ["Payload", fmtBytes((data.manifest as { payload_bytes?: number } | null)?.payload_bytes ?? null)],
-                  ["Created", fmtAge((data.manifest as { created_at?: string } | null)?.created_at ?? null)],
-                  ["Producer", shortId((data.manifest as { producer_id?: string } | null)?.producer_id ?? null, 30)],
+                  ["Payload", fmtBytes(data.manifest?.payload_bytes)],
+                  ["Created", fmtAge(data.manifest?.created_at)],
+                  ["Producer", shortId(data.manifest?.producer_id, 30)],
                   ["Environments", Object.entries(data.stats?.envs ?? {}).map(([key, value]) => `${key} ${value}`).join(", ") || "–"],
                   ["Policies in batch", Object.entries(data.stats?.policy_steps ?? {}).map(([key, value]) => `${key}:${value}`).join(", ") || "–"],
                   ["Path", shortId(data.path, 80)],
@@ -234,12 +245,7 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
                 {mode === "groups" ? (
                   <>
                     <input className="input w-full sm:w-56" aria-label="Search rollout groups" placeholder="Search prompt / group / id" value={filters.search} onChange={(e) => setFilter("search", e.target.value)} />
-                    <Field label="env">
-                      <select className="select" value={filters.env} onChange={(e) => setFilter("env", e.target.value)}>
-                        <option value="">all</option>
-                        {Object.keys(data.stats?.envs ?? {}).map((env) => <option key={env} value={env}>{env}</option>)}
-                      </select>
-                    </Field>
+                    {envField}
                     <Field label="outcome">
                       <select className="select" value={groupOutcome} onChange={(e) => setGroupOutcome(e.target.value)}>
                         <option value="all">all</option>
@@ -267,12 +273,7 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
                 ) : (
                   <>
                     <input className="input w-full sm:w-56" aria-label="Search rollouts" placeholder="Search prompt / completion / id" value={filters.search} onChange={(e) => setFilter("search", e.target.value)} />
-                    <Field label="env">
-                      <select className="select" value={filters.env} onChange={(e) => setFilter("env", e.target.value)}>
-                        <option value="">all</option>
-                        {Object.keys(data.stats?.envs ?? {}).map((env) => <option key={env} value={env}>{env}</option>)}
-                      </select>
-                    </Field>
+                    {envField}
                     <Field label="reward">
                       <input className="input w-16" aria-label="Minimum reward" inputMode="decimal" placeholder="min" value={filters.min_reward} onChange={(e) => setFilter("min_reward", e.target.value)} />
                       <input className="input w-16" aria-label="Maximum reward" inputMode="decimal" placeholder="max" value={filters.max_reward} onChange={(e) => setFilter("max_reward", e.target.value)} />
@@ -324,12 +325,7 @@ export function InspectorView({ apiBase, runId, params, live }: { apiBase: strin
                     groups={groups}
                     total={data.groups.length}
                     expanded={expandedGroups}
-                    onToggle={(key) => setExpandedGroups((previous) => {
-                      const next = new Set(previous);
-                      if (next.has(key)) next.delete(key);
-                      else next.add(key);
-                      return next;
-                    })}
+                    onToggle={(key) => setExpandedGroups((previous) => toggleInSet(previous, key))}
                     onOpen={(index) => setDetail({ step: data.queue_step!, index })}
                     onShowTable={(group) => { setFilters({ ...EMPTY_FILTERS, group_key: group.group_key }); setOffset(0); setMode("rows"); }}
                   />
@@ -478,9 +474,9 @@ function RolloutGroupCard({
   const columns: Column<RolloutRow>[] = [
     { key: "row_index", label: "#", render: (row) => <span className="tabular text-muted">{row.row_index}</span>, width: "3rem" },
     { key: "reward", label: "Reward", align: "right", render: (row) => <RewardCell value={row.reward} /> },
-    { key: "advantage", label: "Adv", align: "right", render: (row) => <span className={row.advantage === null ? "text-muted" : row.advantage > 0 ? "text-[var(--success-text)]" : row.advantage < 0 ? "text-critical" : "text-muted"}>{fmt(row.advantage, 3)}</span> },
+    { key: "advantage", label: "Adv", align: "right", render: (row) => <AdvantageCell value={row.advantage} /> },
     { key: "completion_token_count", label: "Tokens", align: "right", render: (row) => fmtInt(row.completion_token_count) },
-    { key: "is_truncated", label: "Stop", render: (row) => row.is_truncated ? <Tag tone="warning">truncated</Tag> : <span className="text-muted">{row.stop_condition ?? "stop"}</span> },
+    { key: "is_truncated", label: "Stop", render: (row) => <StopCell row={row} /> },
     { key: "completion", label: "Completion", render: (row) => <span className="block max-w-[34rem] truncate text-ink2" title={row.completion ?? undefined}>{(row.completion ?? "").replace(/\s+/g, " ").slice(0, 220)}</span> },
   ];
   return (
@@ -531,6 +527,14 @@ function GroupOutcome({ group }: { group: RolloutGroup }) {
   return <Tag tone="accent">mixed</Tag>;
 }
 
+function AdvantageCell({ value }: { value: number | null }) {
+  return <span className={value === null ? "text-muted" : value > 0 ? "text-[var(--success-text)]" : value < 0 ? "text-critical" : "text-muted"}>{fmt(value, 3)}</span>;
+}
+
+export function StopCell({ row }: { row: { is_truncated: boolean; stop_condition: string | null } }) {
+  return row.is_truncated ? <Tag tone="warning">truncated</Tag> : <span className="text-muted">{row.stop_condition ?? "stop"}</span>;
+}
+
 export function RewardCell({ value }: { value: number | null }) {
   if (value === null) return <span className="text-muted">–</span>;
   return (
@@ -544,21 +548,12 @@ export function RewardCell({ value }: { value: number | null }) {
 }
 
 function RowDetailDrawer({ apiBase, runId, target, onClose, siblings, onOpen }: { apiBase: string; runId: string; target: { step: number; index: number } | null; onClose: () => void; siblings: RolloutGroup[]; onOpen: (index: number) => void }) {
-  const [loadedIndex, setLoadedIndex] = useState<number | null>(null);
-  const detail = usePoll<RowDetail>(
+  const { detail, displayedIndex, pendingIndex } = useRowDetail(
     target ? runUrl(apiBase, runId, `/rollouts/${target.step}/rows/${target.index}`) : null,
-    0,
-    { resourceKey: target ? `${runId}:${target.step}:rollout-detail` : null },
+    target ? `${runId}:${target.step}:rollout-detail` : null,
+    target?.index ?? null,
   );
   const row = detail.data;
-  useEffect(() => {
-    if (detail.data && target) setLoadedIndex(detail.data.row_index ?? target.index);
-  }, [detail.updatedAt]);
-  useEffect(() => {
-    if (target === null) setLoadedIndex(null);
-  }, [target]);
-  const displayedIndex = row?.row_index ?? loadedIndex ?? target?.index ?? null;
-  const pendingIndex = target && displayedIndex !== target.index ? target.index : null;
   const metadata = (row?.metadata ?? {}) as Record<string, unknown>;
   const group = displayedIndex !== null ? siblings.find((g) => g.row_indexes.includes(displayedIndex)) : undefined;
   return (

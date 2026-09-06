@@ -20,23 +20,11 @@ from wavelet.monitor import tail_jsonl
 from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 
 STEP_DIR_PREFIX = "step-"
-
-
 STABLE_BATCH_MARKER = "STABLE"
-
-
 POLICY_META_FILENAME = "policy.json"
-
-
 MANIFEST_FILENAME = "manifest.json"
-
-
 CLAIM_FILENAME = "claim.json"
-
-
 CONSUMED_FILENAME = "consumed.json"
-
-
 QUEUE_EVENT_FILENAME = "queue.jsonl"
 
 
@@ -51,14 +39,6 @@ class RolloutBatch:
 class PolicySnapshot:
     step: int
     step_dir: Path
-
-    @property
-    def adapter_dir(self) -> Path:
-        return self.step_dir / "adapter"
-
-    @property
-    def model_dir(self) -> Path:
-        return self.step_dir / "model"
 
     @property
     def meta_path(self) -> Path:
@@ -349,41 +329,22 @@ def record_rollout_claim(
     consumer_id: str | None = None,
     events_dir: Path | None = None,
 ) -> ClaimRecord:
-    consumer_id = consumer_id or process_identity("rl-trainer")
     claim = ClaimRecord(
         format_version=1,
         queue_step=batch.step,
-        consumer_id=consumer_id,
+        consumer_id=consumer_id or process_identity("rl-trainer"),
         trainer_step_before=trainer_step_before,
         claimed_at=utc_now(),
     )
     write_claim(batch.step_dir, claim)
-    manifest = _read_manifest_best_effort(batch)
-    append_event_best_effort(
-        events_dir,
-        QueueEvent(
-            time=claim.claimed_at,
-            kind="rollout_claimed",
-            queue_step=batch.step,
-            optimizer_step=(None if manifest is None else manifest.optimizer_step),
-            policy_step=None if manifest is None else manifest.policy_step,
-            consumer_id=claim.consumer_id,
-        ),
-    )
-    append_trace_event_best_effort(
-        _trace_output_dir(events_dir),
-        make_trace_event(
-            subsystem="trainer",
-            event="rollout_claimed",
-            step=trainer_step_before,
-            queue_step=batch.step,
-            optimizer_step=(None if manifest is None else manifest.optimizer_step),
-            policy_step=None if manifest is None else manifest.policy_step,
-            details={
-                "consumer_id": claim.consumer_id,
-                "path": str(batch.path),
-            },
-        ),
+    _record_lifecycle(
+        batch,
+        kind="rollout_claimed",
+        recorded_at=claim.claimed_at,
+        step=trainer_step_before,
+        consumer_id=claim.consumer_id,
+        events_dir=events_dir,
+        details={"path": str(batch.path)},
     )
     return claim
 
@@ -397,48 +358,70 @@ def record_rollout_consumed(
     consumer_id: str | None = None,
     events_dir: Path | None = None,
 ) -> ConsumedRecord:
-    consumer_id = consumer_id or process_identity("rl-trainer")
     consumed = ConsumedRecord(
         format_version=1,
         queue_step=batch.step,
-        consumer_id=consumer_id,
+        consumer_id=consumer_id or process_identity("rl-trainer"),
         trainer_step_before=trainer_step_before,
         trainer_step_after=trainer_step_after,
         optimizer_step_completed=optimizer_step_completed,
         consumed_at=utc_now(),
     )
     write_consumed(batch.step_dir, consumed)
+    _record_lifecycle(
+        batch,
+        kind="rollout_consumed",
+        recorded_at=consumed.consumed_at,
+        step=trainer_step_after,
+        consumer_id=consumed.consumer_id,
+        events_dir=events_dir,
+        details={
+            "trainer_step_before": trainer_step_before,
+            "optimizer_step_completed": optimizer_step_completed,
+        },
+        fallback_optimizer_step=trainer_step_after,
+    )
+    return consumed
+
+
+def _record_lifecycle(
+    batch: RolloutBatch,
+    *,
+    kind: str,
+    recorded_at: str,
+    step: int,
+    consumer_id: str,
+    events_dir: Path | None,
+    details: dict[str, Any],
+    fallback_optimizer_step: int | None = None,
+) -> None:
     manifest = _read_manifest_best_effort(batch)
+    policy_step = None if manifest is None else manifest.policy_step
     append_event_best_effort(
         events_dir,
         QueueEvent(
-            time=consumed.consumed_at,
-            kind="rollout_consumed",
+            time=recorded_at,
+            kind=kind,
             queue_step=batch.step,
-            optimizer_step=(None if manifest is None else manifest.optimizer_step),
-            policy_step=None if manifest is None else manifest.policy_step,
-            consumer_id=consumed.consumer_id,
+            optimizer_step=None if manifest is None else manifest.optimizer_step,
+            policy_step=policy_step,
+            consumer_id=consumer_id,
         ),
     )
     append_trace_event_best_effort(
         _trace_output_dir(events_dir),
         make_trace_event(
             subsystem="trainer",
-            event="rollout_consumed",
-            step=trainer_step_after,
+            event=kind,
+            step=step,
             queue_step=batch.step,
             optimizer_step=(
-                trainer_step_after if manifest is None else manifest.optimizer_step
+                fallback_optimizer_step if manifest is None else manifest.optimizer_step
             ),
-            policy_step=None if manifest is None else manifest.policy_step,
-            details={
-                "consumer_id": consumed.consumer_id,
-                "trainer_step_before": trainer_step_before,
-                "optimizer_step_completed": optimizer_step_completed,
-            },
+            policy_step=policy_step,
+            details={"consumer_id": consumer_id, **details},
         ),
     )
-    return consumed
 
 
 def _read_manifest_best_effort(batch: RolloutBatch) -> RolloutManifest | None:
@@ -499,8 +482,7 @@ def resolve_policy_dir(output_dir: Path, config: RLPolicyTransferConfig) -> Path
     return output_dir / "policies"
 
 
-def get_policy_step_dir(policy_dir: Path, step: int) -> Path:
-    return policy_dir / f"{STEP_DIR_PREFIX}{step:06d}"
+get_policy_step_dir = get_step_dir
 
 
 def parse_step(path: Path) -> int | None:
@@ -542,13 +524,13 @@ def _wait_for_item(
     return item, time.monotonic() - started_at
 
 
-def _available_steps(root: Path, is_stable: Callable[[Path], bool]) -> list[int]:
+def _available_steps(root: Path) -> list[int]:
     if not root.exists():
         return []
     return sorted(
         step
         for candidate in root.iterdir()
-        if (step := parse_step(candidate)) is not None and is_stable(candidate)
+        if (step := parse_step(candidate)) is not None and _is_stable_dir(candidate)
     )
 
 
@@ -556,7 +538,20 @@ def _is_stable_dir(path: Path) -> bool:
     return path.is_dir() and (path / STABLE_BATCH_MARKER).exists()
 
 
-def _record_received(
+def _stable_batch(
+    queue_dir: Path,
+    step: int,
+    filename: str,
+    payload_present: Callable[[Path], bool],
+) -> RolloutBatch | None:
+    step_dir = get_step_dir(queue_dir, step)
+    target_path = step_dir / filename
+    if not _is_stable_dir(step_dir) or not payload_present(target_path):
+        return None
+    return RolloutBatch(step=step, path=target_path, step_dir=step_dir)
+
+
+def _append_received_events(
     events_dir: Path | None,
     *,
     kind: str,
@@ -698,11 +693,9 @@ class FileSystemRolloutSender:
 
     def stable_batch(self, step: int) -> RolloutBatch | None:
         """Return an immutable stable batch for idempotent scheduler resume."""
-        step_dir = get_step_dir(self.queue_dir, step)
-        target_path = step_dir / self.config.rollout_filename
-        if not _is_stable_dir(step_dir) or not target_path.is_file():
-            return None
-        return RolloutBatch(step=step, path=target_path, step_dir=step_dir)
+        return _stable_batch(
+            self.queue_dir, step, self.config.rollout_filename, Path.is_file
+        )
 
 
 class FileSystemRolloutReceiver:
@@ -721,18 +714,6 @@ class FileSystemRolloutReceiver:
         self._consumed_steps: set[int] = set()
         self.events_dir = events_dir
         self.consumer_id = consumer_id
-
-    def can_receive(self) -> bool:
-        return self._stable_batch_for_step(self.next_step) is not None
-
-    def receive(self) -> RolloutBatch:
-        batch = self._stable_batch_for_step(self.next_step)
-        if batch is None:
-            raise FileNotFoundError(
-                f"No stable rollout batch available for step {self.next_step}."
-            )
-        self._accept(batch, wait_seconds=0.0, mode="receive")
-        return batch
 
     def wait(self) -> RolloutBatch:
         batch, wait_seconds = _wait_for_item(
@@ -767,16 +748,12 @@ class FileSystemRolloutReceiver:
         return batch
 
     def available_steps(self) -> list[int]:
-        return _available_steps(self.queue_dir, _is_stable_dir)
+        return _available_steps(self.queue_dir)
 
     def _stable_batch_for_step(self, step: int) -> RolloutBatch | None:
-        step_dir = get_step_dir(self.queue_dir, step)
-        if not _is_stable_dir(step_dir):
-            return None
-        batch_path = step_dir / self.config.rollout_filename
-        if not batch_path.exists():
-            return None
-        return RolloutBatch(step=step, path=batch_path, step_dir=step_dir)
+        return _stable_batch(
+            self.queue_dir, step, self.config.rollout_filename, Path.exists
+        )
 
     def _oldest_available_batch(self) -> RolloutBatch | None:
         for step in self.available_steps():
@@ -813,7 +790,7 @@ class FileSystemRolloutReceiver:
         except OSError:
             payload_bytes = None
         manifest = _read_manifest_best_effort(batch)
-        _record_received(
+        _append_received_events(
             self.events_dir,
             kind="rollout_received",
             subsystem="trainer",
@@ -844,18 +821,6 @@ class FileSystemPolicyReceiver:
         self.events_dir = events_dir
         self.consumer_id = consumer_id
 
-    def can_receive(self) -> bool:
-        return self._stable_policy_for_step(self.next_step) is not None
-
-    def receive(self) -> PolicySnapshot:
-        snapshot = self._stable_policy_for_step(self.next_step)
-        if snapshot is None:
-            raise FileNotFoundError(
-                f"No stable policy snapshot available for step {self.next_step}."
-            )
-        self._accept(snapshot, wait_seconds=0.0, mode="receive")
-        return snapshot
-
     def wait(self) -> PolicySnapshot:
         snapshot, wait_seconds = _wait_for_item(
             lambda: self._stable_policy_for_step(self.next_step),
@@ -874,7 +839,7 @@ class FileSystemPolicyReceiver:
         return self.wait()
 
     def available_steps(self) -> list[int]:
-        return _available_steps(self.policy_dir, _is_stable_dir)
+        return _available_steps(self.policy_dir)
 
     def _stable_policy_for_step(self, step: int) -> PolicySnapshot | None:
         step_dir = get_policy_step_dir(self.policy_dir, step)
@@ -891,7 +856,7 @@ class FileSystemPolicyReceiver:
     ) -> None:
         consumer_id = self.consumer_id or process_identity("rl-inference")
         payload_bytes = _policy_artifact_bytes(snapshot.meta_path)
-        _record_received(
+        _append_received_events(
             self.events_dir,
             kind="policy_received",
             subsystem="inference",
@@ -967,15 +932,15 @@ def publish_adapter_policy_snapshot(
     (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(meta))
     (tmp_dir / STABLE_BATCH_MARKER).touch()
     tmp_dir.replace(step_dir)
+    record_policy_export_event(output_dir, step)
+    return step_dir
+
+
+def record_policy_export_event(output_dir: Path, step: int) -> None:
     append_event_best_effort(
         output_dir / "events",
-        QueueEvent(
-            time=utc_now(),
-            kind="policy_export_completed",
-            policy_step=step,
-        ),
+        QueueEvent(time=utc_now(), kind="policy_export_completed", policy_step=step),
     )
-    return step_dir
 
 
 def policy_lag(
@@ -1011,26 +976,6 @@ def event_rate(
         ):
             count += 1
     return count / window_seconds, parse_errors
-
-
-def publish_rate(
-    events_dir: Path, *, window_seconds: float = 60.0
-) -> tuple[float, int]:
-    return event_rate(
-        events_dir,
-        kind="rollout_published",
-        window_seconds=window_seconds,
-    )
-
-
-def consume_rate(
-    events_dir: Path, *, window_seconds: float = 60.0
-) -> tuple[float, int]:
-    return event_rate(
-        events_dir,
-        kind="rollout_consumed",
-        window_seconds=window_seconds,
-    )
 
 
 def _parse_datetime(value: str) -> datetime | None:
@@ -1138,8 +1083,12 @@ def build_queue_report(
         detail=detail,
         limit=limit,
     )
-    publish_per_second, publish_parse_errors = publish_rate(events_dir)
-    consume_per_second, consume_parse_errors = consume_rate(events_dir)
+    publish_per_second, publish_parse_errors = event_rate(
+        events_dir, kind="rollout_published"
+    )
+    consume_per_second, consume_parse_errors = event_rate(
+        events_dir, kind="rollout_consumed"
+    )
     summary = asdict(queue_snapshot)
     summary.pop("items", None)
     return {
@@ -1274,10 +1223,6 @@ class RolloutChunkAccumulator:
         self.pending_batches = []
         self.pending_rows = 0
         return paths, batches, loaded_chunks
-
-    def drain_pending_paths(self) -> tuple[list[Path], int]:
-        paths, _, loaded_chunks = self.drain_pending_batches()
-        return paths, loaded_chunks
 
     def mark_loaded(
         self,

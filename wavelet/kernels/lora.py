@@ -376,9 +376,3 @@ def apply_lora_qkv(self, X: Tensor, inplace: bool = True):
         VS,
         inplace,
     )
-
-
-def apply_lora_o(self, X: Tensor) -> Tensor:
-    """Apply fused LoRA_W kernel to o_proj."""
-    OW, OW_quant, OA, OB, OS = get_lora_parameters(self.o_proj)
-    return LoRA_W.apply(X, OW, OW_quant, OA, OB, OS)

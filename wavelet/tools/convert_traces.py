@@ -178,7 +178,7 @@ def convert_traces(
     return output_path
 
 
-def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "inputs", nargs="+", type=Path, help="Trace JSONL files or directories"
@@ -191,11 +191,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--public", action="store_true", help="Create a public Hub dataset"
     )
-    return parser.parse_args(argv)
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parse_args(argv)
+    args = parser.parse_args(argv)
     try:
         result = convert_traces(
             args.inputs,

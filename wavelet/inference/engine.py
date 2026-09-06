@@ -1,18 +1,20 @@
-# ruff: noqa: F811
-
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+import torch
 
 from wavelet.configs.rl_config import RLConfig, RLSamplingConfig
 from wavelet.data.rl import (
@@ -20,6 +22,17 @@ from wavelet.data.rl import (
     rl_examples_from_payload,
     rl_examples_to_payload,
 )
+from wavelet.data.sft import Example, apply_chat_template, build_sample
+from wavelet.inference.policy import (
+    PolicyInferenceEngine,
+    coerce_token_ids,
+    expected_served_model_names,
+    prompt_token_ids,
+    require_expected_served_model,
+)
+from wavelet.monitor import emit_perf, perf_enabled
+from wavelet.trainer.model import setup_tokenizer
+from wavelet.transport.policy import NCCL_READY_MARKER
 
 logger = logging.getLogger(__name__)
 ADMIN_REQUEST_ATTEMPTS = 3
@@ -219,8 +232,26 @@ def extract_vllm_sampling_mask(
     return normalized
 
 
-def sampling_mask_required(config: RLConfig) -> bool:
-    return config.sampling_mask_required()
+_SAMPLING_MASK_ERRORS = {
+    "openai": (
+        "OpenAI rollout response did not include sampling_mask. Ensure the vLLM "
+        "server uses --return-sampling-mask."
+    ),
+    "vllm": (
+        "vLLM generation did not return sampling_mask. Ensure the server uses "
+        "--return-sampling-mask."
+    ),
+}
+
+
+def _require_sampling_mask(
+    config: RLConfig,
+    sampling_mask: list[list[int]] | None,
+    *,
+    source: str,
+) -> None:
+    if config.sampling_mask_required() and sampling_mask is None:
+        raise RuntimeError(_SAMPLING_MASK_ERRORS[source])
 
 
 def extract_vllm_prompt_logprobs(
@@ -255,16 +286,6 @@ def extract_vllm_prompt_logprobs(
             )
         values.append(logprob_value(candidate))
     return values
-
-
-from wavelet.inference.policy import (
-    PolicyInferenceEngine,
-    RLInference,
-    expected_served_model_names,
-    require_expected_served_model,
-)
-from wavelet.trainer.model import setup_tokenizer
-from wavelet.transport.policy import NCCL_READY_MARKER
 
 
 class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
@@ -357,10 +378,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         self._request_all("POST", "/sleep", {"level": 1})
 
     def wake(self, *, tags: list[str] | None = None) -> None:
-        payload: dict[str, Any] = {}
-        if tags is not None:
-            payload["tags"] = tags
-        self._request_all("POST", "/wake", payload)
+        self._request_all("POST", "/wake", {} if tags is None else {"tags": tags})
 
     def annotate(self, records: list[RLExample]) -> list[RLExample]:
         if self._uses_openai_rollouts():
@@ -435,10 +453,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
     ) -> list[RLExample]:
         annotated: list[RLExample] = []
         for record in records:
-            prompt_ids = RLInference(self.config).prompt_token_ids(
-                self.tokenizer,
-                record,
-            )
+            prompt_ids = prompt_token_ids(self.tokenizer, record)
             prompt_ids, max_completion_tokens = fit_generation_context(
                 prompt_ids,
                 max_prompt_tokens=(self.config.inference.sampling.max_prompt_tokens),
@@ -515,11 +530,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         sampling_mask = extract_vllm_sampling_mask(
             choice.get("sampling_mask"), completion_ids
         )
-        if sampling_mask_required(self.config) and sampling_mask is None:
-            raise RuntimeError(
-                "OpenAI rollout response did not include sampling_mask. Ensure "
-                "the vLLM server uses --return-sampling-mask."
-            )
+        _require_sampling_mask(self.config, sampling_mask, source="openai")
         return _pretokenized_rollout_record(
             record,
             completion_text=completion_text,
@@ -553,9 +564,6 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
                 )
             values.append(float(item["logprob"]))
         return values
-
-    def close(self) -> None:
-        return None
 
     def _request_all(
         self,
@@ -680,15 +688,6 @@ def _shift_completion_sample(
     full_sampling_mask: list[list[int] | None] = [None] * len(prompt_ids)
     full_sampling_mask.extend(sampling_mask or [None] * len(completion_ids))
     full_temperatures = [temperature] * len(full_ids)
-    if len(full_ids) < 2:
-        return {
-            "input_ids": [],
-            "target_ids": [],
-            "loss_mask": [],
-            "inference_logprobs": [],
-            "temperatures": [],
-            "sampling_masks": [],
-        }
     return {
         "input_ids": full_ids[:-1],
         "target_ids": full_ids[1:],
@@ -743,34 +742,12 @@ def _pretokenized_rollout_record(
     )
 
 
-import gc
-import os
-import threading
-from dataclasses import dataclass, replace
-from pathlib import Path
-from time import perf_counter
-from typing import Any
-
-import torch
-
-from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl import RLExample
-from wavelet.data.sft import Example, build_sample
-from wavelet.inference.policy import PolicyInferenceEngine, RLInference, token_ids
-from wavelet.trainer.model import setup_tokenizer
-from wavelet.utils.monitoring import emit_perf, perf_enabled
-
-
 @dataclass
 class _OpenAIBatchRequest:
     payload: dict[str, Any]
     done: threading.Event
     result: dict[str, Any] | None = None
     error: BaseException | None = None
-
-
-def _vllm_dtype(config: RLConfig) -> str:
-    return config.inference.vllm.dtype or config.model.torch_dtype
 
 
 def _sampling_params_type():
@@ -797,6 +774,10 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         self._tokenize_tokens = 0
         self._tokenize_seconds = 0.0
 
+    def _require_setup(self, *resources: object) -> None:
+        if any(resource is None for resource in resources):
+            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+
     def setup(self) -> None:
         os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
         try:
@@ -818,12 +799,12 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 if vllm_config.trust_remote_code is None
                 else vllm_config.trust_remote_code
             ),
-            "dtype": _vllm_dtype(self.config),
+            "dtype": vllm_config.dtype or self.config.model.torch_dtype,
             "tensor_parallel_size": vllm_config.tensor_parallel_size,
             "gpu_memory_utilization": vllm_config.gpu_memory_utilization,
             "enforce_eager": vllm_config.enforce_eager,
             "logprobs_mode": "processed_logprobs",
-            "return_sampling_mask": sampling_mask_required(self.config),
+            "return_sampling_mask": self.config.sampling_mask_required(),
             "enable_lora": self.config.lora is not None,
             "max_loras": 1,
             "max_cpu_loras": 1,
@@ -849,7 +830,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         self._openai_batch_worker.start()
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
-        started_at = perf_counter()
+        started_at = time.perf_counter()
         adapter_dir = policy_dir / "adapter"
         if adapter_dir.exists():
             self._load_adapter_policy(adapter_dir, step=step)
@@ -858,7 +839,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 "vllm_load_policy",
                 step=step,
                 kind="adapter",
-                seconds=perf_counter() - started_at,
+                seconds=time.perf_counter() - started_at,
             )
             return
         model_dir = policy_dir / "model"
@@ -872,18 +853,15 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         )
 
     def init_weight_transfer(self, init_info: dict[str, Any]) -> None:
-        if self.llm is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        self._require_setup(self.llm)
         self.llm.init_weight_transfer_engine({"init_info": init_info})
 
     def update_weights(self, update_info: dict[str, Any]) -> None:
-        if self.llm is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        self._require_setup(self.llm)
         self.llm.update_weights({"update_info": update_info})
 
     def sleep(self) -> None:
-        if self.llm is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        self._require_setup(self.llm)
         if hasattr(self.llm, "llm_engine") and hasattr(
             self.llm.llm_engine,
             "reset_prefix_cache",
@@ -896,26 +874,16 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             torch.cuda.empty_cache()
 
     def wake(self, *, tags: list[str] | None = None) -> None:
-        if self.llm is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
-        kwargs = {}
-        if tags is not None:
-            kwargs["tags"] = tags
-        self.llm.wake_up(**kwargs)
+        self._require_setup(self.llm)
+        self.llm.wake_up(**({} if tags is None else {"tags": tags}))
 
     def annotate(self, records: list[RLExample]) -> list[RLExample]:
-        if self.llm is None or self.tokenizer is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        self._require_setup(self.llm, self.tokenizer)
         if not self.config.inference.enabled:
             return records
 
         prompts = [
-            {
-                "prompt_token_ids": RLInference(self.config).prompt_token_ids(
-                    self.tokenizer,
-                    record,
-                )
-            }
+            {"prompt_token_ids": prompt_token_ids(self.tokenizer, record)}
             for record in records
         ]
         sampling_params = self._sampling_params()
@@ -961,11 +929,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 sampling_mask = extract_vllm_sampling_mask(
                     getattr(output, "sampling_mask", None), completion_ids
                 )
-                if sampling_mask_required(self.config) and sampling_mask is None:
-                    raise RuntimeError(
-                        "vLLM generation did not return sampling_mask. Ensure the "
-                        "server uses --return-sampling-mask."
-                    )
+                _require_sampling_mask(self.config, sampling_mask, source="vllm")
                 generated_records.append(
                     _pretokenized_rollout_record(
                         record,
@@ -1023,12 +987,12 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         max_size = vllm_config.openai_batch_max_size
         first_wait = vllm_config.openai_batch_wait_seconds
         max_wait = max(first_wait, vllm_config.openai_batch_max_wait_seconds)
-        started_at = perf_counter()
+        started_at = time.perf_counter()
         if first_wait > 0:
             self._openai_batch_condition.wait(timeout=first_wait)
 
         while len(self._openai_batch) < min_size:
-            remaining = (started_at + max_wait) - perf_counter()
+            remaining = (started_at + max_wait) - time.perf_counter()
             if remaining <= 0:
                 break
             self._openai_batch_condition.wait(timeout=remaining)
@@ -1047,25 +1011,21 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         self,
         payloads: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        started_at = perf_counter()
-        if self.llm is None or self.tokenizer is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        started_at = time.perf_counter()
+        self._require_setup(self.llm, self.tokenizer)
         sampling_params_type = _sampling_params_type()
         prompts: list[dict[str, list[int]]] = []
         prompt_id_rows: list[list[int]] = []
         sampling_params: list[Any] = []
         for payload in payloads:
-            messages = payload["messages"]
             prompt_ids = payload.get("tokens")
             if prompt_ids is None:
-                prompt_ids = token_ids(
-                    self.tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=payload.get("tools"),
-                        **(payload.get("chat_template_kwargs") or {}),
-                    )
+                prompt_ids = apply_chat_template(
+                    self.tokenizer,
+                    payload["messages"],
+                    add_generation_prompt=True,
+                    tools=payload.get("tools"),
+                    chat_template_kwargs=payload.get("chat_template_kwargs"),
                 )
             else:
                 prompt_ids = [int(token_id) for token_id in prompt_ids]
@@ -1113,11 +1073,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             sampling_mask = extract_vllm_sampling_mask(
                 getattr(output, "sampling_mask", None), completion_ids
             )
-            if sampling_mask_required(self.config) and sampling_mask is None:
-                raise RuntimeError(
-                    "vLLM generation did not return sampling_mask. Ensure the "
-                    "server uses --return-sampling-mask."
-                )
+            _require_sampling_mask(self.config, sampling_mask, source="vllm")
             finish_reason = getattr(output, "finish_reason", None) or "stop"
             results.append(
                 {
@@ -1146,7 +1102,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                     },
                 }
             )
-        seconds = perf_counter() - started_at
+        seconds = time.perf_counter() - started_at
         max_memory = 0
         if torch.cuda.is_available():
             max_memory = torch.cuda.max_memory_reserved()
@@ -1196,22 +1152,21 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         return prompt_ids, fitted_kwargs
 
     def tokenize_messages(self, payload: dict[str, Any]) -> dict[str, Any]:
-        started_at = perf_counter()
-        if self.tokenizer is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        started_at = time.perf_counter()
+        self._require_setup(self.tokenizer)
         if "prompt" in payload:
-            ids = token_ids(self.tokenizer(payload["prompt"], add_special_tokens=False))
-        else:
-            ids = token_ids(
-                self.tokenizer.apply_chat_template(
-                    payload["messages"],
-                    tokenize=True,
-                    add_generation_prompt=payload.get("add_generation_prompt", True),
-                    tools=payload.get("tools"),
-                    **(payload.get("chat_template_kwargs") or {}),
-                )
+            ids = coerce_token_ids(
+                self.tokenizer(payload["prompt"], add_special_tokens=False)
             )
-        seconds = perf_counter() - started_at
+        else:
+            ids = apply_chat_template(
+                self.tokenizer,
+                payload["messages"],
+                add_generation_prompt=payload.get("add_generation_prompt", True),
+                tools=payload.get("tools"),
+                chat_template_kwargs=payload.get("chat_template_kwargs"),
+            )
+        seconds = time.perf_counter() - started_at
         self._tokenize_calls += 1
         self._tokenize_tokens += len(ids)
         self._tokenize_seconds += seconds
@@ -1227,8 +1182,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         token_ids: list[int],
         logprobs: object,
     ) -> list[dict[str, object]]:
-        if self.tokenizer is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        self._require_setup(self.tokenizer)
         if logprobs is None:
             raise RuntimeError(
                 "vLLM generation did not return sampled-token logprobs. Enable "
@@ -1242,7 +1196,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 "bytes": None,
                 "top_logprobs": [],
             }
-            for token_id, logprob in zip(token_ids, values, strict=True)
+            for logprob in values
         ]
 
     def close(self) -> None:
@@ -1264,8 +1218,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
     def _load_adapter_policy(
         self, adapter_dir: Path, *, step: int | None = None
     ) -> None:
-        if self.llm is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        self._require_setup(self.llm)
         if self.config.lora is None:
             raise ValueError("vLLM adapter policy transfer requires lora config.")
         try:
@@ -1300,8 +1253,7 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
         )
 
     def _attach_prompt_logprobs(self, records: list[RLExample]) -> list[RLExample]:
-        if self.llm is None or self.tokenizer is None:
-            raise RuntimeError("vLLM inference engine not set up. Call setup() first.")
+        self._require_setup(self.llm, self.tokenizer)
         # vLLM prompt logprobs are always computed on unscaled logits, so they
         # can only be labeled truthfully when sampling ran at temperature 1.
         temperature = self.config.inference.sampling.temperature

@@ -7,12 +7,7 @@ import wavelet.cli
 
 def _clear_lazy_import_targets() -> None:
     for module_name in list(sys.modules):
-        if module_name.startswith("wavelet.entrypoints.") or module_name in {
-            "wavelet.orchestrator.preflight",
-            "wavelet.inference.diagnostics",
-            "wavelet.orchestrator.diagnostics",
-            "wavelet.trainer.diagnostics",
-        }:
+        if module_name.startswith("wavelet.entrypoints."):
             del sys.modules[module_name]
 
 
@@ -57,7 +52,3 @@ def test_debug_usage_does_not_eagerly_import_debug_entrypoints(
     assert "wavelet.entrypoints.rl_inference_debug" not in sys.modules
     assert "wavelet.entrypoints.rl_orchestrator_debug" not in sys.modules
     assert "wavelet.entrypoints.rl_trainer_debug" not in sys.modules
-    assert "wavelet.orchestrator.preflight" not in sys.modules
-    assert "wavelet.inference.diagnostics" not in sys.modules
-    assert "wavelet.orchestrator.diagnostics" not in sys.modules
-    assert "wavelet.trainer.diagnostics" not in sys.modules

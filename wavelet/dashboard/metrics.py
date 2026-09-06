@@ -13,6 +13,7 @@ import json
 import math
 import threading
 from array import array
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ class MetricTable:
     steps: list[float | None] = field(default_factory=list)
     timestamps: list[str | None] = field(default_factory=list)
     columns: dict[str, array] = field(default_factory=dict)
-    counts: dict[str, int] = field(default_factory=dict)
+    counts: Counter[str] = field(default_factory=Counter)
     last_row: dict[str, Any] | None = None
 
     def __len__(self) -> int:
@@ -56,7 +57,7 @@ class MetricTable:
                 column = array("d", [_NAN]) * index
                 self.columns[key] = column
             column.append(float(value))
-            self.counts[key] = self.counts.get(key, 0) + 1
+            self.counts[key] += 1
         for column in self.columns.values():
             if len(column) <= index:
                 column.append(_NAN)

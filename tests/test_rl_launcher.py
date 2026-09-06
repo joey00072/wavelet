@@ -12,20 +12,15 @@ import pytest
 
 import wavelet.orchestrator.envs as verifier_envs
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 from wavelet.inference import server as inference_server
-from wavelet.inference.http import HTTPPolicyInferenceEngine, _shift_completion_sample
+from wavelet.inference.engine import (
+    HTTPPolicyInferenceEngine,
+    VLLMPolicyInferenceEngine,
+    _shift_completion_sample,
+)
 from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
-from wavelet.inference.vllm import VLLMPolicyInferenceEngine
 from wavelet.orchestrator import runtime
-from wavelet.orchestrator.queue import (
-    FileSystemRolloutSender,
-    publish_adapter_policy_snapshot,
-)
-from wavelet.orchestrator.rollout_worker import (
-    _colocated_trainer_device_ids,
-    _wait_for_colocated_training_memory,
-)
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.runtime import (
     _config_path_for_role,
@@ -44,17 +39,26 @@ from wavelet.orchestrator.schedule import (
     rollout_chunk_examples,
     rollout_groups_for_chunk,
 )
-from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
-from wavelet.trainer.rl_trainer import RLTrainer
-from wavelet.trainer.rl_worker import (
+from wavelet.orchestrator.scheduler import (
+    PublishMode,
+    _colocated_trainer_device_ids,
+    _wait_for_colocated_training_memory,
+    resolve_rollout_schedule,
+)
+from wavelet.trainer.rl import (
+    RLTrainer,
     _dummy_rollout_row,
     _run_streaming_rollout_training,
-    _StreamingChunkAccumulator,
     _use_streaming_rollout_chunks,
     _validate_rollout_batch,
     _validate_streaming_rollout_batch,
 )
-from wavelet.utils.policy_transfer import NCCL_READY_MARKER
+from wavelet.transport.policy import NCCL_READY_MARKER
+from wavelet.transport.queue import (
+    FileSystemRolloutSender,
+    RolloutChunkAccumulator,
+    publish_adapter_policy_snapshot,
+)
 
 
 class _FakeWorld:
@@ -328,7 +332,7 @@ def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
     counts[639] = 18
 
     steps = 0
-    accumulator = _StreamingChunkAccumulator()
+    accumulator = RolloutChunkAccumulator()
     for row_count in counts:
         accumulator.mark_loaded(rows=row_count, chunks=1, loss_scale=0.0)
         if accumulator.should_step(chunks_per_step=8):
@@ -341,7 +345,7 @@ def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
 
 
 def test_streaming_rollout_waits_for_full_chunk_group_when_rows_overshoot() -> None:
-    accumulator = _StreamingChunkAccumulator(
+    accumulator = RolloutChunkAccumulator(
         accumulated_rows=1200,
         accumulated_chunks=7,
     )
@@ -351,7 +355,7 @@ def test_streaming_rollout_waits_for_full_chunk_group_when_rows_overshoot() -> N
 
 
 def test_streaming_chunk_accumulator_preserves_chunk_step_boundary(tmp_path) -> None:
-    accumulator = _StreamingChunkAccumulator()
+    accumulator = RolloutChunkAccumulator()
     first = tmp_path / "first.jsonl"
     second = tmp_path / "second.jsonl"
 
@@ -360,7 +364,7 @@ def test_streaming_chunk_accumulator_preserves_chunk_step_boundary(tmp_path) -> 
     accumulator.buffer(second, 3)
     assert accumulator.should_load(min_rows=4)
 
-    paths, chunks = accumulator.drain_pending_paths()
+    paths, _batches, chunks = accumulator.drain_pending_batches()
     accumulator.mark_loaded(rows=5, chunks=chunks, loss_scale=7.0)
 
     assert paths == [first, second]
@@ -691,7 +695,7 @@ def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
 
     assert (
         _argv_value(argv, "--worker-extension-cls")
-        == "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
+        == "wavelet.transport.policy.NCCLWeightUpdateWorker"
     )
 
 
@@ -1014,7 +1018,7 @@ def test_sleep_colocate_memory_wait_can_be_disabled(monkeypatch) -> None:
         raise AssertionError("memory query should be skipped")
 
     monkeypatch.setattr(
-        "wavelet.orchestrator.rollout_worker._query_gpu_memory_mib",
+        "wavelet.orchestrator.scheduler._query_gpu_memory_mib",
         fail_query,
     )
 

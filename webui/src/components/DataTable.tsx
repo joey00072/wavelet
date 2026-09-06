@@ -11,6 +11,13 @@ export type Column<T> = {
   title?: string;
 };
 
+export type Sort = { key: string; desc: boolean };
+
+/** Clicking the active column flips direction; a new column starts descending. */
+export function toggleSort(sort: Sort, key: string): Sort {
+  return sort.key === key ? { key, desc: !sort.desc } : { key, desc: true };
+}
+
 export function DataTable<T>({
   rows,
   columns,
@@ -18,7 +25,6 @@ export function DataTable<T>({
   sort,
   onSort,
   onRowClick,
-  selectedKey,
   empty = "No rows",
   dense = false,
   maxHeight,
@@ -27,10 +33,9 @@ export function DataTable<T>({
   rows: T[];
   columns: Column<T>[];
   rowKey: (row: T) => string;
-  sort?: { key: string; desc: boolean } | null;
+  sort?: Sort | null;
   onSort?: (key: string) => void;
   onRowClick?: (row: T) => void;
-  selectedKey?: string | null;
   empty?: string;
   dense?: boolean;
   maxHeight?: number | string;
@@ -73,31 +78,26 @@ export function DataTable<T>({
               </td>
             </tr>
           )}
-          {rows.map((row) => {
-            const key = rowKey(row);
-            const selected = selectedKey !== undefined && selectedKey === key;
-            return (
-              <tr
-                key={key}
-                className={`border-b border-edge last:border-0 ${onRowClick ? "tr-hover cursor-pointer" : ""} ${selected ? "tr-selected" : ""}`}
-                onClick={onRowClick ? () => onRowClick(row) : undefined}
-                onKeyDown={onRowClick ? (event) => {
-                  if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
-                    event.preventDefault();
-                    onRowClick(row);
-                  }
-                } : undefined}
-                tabIndex={onRowClick ? 0 : undefined}
-                aria-selected={selected || undefined}
-              >
-                {columns.map((col) => (
-                  <td key={col.key} className={`td ${dense ? "!py-1" : ""} ${col.align === "right" ? "text-right tabular" : ""}`}>
-                    {col.render(row)}
-                  </td>
-                ))}
-              </tr>
-            );
-          })}
+          {rows.map((row) => (
+            <tr
+              key={rowKey(row)}
+              className={`border-b border-edge last:border-0 ${onRowClick ? "tr-hover cursor-pointer" : ""}`}
+              onClick={onRowClick ? () => onRowClick(row) : undefined}
+              onKeyDown={onRowClick ? (event) => {
+                if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+                  event.preventDefault();
+                  onRowClick(row);
+                }
+              } : undefined}
+              tabIndex={onRowClick ? 0 : undefined}
+            >
+              {columns.map((col) => (
+                <td key={col.key} className={`td ${dense ? "!py-1" : ""} ${col.align === "right" ? "text-right tabular" : ""}`}>
+                  {col.render(row)}
+                </td>
+              ))}
+            </tr>
+          ))}
         </tbody>
       </table>
     </div>

@@ -1,5 +1,5 @@
 import { runUrl, usePoll } from "../api/client";
-import type { QueueReport, RunEvent, RunSummary, Timeline, TimelineStep } from "../api/types";
+import type { QueueReport, RunEvent, RunSummary, Timeline } from "../api/types";
 import { ChartCard } from "../charts/ChartCard";
 import { LineChart, SeriesTable } from "../charts/LineChart";
 import { StatTile } from "../charts/StatTile";
@@ -75,16 +75,16 @@ export function PipelineView({ apiBase, runId, summary }: { apiBase: string; run
             columns={[
               { key: "queue_step", label: "Queue step", align: "right", render: (i) => i.queue_step },
               { key: "status", label: "Status", render: (i) => <Tag tone={i.status === "ready" ? "good" : i.status === "stale" || i.status === "abandoned_claim" ? "serious" : i.status === "incomplete" ? "warning" : "neutral"}>{i.status}</Tag> },
-              { key: "opt", label: "Optimizer", align: "right", render: (i) => String((i.manifest as { optimizer_step?: number } | null)?.optimizer_step ?? "–") },
-              { key: "policy", label: "Policy", align: "right", render: (i) => String((i.manifest as { policy_step?: number } | null)?.policy_step ?? "–") },
-              { key: "lag", label: "Lag now", align: "right", title: "latest exported policy − batch policy", render: (i) => { const p = (i.manifest as { policy_step?: number } | null)?.policy_step; return p === undefined || p === null || q?.policy?.latest_exported_step == null ? "–" : q.policy.latest_exported_step - p; } },
-              { key: "rows", label: "Rows", align: "right", render: (i) => String((i.manifest as { rows?: number } | null)?.rows ?? "–") },
-              { key: "reward", label: "Reward", align: "right", render: (i) => fmt((i.manifest as { reward_mean?: number } | null)?.reward_mean ?? null, 3) },
-              { key: "tokens", label: "Tokens", align: "right", render: (i) => fmtInt((i.manifest as { tokens?: number } | null)?.tokens ?? null) },
-              { key: "created", label: "Created", render: (i) => fmtDateTime((i.manifest as { created_at?: string } | null)?.created_at) },
-              { key: "claimed", label: "Claimed", render: (i) => fmtDateTime((i.claim as { claimed_at?: string } | null)?.claimed_at) },
-              { key: "consumed", label: "Consumed", render: (i) => fmtDateTime((i.consumed as { consumed_at?: string } | null)?.consumed_at) },
-              { key: "consumer", label: "Consumer", render: (i) => shortId((i.claim as { consumer_id?: string } | null)?.consumer_id ?? null, 28) },
+              { key: "opt", label: "Optimizer", align: "right", render: (i) => String(i.manifest?.optimizer_step ?? "–") },
+              { key: "policy", label: "Policy", align: "right", render: (i) => String(i.manifest?.policy_step ?? "–") },
+              { key: "lag", label: "Lag now", align: "right", title: "latest exported policy − batch policy", render: (i) => { const p = i.manifest?.policy_step; return p === undefined || p === null || q?.policy?.latest_exported_step == null ? "–" : q.policy.latest_exported_step - p; } },
+              { key: "rows", label: "Rows", align: "right", render: (i) => String(i.manifest?.rows ?? "–") },
+              { key: "reward", label: "Reward", align: "right", render: (i) => fmt(i.manifest?.reward_mean, 3) },
+              { key: "tokens", label: "Tokens", align: "right", render: (i) => fmtInt(i.manifest?.tokens) },
+              { key: "created", label: "Created", render: (i) => fmtDateTime(i.manifest?.created_at) },
+              { key: "claimed", label: "Claimed", render: (i) => fmtDateTime(i.claim?.claimed_at) },
+              { key: "consumed", label: "Consumed", render: (i) => fmtDateTime(i.consumed?.consumed_at) },
+              { key: "consumer", label: "Consumer", render: (i) => shortId(i.claim?.consumer_id, 28) },
               { key: "age", label: "Age", align: "right", render: (i) => fmtSeconds(i.age_seconds) },
               { key: "errors", label: "Parse errors", render: (i) => (i.parse_errors.length ? <Tag tone="critical">{i.parse_errors.length}</Tag> : <span className="text-muted">0</span>) },
             ]}

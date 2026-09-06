@@ -1,6 +1,5 @@
 from wavelet.configs.rl_config import RLDataConfig
-from wavelet.data.rl_records import deserialize_rl_record, serialize_rl_record
-from wavelet.data.rl_types import RLExample
+from wavelet.data.rl import RLExample, deserialize_rl_record, serialize_rl_record
 
 
 def test_rollout_record_round_trip_preserves_training_fields():

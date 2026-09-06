@@ -43,7 +43,9 @@ def _async_manager(
 
     monkeypatch.setattr("wavelet.trainer.ckpt.dcp.async_save", async_save)
     monkeypatch.setattr("wavelet.trainer.ckpt.barrier", lambda world: None)
-    monkeypatch.setattr("wavelet.trainer.ckpt.distributed_uses_cuda", lambda: False)
+    monkeypatch.setattr(
+        "wavelet.trainer.distributed.distributed_uses_cuda", lambda: False
+    )
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     return manager
 

@@ -12,14 +12,10 @@ from wavelet.data.rl import (
     rl_examples_from_payload,
     rl_examples_to_payload,
 )
-from wavelet.inference.diagnostics import inference_debug_state
+from wavelet.debug import inference_debug_state
 from wavelet.inference.engine import VLLMPolicyInferenceEngine
 from wavelet.transport.policy import nccl_world_size
 from wavelet.utils.config import load_config
-
-
-def _server_engine_config(config: RLConfig) -> RLConfig:
-    return config
 
 
 class _GenerationGate:
@@ -230,7 +226,7 @@ def _build_app(config: RLConfig):
             "`uv sync`."
         ) from exc
 
-    engine = VLLMPolicyInferenceEngine(_server_engine_config(config))
+    engine = VLLMPolicyInferenceEngine(config)
     generation_gate = _GenerationGate()
     app = FastAPI(
         title="Wavelet vLLM RL Server",

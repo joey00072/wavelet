@@ -10,6 +10,8 @@ from pydantic import (
     model_validator,
 )
 
+from wavelet.orchestrator.sources import VERIFIER_ROLLOUT_FUNCTION
+
 
 class ConfigModel(BaseModel):
     """Base for every config model: unknown or misspelled keys are errors."""
@@ -534,20 +536,25 @@ class SFTConfig(TrainerConfig):
         return self
 
 
-def _normalize_legacy_sampling_fields(value: object) -> object:
-    if not isinstance(value, dict):
-        return value
-    normalized = dict(value)
-    if "max_tokens" in normalized:
-        legacy = normalized.pop("max_tokens")
-        current = normalized.get("max_completion_tokens", legacy)
-        if current != legacy:
-            raise ValueError(
-                "sampling.max_tokens and sampling.max_completion_tokens disagree; "
-                "set only max_completion_tokens."
-            )
-        normalized["max_completion_tokens"] = legacy
-    return normalized
+class _LegacySamplingConfig(ConfigModel):
+    """Accept the legacy ``max_tokens`` spelling of ``max_completion_tokens``."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_sampling_fields(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "max_tokens" in normalized:
+            legacy = normalized.pop("max_tokens")
+            current = normalized.get("max_completion_tokens", legacy)
+            if current != legacy:
+                raise ValueError(
+                    "sampling.max_tokens and sampling.max_completion_tokens disagree; "
+                    "set only max_completion_tokens."
+                )
+            normalized["max_completion_tokens"] = legacy
+        return normalized
 
 
 class RLDataConfig(TrainingDataConfig):
@@ -684,7 +691,7 @@ class RLPolicyTransferConfig(ConfigModel):
     nccl_rank_offset: int = Field(default=1, ge=1)
 
 
-class RLSamplingConfig(ConfigModel):
+class RLSamplingConfig(_LegacySamplingConfig):
     temperature: float = Field(default=1.0, ge=0.0)
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=-1, ge=-1)
@@ -698,13 +705,18 @@ class RLSamplingConfig(ConfigModel):
     seed: int | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_legacy_sampling_fields(cls, value: object) -> object:
-        return _normalize_legacy_sampling_fields(value)
+
+_EVAL_SAMPLING_ARGS = (
+    "temperature",
+    "top_p",
+    "max_completion_tokens",
+    "reasoning_effort",
+    "seed",
+)
+_EVAL_SAMPLING_EXTRA_BODY_ARGS = ("top_k", "min_p", "min_tokens", "repetition_penalty")
 
 
-class RLEvalSamplingConfig(ConfigModel):
+class RLEvalSamplingConfig(_LegacySamplingConfig):
     temperature: float | None = Field(default=None, ge=0.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=-1)
@@ -716,51 +728,38 @@ class RLEvalSamplingConfig(ConfigModel):
     seed: int | None = None
     extra_body: dict[str, Any] = Field(default_factory=dict)
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_legacy_sampling_fields(cls, value: object) -> object:
-        return _normalize_legacy_sampling_fields(value)
-
     def to_sampling_args(self) -> dict[str, Any]:
         args: dict[str, Any] = {"logprobs": True}
-        if self.temperature is not None:
-            args["temperature"] = self.temperature
-        if self.top_p is not None:
-            args["top_p"] = self.top_p
-        if self.max_completion_tokens is not None:
-            args["max_completion_tokens"] = self.max_completion_tokens
-        if self.reasoning_effort is not None:
-            args["reasoning_effort"] = self.reasoning_effort
-        if self.seed is not None:
-            args["seed"] = self.seed
-
-        extra_body = dict(self.extra_body)
-        extra_body["return_token_ids"] = True
-        if self.top_k is not None:
-            extra_body["top_k"] = self.top_k
-        if self.min_p is not None:
-            extra_body["min_p"] = self.min_p
-        if self.min_tokens is not None:
-            extra_body["min_tokens"] = self.min_tokens
-        if self.repetition_penalty is not None:
-            extra_body["repetition_penalty"] = self.repetition_penalty
+        extra_body = {**self.extra_body, "return_token_ids": True}
+        for target, keys in (
+            (args, _EVAL_SAMPLING_ARGS),
+            (extra_body, _EVAL_SAMPLING_EXTRA_BODY_ARGS),
+        ):
+            for key in keys:
+                if (value := getattr(self, key)) is not None:
+                    target[key] = value
         args["extra_body"] = extra_body
         return args
 
 
-class RLEvalEnvConfig(ConfigModel):
+class _NamedEnvConfig(ConfigModel):
+    """Verifier environment addressed by ``id`` with an optional display name."""
+
     id: str
     name: str | None = None
+
+    @property
+    def resolved_name(self) -> str:
+        return self.name or self.id.split("@", 1)[0]
+
+
+class RLEvalEnvConfig(_NamedEnvConfig):
     args: dict[str, Any] = Field(default_factory=dict)
     sampling: RLEvalSamplingConfig = RLEvalSamplingConfig()
     num_examples: int = -1
     rollouts_per_example: int = Field(default=1, ge=1)
     interval: int = Field(default=100, ge=1)
     max_retries: int = Field(default=0, ge=0)
-
-    @property
-    def resolved_name(self) -> str:
-        return self.name or self.id.split("@", 1)[0]
 
 
 class RLEvalConfig(ConfigModel):
@@ -786,14 +785,14 @@ class RLEvalConfig(ConfigModel):
             else:
                 merged = group_sampling | env.sampling.model_dump(exclude_unset=True)
                 env.sampling = RLEvalSamplingConfig(**merged)
-            if "num_examples" not in env.model_fields_set:
-                env.num_examples = self.num_examples
-            if "rollouts_per_example" not in env.model_fields_set:
-                env.rollouts_per_example = self.rollouts_per_example
-            if "interval" not in env.model_fields_set:
-                env.interval = self.interval
-            if "max_retries" not in env.model_fields_set:
-                env.max_retries = self.max_retries
+            for name in (
+                "num_examples",
+                "rollouts_per_example",
+                "interval",
+                "max_retries",
+            ):
+                if name not in env.model_fields_set:
+                    setattr(env, name, getattr(self, name))
 
         names = [env.resolved_name for env in self.env]
         duplicates = {name for name in names if names.count(name) > 1}
@@ -845,9 +844,7 @@ class RLVLLMConfig(ConfigModel):
     max_model_len: int | None = Field(
         default=None,
         ge=8,
-        description=(
-            "Optional vLLM context limit; unset uses the model-native limit."
-        ),
+        description=("Optional vLLM context limit; unset uses the model-native limit."),
     )
     quantization: str | None = None
     load_format: str | None = None
@@ -988,28 +985,24 @@ class RLStateServerConfig(ConfigModel):
     max_events: int = Field(default=2000, ge=100)
 
 
-class _StrictConfig(ConfigModel):
-    pass
-
-
-class TokensLengthPenaltyConfig(_StrictConfig):
+class TokensLengthPenaltyConfig(ConfigModel):
     type: Literal["tokens"] = "tokens"
     completion_weight: float = Field(default=1.0, ge=0.0)
     tool_response_weight: float = Field(default=1.0, ge=0.0)
 
 
-class TurnsLengthPenaltyConfig(_StrictConfig):
+class TurnsLengthPenaltyConfig(ConfigModel):
     type: Literal["turns"] = "turns"
 
 
-class LinearLengthPenaltyConfig(_StrictConfig):
+class LinearLengthPenaltyConfig(ConfigModel):
     type: Literal["linear"] = "linear"
     num_output_tokens_weight: float = Field(default=0.25, ge=0.0, allow_inf_nan=False)
     num_input_tokens_weight: float = Field(default=0.1, ge=0.0, allow_inf_nan=False)
     num_turns_weight: float = Field(default=0.1, ge=0.0, allow_inf_nan=False)
 
 
-class TruncationLengthPenaltyConfig(_StrictConfig):
+class TruncationLengthPenaltyConfig(ConfigModel):
     type: Literal["truncation"] = "truncation"
     penalty: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
 
@@ -1029,22 +1022,22 @@ def _normalize_length_penalty(value: object) -> object:
     return value
 
 
-class PassthroughAlgorithmConfig(_StrictConfig):
+class PassthroughAlgorithmConfig(ConfigModel):
     type: Literal["passthrough"] = "passthrough"
 
 
-class RewardAlgorithmConfig(_StrictConfig):
+class RewardAlgorithmConfig(ConfigModel):
     type: Literal["reward"] = "reward"
 
 
-class GRPOAlgorithmConfig(_StrictConfig):
+class GRPOAlgorithmConfig(ConfigModel):
     type: Literal["grpo"] = "grpo"
     normalize_advantages: bool = False
     epsilon: float = Field(default=1e-6, gt=0.0)
     length_penalty: LengthPenaltyConfig | None = None
 
 
-class MaxRLAlgorithmConfig(_StrictConfig):
+class MaxRLAlgorithmConfig(ConfigModel):
     type: Literal["max_rl"] = "max_rl"
 
 
@@ -1063,12 +1056,12 @@ class RLTeacherConfig(ConfigModel):
         return self.name
 
 
-class OPDAlgorithmConfig(_StrictConfig):
+class OPDAlgorithmConfig(ConfigModel):
     type: Literal["opd"] = "opd"
     teacher: RLTeacherConfig
 
 
-class OPSDAlgorithmConfig(_StrictConfig):
+class OPSDAlgorithmConfig(ConfigModel):
     type: Literal["opsd"] = "opsd"
     demo_key: str = Field(default="demonstration", min_length=1)
     template: str = (
@@ -1083,14 +1076,14 @@ class OPSDAlgorithmConfig(_StrictConfig):
         return self
 
 
-class SFTDistillAlgorithmConfig(_StrictConfig):
+class SFTDistillAlgorithmConfig(ConfigModel):
     type: Literal["sft"] = "sft"
 
 
 AlgorithmScope = Literal["rollout", "group", "both"]
 
 
-class CustomAlgorithmConfig(_StrictConfig):
+class CustomAlgorithmConfig(ConfigModel):
     """Select a registered algorithm from a user-owned Python file."""
 
     type: Literal["custom"] = "custom"
@@ -1241,11 +1234,10 @@ class RLCurriculumConfig(ConfigModel):
     gates: dict[str, RLCurriculumGateConfig] = Field(default_factory=dict)
 
 
-class RLTrainEnvConfig(ConfigModel):
+class RLTrainEnvConfig(_NamedEnvConfig):
     """One weighted verifier training environment."""
 
     id: str = Field(min_length=1)
-    name: str | None = None
     args: dict[str, Any] = Field(default_factory=dict)
     ratio: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
     data_path: Path | None = None
@@ -1253,10 +1245,6 @@ class RLTrainEnvConfig(ConfigModel):
     group_size: int | None = Field(default=None, ge=1)
     algo: RLAlgorithmConfig | None = None
     curriculum: RLCurriculumConfig | None = None
-
-    @property
-    def resolved_name(self) -> str:
-        return self.name or self.id.split("@", 1)[0]
 
 
 class RLOrchestratorConfig(ConfigModel):
@@ -1297,6 +1285,10 @@ class RLOrchestratorConfig(ConfigModel):
     tasks_per_minute: int | None = Field(default=None, ge=1)
     pipeline_status_interval_seconds: float = Field(default=30.0, gt=0.0)
     state_server: RLStateServerConfig = RLStateServerConfig()
+
+    @property
+    def uses_verifiers(self) -> bool:
+        return self.custom_rollout_function == VERIFIER_ROLLOUT_FUNCTION
 
     @model_validator(mode="after")
     def validate_batch_target(self) -> "RLOrchestratorConfig":
@@ -1347,10 +1339,7 @@ class RLOrchestratorConfig(ConfigModel):
     def validate_task_rate_limit_source(self) -> "RLOrchestratorConfig":
         if self.tasks_per_minute is None:
             return self
-        if (
-            self.custom_rollout_function
-            != "wavelet.orchestrator.verifiers:generate_rollouts"
-        ):
+        if not self.uses_verifiers:
             raise ValueError(
                 "orchestrator.tasks_per_minute currently requires the Verifiers "
                 "rollout source."
@@ -1560,6 +1549,11 @@ class RLConfig(TrainerConfig):
             for env in self.orchestrator.envs
         ]
 
+    def _async_process(self) -> bool:
+        return (
+            self.launcher.mode == "process" and self.orchestrator.max_async_level >= 1
+        )
+
     def sampling_mask_required(self) -> bool:
         """Return whether truncated sampling needs its support set recorded."""
         configured = self.inference.vllm.return_sampling_mask
@@ -1603,11 +1597,9 @@ class RLConfig(TrainerConfig):
     def validate_multiple_training_environments(self) -> "RLConfig":
         if not self.orchestrator.envs:
             return self
-        if self.orchestrator.custom_rollout_function != (
-            "wavelet.orchestrator.verifiers:generate_rollouts"
-        ):
+        if not self.orchestrator.uses_verifiers:
             raise ValueError("orchestrator.envs requires the Verifiers rollout source.")
-        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+        if not self._async_process():
             raise ValueError(
                 "orchestrator.envs requires launcher.mode='process' and "
                 "orchestrator.max_async_level>=1."
@@ -1633,11 +1625,9 @@ class RLConfig(TrainerConfig):
         ]
         if not any(curriculum is not None for curriculum in curricula):
             return self
-        if self.orchestrator.custom_rollout_function != (
-            "wavelet.orchestrator.verifiers:generate_rollouts"
-        ):
+        if not self.orchestrator.uses_verifiers:
             raise ValueError("Curriculum requires the Verifiers rollout source.")
-        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+        if not self._async_process():
             raise ValueError(
                 "Curriculum requires launcher.mode='process' and "
                 "orchestrator.max_async_level>=1."
@@ -1665,9 +1655,7 @@ class RLConfig(TrainerConfig):
                 "Configure an OPD teacher under algo.teacher or "
                 "orchestrator.envs[].algo.teacher."
             )
-        if is_distillation and self.orchestrator.custom_rollout_function != (
-            "wavelet.orchestrator.verifiers:generate_rollouts"
-        ):
+        if is_distillation and not self.orchestrator.uses_verifiers:
             raise ValueError(
                 "Distillation algorithms require the Verifiers rollout source."
             )
@@ -1686,14 +1674,12 @@ class RLConfig(TrainerConfig):
     def validate_token_batch_scheduler(self) -> "RLConfig":
         if self.orchestrator.token_batch_size is None:
             return self
-        if self.orchestrator.custom_rollout_function != (
-            "wavelet.orchestrator.verifiers:generate_rollouts"
-        ):
+        if not self.orchestrator.uses_verifiers:
             raise ValueError(
                 "orchestrator.token_batch_size currently requires the Verifiers "
                 "rollout source."
             )
-        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+        if not self._async_process():
             raise ValueError(
                 "orchestrator.token_batch_size requires launcher.mode='process' "
                 "and orchestrator.max_async_level>=1."
@@ -1716,14 +1702,12 @@ class RLConfig(TrainerConfig):
         concurrency = self.orchestrator.concurrency
         if concurrency is None:
             return self
-        if self.orchestrator.custom_rollout_function != (
-            "wavelet.orchestrator.verifiers:generate_rollouts"
-        ):
+        if not self.orchestrator.uses_verifiers:
             raise ValueError(
                 "orchestrator.concurrency currently requires the Verifiers "
                 "rollout source."
             )
-        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+        if not self._async_process():
             raise ValueError(
                 "orchestrator.concurrency requires launcher.mode='process' and "
                 "orchestrator.max_async_level>=1."
@@ -1769,13 +1753,11 @@ class RLConfig(TrainerConfig):
     def validate_background_evals(self) -> "RLConfig":
         if self.eval is None or not self.eval.background:
             return self
-        if self.orchestrator.custom_rollout_function != (
-            "wavelet.orchestrator.verifiers:generate_rollouts"
-        ):
+        if not self.orchestrator.uses_verifiers:
             raise ValueError(
                 "eval.background currently requires the Verifiers rollout source."
             )
-        if self.launcher.mode != "process" or self.orchestrator.max_async_level < 1:
+        if not self._async_process():
             raise ValueError(
                 "eval.background requires launcher.mode='process' and "
                 "orchestrator.max_async_level>=1."

@@ -65,24 +65,15 @@ def parse_vllm_metrics(text: str) -> ParsedVLLMMetrics:
             if capacity is not None:
                 cache_capacities.append(capacity)
             continue
-        if (
-            name == _WAITING_BY_REASON_NAME
-            and labels.get("reason") == "capacity"
-        ):
-            try:
-                value = float(parts[1])
-            except ValueError:
-                continue
-            if math.isfinite(value):
+        if name == _WAITING_BY_REASON_NAME and labels.get("reason") == "capacity":
+            value = _finite_float(parts[1])
+            if value is not None:
                 waiting_capacity.append(value)
             continue
         if name not in supported:
             continue
-        try:
-            value = float(parts[1])
-        except ValueError:
-            continue
-        if math.isfinite(value):
+        value = _finite_float(parts[1])
+        if value is not None:
             values.setdefault(name, []).append(value)
 
     def summed(names: set[str]) -> float:
@@ -94,9 +85,7 @@ def parse_vllm_metrics(text: str) -> ParsedVLLMMetrics:
         kv_cache_usage=max(usage_values, default=0.0),
         running=int(summed(_RUNNING_NAMES)),
         waiting=int(summed(_WAITING_NAMES)),
-        waiting_capacity=(
-            int(sum(waiting_capacity)) if waiting_capacity else None
-        ),
+        waiting_capacity=(int(sum(waiting_capacity)) if waiting_capacity else None),
         kv_capacity_tokens=sum(cache_capacities) or None,
         preemptions_total=int(
             max((summed({name}) for name in _PREEMPTION_NAMES), default=0.0)
@@ -111,6 +100,15 @@ def parse_vllm_metrics(text: str) -> ParsedVLLMMetrics:
             name in values for name in _GENERATION_TOKEN_NAMES | _PROMPT_TOKEN_NAMES
         ),
     )
+
+
+def _finite_float(text: str) -> float | None:
+    """Parse a Prometheus sample value, rejecting unparsable or non-finite text."""
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
 
 
 def _prometheus_labels(metric: str) -> dict[str, str]:

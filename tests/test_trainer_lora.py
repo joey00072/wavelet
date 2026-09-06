@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from wavelet.kernels.utils import get_lora_parameters
-from wavelet.trainer import lora as lora_utils
+from wavelet.trainer import model as lora_utils
 
 
 class _FakePeftModel:

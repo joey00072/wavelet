@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,8 +24,15 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from wavelet.configs.sft import SFTConfig
+from wavelet.configs.sft import FSDPConfig, SFTConfig
 from wavelet.data.sft import Example, load_records, setup_dataloader, setup_dataset
+from wavelet.kernels.patch import (
+    patch_fused_mlp,
+    patch_fused_o,
+    patch_fused_qkv,
+    patch_smart_gc,
+)
+from wavelet.monitor import RunMonitor, setup_config_logger
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.context_parallel import (
     context_parallel_batch,
@@ -34,13 +42,37 @@ from wavelet.trainer.debug import DEBUG_MODEL_NAME
 from wavelet.trainer.distributed import (
     ParallelDims,
     World,
+    all_ranks_true,
     distributed_uses_cuda,
     get_world,
     set_world,
+    world_is_distributed,
 )
 from wavelet.trainer.garbage_collection import DeterministicGarbageCollector
-from wavelet.trainer.model import sync_hf_tp_lora_replicated_grads
+from wavelet.trainer.model import (
+    TORCH_DTYPES,
+    apply_activation_checkpointing,
+    apply_liger_kernel,
+    apply_lora,
+    compile_transformer_layers,
+    enforce_single_lora_adapter,
+    export_model_for_save,
+    load_fsdp2_model_from_hf,
+    maybe_wrap_ddp,
+    maybe_wrap_fsdp,
+    prepare_hf_tp_lora_for_training,
+    save_model,
+    setup_model,
+    setup_tokenizer,
+    sync_hf_tp_lora_replicated_grads,
+)
 from wavelet.trainer.moe import configure_hf_moe_routers, moe_load_balance_metrics
+from wavelet.trainer.optim import (
+    OffloadActivations,
+    enable_optimizer_state_offload,
+    setup_optimizer,
+    setup_scheduler,
+)
 from wavelet.trainer.perf import (
     estimate_training_flops_per_token,
     model_compute_dtype,
@@ -55,7 +87,6 @@ from wavelet.trainer.telemetry import (
 )
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
-from wavelet.utils.monitoring import RunMonitor, setup_config_logger
 from wavelet.utils.pathing import (
     get_config_dir,
     resolve_resume_checkpoint_source,
@@ -74,13 +105,26 @@ def _lora_dtype(
     model_dtype: str, optimization_dtype: str = "model"
 ) -> torch.dtype | None:
     dtype = model_dtype if optimization_dtype == "model" else optimization_dtype
-    if dtype == "bfloat16":
-        return torch.bfloat16
-    if dtype == "float16":
-        return torch.float16
-    if dtype == "float32":
-        return torch.float32
-    return None
+    return TORCH_DTYPES.get(dtype)
+
+
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _reduce_by_key(
+    dicts: Sequence[Mapping[str, float]],
+    reduce: Callable[[str, list[float]], float],
+    *,
+    keep: Callable[[str], bool] = lambda key: True,
+    ordered: bool = False,
+) -> dict[str, float]:
+    """Apply ``reduce(key, values)`` to the values present for each key."""
+    keys = {key for metrics in dicts for key in metrics if keep(key)}
+    return {
+        key: reduce(key, [float(metrics[key]) for metrics in dicts if key in metrics])
+        for key in (sorted(keys) if ordered else keys)
+    }
 
 
 def _unwrap_dataset_state(state: object) -> dict[str, Any] | None:
@@ -113,17 +157,21 @@ def _dataloader_progress(
         if state is not None:
             states.append(state)
 
-    if not states:
-        stats_fn = getattr(dataset, "stats", None)
-        stats = stats_fn() if callable(stats_fn) else {}
-        base = getattr(dataset, "base", dataset)
-        return {
-            "step": int(getattr(base, "step", 0)),
-            "epoch": int(getattr(base, "epoch", 0)),
-            "num_samples": dict(stats.get("samples", {})),
-            "num_tokens": dict(stats.get("tokens", {})),
-        }
+    if states:
+        return _merge_progress_states(states)
+    stats_fn = getattr(dataset, "stats", None)
+    stats = stats_fn() if callable(stats_fn) else {}
+    base = getattr(dataset, "base", dataset)
+    return {
+        "step": int(getattr(base, "step", 0)),
+        "epoch": int(getattr(base, "epoch", 0)),
+        "num_samples": dict(stats.get("samples", {})),
+        "num_tokens": dict(stats.get("tokens", {})),
+    }
 
+
+def _merge_progress_states(states: list[dict[str, Any]]) -> dict[str, Any]:
+    """Combine per-worker/per-rank dataset progress into one progress record."""
     num_samples: defaultdict[str, int] = defaultdict(int)
     num_tokens: defaultdict[str, int] = defaultdict(int)
     for state in states:
@@ -164,7 +212,8 @@ class BaseTrainer:
         self._memory_profiler: CudaMemoryProfiler | None = None
         self._model_flops_per_token: int | None = None
         self._model_compute_dtype: torch.dtype | None = None
-        self._sft_moe_metric_accum: list[dict[str, float]] = []
+        self._step_model_tokens = 0
+        self._latest_rank_telemetry: list[dict[str, Any]] | None = None
         self.accumulation_steps = 1
         self.ckpt_manager: CheckpointManager | None = None
         self.resume_checkpoint_dir: Path | None = None
@@ -189,6 +238,16 @@ class BaseTrainer:
             or self.world is None
         ):
             raise RuntimeError("Trainer not set up. Call setup() first.")
+
+    def _require_world(self) -> World:
+        if self.world is None:
+            raise RuntimeError("World not set up. Call setup() first.")
+        return self.world
+
+    def _require_monitor(self) -> RunMonitor:
+        if self.monitor is None:
+            raise RuntimeError("Monitor not set up. Call setup() first.")
+        return self.monitor
 
     def _after_resume(self) -> None:
         pass
@@ -285,8 +344,7 @@ class BaseTrainer:
 
     def train_until(self, target_step: int, *, finish_run: bool = False) -> None:
         self._validate_ready()
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
+        self._require_monitor()
         if self._run_closed:
             raise RuntimeError("Trainer run has already been finalized.")
         assert self.model is not None
@@ -343,12 +401,11 @@ class BaseTrainer:
     def _finish_if_requested(self, finish_run: bool, *, status: str) -> None:
         if not finish_run:
             return
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
+        monitor = self._require_monitor()
         self._close_step_profiler()
         self._close_memory_profiler()
         try:
-            self.monitor.finish(status=status, step=self.step)
+            monitor.finish(status=status, step=self.step)
             self._run_closed = True
             if status == "completed":
                 self._save_model()
@@ -380,7 +437,7 @@ class BaseTrainer:
                 / "profiler"
                 / f"trace-{config.start_step}-{config.end_step}.json"
             )
-            if self.world is not None and self.world.world_size > 1:
+            if world_is_distributed(self.world):
                 trace_path = trace_path.with_name(
                     f"{trace_path.stem}.rank-{self.world.rank}{trace_path.suffix}"
                 )
@@ -407,11 +464,9 @@ class BaseTrainer:
         config = self.config.memory_profiler
         if config is None or self._memory_profiler is not None:
             return
-        if self.world is None:
-            raise RuntimeError("World must be set up before memory profiling")
         self._memory_profiler = CudaMemoryProfiler(
             config.output_dir or (self.output_dir / "memory"),
-            rank=self.world.rank,
+            rank=self._require_world().rank,
             interval=config.interval,
             max_entries=config.max_entries,
         )
@@ -427,10 +482,8 @@ class BaseTrainer:
         self._memory_profiler = None
 
     def _setup_distributed(self) -> None:
-        fsdp_config = getattr(self.config, "fsdp", None)
         should_init_dist = (
-            bool(fsdp_config is not None and fsdp_config.enabled)
-            or int(os.environ.get("WORLD_SIZE", "1")) > 1
+            self.config.fsdp.enabled or int(os.environ.get("WORLD_SIZE", "1")) > 1
         )
 
         if should_init_dist and not torch.distributed.is_initialized():
@@ -458,41 +511,31 @@ class BaseTrainer:
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
             if torch.cuda.is_available() and distributed_uses_cuda():
                 torch.cuda.set_device(local_rank)
-            world = get_world()
-            self.world = world
-            self._setup_parallel_dims()
-            return
-
-        world = World(
-            rank=0,
-            local_rank=0,
-            world_size=1,
-            local_world_size=1,
-            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-        )
-        set_world(world)
-        self.world = world
+            self.world = get_world()
+        else:
+            self.world = World(
+                rank=0,
+                local_rank=0,
+                world_size=1,
+                local_world_size=1,
+                device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            )
+            set_world(self.world)
         self._setup_parallel_dims()
 
     def _distributed_backend(self) -> str:
-        fsdp_config = getattr(self.config, "fsdp", None)
-        configured_backend = getattr(fsdp_config, "backend", "auto")
-        if configured_backend == "auto":
+        configured_backend = self.config.fsdp.backend
+        if configured_backend in ("auto", "hybrid"):
             # torch.distributed.checkpoint.async_save requires a CPU backend in
             # the default group, so CUDA runs use the hybrid backend by default.
             return "cpu:gloo,cuda:nccl" if torch.cuda.is_available() else "gloo"
-        if configured_backend == "hybrid":
-            if torch.cuda.is_available():
-                return "cpu:gloo,cuda:nccl"
-            return "gloo"
         return configured_backend
 
     def _setup_parallel_dims(self) -> None:
-        fsdp_config = getattr(self.config, "fsdp", None)
-        if self.world is None:
-            raise RuntimeError("World must be set up before parallel dims")
-        if fsdp_config is None or not fsdp_config.enabled:
-            self.parallel_dims = ParallelDims(world_size=self.world.world_size)
+        fsdp_config = self.config.fsdp
+        world = self._require_world()
+        if not fsdp_config.enabled:
+            self.parallel_dims = ParallelDims(world_size=world.world_size)
             return
         self.parallel_dims = ParallelDims(
             dp_replicate=fsdp_config.dp_replicate,
@@ -500,7 +543,7 @@ class BaseTrainer:
             cp=fsdp_config.cp,
             tp=fsdp_config.tp,
             ep=fsdp_config.ep,
-            world_size=self.world.world_size,
+            world_size=world.world_size,
         )
         if self.parallel_dims.cp_enabled:
             divisor = self.parallel_dims.seq_len_divisor
@@ -511,32 +554,23 @@ class BaseTrainer:
                 )
 
     def _setup_tokenizer(self) -> None:
-        from wavelet.trainer.model import setup_tokenizer
-
         self.tokenizer = setup_tokenizer(self.config.model)
 
     def _setup_model(self) -> None:
-        from wavelet.trainer.model import (
-            apply_liger_kernel,
-            apply_lora,
-            prepare_hf_tp_lora_for_training,
-            setup_model,
-        )
-
         # Apply Liger kernel patches before from_pretrained so the class methods
         # are in place when model weights are loaded.
         apply_liger_kernel(self.config.loss_impl, self.config.model.name)
-        fsdp_config = getattr(self.config, "fsdp", None)
+        fsdp_config = self.config.fsdp
         use_fsdp2_meta_init = self._use_fsdp2_meta_init(fsdp_config)
         self._validate_model_execution_mode(fsdp_config)
         model = setup_model(
             self.config.model,
             max_seq_length=self.config.data.seq_len,
             distributed=bool(
-                (self.world is not None and self.world.world_size > 1)
+                world_is_distributed(self.world)
                 or self.config.model.load_in_4bit
-                or (fsdp_config is not None and fsdp_config.enabled)
-                or (self.parallel_dims is not None and self.parallel_dims.tp_enabled)
+                or fsdp_config.enabled
+                or self._tp_enabled()
             ),
             parallel_dims=self.parallel_dims,
             initialize_on_meta=use_fsdp2_meta_init,
@@ -568,36 +602,29 @@ class BaseTrainer:
         # saved_tensors_hooks and streams them to pinned CPU RAM during forward,
         # fetching them back during backward. Matches TRL's activation_offloading=True.
         if self.config.activation_offloading is not None:
-            from wavelet.trainer.optim import maybe_activation_offloading
-
-            self.act_offload_ctx = maybe_activation_offloading(
-                self.config.activation_offloading
+            self.act_offload_ctx = OffloadActivations(
+                use_pin_memory=self.config.activation_offloading.pin_memory
             )
         self._apply_optional_model_kernels(model)
         activation_checkpointing = self.config.model.activation_checkpointing
         if activation_checkpointing is not None and not self.config.model.smart_gc:
-            from wavelet.trainer.model import apply_activation_checkpointing
-
             apply_activation_checkpointing(model, activation_checkpointing)
         if self.config.model.compile:
-            from wavelet.trainer.model import compile_transformer_layers
-
             compile_transformer_layers(
                 model,
                 fullgraph=self.config.model.compile_fullgraph,
             )
         self.model = self._wrap_distributed_model(model, fsdp_config)
         if use_fsdp2_meta_init:
-            from wavelet.trainer.model import load_fsdp2_model_from_hf
-
-            if self.world is None:
-                raise RuntimeError("World must be initialized before loading FSDP2.")
             load_fsdp2_model_from_hf(
                 self.model,
                 self.config.model,
-                world=self.world,
+                world=self._require_world(),
                 cpu_offload=bool(fsdp_config.cpu_offload),
             )
+
+    def _tp_enabled(self) -> bool:
+        return self.parallel_dims is not None and self.parallel_dims.tp_enabled
 
     def _model_forward_context(self) -> contextlib.AbstractContextManager[None]:
         if self.world is None or self.world.device.type != "cuda":
@@ -614,11 +641,11 @@ class BaseTrainer:
             return torch.autocast(device_type="cuda", dtype=dtype)
         return contextlib.nullcontext()
 
-    def _use_fsdp2_meta_init(self, fsdp_config: Any) -> bool:
+    def _use_fsdp2_meta_init(self, fsdp_config: FSDPConfig) -> bool:
         if not (
             self.config.model.meta_device_init
-            and getattr(fsdp_config, "enabled", False)
-            and getattr(fsdp_config, "impl", "fsdp1") == "fsdp2"
+            and fsdp_config.enabled
+            and fsdp_config.impl == "fsdp2"
         ):
             return False
         if self.config.model.name == DEBUG_MODEL_NAME:
@@ -633,7 +660,7 @@ class BaseTrainer:
                 "adapter; using the standard Hugging Face load path."
             )
             return False
-        if self.parallel_dims is not None and self.parallel_dims.tp_enabled:
+        if self._tp_enabled():
             logger.warning(
                 "FSDP2 meta initialization with tensor parallelism is not yet "
                 "validated; using the standard Hugging Face load path."
@@ -648,8 +675,8 @@ class BaseTrainer:
             return False
         return True
 
-    def _validate_model_execution_mode(self, fsdp_config: Any) -> None:
-        if self.config.model.load_in_4bit and getattr(fsdp_config, "enabled", False):
+    def _validate_model_execution_mode(self, fsdp_config: FSDPConfig) -> None:
+        if self.config.model.load_in_4bit and fsdp_config.enabled:
             raise NotImplementedError(
                 "QLoRA training uses replicated DDP in Wavelet. Disable FSDP "
                 "for model.load_in_4bit=true."
@@ -662,22 +689,6 @@ class BaseTrainer:
 
     def _apply_optional_model_kernels(self, model: PreTrainedModel) -> None:
         mconf = self.config.model
-        if not any(
-            (
-                mconf.fused_lora_mlp,
-                mconf.fused_lora_qkv,
-                mconf.fused_lora_o,
-                mconf.smart_gc,
-            )
-        ):
-            return
-        from wavelet.kernels.patch import (
-            patch_fused_mlp,
-            patch_fused_o,
-            patch_fused_qkv,
-            patch_smart_gc,
-        )
-
         if mconf.fused_lora_mlp:
             patch_fused_mlp(model)
         if mconf.fused_lora_qkv:
@@ -690,26 +701,20 @@ class BaseTrainer:
     def _wrap_distributed_model(
         self,
         model: PreTrainedModel,
-        fsdp_config: Any,
+        fsdp_config: FSDPConfig,
     ) -> PreTrainedModel:
-        from wavelet.trainer.model import maybe_wrap_ddp, maybe_wrap_fsdp
-
+        tp_enabled = self._tp_enabled()
         if (
             self.world
-            and (fsdp_config is None or not fsdp_config.enabled)
-            and not (self.parallel_dims is not None and self.parallel_dims.tp_enabled)
+            and not fsdp_config.enabled
+            and not tp_enabled
             and not self.config.model.load_in_4bit
         ):
             model = model.to(self.world.device)
-        tp_enabled = self.parallel_dims is not None and self.parallel_dims.tp_enabled
-        fsdp_wrap_enabled = (
-            fsdp_config is not None
-            and fsdp_config.enabled
-            and (
-                self.parallel_dims is None
-                or self.parallel_dims.fsdp_enabled
-                or not tp_enabled
-            )
+        fsdp_wrap_enabled = fsdp_config.enabled and (
+            self.parallel_dims is None
+            or self.parallel_dims.fsdp_enabled
+            or not tp_enabled
         )
         if self.world and fsdp_wrap_enabled:
             model = maybe_wrap_fsdp(
@@ -719,7 +724,7 @@ class BaseTrainer:
                 world=self.world,
                 parallel_dims=self.parallel_dims,
             )
-        elif self.world and self.world.world_size > 1 and not tp_enabled:
+        elif world_is_distributed(self.world) and not tp_enabled:
             model = maybe_wrap_ddp(
                 model,
                 model_config=self.config.model,
@@ -729,13 +734,8 @@ class BaseTrainer:
         return model
 
     def _setup_data(self) -> None:
-        from wavelet.data.sft import setup_dataset
-
         if not self.tokenizer:
             raise RuntimeError("Tokenizer must be set up before data")
-        if not self.world:
-            raise RuntimeError("World must be set up before data")
-
         data_rank, data_world_size = self._data_partition()
         self.dataset = setup_dataset(
             self.tokenizer,
@@ -745,28 +745,22 @@ class BaseTrainer:
         )
 
     def _data_partition(self) -> tuple[int, int]:
-        if self.world is None:
-            raise RuntimeError("World must be set up before data partitioning")
+        world = self._require_world()
         if self.parallel_dims is None:
-            return self.world.rank, self.world.world_size
-
-        data_world_size = self._data_parallel_world_size()
+            return world.rank, world.world_size
         data_rank = self._rank_in_pipeline_stage() // self._model_parallel_size()
-        return data_rank, data_world_size
+        return data_rank, self._data_parallel_world_size()
 
     def _is_data_parallel_metric_leader(self) -> bool:
-        if self.world is None:
-            raise RuntimeError("World must be set up before metric partitioning")
+        self._require_world()
         if self.parallel_dims is None:
             return True
-
         return self._rank_in_pipeline_stage() % self._model_parallel_size() == 0
 
     def _data_parallel_world_size(self) -> int:
-        if self.world is None:
-            raise RuntimeError("World must be set up before data partitioning")
+        world = self._require_world()
         if self.parallel_dims is None:
-            return self.world.world_size
+            return world.world_size
         return self.parallel_dims.dp_replicate * self.parallel_dims.dp_shard
 
     def _model_parallel_size(self) -> int:
@@ -777,20 +771,12 @@ class BaseTrainer:
         return self.parallel_dims.cp * self.parallel_dims.tp
 
     def _rank_in_pipeline_stage(self) -> int:
-        if self.world is None:
-            raise RuntimeError("World must be set up before data partitioning")
         ranks_per_pipeline_stage = (
             self._data_parallel_world_size() * self._model_parallel_size()
         )
-        return self.world.rank % ranks_per_pipeline_stage
+        return self._require_world().rank % ranks_per_pipeline_stage
 
     def _setup_optimizer(self) -> None:
-        from wavelet.trainer.model import enforce_single_lora_adapter
-        from wavelet.trainer.optim import (
-            enable_optimizer_state_offload,
-            setup_optimizer,
-        )
-
         if not self.model:
             raise RuntimeError("Model must be set up before optimizer")
 
@@ -803,8 +789,6 @@ class BaseTrainer:
             enable_optimizer_state_offload(self.optimizer)
 
     def _setup_scheduler(self, *, total_steps: int | None = None) -> None:
-        from wavelet.trainer.optim import setup_scheduler
-
         if not self.optimizer:
             raise RuntimeError("Optimizer must be set up before scheduler")
 
@@ -910,11 +894,9 @@ class BaseTrainer:
         )
 
     def _prepare_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        if self.world is None:
-            raise RuntimeError("World not set up")
+        device = self._require_world().device
         prepared = {
-            key: value.to(self.world.device, non_blocking=True)
-            for key, value in batch.items()
+            key: value.to(device, non_blocking=True) for key, value in batch.items()
         }
         return prepare_context_parallel_batch(
             prepared,
@@ -937,15 +919,14 @@ class BaseTrainer:
     def _maybe_checkpoint(self) -> None:
         if self.ckpt_manager is None:
             return
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
+        monitor = self._require_monitor()
         self.ckpt_manager.poll_pending_save()
         did_save = self.ckpt_manager.save(
             self._trainer_state(),
             dataloader=self._checkpoint_dataloader(),
         )
         if did_save:
-            self.monitor.log_event(
+            monitor.log_event(
                 "checkpoint_triggered",
                 step=self.step,
                 payload={
@@ -1014,19 +995,7 @@ class BaseTrainer:
     def _require_finite_loss(self, loss: Tensor, *, label: str) -> None:
         """Abort every rank together when any rank observes a non-finite loss."""
         local_finite = bool(torch.isfinite(loss.detach()).all().item())
-        all_finite = local_finite
-        if torch.distributed.is_initialized():
-            finite_flag = torch.tensor(
-                int(local_finite),
-                dtype=torch.int32,
-                device=loss.device,
-            )
-            torch.distributed.all_reduce(
-                finite_flag,
-                op=torch.distributed.ReduceOp.MIN,
-            )
-            all_finite = bool(finite_flag.item())
-        if all_finite:
+        if all_ranks_true(local_finite, device=loss.device):
             return
         if self.optimizer is not None:
             self.optimizer.zero_grad(set_to_none=True)
@@ -1036,11 +1005,50 @@ class BaseTrainer:
             f"{self.step}; aborting before backward to keep ranks synchronized."
         )
 
+    def _step_performance_metrics(
+        self,
+        *,
+        local_tokens: int,
+        elapsed: float,
+        dtype: torch.dtype | None,
+    ) -> dict[str, float]:
+        """Throughput, MFU, and per-rank telemetry for one optimizer step."""
+        elapsed = max(elapsed, 1e-9)
+        global_tokens = local_tokens * self._data_parallel_world_size()
+        peak_memory_gib = (
+            torch.cuda.max_memory_reserved() / 1024**3
+            if torch.cuda.is_available()
+            else 0.0
+        )
+        world_size = self.world.world_size if self.world is not None else 1
+        metrics = {
+            "perf/tokens_per_second": global_tokens / elapsed,
+            "perf/peak_memory_gib": peak_memory_gib,
+        }
+        metrics.update(
+            training_flop_metrics(
+                flops_per_token=self._model_flops_per_token,
+                model_tokens=global_tokens,
+                elapsed_seconds=elapsed,
+                world_size=world_size,
+                dtype=dtype,
+            )
+        )
+        replication = max(world_size // max(self._data_parallel_world_size(), 1), 1)
+        sample = sample_rank_telemetry(
+            self.world,
+            tokens=local_tokens,
+            seconds=elapsed,
+            replication=replication,
+        )
+        ranks = gather_rank_telemetry(sample, self.world)
+        self._latest_rank_telemetry = rank_rows(ranks)
+        metrics.update(node_metrics(ranks))
+        return metrics
+
     def _save_model(self) -> None:
         if self.world is None or self.model is None or self.tokenizer is None:
             return
-        from wavelet.trainer.model import export_model_for_save, save_model
-
         saveable_model, state_dict = export_model_for_save(self.model)
         save_model(
             saveable_model,
@@ -1062,7 +1070,7 @@ class SFTTrainer(BaseTrainer):
         self._val_records: list[Example] | None = None
         self._validated_steps: set[int] = set()
         self._step_started_at: float | None = None
-        self._step_model_tokens = 0
+        self._sft_moe_metric_accum: list[dict[str, float]] = []
 
     def _setup_data(self) -> None:
         super()._setup_data()
@@ -1118,33 +1126,24 @@ class SFTTrainer(BaseTrainer):
         self._validated_steps.add(step)
 
     def _run_validation(self, step: int) -> None:
-        if self.model is None or self.world is None:
-            raise RuntimeError("Model and world must be set up before validation")
-        if self.monitor is None:
-            raise RuntimeError("Monitor must be set up before validation")
+        if self.model is None:
+            raise RuntimeError("Model must be set up before validation")
+        device = self._require_world().device
+        monitor = self._require_monitor()
         if self.val_dataloader is None:
             raise RuntimeError("Validation dataloader is not set up")
 
         was_training = self.model.training
-        total_loss = torch.zeros((), dtype=torch.float32, device=self.world.device)
-        total_tokens = torch.zeros((), dtype=torch.int64, device=self.world.device)
-        nonfinite_batches = torch.zeros((), dtype=torch.int64, device=self.world.device)
+        total_loss = torch.zeros((), dtype=torch.float32, device=device)
+        total_tokens = torch.zeros((), dtype=torch.int64, device=device)
+        nonfinite_batches = torch.zeros((), dtype=torch.int64, device=device)
         iterator = iter(self.val_dataloader)
         self.model.eval()
         try:
             with torch.no_grad():
                 while True:
                     raw_batch = next(iterator, None)
-                    has_batch = torch.tensor(
-                        int(raw_batch is not None),
-                        dtype=torch.int32,
-                        device=self.world.device,
-                    )
-                    if torch.distributed.is_initialized():
-                        torch.distributed.all_reduce(
-                            has_batch, op=torch.distributed.ReduceOp.MIN
-                        )
-                    if not bool(has_batch.item()):
+                    if not all_ranks_true(raw_batch is not None, device=device):
                         break
                     assert raw_batch is not None
                     batch = self._prepare_batch(raw_batch)
@@ -1180,26 +1179,24 @@ class SFTTrainer(BaseTrainer):
                 logger.warning(
                     "Validation at step %s had no finite trainable tokens", step
                 )
-            self.monitor.log({"val/loss": mean_loss}, step)
+            monitor.log({"val/loss": mean_loss}, step)
         finally:
             self.model.train(was_training)
         self.val_dataloader = self._build_validation_dataloader()
 
     def _setup_accumulation_steps(self) -> None:
-        if self.world is None:
-            raise RuntimeError("World must be set up before accumulation steps")
-        global_micro_batch = self.config.data.micro_batch_size * self.world.world_size
+        world_size = self._require_world().world_size
+        global_micro_batch = self.config.data.micro_batch_size * world_size
         if self.config.data.batch_size % global_micro_batch != 0:
             raise ValueError(
                 "SFT data.batch_size is the global optimizer batch size and must be "
                 "divisible by data.micro_batch_size * world_size "
-                f"({self.config.data.micro_batch_size} * {self.world.world_size})."
+                f"({self.config.data.micro_batch_size} * {world_size})."
             )
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
     def _log_train_output(self, output: TrainOutput, progress: tqdm) -> None:
-        if self.monitor is None:
-            raise RuntimeError("Monitor not set up. Call setup() first.")
+        monitor = self._require_monitor()
         if self.step % self.config.log.log_every != 0:
             return
         loss = output.loss.loss.item()
@@ -1208,9 +1205,7 @@ class SFTTrainer(BaseTrainer):
         metrics.update(self._dataset_progress_metrics())
         metrics.update(self._progress_metrics())
         metrics.update({"loss": loss, "lr": lr})
-        self.monitor.log(
-            metrics, self.step, ranks=getattr(self, "_latest_rank_telemetry", None)
-        )
+        monitor.log(metrics, self.step, ranks=self._latest_rank_telemetry)
         progress.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")
 
     def _train_step(self, batch: dict[str, Tensor]) -> TrainOutput:
@@ -1264,64 +1259,23 @@ class SFTTrainer(BaseTrainer):
         )
 
     def _aggregate_sft_moe_metrics(self) -> dict[str, float]:
-        keys = {key for metrics in self._sft_moe_metric_accum for key in metrics}
-        aggregated = {
-            key: (
-                max(
-                    metrics[key]
-                    for metrics in self._sft_moe_metric_accum
-                    if key in metrics
-                )
-                if key.endswith("/max")
-                else sum(
-                    metrics[key]
-                    for metrics in self._sft_moe_metric_accum
-                    if key in metrics
-                )
-                / sum(key in metrics for metrics in self._sft_moe_metric_accum)
-            )
-            for key in keys
-        }
+        aggregated = _reduce_by_key(
+            self._sft_moe_metric_accum,
+            lambda key, values: max(values) if key.endswith("/max") else _mean(values),
+        )
         self._sft_moe_metric_accum.clear()
         return aggregated
 
     def _finish_step_performance_metrics(self) -> dict[str, float]:
         if self._step_started_at is None:
             raise RuntimeError("SFT step timer was not started.")
-        elapsed = max(time.perf_counter() - self._step_started_at, 1e-9)
-        global_tokens = self._step_model_tokens * self._data_parallel_world_size()
-        peak_memory_gib = (
-            torch.cuda.max_memory_reserved() / 1024**3
-            if torch.cuda.is_available()
-            else 0.0
+        metrics = self._step_performance_metrics(
+            local_tokens=self._step_model_tokens,
+            elapsed=time.perf_counter() - self._step_started_at,
+            dtype=self._model_compute_dtype,
         )
         self._step_started_at = None
-        local_tokens = self._step_model_tokens
         self._step_model_tokens = 0
-        metrics = {
-            "perf/tokens_per_second": global_tokens / elapsed,
-            "perf/peak_memory_gib": peak_memory_gib,
-        }
-        world_size = self.world.world_size if self.world is not None else 1
-        metrics.update(
-            training_flop_metrics(
-                flops_per_token=self._model_flops_per_token,
-                model_tokens=global_tokens,
-                elapsed_seconds=elapsed,
-                world_size=world_size,
-                dtype=self._model_compute_dtype,
-            )
-        )
-        replication = max(world_size // max(self._data_parallel_world_size(), 1), 1)
-        sample = sample_rank_telemetry(
-            self.world,
-            tokens=local_tokens,
-            seconds=elapsed,
-            replication=replication,
-        )
-        ranks = gather_rank_telemetry(sample, self.world)
-        self._latest_rank_telemetry = rank_rows(ranks)
-        metrics.update(node_metrics(ranks))
         return metrics
 
     def _dataset_progress_metrics(self) -> dict[str, float]:
@@ -1345,28 +1299,14 @@ class SFTTrainer(BaseTrainer):
 
     def _sync_dataset_progress(self, progress: dict[str, Any]) -> dict[str, Any]:
         if (
-            self.world is None
-            or self.world.world_size <= 1
+            not world_is_distributed(self.world)
             or not torch.distributed.is_initialized()
         ):
             return progress
         payload = progress if self._is_data_parallel_metric_leader() else None
         gathered: list[dict[str, Any] | None] = [None] * self.world.world_size
         torch.distributed.all_gather_object(gathered, payload)
-        contributors = [item for item in gathered if item is not None]
-        samples: defaultdict[str, int] = defaultdict(int)
-        tokens: defaultdict[str, int] = defaultdict(int)
-        for item in contributors:
-            for name, value in item["num_samples"].items():
-                samples[name] += int(value)
-            for name, value in item["num_tokens"].items():
-                tokens[name] += int(value)
-        return {
-            "step": max(int(item["step"]) for item in contributors),
-            "epoch": max(int(item["epoch"]) for item in contributors),
-            "num_samples": dict(samples),
-            "num_tokens": dict(tokens),
-        }
+        return _merge_progress_states([item for item in gathered if item is not None])
 
     def _forward_loss(self, batch: dict[str, Tensor]) -> LossOutput:
         if self.model is None:

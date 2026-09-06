@@ -520,7 +520,7 @@ def test_registry_marks_current_run_and_resolves_alias(tmp_path: Path) -> None:
 
     assert [s["id"] for s in summaries] == ["newer", "older"]
     assert [s["is_current"] for s in summaries] == [True, False]
-    assert registry.current_run_id() == "newer"
+    assert registry._current_run_id() == "newer"
     assert registry.reader("current") is not None
     assert registry.reader("current").output_dir == newer.resolve()
     assert registry.reader("older").output_dir == older.resolve()

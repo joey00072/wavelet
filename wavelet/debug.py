@@ -10,7 +10,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -18,27 +19,15 @@ from typing import Any, Literal
 
 from wavelet.configs.config import CustomAlgorithmConfig, RLAlgorithmConfig, RLConfig
 from wavelet.data.rl import RLExample, load_rl_records
+from wavelet.monitor import RolloutMetricInputs, _existing_path, rollout_metrics
 from wavelet.orchestrator.algorithms import build_algorithm
-from wavelet.orchestrator.metrics import RolloutMetricInputs, rollout_metrics
 from wavelet.orchestrator.placement import (
-    device_group_conflict_error as _device_group_conflict_error,
-)
-from wavelet.orchestrator.placement import (
-    device_group_size as _device_group_size,
-)
-from wavelet.orchestrator.placement import (
-    device_groups as _as_device_groups,
-)
-from wavelet.orchestrator.placement import (
-    http_ports as _http_ports,
-)
-from wavelet.orchestrator.placement import (
-    required_inference_devices as _required_inference_devices,
-)
-from wavelet.orchestrator.placement import (
-    rollout_reward_mode_error as _rollout_reward_mode_error,
-)
-from wavelet.orchestrator.placement import (
+    device_group_conflict_error,
+    device_group_size,
+    device_groups,
+    http_ports,
+    required_inference_devices,
+    rollout_reward_mode_error,
     trainer_device_group,
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
@@ -96,7 +85,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _preflight_main(argv: list[str]) -> int:
-    from wavelet.configs.config import RLConfig
     from wavelet.utils.config import load_config
 
     parser = argparse.ArgumentParser(
@@ -107,12 +95,11 @@ def _preflight_main(argv: list[str]) -> int:
     args, config_args = parser.parse_known_args(argv)
 
     report = build_preflight_report(load_config(RLConfig, config_args))
-    _print_preflight_report(report, json_output=args.json_output)
+    _print_report(report, json_output=args.json_output, text=_print_preflight_text)
     return 0 if report["ok"] else 1
 
 
 def _inference_main(argv: list[str]) -> int:
-    from wavelet.configs.config import RLConfig
     from wavelet.utils.config import load_config
 
     parser = _inference_parser()
@@ -159,19 +146,21 @@ def _inference_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_INFERENCE_ARG_MINIMUMS = (
+    ("count", 1),
+    ("warmup", 0),
+    ("repeats", 1),
+    ("concurrency", 1),
+    ("stagger_ms", 0),
+    ("max_completion_tokens", 1),
+)
+
+
 def _validate_inference_args(args: argparse.Namespace) -> None:
-    if args.count < 1:
-        raise SystemExit("--count must be >= 1")
-    if args.warmup < 0:
-        raise SystemExit("--warmup must be >= 0")
-    if args.repeats < 1:
-        raise SystemExit("--repeats must be >= 1")
-    if args.concurrency < 1:
-        raise SystemExit("--concurrency must be >= 1")
-    if args.stagger_ms < 0:
-        raise SystemExit("--stagger-ms must be >= 0")
-    if args.max_completion_tokens < 1:
-        raise SystemExit("--max-completion-tokens must be >= 1")
+    for name, minimum in _INFERENCE_ARG_MINIMUMS:
+        if getattr(args, name) < minimum:
+            flag = name.replace("_", "-")
+            raise SystemExit(f"--{flag} must be >= {minimum}")
     if args.data_parallel_size is not None and args.data_parallel_size < 1:
         raise SystemExit("--data-parallel-size must be >= 1")
 
@@ -189,9 +178,7 @@ def _run_continuous_batch_probe(config: Any, args: argparse.Namespace) -> int:
     _print_report(
         {
             "metrics": metrics.to_dict(),
-            "sample": [
-                request.to_dict() for request in requests[: min(5, len(requests))]
-            ],
+            "sample": [request.to_dict() for request in requests[:5]],
             "errors": [
                 request.to_dict() for request in requests if request.error is not None
             ][:5],
@@ -221,7 +208,7 @@ def _run_inference_engine_probe(config: Any, args: argparse.Namespace) -> int:
     _print_report(
         {
             "metrics": metrics.to_dict(),
-            "sample": _sample_records(annotated, limit=min(3, len(annotated))),
+            "sample": _sample_records(annotated, limit=3),
         },
         json_output=args.json_output,
     )
@@ -229,7 +216,6 @@ def _run_inference_engine_probe(config: Any, args: argparse.Namespace) -> int:
 
 
 def _orchestrator_main(argv: list[str]) -> int:
-    from wavelet.configs.config import RLConfig
     from wavelet.inference.policy import create_policy_inference_engine
     from wavelet.utils.config import load_config
 
@@ -296,7 +282,6 @@ def _orchestrator_main(argv: list[str]) -> int:
 
 
 def _trainer_main(argv: list[str]) -> int:
-    from wavelet.configs.config import RLConfig
     from wavelet.utils.config import load_config
 
     parser = argparse.ArgumentParser(
@@ -360,30 +345,38 @@ def _trainer_main(argv: list[str]) -> int:
             json.dumps(report, indent=2, sort_keys=True),
             encoding="utf-8",
         )
-    _print_trainer_report(report, json_output=args.json_output)
+    _print_report(report, json_output=args.json_output, text=_print_trainer_text)
     return _trainer_exit_code(report, action=args.action)
 
 
 def _sample_records(records: list[Any], *, limit: int) -> list[dict[str, Any]]:
-    sample = []
-    for record in records[:limit]:
-        completion_text = ""
-        if record.completion:
-            completion_text = record.completion[0].get("content", "")
-        sample.append(
-            {
-                "completion": completion_text,
-                "trainable_tokens": sum(record.loss_mask or []),
-                "has_inference_logprobs": record.inference_logprobs is not None,
-            }
-        )
-    return sample
+    return [
+        {
+            "completion": (
+                record.completion[0].get("content", "") if record.completion else ""
+            ),
+            "trainable_tokens": sum(record.loss_mask or []),
+            "has_inference_logprobs": record.inference_logprobs is not None,
+        }
+        for record in records[:limit]
+    ]
 
 
-def _print_report(report: dict[str, Any], *, json_output: bool) -> None:
+def _print_report(
+    report: dict[str, Any],
+    *,
+    json_output: bool,
+    text: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
     if json_output:
         print(json.dumps(report, indent=2, sort_keys=True))
-        return
+    elif text is not None:
+        text(report)
+    else:
+        _print_nested_text(report)
+
+
+def _print_nested_text(report: dict[str, Any]) -> None:
     for key, value in report.items():
         if isinstance(value, dict):
             print(f"{key}:")
@@ -393,11 +386,7 @@ def _print_report(report: dict[str, Any], *, json_output: bool) -> None:
             print(f"{key}: {value}")
 
 
-def _print_preflight_report(report: dict[str, Any], *, json_output: bool) -> None:
-    if json_output:
-        print(json.dumps(report, indent=2, sort_keys=True))
-        return
-
+def _print_preflight_text(report: dict[str, Any]) -> None:
     status = "ok" if report["ok"] else "failed"
     print(f"preflight: {status}")
     print("summary:")
@@ -417,19 +406,21 @@ def _print_preflight_report(report: dict[str, Any], *, json_output: bool) -> Non
             print(f"    {key}: {value}")
 
 
-def _print_trainer_report(report: dict[str, Any], *, json_output: bool) -> None:
-    if json_output:
-        print(json.dumps(report, indent=2, sort_keys=True))
-        return
+def _print_trainer_text(report: dict[str, Any]) -> None:
     print(f"path: {report['path']}")
     _print_present_fields(report, ("ok", "passed", "skipped"))
-    if "summary" in report:
-        for key, value in report["summary"].items():
-            print(f"{key}: {value}")
-    _print_present_fields(report, ("rows_exported", "write_path"))
+    for key, value in report.get("summary", {}).items():
+        print(f"{key}: {value}")
     _print_present_fields(
         report,
-        ("token_count", "max_abs_diff", "mean_abs_diff", "skip_reason"),
+        (
+            "rows_exported",
+            "write_path",
+            "token_count",
+            "max_abs_diff",
+            "mean_abs_diff",
+            "skip_reason",
+        ),
     )
     _print_report_issues("errors", report["errors"])
     _print_report_issues("warnings", report["warnings"])
@@ -481,7 +472,7 @@ def inspect_rollout_batch(
     rows_with_inference_logprobs = 0
     rows_with_teacher_logprobs = 0
 
-    for row_index, payload in _iter_jsonl(path):
+    for row_index, payload in _iter_jsonl_or_errors(path):
         if max_rows is not None and rows_scanned >= max_rows:
             break
         rows_scanned += 1
@@ -540,7 +531,7 @@ def build_runtime_parity_report(
     rows_missing_trainer_logprobs = 0
     rows_missing_inference_logprobs = 0
 
-    for row_index, payload in _iter_jsonl(path):
+    for row_index, payload in _iter_jsonl_or_errors(path):
         if max_rows is not None and rows_checked >= max_rows:
             break
         if "_wavelet_parse_error" in payload:
@@ -638,7 +629,7 @@ def export_rollout_token_debug(
     trainable_tokens = 0
     write_path.parent.mkdir(parents=True, exist_ok=True)
     with write_path.open("w", encoding="utf-8") as handle:
-        for row_index, payload in _iter_jsonl(path):
+        for row_index, payload in _iter_jsonl_or_errors(path):
             if max_rows is not None and rows_scanned >= max_rows:
                 break
             rows_scanned += 1
@@ -694,7 +685,7 @@ def _resolve_rollout_path(
     return get_step_dir(queue_dir, queue_step) / config.transport.rollout_filename
 
 
-def _iter_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
+def _iter_jsonl_or_errors(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
     with Path(path).open("r", encoding="utf-8") as handle:
         for row_index, line in enumerate(handle):
             if not line.strip():
@@ -823,11 +814,11 @@ def _sample_row(
     row_index: int,
     stats: dict[str, Any],
 ) -> dict[str, Any]:
-    metadata = payload.get("metadata")
+    metadata = _metadata(payload)
     return {
         "row": row_index,
-        "example_id": _metadata_value(metadata, "example_id"),
-        "trajectory_id": _metadata_value(metadata, "trajectory_id"),
+        "example_id": metadata.get("example_id"),
+        "trajectory_id": metadata.get("trajectory_id"),
         "tokens": stats["tokens"],
         "trainable_tokens": stats["trainable_tokens"],
         "reward": payload.get("reward"),
@@ -847,12 +838,12 @@ def _token_debug_row(
     trainable_indexes = [
         index for index, trainable in enumerate(loss_mask) if bool(trainable)
     ]
-    metadata = payload.get("metadata")
+    metadata = _metadata(payload)
     return {
         "row": row_index,
-        "example_id": _metadata_value(metadata, "example_id"),
-        "trajectory_id": _metadata_value(metadata, "trajectory_id"),
-        "rollout_key": _metadata_value(metadata, "rollout_key"),
+        "example_id": metadata.get("example_id"),
+        "trajectory_id": metadata.get("trajectory_id"),
+        "rollout_key": metadata.get("rollout_key"),
         "input_ids": [int(value) for value in input_ids],
         "target_ids": [int(value) for value in target_ids],
         "loss_mask": loss_mask,
@@ -867,10 +858,9 @@ def _token_debug_row(
     }
 
 
-def _metadata_value(metadata: object, key: str) -> object | None:
-    if isinstance(metadata, dict):
-        return metadata.get(key)
-    return None
+def _metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = payload.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
 
 
 def _sequence(value: object) -> list[Any] | None:
@@ -1097,7 +1087,6 @@ def http_health(config: RLConfig) -> list[dict[str, Any]]:
         started_at = time.perf_counter()
         try:
             payload = _http_json(base_url, "GET", "/health")
-            debug_state = None
             try:
                 debug_state = _http_json(base_url, "GET", "/debug/state")
             except (OSError, RuntimeError):
@@ -1286,14 +1275,14 @@ def _continuous_batch_metrics(
     completion_tokens = sum(request.completion_tokens for request in requests)
     total_tokens = sum(request.total_tokens for request in requests)
     latencies = [request.latency_seconds for request in requests if request.ok]
-    per_rank_requests: dict[str, int] = {}
-    for request in requests:
-        rank = (
+    per_rank_requests = dict(
+        Counter(
             "none"
             if request.data_parallel_rank is None
             else str(request.data_parallel_rank)
+            for request in requests
         )
-        per_rank_requests[rank] = per_rank_requests.get(rank, 0) + 1
+    )
     wall = max(wall_seconds, 1e-9)
     max_observed_concurrency = _max_observed_concurrency(requests)
     return ContinuousBatchMetrics(
@@ -1737,11 +1726,7 @@ def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:
             if env.data_path is not None:
                 env_paths = [env.data_path]
             elif config.data.source == "local":
-                env_paths = (
-                    config.data.path
-                    if isinstance(config.data.path, list)
-                    else [config.data.path]
-                )
+                env_paths = _local_data_paths(config)
             else:
                 checks.append(
                     PreflightCheck(
@@ -1781,9 +1766,6 @@ def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:
                 message=f"data.source={config.data.source!r} does not require a local path preflight.",
             )
         ]
-    paths = (
-        config.data.path if isinstance(config.data.path, list) else [config.data.path]
-    )
     return [
         PreflightCheck(
             f"data_path_{index}",
@@ -1791,8 +1773,13 @@ def _data_path_checks(config: RLConfig) -> list[PreflightCheck]:
             f"Local data path {'exists' if Path(path).exists() else 'does not exist'}: {path}",
             {"path": str(path)},
         )
-        for index, path in enumerate(paths)
+        for index, path in enumerate(_local_data_paths(config))
     ]
+
+
+def _local_data_paths(config: RLConfig) -> list[Path]:
+    path = config.data.path
+    return path if isinstance(path, list) else [path]
 
 
 def _output_dir_check(output_dir: Path, *, clean: bool) -> PreflightCheck:
@@ -1813,7 +1800,7 @@ def _output_dir_check(output_dir: Path, *, clean: bool) -> PreflightCheck:
 
 
 def _parent_writable_check(path: Path, *, name: str) -> PreflightCheck:
-    parent = _existing_parent(path)
+    parent = _existing_path(path)
     writable = os.access(parent, os.W_OK)
     return PreflightCheck(
         name,
@@ -1825,13 +1812,6 @@ def _parent_writable_check(path: Path, *, name: str) -> PreflightCheck:
         ),
         {"path": str(path), "parent": str(parent)},
     )
-
-
-def _existing_parent(path: Path) -> Path:
-    cursor = path if path.exists() else path.parent
-    while not cursor.exists() and cursor != cursor.parent:
-        cursor = cursor.parent
-    return cursor
 
 
 def _launcher_checks(config: RLConfig) -> list[PreflightCheck]:
@@ -1859,7 +1839,7 @@ def _launcher_checks(config: RLConfig) -> list[PreflightCheck]:
 
 
 def _rollout_reward_mode_check(config: RLConfig) -> PreflightCheck:
-    error = _rollout_reward_mode_error(config)
+    error = rollout_reward_mode_error(config)
     return PreflightCheck(
         "rollout_reward_mode",
         "ok" if error is None else "error",
@@ -1895,7 +1875,7 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
     gpu_indices = _available_gpu_indices()
     replicas = config.launcher.inference_num_replicas
     try:
-        inference_groups = _as_device_groups(
+        inference_groups = device_groups(
             config.launcher.inference_cuda_visible_devices,
             replicas,
         )
@@ -1909,8 +1889,8 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
         ]
 
     for index, group in enumerate(inference_groups):
-        device_count = _device_group_size(config, group)
-        required = _required_inference_devices(config)
+        device_count = device_group_size(config, group)
+        required = required_inference_devices(config)
         status: CheckStatus = "ok" if device_count >= required else "warning"
         fallback = (
             f"Inference replica {index} has {device_count} visible "
@@ -1941,7 +1921,7 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
         )
 
     try:
-        trainer_group = _trainer_device_group(config)
+        trainer_group = trainer_device_group(config, strict=False)
     except ValueError as exc:
         checks.append(
             PreflightCheck(
@@ -1988,7 +1968,7 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
     process_count_check = _trainer_process_count_check(config, trainer_group)
     if process_count_check is not None:
         checks.append(process_count_check)
-    conflict = _device_group_conflict_error(config)
+    conflict = device_group_conflict_error(config)
     if conflict is not None:
         checks.append(
             PreflightCheck(
@@ -2010,7 +1990,7 @@ def _port_checks(config: RLConfig) -> list[PreflightCheck]:
             )
         ]
     try:
-        ports = _http_ports(config, config.launcher.inference_num_replicas)
+        ports = http_ports(config, config.launcher.inference_num_replicas)
     except ValueError as exc:
         return [
             PreflightCheck(
@@ -2149,16 +2129,12 @@ def _algorithm_check(
         name,
         status,
         message,
-        _custom_algorithm_details(algorithm),
+        {
+            "file": str(algorithm.file),
+            "algorithm": algorithm.algorithm,
+            "scope": algorithm.scope,
+        },
     )
-
-
-def _custom_algorithm_details(config: CustomAlgorithmConfig) -> dict[str, Any]:
-    return {
-        "file": str(config.file),
-        "algorithm": config.algorithm,
-        "scope": config.scope,
-    }
 
 
 def _low_precision_checks(config: RLConfig) -> list[PreflightCheck]:
@@ -2166,21 +2142,16 @@ def _low_precision_checks(config: RLConfig) -> list[PreflightCheck]:
     inference_quantized = bool(
         config.inference.vllm.quantization or config.inference.vllm.load_format
     )
-    if not trainer_4bit and not inference_quantized:
-        return [
-            PreflightCheck(
-                name="low_precision",
-                status="ok",
-                message="No low-precision trainer or inference settings enabled.",
-                details=_low_precision_summary(config),
-            )
-        ]
-
+    low_precision = trainer_4bit or inference_quantized
     checks: list[PreflightCheck] = [
         PreflightCheck(
             name="low_precision",
             status="ok",
-            message="Resolved low-precision launch settings.",
+            message=(
+                "Resolved low-precision launch settings."
+                if low_precision
+                else "No low-precision trainer or inference settings enabled."
+            ),
             details=_low_precision_summary(config),
         )
     ]
@@ -2270,14 +2241,14 @@ def _resolved_commands(config: RLConfig) -> list[dict[str, Any]]:
                 "role": "trainer",
                 "command": "uv run python -m wavelet rl",
                 "config": "<provided config>",
-                "cuda_visible_devices": _trainer_device_group(config),
+                "cuda_visible_devices": trainer_device_group(config, strict=False),
             }
         ]
 
     if config.launcher.mode in {"process", "colocate", "colocate_sleep"}:
         commands: list[dict[str, Any]] = []
-        ports = _http_ports(config, config.launcher.inference_num_replicas)
-        inference_groups = _as_device_groups(
+        ports = http_ports(config, config.launcher.inference_num_replicas)
+        inference_groups = device_groups(
             config.launcher.inference_cuda_visible_devices,
             len(ports),
         )
@@ -2304,7 +2275,7 @@ def _resolved_commands(config: RLConfig) -> list[dict[str, Any]]:
                     "role": "trainer",
                     "command": "uv run python -m wavelet rl-trainer",
                     "torchrun_nproc_per_node": config.launcher.trainer_num_processes,
-                    "cuda_visible_devices": _trainer_device_group(config),
+                    "cuda_visible_devices": trainer_device_group(config, strict=False),
                 },
                 {
                     "role": "inference",
@@ -2319,13 +2290,9 @@ def _resolved_commands(config: RLConfig) -> list[dict[str, Any]]:
         {
             "role": "integrated",
             "command": "uv run python -m wavelet rl",
-            "cuda_visible_devices": _trainer_device_group(config),
+            "cuda_visible_devices": trainer_device_group(config, strict=False),
         }
     ]
-
-
-def _trainer_device_group(config: RLConfig) -> str | None:
-    return trainer_device_group(config, strict=False)
 
 
 def _available_gpu_indices() -> set[str] | None:

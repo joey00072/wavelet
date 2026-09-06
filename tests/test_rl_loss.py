@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from wavelet.configs.rl_config import RLLossConfig
-from wavelet.trainer.rl_loss import (
+from wavelet.trainer.losses import (
     LossInputs,
     component_normalization_unit_counts,
     compute_loss,

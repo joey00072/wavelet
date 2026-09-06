@@ -50,8 +50,7 @@ Training-batch reward alone is not a parity signal.
 
 ## Canonical Implementation Owners
 
-Compatibility modules preserve established imports, but new code should use
-these implementation owners:
+Each contract has one implementation owner:
 
 | Contract | Canonical owner |
 |---|---|

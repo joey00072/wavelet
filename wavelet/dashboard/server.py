@@ -50,7 +50,7 @@ class RunRegistry:
 
     def reader(self, run_id: str) -> RunArtifacts | None:
         if run_id == CURRENT_RUN_ALIAS:
-            current = self.current_run_id()
+            current = self._current_run_id()
             return None if current is None else self.reader(current)
         with self._lock:
             reader = self._readers.get(run_id)
@@ -84,7 +84,7 @@ class RunRegistry:
         )
         return summaries
 
-    def current_run_id(self) -> str | None:
+    def _current_run_id(self) -> str | None:
         return current_run_id(self.summaries())
 
 
@@ -142,31 +142,6 @@ def register_run_routes(
         if reader is None:
             raise http_exception(status_code=404, detail=f"Unknown run '{run_id}'.")
         return reader
-
-    def filters_from(
-        env: str | None,
-        group_key: str | None,
-        example_id: str | None,
-        min_reward: float | None,
-        max_reward: float | None,
-        truncated: bool | None,
-        stop_condition: str | None,
-        advantage: str | None,
-        has_error: bool | None,
-        search: str | None,
-    ) -> RowFilters:
-        return RowFilters(
-            env=env,
-            group_key=group_key,
-            example_id=example_id,
-            min_reward=min_reward,
-            max_reward=max_reward,
-            truncated=truncated,
-            stop_condition=stop_condition,
-            advantage_sign=advantage,
-            has_error=has_error,
-            search=search,
-        )
 
     @app.get(f"{API_PREFIX}/health")
     async def api_health() -> dict[str, Any]:
@@ -258,17 +233,13 @@ def register_run_routes(
             descending=order == "desc",
             offset=offset,
             limit=limit,
-            filters=filters_from(
-                None,
-                None,
-                example_id,
-                min_reward,
-                max_reward,
-                truncated,
-                None,
-                None,
-                has_error,
-                search,
+            filters=RowFilters(
+                example_id=example_id,
+                min_reward=min_reward,
+                max_reward=max_reward,
+                truncated=truncated,
+                has_error=has_error,
+                search=search,
             ),
         )
 
@@ -313,17 +284,17 @@ def register_run_routes(
             descending=order == "desc",
             offset=offset,
             limit=limit,
-            filters=filters_from(
-                env,
-                group_key,
-                example_id,
-                min_reward,
-                max_reward,
-                truncated,
-                stop_condition,
-                advantage,
-                has_error,
-                search,
+            filters=RowFilters(
+                env=env,
+                group_key=group_key,
+                example_id=example_id,
+                min_reward=min_reward,
+                max_reward=max_reward,
+                truncated=truncated,
+                stop_condition=stop_condition,
+                advantage_sign=advantage,
+                has_error=has_error,
+                search=search,
             ),
         )
 

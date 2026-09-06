@@ -7,17 +7,17 @@ import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import ModelConfig
-from wavelet.data.rl_dataset import (
+from wavelet.data.rl import (
     PackedRLDataset,
     RLDataset,
     RLExample,
     setup_rl_dataloader,
 )
-from wavelet.distributed.world import World
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.ckpt import TrainerState
+from wavelet.trainer.distributed import World
 from wavelet.trainer.model import _fsdp_mixed_precision
-from wavelet.trainer.rl_trainer import (
+from wavelet.trainer.rl import (
     RLTrainer,
     _packed_causal_attention_mask,
     _packed_training_attention_mask,

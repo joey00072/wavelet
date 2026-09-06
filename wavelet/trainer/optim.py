@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import copy
+import importlib
 import logging
 import math
 import warnings
 from collections.abc import Callable, Iterable, Sequence
-from contextlib import nullcontext
 
 import psutil
 import torch
@@ -23,11 +23,8 @@ from torch.optim.lr_scheduler import (
 )
 from torch.utils.hooks import RemovableHandle
 
-from wavelet.configs.sft import (
-    ActivationOffloadingConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-)
+from wavelet.configs.sft import OptimizerConfig, SchedulerConfig
+from wavelet.trainer.types import lora_adapter_name_from_key
 
 
 class SignSGD(Optimizer):
@@ -78,14 +75,13 @@ class OptimizerStateOffloader:
     def install(self) -> None:
         if self._handles:
             raise RuntimeError("Optimizer state offload hooks are already installed.")
+        optimizer = self.optimizer
         self._handles = [
-            self.optimizer.register_step_pre_hook(self._before_step),
-            self.optimizer.register_step_post_hook(self._after_step),
-            self.optimizer.register_state_dict_pre_hook(self._before_state_dict),
-            self.optimizer.register_state_dict_post_hook(self._after_state_dict),
-            self.optimizer.register_load_state_dict_post_hook(
-                self._after_load_state_dict
-            ),
+            optimizer.register_step_pre_hook(lambda *_: self.move_to_parameters()),
+            optimizer.register_step_post_hook(lambda *_: self.move_to_cpu()),
+            optimizer.register_state_dict_pre_hook(lambda _: self.move_to_parameters()),
+            optimizer.register_state_dict_post_hook(self._after_state_dict),
+            optimizer.register_load_state_dict_post_hook(lambda _: self.move_to_cpu()),
         ]
         self.move_to_cpu()
 
@@ -108,25 +104,6 @@ class OptimizerStateOffloader:
                     pin_memory=should_pin,
                 )
 
-    def _before_step(
-        self,
-        _optimizer: Optimizer,
-        _args: tuple[object, ...],
-        _kwargs: dict[str, object],
-    ) -> None:
-        self.move_to_parameters()
-
-    def _after_step(
-        self,
-        _optimizer: Optimizer,
-        _args: tuple[object, ...],
-        _kwargs: dict[str, object],
-    ) -> None:
-        self.move_to_cpu()
-
-    def _before_state_dict(self, _optimizer: Optimizer) -> None:
-        self.move_to_parameters()
-
     def _after_state_dict(
         self,
         _optimizer: Optimizer,
@@ -134,9 +111,6 @@ class OptimizerStateOffloader:
     ) -> dict[str, object]:
         self.move_to_cpu()
         return state_dict
-
-    def _after_load_state_dict(self, _optimizer: Optimizer) -> None:
-        self.move_to_cpu()
 
 
 def _move_optimizer_state_value(
@@ -199,6 +173,17 @@ def enable_optimizer_state_offload(
     return offloader
 
 
+# Optimizer type -> (module, class, implementation override). 8-bit optimizers
+# don't support fused/foreach, so they always use the for-loop implementation.
+_ADAM_OPTIMIZERS: dict[str, tuple[str, str, str | None]] = {
+    "adamw": ("torch.optim", "AdamW", None),
+    "adam": ("torch.optim", "Adam", None),
+    "adamw_8bit": ("bitsandbytes.optim", "AdamW8bit", "for-loop"),
+    "paged_adamw_8bit": ("bitsandbytes.optim", "PagedAdamW8bit", "for-loop"),
+    "adam_8bit": ("bitsandbytes.optim", "Adam8bit", "for-loop"),
+}
+
+
 def setup_optimizer(
     config: OptimizerConfig,
     named_params: Iterable[tuple[str, nn.Parameter]],
@@ -207,58 +192,8 @@ def setup_optimizer(
     _validate_single_trainable_lora_adapter(named_params)
     params = [param for _, param in named_params if param.requires_grad]
 
-    if config.type in ("adamw", "adamw_8bit", "paged_adamw_8bit"):
-        if config.type == "adamw_8bit":
-            from bitsandbytes.optim import AdamW8bit
-
-            # 8-bit optimizers don't support fused/foreach; force for-loop
-            return _build_optimizer(
-                AdamW8bit,
-                params,
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                betas=(config.betas1, config.betas2),
-                implementation="for-loop",
-            )
-        if config.type == "paged_adamw_8bit":
-            from bitsandbytes.optim import PagedAdamW8bit
-
-            return _build_optimizer(
-                PagedAdamW8bit,
-                params,
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                betas=(config.betas1, config.betas2),
-                implementation="for-loop",
-            )
-        return _build_optimizer(
-            AdamW,
-            params,
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(config.betas1, config.betas2),
-            implementation=config.implementation,
-        )
-    if config.type in ("adam", "adam_8bit"):
-        if config.type == "adam_8bit":
-            from bitsandbytes.optim import Adam8bit
-
-            return _build_optimizer(
-                Adam8bit,
-                params,
-                lr=config.lr,
-                weight_decay=config.weight_decay,
-                betas=(config.betas1, config.betas2),
-                implementation="for-loop",
-            )
-        return _build_optimizer(
-            Adam,
-            params,
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(config.betas1, config.betas2),
-            implementation=config.implementation,
-        )
+    if config.type == "sign_sgd":
+        return SignSGD(params, lr=config.lr, weight_decay=config.weight_decay)
     if config.type == "sgd":
         return _build_optimizer(
             SGD,
@@ -269,46 +204,32 @@ def setup_optimizer(
             nesterov=config.nesterov,
             implementation=config.implementation,
         )
-    if config.type == "sign_sgd":
-        return SignSGD(
-            params,
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-        )
-    raise ValueError(f"Unsupported optimizer type: {config.type}")
+    if config.type not in _ADAM_OPTIMIZERS:
+        raise ValueError(f"Unsupported optimizer type: {config.type}")
+    module_name, class_name, implementation = _ADAM_OPTIMIZERS[config.type]
+    return _build_optimizer(
+        getattr(importlib.import_module(module_name), class_name),
+        params,
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        betas=(config.betas1, config.betas2),
+        implementation=implementation or config.implementation,
+    )
 
 
 def _validate_single_trainable_lora_adapter(
     named_params: Sequence[tuple[str, nn.Parameter]],
 ) -> None:
     adapter_names = {
-        adapter_name
+        lora_adapter_name_from_key(name)
         for name, param in named_params
         if param.requires_grad
-        for adapter_name in [_lora_adapter_name_from_parameter(name)]
-        if adapter_name is not None
-    }
+    } - {None}
     if len(adapter_names) > 1:
         raise RuntimeError(
             "Wavelet optimizers support trainable parameters from exactly one "
             f"LoRA adapter; found {sorted(adapter_names)}."
         )
-
-
-def _lora_adapter_name_from_parameter(name: str) -> str | None:
-    for marker in (
-        ".lora_A.",
-        ".lora_B.",
-        ".lora_embedding_A.",
-        ".lora_embedding_B.",
-    ):
-        if marker not in name:
-            continue
-        suffix = name.split(marker, 1)[1]
-        if "." not in suffix:
-            return None
-        return suffix.split(".", 1)[0]
-    return None
 
 
 def _build_optimizer(
@@ -323,11 +244,10 @@ def _build_optimizer(
     nesterov: bool | None = None,
 ) -> Optimizer:
     kwargs: dict[str, object] = {}
-    if implementation == "fused":
-        kwargs["fused"] = True
-    elif implementation == "foreach":
-        kwargs["foreach"] = True
+    if implementation in ("fused", "foreach"):
+        kwargs[implementation] = True
 
+    # Only torch's Adam/AdamW receive betas; 8-bit variants keep their defaults.
     if cls in {AdamW, Adam}:
         assert betas is not None
         kwargs["betas"] = betas
@@ -345,37 +265,16 @@ def _build_optimizer(
         kwargs.pop("fused")
 
     try:
-        return cls(
-            params=params,
-            lr=lr,
-            weight_decay=weight_decay,
-            **kwargs,
-        )
+        return cls(params=params, lr=lr, weight_decay=weight_decay, **kwargs)
     except TypeError as exc:
-        if kwargs.get("fused") is True:
-            warnings.warn(
-                f"{cls.__name__} fused optimizer unsupported in this runtime; "
-                f"falling back to for-loop. {exc}"
-            )
-            kwargs.pop("fused")
-            return cls(
-                params=params,
-                lr=lr,
-                weight_decay=weight_decay,
-                **kwargs,
-            )
-        if kwargs.get("foreach") is True:
-            warnings.warn(
-                f"{cls.__name__} foreach optimizer unsupported in this runtime; "
-                f"falling back to for-loop. {exc}"
-            )
-            kwargs.pop("foreach")
-            return cls(
-                params=params,
-                lr=lr,
-                weight_decay=weight_decay,
-                **kwargs,
-            )
+        for flag in ("fused", "foreach"):
+            if kwargs.get(flag) is True:
+                warnings.warn(
+                    f"{cls.__name__} {flag} optimizer unsupported in this runtime; "
+                    f"falling back to for-loop. {exc}"
+                )
+                kwargs.pop(flag)
+                return cls(params=params, lr=lr, weight_decay=weight_decay, **kwargs)
         raise
 
 
@@ -405,9 +304,28 @@ def _resolve_min_lr_factor(
 ) -> float:
     if min_lr_factor is not None:
         return min_lr_factor
-    if min_lr <= 0.0:
-        return 1e-8
-    return min_lr / lr
+    return min_lr / lr if min_lr > 0.0 else 1e-8
+
+
+def _warmup(optimizer: Optimizer, warmup_steps: int, min_lr_factor: float) -> LinearLR:
+    return LinearLR(
+        optimizer, start_factor=min_lr_factor, end_factor=1.0, total_iters=warmup_steps
+    )
+
+
+def _hold(optimizer: Optimizer, steps: int) -> LinearLR:
+    # LinearLR (not ConstantLR) keeps scheduler state_dict layouts unchanged.
+    return LinearLR(optimizer, start_factor=1.0, end_factor=1.0, total_iters=steps)
+
+
+def _chain(
+    optimizer: Optimizer,
+    schedulers: list[LRScheduler],
+    milestones: list[int],
+) -> LRScheduler:
+    if len(schedulers) == 1:
+        return schedulers[0]
+    return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
 
 
 def setup_scheduler(
@@ -417,53 +335,19 @@ def setup_scheduler(
     total_steps: int,
     lr: float,
 ) -> LRScheduler:
+    builder = _SCHEDULER_BUILDERS.get(scheduler_config.type)
+    if builder is None:
+        raise ValueError(f"Invalid scheduler type: {scheduler_config.type}")
     warmup_steps = _resolve_warmup_steps(scheduler_config, total_steps)
-    decay_steps = _resolve_decay_steps(
-        scheduler_config,
+    return builder(
+        optimizer,
         total_steps=total_steps,
         warmup_steps=warmup_steps,
+        decay_steps=_resolve_decay_steps(scheduler_config, total_steps, warmup_steps),
+        lr=lr,
+        min_lr=scheduler_config.min_lr,
+        min_lr_factor=scheduler_config.min_lr_factor,
     )
-
-    if scheduler_config.type == "constant":
-        return setup_constant_scheduler(
-            optimizer,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            lr=lr,
-            min_lr=scheduler_config.min_lr,
-            min_lr_factor=scheduler_config.min_lr_factor,
-        )
-    if scheduler_config.type == "linear":
-        return setup_linear_scheduler(
-            optimizer,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            decay_steps=decay_steps,
-            lr=lr,
-            min_lr=scheduler_config.min_lr,
-            min_lr_factor=scheduler_config.min_lr_factor,
-        )
-    if scheduler_config.type == "cosine":
-        return setup_cosine_scheduler(
-            optimizer,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            lr=lr,
-            min_lr=scheduler_config.min_lr,
-            min_lr_factor=scheduler_config.min_lr_factor,
-            decay_steps=decay_steps,
-        )
-    if scheduler_config.type == "sqrt":
-        return setup_sqrt_scheduler(
-            optimizer,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            decay_steps=decay_steps,
-            lr=lr,
-            min_lr=scheduler_config.min_lr,
-            min_lr_factor=scheduler_config.min_lr_factor,
-        )
-    raise ValueError(f"Invalid scheduler type: {scheduler_config.type}")
 
 
 def setup_constant_scheduler(
@@ -474,12 +358,9 @@ def setup_constant_scheduler(
     lr: float,
     min_lr: float,
     min_lr_factor: float | None = None,
+    decay_steps: int | None = None,  # unused; shared builder signature
 ) -> LRScheduler:
-    min_lr_factor = _resolve_min_lr_factor(
-        min_lr,
-        min_lr_factor,
-        lr,
-    )
+    min_lr_factor = _resolve_min_lr_factor(min_lr, min_lr_factor, lr)
 
     if total_steps <= 0:
         raise ValueError("Constant scheduler requires total_steps > 0")
@@ -487,26 +368,14 @@ def setup_constant_scheduler(
         return ConstantLR(optimizer, factor=1.0)
 
     warmup_steps = min(warmup_steps, total_steps)
-    schedulers: list[LRScheduler] = [
-        LinearLR(
-            optimizer,
-            start_factor=min_lr_factor,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-    ]
-    milestones: list[int] = [warmup_steps]
-
-    constant_steps = max(total_steps - warmup_steps, 1)
-    schedulers.append(
-        LinearLR(
-            optimizer,
-            start_factor=1.0,
-            end_factor=1.0,
-            total_iters=constant_steps,
-        )
+    return SequentialLR(
+        optimizer,
+        schedulers=[
+            _warmup(optimizer, warmup_steps, min_lr_factor),
+            _hold(optimizer, max(total_steps - warmup_steps, 1)),
+        ],
+        milestones=[warmup_steps],
     )
-    return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
 
 
 def setup_linear_scheduler(
@@ -519,11 +388,7 @@ def setup_linear_scheduler(
     min_lr: float,
     min_lr_factor: float | None = None,
 ) -> LRScheduler:
-    min_lr_factor = _resolve_min_lr_factor(
-        min_lr,
-        min_lr_factor,
-        lr,
-    )
+    min_lr_factor = _resolve_min_lr_factor(min_lr, min_lr_factor, lr)
 
     if total_steps <= 0:
         raise ValueError("Linear scheduler requires total_steps > 0")
@@ -547,28 +412,14 @@ def setup_linear_scheduler(
     milestones: list[int] = []
 
     if warmup_steps > 0:
-        schedulers.append(
-            LinearLR(
-                optimizer,
-                start_factor=min_lr_factor,
-                end_factor=1.0,
-                total_iters=warmup_steps,
-            )
-        )
+        schedulers.append(_warmup(optimizer, warmup_steps, min_lr_factor))
         milestones.append(warmup_steps)
 
     decay_start = min(total_steps - decay_steps, effective_total)
     if decay_steps > 0 and decay_start >= warmup_steps:
         constant_steps = decay_start - warmup_steps
         if constant_steps > 0:
-            schedulers.append(
-                LinearLR(
-                    optimizer,
-                    start_factor=1.0,
-                    end_factor=1.0,
-                    total_iters=constant_steps,
-                )
-            )
+            schedulers.append(_hold(optimizer, constant_steps))
             milestones.append(decay_start)
         schedulers.append(
             LinearLR(
@@ -578,10 +429,7 @@ def setup_linear_scheduler(
                 total_iters=max(decay_steps - 1, 1),
             )
         )
-
-    if len(schedulers) == 1:
-        return schedulers[0]
-    return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
+    return _chain(optimizer, schedulers, milestones)
 
 
 class OffloadActivations(saved_tensors_hooks):
@@ -663,14 +511,6 @@ class OffloadActivations(saved_tensors_hooks):
         return tensor.to("cuda", non_blocking=True) if offloaded else tensor
 
 
-def maybe_activation_offloading(
-    config: ActivationOffloadingConfig | None,
-) -> OffloadActivations | nullcontext:
-    if config is None:
-        return nullcontext()
-    return OffloadActivations(use_pin_memory=config.pin_memory)
-
-
 def setup_cosine_scheduler(
     optimizer: Optimizer,
     *,
@@ -690,14 +530,7 @@ def setup_cosine_scheduler(
     milestones: list[int] = []
 
     if warmup_steps > 0:
-        schedulers.append(
-            LinearLR(
-                optimizer,
-                start_factor=min_lr_factor,
-                end_factor=1.0,
-                total_iters=warmup_steps,
-            )
-        )
+        schedulers.append(_warmup(optimizer, warmup_steps, min_lr_factor))
         milestones.append(warmup_steps)
 
     effective_total = max(total_steps - 1, 1)
@@ -713,10 +546,7 @@ def setup_cosine_scheduler(
             eta_min=max(min_lr, min_lr_factor * lr),
         )
     )
-
-    if len(schedulers) == 1:
-        return schedulers[0]
-    return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
+    return _chain(optimizer, schedulers, milestones)
 
 
 def setup_sqrt_scheduler(
@@ -742,14 +572,7 @@ def setup_sqrt_scheduler(
     milestones: list[int] = []
 
     if warmup_steps > 0:
-        schedulers.append(
-            LinearLR(
-                optimizer,
-                start_factor=min_lr_factor,
-                end_factor=1.0,
-                total_iters=warmup_steps,
-            )
-        )
+        schedulers.append(_warmup(optimizer, warmup_steps, min_lr_factor))
         milestones.append(warmup_steps)
 
     post_warmup_span = max(total_steps - warmup_steps - 1, 1)
@@ -765,13 +588,13 @@ def setup_sqrt_scheduler(
         t = min(decay_step / decay_span, 1.0)
         return min_lr_factor + (1.0 - min_lr_factor) * math.sqrt(max(1.0 - t, 0.0))
 
-    schedulers.append(
-        LambdaLR(
-            optimizer,
-            _sqrt_factor,
-        )
-    )
+    schedulers.append(LambdaLR(optimizer, _sqrt_factor))
+    return _chain(optimizer, schedulers, milestones)
 
-    if len(schedulers) == 1:
-        return schedulers[0]
-    return SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
+
+_SCHEDULER_BUILDERS: dict[str, Callable[..., LRScheduler]] = {
+    "constant": setup_constant_scheduler,
+    "linear": setup_linear_scheduler,
+    "cosine": setup_cosine_scheduler,
+    "sqrt": setup_sqrt_scheduler,
+}

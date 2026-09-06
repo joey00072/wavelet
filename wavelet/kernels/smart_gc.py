@@ -10,7 +10,6 @@ Based on the approach described in https://unsloth.ai/docs/blog/500k-context-len
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import torch
 
@@ -20,7 +19,6 @@ logger = logging.getLogger(__name__)
 _MINIMUM_OFFLOAD_NUMEL = 2 * 1024 * 1024 // 2  # elements (assumes bf16/fp16)
 
 _original_CheckpointFunction: type | None = None
-_original_checkpoint: Any = None
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -200,7 +198,7 @@ class _autocast_contexts:
             context.__exit__(*exc_info)
 
 
-# ── patch / unpatch ───────────────────────────────────────────────────────────
+# ── patch ───────────────────────────────────────────────────────────────────
 
 
 def patch_smart_gc(
@@ -222,7 +220,7 @@ def patch_smart_gc(
 
     Returns True if the patch was applied.
     """
-    global _original_CheckpointFunction, _original_checkpoint
+    global _original_CheckpointFunction
 
     if seq_len < 512:
         logger.info("patch_smart_gc: seq_len=%d < 512 — skipping CPU offload", seq_len)
@@ -235,18 +233,15 @@ def patch_smart_gc(
     import torch.utils.checkpoint as _cp
 
     _original_CheckpointFunction = _cp.CheckpointFunction
-    _original_checkpoint = _cp.checkpoint
-
+    original_checkpoint = _cp.checkpoint
     _cp.CheckpointFunction = WaveletCheckpointFunction
-
-    _orig = _original_checkpoint
 
     def _wavelet_checkpoint(function, *args, **kwargs):
         preserve = kwargs.pop("preserve_rng_state", True)
         use_reentrant = kwargs.pop("use_reentrant", True)
         if not use_reentrant:
             # Non-reentrant path: fall back to original (no offloading)
-            return _orig(function, *args, use_reentrant=False, **kwargs)
+            return original_checkpoint(function, *args, use_reentrant=False, **kwargs)
         return WaveletCheckpointFunction.apply(function, preserve, *args)
 
     _cp.checkpoint = _wavelet_checkpoint
@@ -262,19 +257,3 @@ def patch_smart_gc(
         "patch_smart_gc: WaveletCheckpointFunction active (seq_len=%d)", seq_len
     )
     return True
-
-
-def unpatch_smart_gc() -> None:
-    """Restore the original torch.utils.checkpoint.CheckpointFunction."""
-    global _original_CheckpointFunction, _original_checkpoint
-
-    if _original_CheckpointFunction is None:
-        return
-
-    import torch.utils.checkpoint as _cp
-
-    _cp.CheckpointFunction = _original_CheckpointFunction
-    _cp.checkpoint = _original_checkpoint
-    _original_CheckpointFunction = None
-    _original_checkpoint = None
-    logger.info("unpatch_smart_gc: restored original CheckpointFunction")

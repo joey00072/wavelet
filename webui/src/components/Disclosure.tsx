@@ -5,12 +5,9 @@ import { ChevronRight } from "lucide-react";
  * Collapsible section that remembers its state per id. Secondary detail lives
  * behind it so a page opens on its primary signals only.
  */
-export function Disclosure({ id, title, summary, defaultOpen = false, children, className = "" }: { id: string; title: string; summary?: ReactNode; defaultOpen?: boolean; children: ReactNode; className?: string }) {
+export function Disclosure({ id, title, summary, children, className = "" }: { id: string; title: string; summary?: ReactNode; children: ReactNode; className?: string }) {
   const key = `wavelet.disclosure.${id}`;
-  const [open, setOpen] = useState<boolean>(() => {
-    const stored = window.localStorage.getItem(key);
-    return stored === null ? defaultOpen : stored === "1";
-  });
+  const [open, setOpen] = useState(() => window.localStorage.getItem(key) === "1");
   useEffect(() => {
     window.localStorage.setItem(key, open ? "1" : "0");
   }, [key, open]);

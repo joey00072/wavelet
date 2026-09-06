@@ -29,32 +29,14 @@ class TraceEvent:
     details: dict[str, Any] | None = None
 
 
-def make_trace_event(
-    *,
-    subsystem: str,
-    event: str,
-    step: int | None = None,
-    queue_step: int | None = None,
-    optimizer_step: int | None = None,
-    policy_step: int | None = None,
-    task: str | None = None,
-    harness: str | None = None,
-    rollout_id: str | None = None,
-    details: dict[str, Any] | None = None,
-) -> TraceEvent:
+def make_trace_event(*, subsystem: str, event: str, **fields: Any) -> TraceEvent:
+    """Stamp a format-versioned trace event; ``fields`` are ``TraceEvent`` fields."""
     return TraceEvent(
         format_version=1,
         timestamp=datetime.now(UTC).isoformat(),
         subsystem=subsystem,
         event=event,
-        step=step,
-        queue_step=queue_step,
-        optimizer_step=optimizer_step,
-        policy_step=policy_step,
-        task=task,
-        harness=harness,
-        rollout_id=rollout_id,
-        details=details,
+        **fields,
     )
 
 

@@ -10,6 +10,8 @@ from wavelet.orchestrator.scheduler import (
     _VerifierGroupState,
 )
 
+from test_verifiers_rollouts import _bare_scheduler
+
 
 def _scheduler(
     config: RLConfig,
@@ -18,20 +20,13 @@ def _scheduler(
     rollout_step: int | None = None,
     rollout_count: int = 1,
 ) -> VerifierRolloutScheduler:
-    scheduler = object.__new__(VerifierRolloutScheduler)
-    scheduler.config = config
-    scheduler.pending = {}
-    scheduler.pending_clients = {}
-    scheduler.groups = {}
-    scheduler.ready_groups = []
-    scheduler.ready_group_off_policy_steps = []
-    scheduler.cancelled_rollouts_count = 0
-    scheduler.policy_step = policy_step
-    scheduler.rollout_step = rollout_step
-    scheduler.rollout_count = rollout_count
-    scheduler.requires_group_scoring = False
-    scheduler.env_name = "env"
-    return scheduler
+    return _bare_scheduler(
+        config=config,
+        policy_step=policy_step,
+        rollout_step=rollout_step,
+        rollout_count=rollout_count,
+        env_name="env",
+    )
 
 
 def test_group_interrupted_by_policy_swap_is_cancelled_not_rejected() -> None:
@@ -55,7 +50,6 @@ def test_group_interrupted_by_policy_swap_is_cancelled_not_rejected() -> None:
         scheduler.pending[task] = _PendingVerifierRequest(
             group_id=0, client_index=0, rollout_count=2, policy_step=9
         )
-        scheduler.pending_clients[task] = 0
         return scheduler._consume_completed_task(
             task, target_groups=1, outputs=[], accepted_groups=0
         )

@@ -7,15 +7,15 @@ from unittest.mock import Mock
 import torch
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.orchestrator.rollout_worker import (
-    _load_policy_and_update_scheduler,
-    _VerifierPublisherStrategy,
-)
 from wavelet.orchestrator.schedule import (
     latest_exported_policy_step_at_or_before,
     next_exported_policy_step,
     policy_step_to_load,
     required_policy_step,
+)
+from wavelet.orchestrator.scheduler import (
+    _load_policy_and_update_scheduler,
+    _VerifierChunkPublisher,
 )
 from wavelet.trainer.distributed import World
 from wavelet.transport.policy import PolicyExportMixin
@@ -209,7 +209,7 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
             calls.append(("finish", 0))
 
     monkeypatch.setattr(
-        "wavelet.orchestrator.rollout_worker._load_policy_async",
+        "wavelet.orchestrator.scheduler._load_policy_async",
         fake_load_policy_async,
     )
 
@@ -267,10 +267,10 @@ def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None
             calls.append(("finish", 0))
 
     monkeypatch.setattr(
-        "wavelet.orchestrator.rollout_worker._load_policy_async",
+        "wavelet.orchestrator.scheduler._load_policy_async",
         fake_load_policy_async,
     )
-    context = object.__new__(_VerifierPublisherStrategy)
+    context = object.__new__(_VerifierChunkPublisher)
     context.config = _config()
     context.inference_engine = type("Engine", (), {"policy_model_name": "policy"})()
     context.policy_receiver = object()
@@ -309,10 +309,10 @@ def test_background_policy_refresh_closes_submission_gate_immediately(
         return 4
 
     monkeypatch.setattr(
-        "wavelet.orchestrator.rollout_worker._load_policy_and_update_scheduler",
+        "wavelet.orchestrator.scheduler._load_policy_and_update_scheduler",
         fake_update,
     )
-    context = object.__new__(_VerifierPublisherStrategy)
+    context = object.__new__(_VerifierChunkPublisher)
     context.config = _config()
     context.inference_engine = object()
     context.policy_receiver = object()

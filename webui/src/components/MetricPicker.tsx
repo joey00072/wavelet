@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { Search } from "lucide-react";
 
 import { groupKeys } from "../lib/series";
+import { toggleInSet } from "../lib/sets";
 
 export function MetricPicker({ keys, selected, onToggle }: { keys: string[]; selected: string[]; onToggle: (key: string) => void }) {
   const [query, setQuery] = useState("");
@@ -25,14 +26,7 @@ export function MetricPicker({ keys, selected, onToggle }: { keys: string[]; sel
               <button
                 type="button"
                 className="flex w-full items-center justify-between py-1 text-[11px] font-semibold uppercase tracking-wide text-muted hover:text-ink"
-                onClick={() =>
-                  setExpanded((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(group)) next.delete(group);
-                    else next.add(group);
-                    return next;
-                  })
-                }
+                onClick={() => setExpanded((prev) => toggleInSet(prev, group))}
                 aria-expanded={!isCollapsed}
               >
                 <span className="flex items-center gap-1"><span className={`inline-block transition-transform ${isCollapsed ? "" : "rotate-90"}`}>›</span>{group}</span>

@@ -5,11 +5,10 @@ import torch
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.configs.sft import SFTConfig
-from wavelet.data.rl_dataset import PackedRLDataset, RLExample
-from wavelet.distributed.parallel_dims import ParallelDims
-from wavelet.distributed.world import World
-from wavelet.trainer.rl_trainer import RLTrainer
-from wavelet.trainer.sft import SFTTrainer
+from wavelet.data.rl import PackedRLDataset, RLExample
+from wavelet.trainer.distributed import ParallelDims, World
+from wavelet.trainer.rl import RLTrainer
+from wavelet.trainer.trainer import SFTTrainer
 
 
 def _world(world_size: int) -> World:

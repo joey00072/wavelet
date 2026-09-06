@@ -56,34 +56,20 @@ _RESOURCE_METRICS = (
 )
 
 
-def _line_panels(
-    metrics: Sequence[str] = (),
-    regexes: Sequence[str] = (),
-) -> list[wr.LinePlot]:
-    return [wr.LinePlot(x="step", y=[metric]) for metric in metrics] + [
-        wr.LinePlot(x="step", metric_regex=pattern) for pattern in regexes
-    ]
-
-
 def _section(
     name: str,
     *,
     metrics: Sequence[str] = (),
     regexes: Sequence[str] = (),
+    x: str = "step",
 ) -> ws.Section:
+    panels = [wr.LinePlot(x=x, y=[metric]) for metric in metrics] + [
+        wr.LinePlot(x=x, metric_regex=pattern) for pattern in regexes
+    ]
     return ws.Section(
         name=name,
         is_open=True,
-        panels=_line_panels(metrics, regexes),
-        layout_settings=ws.SectionLayoutSettings(columns=_COLUMNS, rows=_ROWS),
-    )
-
-
-def _inference_section() -> ws.Section:
-    return ws.Section(
-        name="inference",
-        is_open=True,
-        panels=[wr.LinePlot(x="RelativeTime(Wall)", metric_regex=r"inference/.*")],
+        panels=panels,
         layout_settings=ws.SectionLayoutSettings(columns=_COLUMNS, rows=_ROWS),
     )
 
@@ -117,7 +103,7 @@ def build_sections(
         train,
         evaluation,
         _section("stability", metrics=_STABILITY_METRICS),
-        _inference_section(),
+        _section("inference", regexes=(r"inference/.*",), x="RelativeTime(Wall)"),
         _section("performance", metrics=_PERFORMANCE_METRICS),
         _section("resources", metrics=_RESOURCE_METRICS),
     ]
@@ -133,30 +119,29 @@ def overview_inputs(
     orchestrator = run_config.get("orchestrator")
     train_envs: list[str] = []
     if isinstance(orchestrator, Mapping):
-        environments = orchestrator.get("envs")
-        if isinstance(environments, list):
-            for environment in environments:
-                if not isinstance(environment, Mapping):
-                    continue
-                name = environment.get("name") or environment.get("id")
-                if isinstance(name, str) and name:
-                    train_envs.append(name.split("@", 1)[0])
+        train_envs = _env_names(orchestrator.get("envs"))
         env_id = orchestrator.get("verifier_env_id")
         if isinstance(env_id, str) and env_id:
             train_envs.append(env_id.split("@", 1)[0])
 
-    eval_envs: list[str] = []
     evaluation = run_config.get("eval")
-    if isinstance(evaluation, Mapping):
-        environments = evaluation.get("env")
-        if isinstance(environments, list):
-            for environment in environments:
-                if not isinstance(environment, Mapping):
-                    continue
-                name = environment.get("name") or environment.get("id")
-                if isinstance(name, str) and name:
-                    eval_envs.append(name.split("@", 1)[0])
+    eval_envs = (
+        _env_names(evaluation.get("env")) if isinstance(evaluation, Mapping) else []
+    )
     return "rl", train_envs, eval_envs
+
+
+def _env_names(environments: object) -> list[str]:
+    if not isinstance(environments, list):
+        return []
+    names: list[str] = []
+    for environment in environments:
+        if not isinstance(environment, Mapping):
+            continue
+        name = environment.get("name") or environment.get("id")
+        if isinstance(name, str) and name:
+            names.append(name.split("@", 1)[0])
+    return names
 
 
 def _list_views(entity: str, project: str) -> list[tuple[str, str]]:

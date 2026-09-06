@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import { qs, runUrl, usePoll } from "../api/client";
 import type { EvalExample, EvalRow, EvalRowsResponse, Evals, RowDetail } from "../api/types";
@@ -7,7 +7,7 @@ import { ChartCard } from "../charts/ChartCard";
 import { LineChart, SeriesTable } from "../charts/LineChart";
 import { Tag } from "../components/Badge";
 import { Field, Segmented, Toolbar } from "../components/Controls";
-import { DataTable, Pager, type Column } from "../components/DataTable";
+import { DataTable, Pager, toggleSort, type Column, type Sort } from "../components/DataTable";
 import { Drawer } from "../components/Drawer";
 import { Disclosure } from "../components/Disclosure";
 import { Empty, ErrorNote, KeyValue, Section } from "../components/KeyValue";
@@ -15,7 +15,8 @@ import { TextBlock, Transcript } from "../components/Transcript";
 import { fmt, fmtInt, fmtPct, fmtSeconds, shortId } from "../lib/format";
 import { updateParams } from "../lib/router";
 import type { LineSeries } from "../lib/series";
-import { RewardCell } from "./InspectorView";
+import { RewardCell, StopCell } from "./InspectorView";
+import { useRowDetail } from "./useRunData";
 
 const PAGE = 50;
 const HEADLINE = /^(avg@\d+|pass@\d+|pass\^\d+)$/;
@@ -34,20 +35,18 @@ export function EvalsView({ apiBase, runId, params, trainerStep = null, live }: 
   const envMeta = envs.find((e) => e.name === env)!;
   const headlineMetrics = envMeta.metrics.filter((m) => HEADLINE.test(m)).sort();
   const history = [...data.history].filter((h) => h.envs[env]).sort((a, b) => (a.step ?? 0) - (b.step ?? 0));
-  const lines: LineSeries[] = headlineMetrics.map((metric, index) => ({
+  const last = history[history.length - 1];
+  const metricLines = (metrics: string[]): LineSeries[] => metrics.map((metric, index) => ({
     id: metric,
     label: metric,
     colorIndex: index,
     points: history.flatMap((h) => (h.step !== null && h.envs[env]?.[metric] !== undefined ? [{ x: h.step, y: h.envs[env][metric] }] : [])),
   }));
+  const lines = metricLines(headlineMetrics);
   const baseline = history.find((h) => h.step === 0);
   const references = baseline ? headlineMetrics.slice(0, 1).map((m) => ({ y: baseline.envs[env][m], label: `${m} at step 0`, colorIndex: 0 })) : [];
-  const auxLines: LineSeries[] = ["completion_len/mean", "is_truncated/mean", "failed_rollouts"].filter((m) => envMeta.metrics.includes(m)).map((metric, index) => ({
-    id: metric,
-    label: metric,
-    colorIndex: index,
-    points: history.flatMap((h) => (h.step !== null && h.envs[env]?.[metric] !== undefined ? [{ x: h.step, y: h.envs[env][metric] }] : [])),
-  }));
+  const auxLines = metricLines(["completion_len/mean", "is_truncated/mean", "failed_rollouts"].filter((m) => envMeta.metrics.includes(m)));
+  const xExtent: [number, number] = [0, Math.max(1, trainerStep ?? 1)];
 
   return (
     <div className="space-y-8">
@@ -61,13 +60,13 @@ export function EvalsView({ apiBase, runId, params, trainerStep = null, live }: 
       <div className="grid gap-x-10 gap-y-8 lg:grid-cols-3">
         <div className="lg:col-span-2">
           <ChartCard title={`${env}: fixed-policy metrics`} subtitle="avg@k is mean reward; pass@k is a 0–1 rate" refetching={evals.refetching} table={<SeriesTable series={lines} />}>
-            <LineChart series={lines} height={240} markers references={references} xExtent={[0, Math.max(1, trainerStep ?? 1)]} />
+            <LineChart series={lines} height={240} markers references={references} xExtent={xExtent} />
           </ChartCard>
         </div>
         {history.length >= 2 ? (
           <ChartCard title="Length, truncation, failures" refetching={evals.refetching} table={<SeriesTable series={auxLines} />}>
-            <LineChart series={auxLines.filter((l) => l.id !== "completion_len/mean")} height={110} yDomain={[0, 1]} yFormat={(v) => fmtPct(v, 0)} markers xExtent={[0, Math.max(1, trainerStep ?? 1)]} />
-            <LineChart series={auxLines.filter((l) => l.id === "completion_len/mean")} height={100} yFormat={(v) => fmtInt(v)} markers xExtent={[0, Math.max(1, trainerStep ?? 1)]} />
+            <LineChart series={auxLines.filter((l) => l.id !== "completion_len/mean")} height={110} yDomain={[0, 1]} yFormat={(v) => fmtPct(v, 0)} markers xExtent={xExtent} />
+            <LineChart series={auxLines.filter((l) => l.id === "completion_len/mean")} height={100} yFormat={(v) => fmtInt(v)} markers xExtent={xExtent} />
           </ChartCard>
         ) : (
           <div>
@@ -75,11 +74,11 @@ export function EvalsView({ apiBase, runId, params, trainerStep = null, live }: 
             <KeyValue
               columns={2}
               items={[
-                ["Policy step", String(history[history.length - 1]?.policy_step ?? "–")],
-                ["Completion length", fmtInt(history[history.length - 1]?.envs[env]?.["completion_len/mean"])],
-                ["Truncated", fmtPct(history[history.length - 1]?.envs[env]?.["is_truncated/mean"])],
-                ["Failed rollouts", fmtPct(history[history.length - 1]?.envs[env]?.["failed_rollouts"])],
-                ["Wall time", fmtSeconds(history[history.length - 1]?.envs[env]?.["time"])],
+                ["Policy step", String(last?.policy_step ?? "–")],
+                ["Completion length", fmtInt(last?.envs[env]?.["completion_len/mean"])],
+                ["Truncated", fmtPct(last?.envs[env]?.["is_truncated/mean"])],
+                ["Failed rollouts", fmtPct(last?.envs[env]?.["failed_rollouts"])],
+                ["Wall time", fmtSeconds(last?.envs[env]?.["time"])],
                 ["Trend", "needs another evaluation"],
               ]}
             />
@@ -118,9 +117,13 @@ function EvalSamples({ apiBase, runId, env, sets, params }: { apiBase: string; r
   const compareParam = params.get("compareStep");
   const compareStep = compareParam !== null && sets.includes(Number(compareParam)) ? Number(compareParam) : null;
   const [mode, setMode] = useState<"examples" | "rows">("examples");
-  const [sort, setSort] = useState<{ key: string; desc: boolean }>({ key: "reward", desc: false });
+  const [sort, setSort] = useState<Sort>({ key: "reward", desc: false });
   const [offset, setOffset] = useState(0);
-  const [filter, setFilter] = useState<{ search: string; truncated: string; has_error: string; min_reward: string; max_reward: string }>({ search: "", truncated: "", has_error: "", min_reward: "", max_reward: "" });
+  const [filter, setFilter] = useState({ search: "", truncated: "", has_error: "" });
+  const patchFilter = (patch: Partial<typeof filter>) => {
+    setOffset(0);
+    setFilter({ ...filter, ...patch });
+  };
   const [detail, setDetail] = useState<number | null>(null);
   const [exampleFilter, setExampleFilter] = useState<"all" | "unsolved" | "partial" | "solved" | "errors">("all");
 
@@ -165,7 +168,7 @@ function EvalSamples({ apiBase, runId, env, sets, params }: { apiBase: string; r
     { key: "row_index", label: "#", sortable: true, render: (r) => <span className="text-muted">{r.row_index}</span> },
     { key: "example_id", label: "Example", sortable: true, render: (r) => shortId(r.example_id, 26) },
     { key: "reward", label: "Reward", sortable: true, align: "right", render: (r) => <RewardCell value={r.reward} /> },
-    { key: "is_truncated", label: "Stop", sortable: true, render: (r) => (r.has_error ? <Tag tone="critical">error</Tag> : r.is_truncated ? <Tag tone="warning">truncated</Tag> : <span className="text-muted">{r.stop_condition ?? "stop"}</span>) },
+    { key: "is_truncated", label: "Stop", sortable: true, render: (r) => (r.has_error ? <Tag tone="critical">error</Tag> : <StopCell row={r} />) },
     { key: "completion_token_count", label: "Tokens", sortable: true, align: "right", render: (r) => fmtInt(r.completion_token_count) },
     { key: "answer", label: "Answer", render: (r) => <span className="block max-w-[10rem] truncate">{r.answer ?? "–"}</span> },
     { key: "completion", label: "Completion", render: (r) => <span className="block max-w-[24rem] truncate text-ink2">{(r.completion ?? r.error ?? "").replace(/\s+/g, " ").slice(0, 160)}</span> },
@@ -212,14 +215,14 @@ function EvalSamples({ apiBase, runId, env, sets, params }: { apiBase: string; r
             <Segmented value={exampleFilter} onChange={setExampleFilter} size="xs" options={[{ value: "all", label: "all" }, { value: "unsolved", label: "unsolved" }, { value: "partial", label: "partial" }, { value: "solved", label: "solved" }, { value: "errors", label: "errors" }]} />
           ) : (
             <>
-              <input className="input w-full sm:w-52" aria-label="Search evaluation rollouts" placeholder="Search" value={filter.search} onChange={(e) => { setOffset(0); setFilter({ ...filter, search: e.target.value }); }} />
+              <input className="input w-full sm:w-52" aria-label="Search evaluation rollouts" placeholder="Search" value={filter.search} onChange={(e) => patchFilter({ search: e.target.value })} />
               <Field label="truncated">
-                <select className="select" value={filter.truncated} onChange={(e) => { setOffset(0); setFilter({ ...filter, truncated: e.target.value }); }}>
+                <select className="select" value={filter.truncated} onChange={(e) => patchFilter({ truncated: e.target.value })}>
                   <option value="">any</option><option value="true">yes</option><option value="false">no</option>
                 </select>
               </Field>
               <Field label="errors">
-                <select className="select" value={filter.has_error} onChange={(e) => { setOffset(0); setFilter({ ...filter, has_error: e.target.value }); }}>
+                <select className="select" value={filter.has_error} onChange={(e) => patchFilter({ has_error: e.target.value })}>
                   <option value="">any</option><option value="true">only</option><option value="false">exclude</option>
                 </select>
               </Field>
@@ -242,7 +245,7 @@ function EvalSamples({ apiBase, runId, env, sets, params }: { apiBase: string; r
             <DataTable rows={examples} columns={exampleColumns} rowKey={(e) => e.example_id} dense onRowClick={(e) => setDetail(e.row_indexes[0])} empty="No examples" maxHeight={520} />
           ) : (
             <>
-              <DataTable rows={data?.rows ?? []} columns={rowColumns} rowKey={(r) => String(r.row_index)} sort={sort} onSort={(key) => { setOffset(0); setSort((prev) => (prev.key === key ? { key, desc: !prev.desc } : { key, desc: true })); }} onRowClick={(r) => setDetail(r.row_index)} dense empty="No rollouts match" />
+              <DataTable rows={data?.rows ?? []} columns={rowColumns} rowKey={(r) => String(r.row_index)} sort={sort} onSort={(key) => { setOffset(0); setSort((prev) => toggleSort(prev, key)); }} onRowClick={(r) => setDetail(r.row_index)} dense empty="No rollouts match" />
               <div className="mt-2"><Pager offset={offset} limit={PAGE} total={data?.filtered ?? 0} onChange={setOffset} /></div>
             </>
           )}
@@ -254,21 +257,13 @@ function EvalSamples({ apiBase, runId, env, sets, params }: { apiBase: string; r
 }
 
 function EvalDetailDrawer({ apiBase, runId, env, step, index, onClose, examples, onOpen }: { apiBase: string; runId: string; env: string; step: number | undefined; index: number | null; onClose: () => void; examples: EvalExample[]; onOpen: (index: number) => void }) {
-  const [loadedIndex, setLoadedIndex] = useState<number | null>(null);
-  const detail = usePoll<RowDetail>(
-    index !== null && step !== undefined ? runUrl(apiBase, runId, `/evals/${step}/${encodeURIComponent(env)}/rows/${index}`) : null,
-    0,
-    { resourceKey: index !== null && step !== undefined ? `${runId}:${env}:${step}:eval-detail` : null },
+  const loaded = index !== null && step !== undefined;
+  const { detail, displayedIndex, pendingIndex } = useRowDetail(
+    loaded ? runUrl(apiBase, runId, `/evals/${step}/${encodeURIComponent(env)}/rows/${index}`) : null,
+    loaded ? `${runId}:${env}:${step}:eval-detail` : null,
+    index,
   );
   const row = detail.data as (RowDetail & { answer?: unknown; error?: string; metrics?: Record<string, number>; info?: unknown }) | null;
-  useEffect(() => {
-    if (detail.data && index !== null) setLoadedIndex(detail.data.row_index ?? index);
-  }, [detail.updatedAt]);
-  useEffect(() => {
-    if (index === null) setLoadedIndex(null);
-  }, [index]);
-  const displayedIndex = row?.row_index ?? loadedIndex ?? index;
-  const pendingIndex = index !== null && displayedIndex !== index ? index : null;
   const example = displayedIndex !== null ? examples.find((e) => e.row_indexes.includes(displayedIndex)) : undefined;
   return (
     <Drawer open={index !== null} onClose={onClose} title={displayedIndex !== null ? `Eval rollout ${displayedIndex} · ${env} · step ${step}` : ""} subtitle={example ? <span className="flex flex-wrap items-center gap-x-2"><span>example {example.example_id} · {example.scored}/{example.attempts} scored · mean {fmt(example.reward_mean, 3)}</span>{pendingIndex !== null && <span className="text-accent">loading #{pendingIndex}</span>}</span> : undefined}>

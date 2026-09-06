@@ -42,7 +42,6 @@ CATEGORY_PREFIXES = (
     ("wavelet/orchestrator/", "orchestrator"),
     ("wavelet/data/", "data"),
     ("wavelet/configs/", "configs"),
-    ("wavelet/distributed/", "distributed"),
     ("wavelet/entrypoints/", "entrypoints"),
     ("wavelet/kernels/", "kernels"),
     ("wavelet/utils/", "utils"),
@@ -56,7 +55,6 @@ CATEGORY_PREFIXES = (
 CORE_CATEGORIES = {
     "configs",
     "data",
-    "distributed",
     "entrypoints",
     "inference",
     "kernels",
@@ -78,6 +76,15 @@ PY_COMPLEXITY_NODES = (
     ast.While,
     ast.With,
     ast.comprehension,
+)
+
+
+_ACCUMULATED_FIELDS = (
+    "lines",
+    "source_lines",
+    "python_functions",
+    "python_classes",
+    "python_complexity_points",
 )
 
 
@@ -150,25 +157,17 @@ def measure_file(root: Path, path: Path) -> FileMetrics:
             blank_lines += 1
         elif _is_comment_line(path.suffix, stripped):
             comment_lines += 1
-    source_lines = len(lines) - blank_lines - comment_lines
+    base = {
+        "path": relative,
+        "suffix": path.suffix,
+        "lines": len(lines),
+        "source_lines": len(lines) - blank_lines - comment_lines,
+        "blank_lines": blank_lines,
+        "comment_lines": comment_lines,
+    }
     if path.suffix != ".py":
-        return FileMetrics(
-            path=relative,
-            suffix=path.suffix,
-            lines=len(lines),
-            source_lines=source_lines,
-            blank_lines=blank_lines,
-            comment_lines=comment_lines,
-        )
-    return _measure_python_file(
-        relative,
-        path.suffix,
-        text,
-        len(lines),
-        source_lines,
-        blank_lines,
-        comment_lines,
-    )
+        return FileMetrics(**base)
+    return _measure_python_file(text, base)
 
 
 def summarize(
@@ -181,28 +180,14 @@ def summarize(
     by_extension: Counter[str] = Counter()
     by_top_level: Counter[str] = Counter()
     by_category: dict[str, Counter[str]] = {}
-    core = Counter()
+    core: Counter[str] = Counter()
     for metric in files:
         by_extension[metric.suffix or "<none>"] += metric.lines
         by_top_level[metric.path.split("/", 1)[0]] += metric.lines
         category = _category_for_path(metric.path)
-        if category not in by_category:
-            by_category[category] = Counter()
-        by_category[category]["files"] += 1
-        by_category[category]["lines"] += metric.lines
-        by_category[category]["source_lines"] += metric.source_lines
-        by_category[category]["python_functions"] += metric.python_functions
-        by_category[category]["python_classes"] += metric.python_classes
-        by_category[category]["python_complexity_points"] += (
-            metric.python_complexity_points
-        )
+        _accumulate(by_category.setdefault(category, Counter()), metric)
         if category in CORE_CATEGORIES:
-            core["files"] += 1
-            core["lines"] += metric.lines
-            core["source_lines"] += metric.source_lines
-            core["python_functions"] += metric.python_functions
-            core["python_classes"] += metric.python_classes
-            core["python_complexity_points"] += metric.python_complexity_points
+            _accumulate(core, metric)
     return {
         "timestamp": timestamp or datetime.now(UTC).isoformat(timespec="seconds"),
         "files": len(files),
@@ -231,6 +216,12 @@ def summarize(
             for metric in sorted(files, key=lambda item: item.lines, reverse=True)[:top]
         ],
     }
+
+
+def _accumulate(totals: Counter[str], metric: FileMetrics) -> None:
+    totals["files"] += 1
+    for name in _ACCUMULATED_FIELDS:
+        totals[name] += getattr(metric, name)
 
 
 def _category_for_path(path: str) -> str:
@@ -281,33 +272,13 @@ def _is_comment_line(suffix: str, stripped: str) -> bool:
     return False
 
 
-def _measure_python_file(
-    path: str,
-    suffix: str,
-    text: str,
-    lines: int,
-    source_lines: int,
-    blank_lines: int,
-    comment_lines: int,
-) -> FileMetrics:
+def _measure_python_file(text: str, base: dict[str, object]) -> FileMetrics:
     try:
         tree = ast.parse(text)
     except SyntaxError:
-        return FileMetrics(
-            path=path,
-            suffix=suffix,
-            lines=lines,
-            source_lines=source_lines,
-            blank_lines=blank_lines,
-            comment_lines=comment_lines,
-        )
+        return FileMetrics(**base)
     return FileMetrics(
-        path=path,
-        suffix=suffix,
-        lines=lines,
-        source_lines=source_lines,
-        blank_lines=blank_lines,
-        comment_lines=comment_lines,
+        **base,
         python_functions=sum(
             isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
             for node in ast.walk(tree)

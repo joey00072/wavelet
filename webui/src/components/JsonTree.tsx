@@ -4,7 +4,7 @@ type Diff = "added" | "removed" | "changed" | null;
 
 export function JsonTree({ value, other, filter = "", depth = 0, path = "", comparing }: { value: unknown; other?: unknown; filter?: string; depth?: number; path?: string; comparing?: boolean }) {
   if (!isObject(value) && !Array.isArray(value)) {
-    return <Leaf value={value} other={other} path={path} />;
+    return <Leaf value={value} other={other} />;
   }
   const diffEnabled = comparing ?? other !== undefined;
   const valueRecord = value as Record<string, unknown>;
@@ -54,7 +54,7 @@ function Node({ name, value, valuePresent, other, otherPresent, comparing, filte
           <span className="w-3" />
         )}
         <span className={`font-medium ${diffClass}`}>{name}</span>
-        {!nested && <Leaf value={shownValue} other={diff === "changed" ? other : undefined} path={path} inline diff={diff} />}
+        {!nested && <Leaf value={shownValue} other={diff === "changed" ? other : undefined} inline diff={diff} />}
         {nested && !shownOpen && <span className="text-muted">{Array.isArray(shownValue) ? `[${shownValue.length}]` : `{${Object.keys(shownValue as object).length}}`}</span>}
       </div>
       {nested && shownOpen && <JsonTree value={valuePresent ? value : Array.isArray(shownValue) ? [] : {}} other={otherPresent ? other : undefined} comparing={comparing} filter={filter} depth={depth} path={path} />}
@@ -62,17 +62,18 @@ function Node({ name, value, valuePresent, other, otherPresent, comparing, filte
   );
 }
 
-function Leaf({ value, other, inline = false, diff = null }: { value: unknown; other?: unknown; path?: string; inline?: boolean; diff?: Diff }) {
-  const text = value === null ? "null" : typeof value === "string" ? `"${value}"` : String(value);
+function Leaf({ value, other, inline = false, diff = null }: { value: unknown; other?: unknown; inline?: boolean; diff?: Diff }) {
   const changed = other !== undefined && JSON.stringify(other) !== JSON.stringify(value);
   return (
     <span className={`${inline ? "" : "text-xs"} tabular break-all font-mono ${diff === "removed" ? "text-critical line-through" : "text-ink"}`}>
-      {text}
-      {changed && (
-        <span className="ml-2 text-muted line-through">{other === null ? "null" : typeof other === "string" ? `"${other}"` : String(other)}</span>
-      )}
+      {leafText(value)}
+      {changed && <span className="ml-2 text-muted line-through">{leafText(other)}</span>}
     </span>
   );
+}
+
+function leafText(value: unknown): string {
+  return value === null ? "null" : typeof value === "string" ? `"${value}"` : String(value);
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

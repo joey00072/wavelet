@@ -6,6 +6,7 @@ from pathlib import Path
 
 from wavelet.configs.rl_config import RLConfig
 from wavelet.data.rl import RLExample
+from wavelet.data.sft import apply_chat_template
 
 
 def expected_served_model_names(config: RLConfig) -> set[str]:
@@ -49,7 +50,7 @@ def create_policy_inference_engine(config: RLConfig) -> PolicyInferenceEngine:
     )
 
 
-def token_ids(value: object) -> list[int]:
+def coerce_token_ids(value: object) -> list[int]:
     if isinstance(value, list):
         return [int(item) for item in value]
     if hasattr(value, "input_ids"):
@@ -59,6 +60,16 @@ def token_ids(value: object) -> list[int]:
                 return [int(item) for item in input_ids[0]]
             return [int(item) for item in input_ids]
     raise TypeError(f"Unsupported tokenized value: {type(value)!r}")
+
+
+def prompt_token_ids(tokenizer, record: RLExample) -> list[int]:
+    return apply_chat_template(
+        tokenizer,
+        record.prompt,
+        add_generation_prompt=True,
+        tools=record.tools,
+        chat_template_kwargs=record.chat_template_kwargs,
+    )
 
 
 class PolicyInferenceEngine(ABC):
@@ -114,17 +125,6 @@ class RLInference:
                 temperatures = record.temperatures
             annotated.append(replace(record, temperatures=temperatures))
         return annotated
-
-    def prompt_token_ids(self, tokenizer, record: RLExample) -> list[int]:
-        kwargs: dict[str, object] = {
-            "tokenize": True,
-            "add_generation_prompt": True,
-        }
-        if record.tools is not None:
-            kwargs["tools"] = record.tools
-        if record.chat_template_kwargs is not None:
-            kwargs.update(record.chat_template_kwargs)
-        return token_ids(tokenizer.apply_chat_template(record.prompt, **kwargs))
 
 
 class PassthroughPolicyInferenceEngine(PolicyInferenceEngine):

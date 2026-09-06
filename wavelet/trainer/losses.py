@@ -13,6 +13,8 @@ from torch import Tensor, nn
 from wavelet.configs.rl_config import RLLossConfig
 from wavelet.trainer.types import LossOutput
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class LossInputs:
@@ -82,13 +84,7 @@ def _safe_mean(values: Tensor, mask: Tensor) -> Tensor:
 def _tensor_stats(values: Tensor) -> dict[str, Tensor]:
     if values.numel() == 0:
         nan = torch.tensor(float("nan"), device=values.device)
-        return {
-            "mean": nan,
-            "median": nan,
-            "std": nan,
-            "min": nan,
-            "max": nan,
-        }
+        return dict.fromkeys(("mean", "median", "std", "min", "max"), nan)
     return {
         "mean": values.mean(),
         "median": values.median(),
@@ -98,99 +94,98 @@ def _tensor_stats(values: Tensor) -> dict[str, Tensor]:
     }
 
 
-def default_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
+TRUST_REGION_METRIC_KEYS = (
+    "mismatch_kl",
+    "masked_mismatch_kl",
+    "unmasked_mismatch_kl",
+    "is_masked",
+    "is_masked_low",
+    "is_masked_high",
+    "policy_loss",
+    "kl_loss",
+    "advantage_mean",
+)
+
+
+def _trust_region_loss(
+    inputs: LossInputs,
+    loss_config: RLLossConfig,
+    *,
+    invalid: Tensor,
+    masked_high: Tensor,
+    masked_low: Tensor,
+    teacher_logprobs: Tensor | None,
+) -> LossOutput:
+    """Importance-weighted policy loss with masked tokens and a KL penalty."""
     trainer_logprobs = inputs.trainer_logprobs
-    inference_logprobs = inputs.inference_logprobs
-    teacher_logprobs = inputs.teacher_logprobs
     advantages = inputs.advantages
     loss_mask = inputs.loss_mask
-
-    trainer_probs = torch.exp(trainer_logprobs)
-    inference_probs = torch.exp(inference_logprobs)
-    probs_diff = trainer_probs - inference_probs
-    invalid_high = probs_diff > loss_config.dppo_mask_high
-    invalid_low = probs_diff < -loss_config.dppo_mask_low
-    invalid = torch.where(advantages > 0, invalid_high, invalid_low)
-
-    is_masked_high = (advantages > 0) & invalid_high
-    is_masked_low = (advantages < 0) & invalid_low
     keep_mask = loss_mask & ~invalid
 
-    log_importance_ratio = trainer_logprobs - inference_logprobs
+    log_importance_ratio = trainer_logprobs - inputs.inference_logprobs
     importance_ratio = torch.exp(log_importance_ratio)
     mismatch_kl = importance_ratio - log_importance_ratio - 1
 
     scaled_advantages = loss_config.adv_tau * advantages
+    teacher_kl = None
     if teacher_logprobs is not None:
         teacher_kl = teacher_logprobs - trainer_logprobs
         scaled_advantages = (
             scaled_advantages + loss_config.teacher_tau * teacher_kl.detach()
         )
-    else:
-        teacher_kl = None
 
     pg_loss = keep_mask * scaled_advantages * importance_ratio
     kl_loss = loss_mask * log_importance_ratio.square()
     per_token_loss = -pg_loss + loss_config.kl_tau * kl_loss
     if inputs.loss_weights is not None:
         per_token_loss = per_token_loss * inputs.loss_weights
-    loss = per_token_loss.sum()
 
     metrics = {
         "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),
         "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & invalid),
         "unmasked_mismatch_kl": _safe_mean(mismatch_kl, keep_mask),
         "is_masked": _safe_mean(invalid.float(), loss_mask),
-        "is_masked_low": _safe_mean(is_masked_low.float(), loss_mask),
-        "is_masked_high": _safe_mean(is_masked_high.float(), loss_mask),
-        "policy_loss": _safe_mean((-pg_loss), loss_mask),
+        "is_masked_low": _safe_mean(masked_low.float(), loss_mask),
+        "is_masked_high": _safe_mean(masked_high.float(), loss_mask),
+        "policy_loss": _safe_mean(-pg_loss, loss_mask),
         "kl_loss": _safe_mean(kl_loss, loss_mask),
         "advantage_mean": _safe_mean(advantages, loss_mask),
     }
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)
-    return LossOutput(loss=loss, metrics=metrics)
+    return LossOutput(loss=per_token_loss.sum(), metrics=metrics)
+
+
+def dppo_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
+    """Return DPPO with an advantage-signed probability trust region."""
+    advantages = inputs.advantages
+    probs_diff = torch.exp(inputs.trainer_logprobs) - torch.exp(
+        inputs.inference_logprobs
+    )
+    invalid_high = probs_diff > loss_config.dppo_mask_high
+    invalid_low = probs_diff < -loss_config.dppo_mask_low
+    return _trust_region_loss(
+        inputs,
+        loss_config,
+        invalid=torch.where(advantages > 0, invalid_high, invalid_low),
+        masked_high=(advantages > 0) & invalid_high,
+        masked_low=(advantages < 0) & invalid_low,
+        teacher_logprobs=inputs.teacher_logprobs,
+    )
 
 
 def ipo_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
     """Return IPO with a symmetric sampled-token probability trust region."""
-    trainer_logprobs = inputs.trainer_logprobs
-    inference_logprobs = inputs.inference_logprobs
-    advantages = inputs.advantages
-    loss_mask = inputs.loss_mask
-
-    trainer_probs = torch.exp(trainer_logprobs)
-    inference_probs = torch.exp(inference_logprobs)
-    probs_diff = trainer_probs - inference_probs
-    invalid = probs_diff.abs() > loss_config.ipo_epsilon
-    invalid_high = probs_diff > loss_config.ipo_epsilon
-    invalid_low = probs_diff < -loss_config.ipo_epsilon
-    keep_mask = loss_mask & ~invalid
-
-    log_importance_ratio = trainer_logprobs - inference_logprobs
-    importance_ratio = torch.exp(log_importance_ratio)
-    mismatch_kl = importance_ratio - log_importance_ratio - 1
-    scaled_advantages = loss_config.adv_tau * advantages
-
-    pg_loss = keep_mask * scaled_advantages * importance_ratio
-    kl_loss = loss_mask * log_importance_ratio.square()
-    per_token_loss = -pg_loss + loss_config.kl_tau * kl_loss
-    if inputs.loss_weights is not None:
-        per_token_loss = per_token_loss * inputs.loss_weights
-
-    return LossOutput(
-        loss=per_token_loss.sum(),
-        metrics={
-            "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),
-            "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & invalid),
-            "unmasked_mismatch_kl": _safe_mean(mismatch_kl, keep_mask),
-            "is_masked": _safe_mean(invalid.float(), loss_mask),
-            "is_masked_low": _safe_mean(invalid_low.float(), loss_mask),
-            "is_masked_high": _safe_mean(invalid_high.float(), loss_mask),
-            "policy_loss": _safe_mean(-pg_loss, loss_mask),
-            "kl_loss": _safe_mean(kl_loss, loss_mask),
-            "advantage_mean": _safe_mean(advantages, loss_mask),
-        },
+    probs_diff = torch.exp(inputs.trainer_logprobs) - torch.exp(
+        inputs.inference_logprobs
+    )
+    return _trust_region_loss(
+        inputs,
+        loss_config,
+        invalid=probs_diff.abs() > loss_config.ipo_epsilon,
+        masked_high=probs_diff > loss_config.ipo_epsilon,
+        masked_low=probs_diff < -loss_config.ipo_epsilon,
+        teacher_logprobs=None,
     )
 
 
@@ -275,7 +270,7 @@ def setup_rl_loss_fn(loss_config: RLLossConfig) -> LossFn:
         return ipo_loss
 
     def dppo_loss(inputs: LossInputs) -> LossOutput:
-        return default_loss_fn(inputs, loss_config)
+        return dppo_loss_fn(inputs, loss_config)
 
     return dppo_loss
 
@@ -305,18 +300,7 @@ def normalization_unit_count(
         return int(loss_mask.sum().item())
     if normalization != "sequence":
         raise ValueError(f"Unsupported RL loss normalization: {normalization!r}")
-
-    seq_len = loss_mask.shape[1]
-    spans_by_row = (
-        [[(0, seq_len)] for _ in range(loss_mask.shape[0])]
-        if position_ids is None
-        else [_sequence_spans(row, seq_len) for row in position_ids]
-    )
-    return sum(
-        int(loss_mask[row_index, start:end].any().item())
-        for row_index, spans in enumerate(spans_by_row)
-        for start, end in spans
-    )
+    return sum(1 for _ in _iter_trainable_spans(loss_mask, position_ids))
 
 
 def _iter_trainable_spans(
@@ -562,9 +546,6 @@ def compute_loss(
     )
 
 
-logger = logging.getLogger(__name__)
-
-
 class ChunkedLmHeadOutput(TypedDict, total=False):
     logits: Tensor | None
     logprobs: Tensor | None
@@ -640,6 +621,25 @@ def _online_softmax_stats_update(
         exp_logits * logits.masked_fill(~torch.isfinite(logits), 0.0)
     ).sum(dim=-1)
     return new_max, new_sums, new_weighted_sums
+
+
+def _chunk_mask_indices(
+    mask_ids: Tensor,
+    mask_lengths: Tensor,
+    *,
+    vocab_start: int,
+    vocab_end: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Return (in-chunk mask, clamped local ids) for sampling-mask ids."""
+    mask_valid = torch.arange(mask_ids.shape[1], device=device).view(
+        1, -1
+    ) < mask_lengths.view(-1, 1)
+    local_ids = mask_ids - vocab_start
+    in_chunk_mask = (
+        mask_valid & (local_ids >= 0) & (local_ids < vocab_end - vocab_start)
+    )
+    return in_chunk_mask, local_ids.clamp(0, vocab_end - vocab_start - 1)
 
 
 def _validate_chunked_logprob_inputs(
@@ -778,17 +778,13 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                     indexes = (labels_chunk[in_chunk] - vocab_start).to(torch.long)
                     target_logits[in_chunk] = scaled_logits[in_chunk, indexes]
                 if mask_logits is not None:
-                    mask_ids = sampling_mask_ids[start:end]
-                    mask_valid = torch.arange(mask_ids.shape[1], device=device).view(
-                        1, -1
-                    ) < sampling_mask_lengths[start:end].view(-1, 1)
-                    local_ids = mask_ids - vocab_start
-                    in_chunk_mask = (
-                        mask_valid
-                        & (local_ids >= 0)
-                        & (local_ids < vocab_end - vocab_start)
+                    in_chunk_mask, safe_ids = _chunk_mask_indices(
+                        sampling_mask_ids[start:end],
+                        sampling_mask_lengths[start:end],
+                        vocab_start=vocab_start,
+                        vocab_end=vocab_end,
+                        device=device,
                     )
-                    safe_ids = local_ids.clamp(0, vocab_end - vocab_start - 1)
                     gathered = torch.gather(scaled_logits, 1, safe_ids)
                     mask_logits = torch.where(in_chunk_mask, gathered, mask_logits)
 
@@ -903,19 +899,13 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                 if masked:
                     masked_rows = sampling_mask_lengths[start:end] > 0
                     if masked_rows.any():
-                        mask_ids = sampling_mask_ids[start:end][masked_rows]
-                        mask_valid = torch.arange(
-                            mask_ids.shape[1], device=hidden.device
-                        ).view(1, -1) < sampling_mask_lengths[start:end][
-                            masked_rows
-                        ].view(-1, 1)
-                        local_ids = mask_ids - vocab_start
-                        in_chunk_mask = (
-                            mask_valid
-                            & (local_ids >= 0)
-                            & (local_ids < vocab_end - vocab_start)
+                        in_chunk_mask, safe_ids = _chunk_mask_indices(
+                            sampling_mask_ids[start:end][masked_rows],
+                            sampling_mask_lengths[start:end][masked_rows],
+                            vocab_start=vocab_start,
+                            vocab_end=vocab_end,
+                            device=hidden.device,
                         )
-                        safe_ids = local_ids.clamp(0, vocab_end - vocab_start - 1)
                         mask_indicator = torch.zeros_like(scaled_logits[masked_rows])
                         mask_indicator.scatter_add_(
                             1, safe_ids, in_chunk_mask.to(mask_indicator.dtype)
@@ -952,15 +942,7 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                                 @ hidden_chunk[masked_rows]
                             )
 
-        return (
-            grad_hidden,
-            grad_weight,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return grad_hidden, grad_weight, None, None, None, None, None
 
 
 def maybe_inject_chunked_lm_head(model: nn.Module, chunk_size: int | str) -> None:
@@ -1012,27 +994,20 @@ def _patch_causal_lm_forward(model: nn.Module) -> None:
             inputs_embeds=inputs_embeds,
             **kwargs,
         )
-        hidden_states = outputs.last_hidden_state
         if isinstance(logits_to_keep, int) and logits_to_keep > 0:
             sequence_slice = slice(-logits_to_keep, None)
         else:
             sequence_slice = slice(None)
+
+        def sliced(tensor: Tensor | None) -> Tensor | None:
+            return None if tensor is None else tensor[:, sequence_slice]
+
         return self.lm_head(
-            hidden_states[:, sequence_slice, :],
-            labels[:, sequence_slice] if labels is not None else None,
-            temperature=(
-                temperature[:, sequence_slice] if temperature is not None else None
-            ),
-            sampling_mask_ids=(
-                sampling_mask_ids[:, sequence_slice]
-                if sampling_mask_ids is not None
-                else None
-            ),
-            sampling_mask_lengths=(
-                sampling_mask_lengths[:, sequence_slice]
-                if sampling_mask_lengths is not None
-                else None
-            ),
+            outputs.last_hidden_state[:, sequence_slice, :],
+            sliced(labels),
+            temperature=sliced(temperature),
+            sampling_mask_ids=sliced(sampling_mask_ids),
+            sampling_mask_lengths=sliced(sampling_mask_lengths),
         )
 
     model.forward = types.MethodType(forward, model)

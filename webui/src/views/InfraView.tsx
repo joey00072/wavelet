@@ -21,8 +21,9 @@ export function InfraView({ apiBase, runId, summary }: { apiBase: string; runId:
   const keys = useMetricKeys(apiBase, runId);
   const inferenceKeys = useMemo(() => (keys.data?.orchestrator ?? []).map((k) => k.key).filter((k) => k.startsWith("inference/") || k.startsWith("generation/concurrency") || k === "generation/executor_concurrency" || k.startsWith("time/")), [keys.data]);
   const live = summary?.status === "running";
-  const trainer = useSeries(apiBase, runId, "trainer", TRAINER_KEYS, 2000, live ? 5000 : 0);
-  const orch = useSeries(apiBase, runId, "orchestrator", inferenceKeys, 2000, live ? 5000 : 0);
+  const interval = live ? 5000 : 0;
+  const trainer = useSeries(apiBase, runId, "trainer", TRAINER_KEYS, 2000, interval);
+  const orch = useSeries(apiBase, runId, "orchestrator", inferenceKeys, 2000, interval);
   const latest = summary?.latest.trainer;
   const latestO = summary?.latest.orchestrator;
   const historical = summary?.status !== "running";
@@ -37,12 +38,14 @@ export function InfraView({ apiBase, runId, summary }: { apiBase: string; runId:
   const mfu = seriesToLines(trainer.data, ["perf/mfu"]);
   const timeKeys = ["time/wait_for_batch", "time/load_data", "time/train_until", "time/export_policy", "time/update_weights", "perf/train_seconds"].filter((k) => trainer.data?.series[k]?.some((v) => v !== null));
   const timeCats = (trainer.data?.steps ?? []).map((s, i) => ({ label: String(s ?? i), values: timeKeys.map((k) => trainer.data?.series[k]?.[i] ?? 0) }));
-  const replicas = [...new Set(inferenceKeys.flatMap((k) => (k.match(/^inference\/(replica_\d+)\//) ? [k.match(/^inference\/(replica_\d+)\//)![1]] : [])))].sort();
+  const replicas = [...new Set(inferenceKeys.flatMap((k) => k.match(/^inference\/(replica_\d+)\//)?.[1] ?? []))].sort();
   const kv = seriesToLines(orch.data, replicas.map((r) => `inference/${r}/kv_cache_usage`), { labels: Object.fromEntries(replicas.map((r) => [`inference/${r}/kv_cache_usage`, r])) });
   const requests = seriesToLines(orch.data, replicas.flatMap((r) => [`inference/${r}/requests_running`, `inference/${r}/requests_waiting`]), { labels: Object.fromEntries(replicas.flatMap((r) => [[`inference/${r}/requests_running`, `${r} running`], [`inference/${r}/requests_waiting`, `${r} waiting`]])) });
   const preemptions = seriesToLines(orch.data, replicas.map((r) => `inference/${r}/preemptions_delta`), { labels: Object.fromEntries(replicas.map((r) => [`inference/${r}/preemptions_delta`, r])) });
   const concurrency = seriesToLines(orch.data, ["generation/concurrency/limit", "generation/executor_concurrency"], { labels: { "generation/concurrency/limit": "rollout concurrency cap", "generation/executor_concurrency": "verifier executors" } });
   const orchTime = seriesToLines(orch.data, ["time/generate_completions", "time/step", "time/publish"].filter((k) => inferenceKeys.includes(k)), { labels: { "time/generate_completions": "generate", "time/step": "orchestrator step", "time/publish": "publish" } });
+  const hasMfu = mfu.some((l) => l.points.length);
+  const diskChart = <ChartCard title="Disk free ratio" refetching={trainer.refetching} table={<SeriesTable series={disk} />}><LineChart series={disk} height={170} yFormat={(v) => fmtPct(v, 0)} yDomain={[0, 1]} /></ChartCard>;
 
   return (
     <div className="space-y-8">
@@ -63,19 +66,15 @@ export function InfraView({ apiBase, runId, summary }: { apiBase: string; runId:
         <div className="grid gap-x-10 gap-y-8 md:grid-cols-2 xl:grid-cols-3">
           <ChartCard title="GPU memory (GiB)" refetching={trainer.refetching} table={<SeriesTable series={memory} />}><LineChart series={memory} height={170} yFormat={(v) => fmt(v, 1)} /></ChartCard>
           <ChartCard title="Tokens per second" refetching={trainer.refetching} table={<SeriesTable series={throughput} />}><LineChart series={throughput} height={170} yFormat={(v) => fmtInt(v)} /></ChartCard>
-          {mfu.some((l) => l.points.length) ? (
+          {hasMfu ? (
             <ChartCard title="Model FLOP utilization" refetching={trainer.refetching} table={<SeriesTable series={mfu} />}><LineChart series={mfu} height={170} yFormat={(v) => fmtPct(v, 0)} yDomain={[0, 1]} /></ChartCard>
-          ) : (
-            <ChartCard title="Disk free ratio" refetching={trainer.refetching} table={<SeriesTable series={disk} />}><LineChart series={disk} height={170} yFormat={(v) => fmtPct(v, 0)} yDomain={[0, 1]} /></ChartCard>
-          )}
+          ) : diskChart}
           {timeKeys.length > 0 && (
             <ChartCard title="Trainer step time breakdown" subtitle="seconds per optimizer step" refetching={trainer.refetching} className="md:col-span-2">
               <BarChart categories={timeCats} seriesLabels={timeKeys.map((k) => k.replace("time/", "").replace("perf/", ""))} height={190} yFormat={(v) => fmtSeconds(v)} />
             </ChartCard>
           )}
-          {mfu.some((l) => l.points.length) && (
-            <ChartCard title="Disk free ratio" refetching={trainer.refetching} table={<SeriesTable series={disk} />}><LineChart series={disk} height={170} yFormat={(v) => fmtPct(v, 0)} yDomain={[0, 1]} /></ChartCard>
-          )}
+          {hasMfu && diskChart}
         </div>
       </Section>
 

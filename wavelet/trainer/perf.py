@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+
+from wavelet.trainer.types import LORA_STATE_ATTRS
 
 
 def _text_config(config: PretrainedConfig) -> PretrainedConfig:
@@ -20,6 +24,14 @@ def _positive_int(config: PretrainedConfig, *names: str) -> int | None:
     return None
 
 
+def _positive_ints(config: PretrainedConfig, *names: str) -> tuple[int, ...] | None:
+    """Return every named positive int, or None if any is missing."""
+    values = [_positive_int(config, name) for name in names]
+    if any(value is None for value in values):
+        return None
+    return tuple(cast(int, value) for value in values)
+
+
 def estimate_active_matmul_parameters(config: PretrainedConfig) -> int | None:
     """Estimate parameters participating in matmuls for one token."""
     config = _text_config(config)
@@ -27,12 +39,13 @@ def estimate_active_matmul_parameters(config: PretrainedConfig) -> int | None:
     hidden_size = _positive_int(config, "hidden_size", "n_embd")
     num_layers = _positive_int(config, "num_hidden_layers", "n_layer")
     num_heads = _positive_int(config, "num_attention_heads", "n_head")
-    if None in {vocab_size, hidden_size, num_layers, num_heads}:
+    if (
+        vocab_size is None
+        or hidden_size is None
+        or num_layers is None
+        or num_heads is None
+    ):
         return None
-    assert vocab_size is not None
-    assert hidden_size is not None
-    assert num_layers is not None
-    assert num_heads is not None
 
     attention_params = _attention_projection_parameters(
         config,
@@ -56,29 +69,24 @@ def _attention_projection_parameters(
     num_layers: int,
     num_heads: int,
 ) -> int:
-    q_lora_rank = _positive_int(config, "q_lora_rank")
-    kv_lora_rank = _positive_int(config, "kv_lora_rank")
-    qk_head_dim = _positive_int(config, "qk_head_dim")
-    qk_rope_head_dim = _positive_int(config, "qk_rope_head_dim")
-    qk_nope_head_dim = _positive_int(config, "qk_nope_head_dim")
-    value_head_dim = _positive_int(config, "v_head_dim")
-    if all(
-        value is not None
-        for value in (
+    mla_dims = _positive_ints(
+        config,
+        "q_lora_rank",
+        "kv_lora_rank",
+        "qk_head_dim",
+        "qk_rope_head_dim",
+        "qk_nope_head_dim",
+        "v_head_dim",
+    )
+    if mla_dims is not None:
+        (
             q_lora_rank,
             kv_lora_rank,
             qk_head_dim,
             qk_rope_head_dim,
             qk_nope_head_dim,
             value_head_dim,
-        )
-    ):
-        assert q_lora_rank is not None
-        assert kv_lora_rank is not None
-        assert qk_head_dim is not None
-        assert qk_rope_head_dim is not None
-        assert qk_nope_head_dim is not None
-        assert value_head_dim is not None
+        ) = mla_dims
         query = num_layers * (
             hidden_size * q_lora_rank + q_lora_rank * num_heads * qk_head_dim
         )
@@ -199,15 +207,7 @@ def _model_config(model: nn.Module) -> PretrainedConfig | None:
 
 
 def _is_lora_parameter(name: str) -> bool:
-    return any(
-        marker in name
-        for marker in (
-            "lora_A",
-            "lora_B",
-            "lora_embedding_A",
-            "lora_embedding_B",
-        )
-    )
+    return any(marker in name for marker in LORA_STATE_ATTRS)
 
 
 def model_compute_dtype(model: nn.Module) -> torch.dtype | None:

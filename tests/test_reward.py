@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from wavelet.configs.rl_config import RLRewardConfig
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 from wavelet.orchestrator.reward import RLRewardScorer
 
 

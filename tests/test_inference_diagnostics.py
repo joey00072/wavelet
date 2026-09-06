@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import json
 
+from wavelet import debug as diagnostics
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample
-from wavelet.entrypoints.rl_debug import main as debug_main
-from wavelet.inference import diagnostics
-from wavelet.inference.diagnostics import (
+from wavelet.data.rl import RLExample
+from wavelet.debug import (
     continuous_batch_probe,
     inference_debug_state,
     make_probe_examples,
     summarize_records,
 )
+from wavelet.entrypoints.rl_debug import main as debug_main
 
 
 def test_inference_debug_state_exposes_serving_fields() -> None:

@@ -32,11 +32,18 @@ class LaunchAttemptPaths:
     log_dir: Path
 
 
+def _int_suffix(name: str, prefix: str) -> int | None:
+    try:
+        return int(name.removeprefix(prefix))
+    except ValueError:
+        return None
+
+
 def _attempt_numbers(parent: Path) -> set[int]:
     return {
-        int(path.name.removeprefix("attempt_"))
+        int(suffix)
         for path in parent.glob("attempt_*")
-        if path.is_dir() and path.name.removeprefix("attempt_").isdigit()
+        if path.is_dir() and (suffix := path.name.removeprefix("attempt_")).isdigit()
     }
 
 
@@ -124,19 +131,23 @@ def list_checkpoint_steps(
     *,
     stable_only: bool = True,
 ) -> list[int]:
-    steps: list[int] = []
-    for candidate in output_dir.glob("checkpoint-*"):
-        if not candidate.is_dir():
-            continue
-        if stable_only and not is_stable_checkpoint(candidate):
-            continue
-        prefix = "checkpoint-"
-        try:
-            step = int(candidate.name.removeprefix(prefix))
-        except ValueError:
-            continue
-        steps.append(step)
-    return sorted(steps)
+    return sorted(
+        step
+        for candidate in output_dir.glob("checkpoint-*")
+        if candidate.is_dir()
+        and (not stable_only or is_stable_checkpoint(candidate))
+        and (step := _int_suffix(candidate.name, "checkpoint-")) is not None
+    )
+
+
+def _require_stable_checkpoint(checkpoint_dir: Path, *, missing: str) -> Path:
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(missing)
+    if not is_stable_checkpoint(checkpoint_dir):
+        raise FileNotFoundError(
+            f"Checkpoint '{checkpoint_dir.name}' exists but is not stable."
+        )
+    return checkpoint_dir
 
 
 def resolve_resume_checkpoint(output_dir: Path, resume_step: int) -> Path:
@@ -146,19 +157,14 @@ def resolve_resume_checkpoint(output_dir: Path, resume_step: int) -> Path:
             raise FileNotFoundError(
                 f"No stable checkpoints found under '{output_dir}'."
             )
-        checkpoint_dir = get_checkpoint_dir(output_dir, steps[-1])
-    else:
-        checkpoint_dir = get_checkpoint_dir(output_dir, resume_step)
-        if not checkpoint_dir.exists():
-            raise FileNotFoundError(
-                f"Checkpoint '{checkpoint_dir.name}' was not found under "
-                f"'{output_dir}'."
-            )
-        if not is_stable_checkpoint(checkpoint_dir):
-            raise FileNotFoundError(
-                f"Checkpoint '{checkpoint_dir.name}' exists but is not stable."
-            )
-    return checkpoint_dir
+        return get_checkpoint_dir(output_dir, steps[-1])
+    checkpoint_dir = get_checkpoint_dir(output_dir, resume_step)
+    return _require_stable_checkpoint(
+        checkpoint_dir,
+        missing=(
+            f"Checkpoint '{checkpoint_dir.name}' was not found under '{output_dir}'."
+        ),
+    )
 
 
 def resolve_resume_checkpoint_source(
@@ -173,13 +179,10 @@ def resolve_resume_checkpoint_source(
             raise ValueError("Checkpoint resume requires resume_step or resume_dir.")
         return resolve_resume_checkpoint(output_dir, resume_step)
     checkpoint_dir = Path(resume_dir)
-    if not checkpoint_dir.exists():
-        raise FileNotFoundError(f"Checkpoint not found at '{checkpoint_dir}'.")
-    if not is_stable_checkpoint(checkpoint_dir):
-        raise FileNotFoundError(
-            f"Checkpoint '{checkpoint_dir.name}' exists but is not stable."
-        )
-    return checkpoint_dir
+    return _require_stable_checkpoint(
+        checkpoint_dir,
+        missing=f"Checkpoint not found at '{checkpoint_dir}'.",
+    )
 
 
 def existing_run_state_entries(output_dir: Path) -> list[str]:

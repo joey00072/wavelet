@@ -3,7 +3,7 @@ import { cloneElement, isValidElement, useEffect, useRef, useState, type ReactNo
 import { LineChart } from "./LineChart";
 import { Maximize2, Settings2, Table2, LineChart as LineIcon } from "lucide-react";
 
-import { Popover, Segmented, Slider } from "../components/Controls";
+import { Popover, Segmented, Slider, smoothingLabel } from "../components/Controls";
 import { Modal } from "../components/Modal";
 import type { SmoothingType } from "../lib/series";
 
@@ -34,6 +34,12 @@ const SMOOTHING_TYPES: Array<{ value: SmoothingType; label: string }> = [
 function defaultYModeFor(title: string): ChartPrefs["yMode"] {
   return /reward|rate|ratio|frac|is_truncated|avg@|pass@|pass\^|mfu|accuracy|solve|admission|usage|kv_cache|entropy|loss|grad_norm|tokens|len|seconds|time\//i.test(title) ? "zero" : "auto";
 }
+
+/** "from zero" is meaningless on a log axis, so it is hidden and reads as auto. */
+function yModeOptions(yLog: boolean, [auto, zero, fixed]: [string, string, string]): Array<{ value: ChartPrefs["yMode"]; label: string }> {
+  return [{ value: "auto", label: auto }, ...(yLog ? [] : [{ value: "zero" as const, label: zero }]), { value: "fixed", label: fixed }];
+}
+
 type Children = ReactNode | ((options: ChartOptions) => ReactNode);
 
 /**
@@ -45,7 +51,6 @@ export function ChartCard({
   title,
   subtitle,
   value,
-  actions,
   table,
   children,
   className = "",
@@ -55,12 +60,10 @@ export function ChartCard({
   smoothable = true,
   height = 180,
   defaultLogScale = false,
-  defaultYMode,
 }: {
   title: string;
   subtitle?: string;
   value?: ReactNode;
-  actions?: ReactNode;
   table?: ReactNode;
   children: Children;
   className?: string;
@@ -70,10 +73,9 @@ export function ChartCard({
   smoothable?: boolean;
   height?: number;
   defaultLogScale?: boolean;
-  defaultYMode?: ChartPrefs["yMode"];
 }) {
   const storageKey = `wavelet.chart.${smoothingKey ?? title}`;
-  const defaults: ChartPrefs = { smoothing: defaultSmoothing, smoothingType: "tema", yMode: defaultYMode ?? defaultYModeFor(title), yMin: null, yMax: null, xLog: false, yLog: defaultLogScale };
+  const defaults: ChartPrefs = { smoothing: defaultSmoothing, smoothingType: "tema", yMode: defaultYModeFor(title), yMin: null, yMax: null, xLog: false, yLog: defaultLogScale };
   const [stored, setStored] = useState<Partial<ChartPrefs> | null>(() => {
     try {
       const raw = window.localStorage.getItem(storageKey);
@@ -84,6 +86,7 @@ export function ChartCard({
   });
   const prefs: ChartPrefs = { ...defaults, ...(stored ?? {}) };
   const { smoothing } = prefs;
+  const yModeValue = prefs.yLog && prefs.yMode === "zero" ? "auto" : prefs.yMode;
   const update = (patch: Partial<ChartPrefs>) => {
     const next: Partial<ChartPrefs> = { ...(stored ?? {}), ...patch };
     for (const key of Object.keys(next) as Array<keyof ChartPrefs>) {
@@ -115,6 +118,9 @@ export function ChartCard({
     return children;
   };
   const [prefix, name] = splitTitle(title);
+  const logToggle = (axis: "xLog" | "yLog", label: string) => (
+    <button type="button" className={`btn !py-0.5 ${prefs[axis] ? "btn-active" : ""}`} onClick={() => update({ [axis]: !prefs[axis] })}>{label}</button>
+  );
   const settings = (
     <Popover
       width={280}
@@ -135,13 +141,13 @@ export function ChartCard({
                 ))}
               </select>
             </div>
-            <Slider min={0} max={0.99} step={0.01} value={smoothing} onChange={(v) => update({ smoothing: v })} format={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+            <Slider min={0} max={0.99} step={0.01} value={smoothing} onChange={(v) => update({ smoothing: v })} format={smoothingLabel} />
           </div>
         )}
         <div className="space-y-2">
           <div className="flex items-center justify-between text-[11px] text-muted">
             <span>Y range</span>
-            <Segmented value={prefs.yLog && prefs.yMode === "zero" ? "auto" : prefs.yMode} onChange={(v) => update({ yMode: v })} size="xs" options={[{ value: "auto", label: "fit data" }, ...(prefs.yLog ? [] : [{ value: "zero" as const, label: "from zero" }]), { value: "fixed", label: "custom" }]} />
+            <Segmented value={yModeValue} onChange={(v) => update({ yMode: v })} size="xs" options={yModeOptions(prefs.yLog, ["fit data", "from zero", "custom"])} />
           </div>
           {prefs.yMode === "fixed" && (
             <div className="flex items-center gap-2 text-[11px] text-muted">
@@ -154,13 +160,13 @@ export function ChartCard({
         <div className="flex items-center justify-between text-[11px] text-muted">
           <span>Log scale</span>
           <div className="flex items-center gap-1">
-            <button type="button" className={`btn !py-0.5 ${prefs.xLog ? "btn-active" : ""}`} onClick={() => update({ xLog: !prefs.xLog })}>x</button>
-            <button type="button" className={`btn !py-0.5 ${prefs.yLog ? "btn-active" : ""}`} onClick={() => update({ yLog: !prefs.yLog })}>y</button>
+            {logToggle("xLog", "x")}
+            {logToggle("yLog", "y")}
           </div>
         </div>
         <div className="flex items-center justify-between">
           <p className="text-[10.5px] leading-relaxed text-muted">Drag to zoom the x range; double-click resets. Click the chart to expand.</p>
-          {prefsActive && <button type="button" className="btn !py-0.5 text-[10.5px]" onClick={() => update(Object.fromEntries(Object.keys(defaults).map((k) => [k, defaults[k as keyof ChartPrefs]])) as Partial<ChartPrefs>)}>reset</button>}
+          {prefsActive && <button type="button" className="btn !py-0.5 text-[10.5px]" onClick={() => update(defaults)}>reset</button>}
         </div>
       </div>
     </Popover>
@@ -185,7 +191,6 @@ export function ChartCard({
           </div>
           <div className="flex shrink-0 items-center gap-1">
             <div className="chart-actions absolute right-0 top-1/2 flex -translate-y-1/2 items-center rounded-md bg-surface pl-2 opacity-0 transition-opacity duration-150 group-hover/card:opacity-100 focus-within:opacity-100" style={{ boxShadow: "-12px 0 12px -6px var(--surface-1)" }}>
-              {actions}
               {settings}
               {table && (
                 <button type="button" className="btn !px-1.5 !py-1" onClick={() => setShowTable((v) => !v)} aria-pressed={showTable} title={showTable ? "Show chart" : "Show table"}>
@@ -233,12 +238,12 @@ export function ChartCard({
           <>
             {smoothable && (
               <div className="w-full sm:w-56">
-                <Slider label="Smoothing" min={0} max={0.99} step={0.01} value={smoothing} onChange={(v) => update({ smoothing: v })} format={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+                <Slider label="Smoothing" min={0} max={0.99} step={0.01} value={smoothing} onChange={(v) => update({ smoothing: v })} format={smoothingLabel} />
               </div>
             )}
-            <Segmented value={prefs.yLog && prefs.yMode === "zero" ? "auto" : prefs.yMode} onChange={(v) => update({ yMode: v })} size="xs" options={[{ value: "auto", label: "fit" }, ...(prefs.yLog ? [] : [{ value: "zero" as const, label: "from 0" }]), { value: "fixed", label: "custom" }]} />
-            <button type="button" className={`btn !py-0.5 ${prefs.xLog ? "btn-active" : ""}`} onClick={() => update({ xLog: !prefs.xLog })}>log x</button>
-            <button type="button" className={`btn !py-0.5 ${prefs.yLog ? "btn-active" : ""}`} onClick={() => update({ yLog: !prefs.yLog })}>log y</button>
+            <Segmented value={yModeValue} onChange={(v) => update({ yMode: v })} size="xs" options={yModeOptions(prefs.yLog, ["fit", "from 0", "custom"])} />
+            {logToggle("xLog", "log x")}
+            {logToggle("yLog", "log y")}
             {settings}
             {table && (
               <button type="button" className={`btn !px-1.5 ${showTable ? "btn-active" : ""}`} onClick={() => setShowTable((v) => !v)} title="Table view">

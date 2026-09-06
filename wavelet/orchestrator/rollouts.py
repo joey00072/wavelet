@@ -22,7 +22,7 @@ from wavelet.orchestrator.algorithms import (
     uses_group_advantages,
 )
 from wavelet.orchestrator.reward import RLRewardScorer, assistant_text
-from wavelet.orchestrator.schedule import required_policy_step
+from wavelet.orchestrator.schedule import required_policy_step, target_steps
 from wavelet.transport.queue import (
     FileSystemRolloutSender,
     QueueEvent,
@@ -78,31 +78,14 @@ class RLOrchestrator:
         step: int | None = None,
         inference_engine=None,
     ) -> Path:
-        attempts = self.config.orchestrator.zero_advantage_max_retries + 1
-        trainable_records: list[RLExample] = []
-        for retry in range(attempts):
-            records = self._load_step_records(step=step, retry=retry)
-            scored_records = self._generate_and_score(
-                records,
-                inference_engine=inference_engine,
-            )
-            trainable_records = self._append_new_groups(
-                trainable_records,
-                self._filter_zero_advantage_records(scored_records),
-                target_groups=self.config.orchestrator.examples_per_step,
-            )
-            if self._has_target_groups(trainable_records):
-                break
-        else:
-            accepted_groups = self._group_count(trainable_records)
-            raise RuntimeError(
-                "Could not materialize the requested rollout group count after "
-                f"{attempts} generation attempt(s) (accepted "
-                f"{accepted_groups}). Increase "
-                "orchestrator.zero_advantage_max_retries, relax filtering, or "
-                "check the reward/model output format."
-            )
-        return self._write_records(trainable_records, step=step)
+        return self._materialize_trainable(
+            lambda retry: self._load_step_records(step=step, retry=retry),
+            target_groups=self.config.orchestrator.examples_per_step,
+            groups_from_first_load=False,
+            inference_engine=inference_engine,
+            step=step,
+            noun="rollout",
+        )
 
     def materialize_native_chunk(
         self,
@@ -115,18 +98,37 @@ class RLOrchestrator:
     ) -> Path:
         if self.config.orchestrator.custom_rollout_function is not None:
             raise ValueError("Native rollout chunks require native rollouts.")
-        attempts = self.config.orchestrator.zero_advantage_max_retries + 1
-        trainable_records: list[RLExample] = []
-        expected_groups: int | None = None
-        for retry in range(attempts):
-            records = self._load_native_chunk_records(
+        return self._materialize_trainable(
+            lambda retry: self._load_native_chunk_records(
                 optimizer_step=optimizer_step,
                 chunk_index=chunk_index,
                 chunk_examples=chunk_examples,
                 retry=retry,
-            )
-            if expected_groups is None:
-                expected_groups = len(records)
+            ),
+            target_groups=None,
+            groups_from_first_load=True,
+            inference_engine=inference_engine,
+            step=queue_step,
+            noun="native chunk",
+        )
+
+    def _materialize_trainable(
+        self,
+        load_records: Callable[[int], list[RLExample]],
+        *,
+        target_groups: int | None,
+        groups_from_first_load: bool,
+        inference_engine,
+        step: int | None,
+        noun: str,
+    ) -> Path:
+        """Regenerate until enough trainable groups exist, then write them."""
+        attempts = self.config.orchestrator.zero_advantage_max_retries + 1
+        trainable_records: list[RLExample] = []
+        for retry in range(attempts):
+            records = load_records(retry)
+            if groups_from_first_load and target_groups is None:
+                target_groups = len(records)
             scored_records = self._generate_and_score(
                 records,
                 inference_engine=inference_engine,
@@ -134,23 +136,20 @@ class RLOrchestrator:
             trainable_records = self._append_new_groups(
                 trainable_records,
                 self._filter_zero_advantage_records(scored_records),
-                target_groups=expected_groups,
+                target_groups=target_groups,
             )
-            if self._has_target_groups(
-                trainable_records,
-                target_groups=expected_groups,
-            ):
+            if self._has_target_groups(trainable_records, target_groups=target_groups):
                 break
         else:
             accepted_groups = self._group_count(trainable_records)
             raise RuntimeError(
-                "Could not materialize the requested native chunk group count after "
+                f"Could not materialize the requested {noun} group count after "
                 f"{attempts} generation attempt(s) (accepted "
                 f"{accepted_groups}). Increase "
                 "orchestrator.zero_advantage_max_retries, relax filtering, or "
                 "check the reward/model output format."
             )
-        return self._write_records(trainable_records, step=queue_step)
+        return self._write_records(trainable_records, step=step)
 
     def _append_new_groups(
         self,
@@ -285,7 +284,7 @@ class RLOrchestrator:
         annotated = self._filter_degenerate_native_rollout_records(annotated)
         annotated = self._drop_incomplete_native_rollout_groups(annotated)
         return self._assign_advantages(
-            [self._score_record(record, scorer) for record in annotated]
+            [replace(record, reward=scorer.score(record)) for record in annotated]
         )
 
     def _expand_native_rollout_records(
@@ -337,13 +336,7 @@ class RLOrchestrator:
     def run(
         self, *, start_step: int = 0, max_steps: int | None = None
     ) -> list[RolloutBatch]:
-        total_steps = (
-            max_steps
-            if max_steps is not None
-            else self.config.max_steps
-            if self.config.max_steps is not None
-            else 1
-        )
+        total_steps = max_steps if max_steps is not None else target_steps(self.config)
         published: list[RolloutBatch] = []
         for offset in range(total_steps):
             published.append(self.publish(step=start_step + offset))
@@ -392,13 +385,6 @@ class RLOrchestrator:
             task=self.config.reward.mode,
             example_id=self._example_id(record),
         )
-
-    def _score_record(
-        self,
-        record: RLExample,
-        scorer: RLRewardScorer,
-    ) -> RLExample:
-        return replace(record, reward=scorer.score(record))
 
     def trim_to_step_examples(self, records: list[RLExample]) -> list[RLExample]:
         limit = self.config.orchestrator.examples_per_step

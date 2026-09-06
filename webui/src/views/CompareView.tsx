@@ -48,7 +48,7 @@ export function CompareView({ apiBase, runs, params }: { apiBase: string; runs: 
         runIds.map(async (id) => {
           try {
             const keys = await fetchJson<MetricKeys>(runUrl(apiBase, id, "/metrics/keys"));
-            for (const src of ["trainer", "orchestrator", "eval"] as const) keys[src].forEach((k) => union[src].add(k.key));
+            for (const src of SOURCES) keys[src].forEach((k) => union[src].add(k.key));
           } catch {
             // run may be unavailable
           }
@@ -107,6 +107,7 @@ export function CompareView({ apiBase, runs, params }: { apiBase: string; runs: 
 
   if (runIds.length < 2) return <Empty title="Select at least two runs" hint="Go to Runs and tick the runs you want to compare, then click Compare." />;
 
+  const latestOf = (line: LineSeries) => lastFinite(line.points.map((p) => p.y));
   const linesFor = (key: string): LineSeries[] =>
     runIds.map((id, index) => {
       const series = seriesByRun[id];
@@ -170,7 +171,7 @@ export function CompareView({ apiBase, runs, params }: { apiBase: string; runs: 
           const lines = linesFor(key);
           const isPct = /rate|ratio|is_truncated|mfu|\/(pass@\d+|pass\^\d+)$/.test(key);
           return (
-            <ChartCard key={key} title={key} smoothingKey={`compare.${key}`} defaultSmoothing={smoothing} defaultLogScale={settings.logScale} height={200} subtitle={lines.map((l) => `${l.label}: ${isPct ? fmtPct(lastFinite(l.points.map((p) => p.y))) : fmt(lastFinite(l.points.map((p) => p.y)), 4)}`).join(" · ")} table={<SeriesTable series={lines} xLabel={xAxis} />}>
+            <ChartCard key={key} title={key} smoothingKey={`compare.${key}`} defaultSmoothing={smoothing} defaultLogScale={settings.logScale} height={200} subtitle={lines.map((l) => `${l.label}: ${isPct ? fmtPct(latestOf(l)) : fmt(latestOf(l), 4)}`).join(" · ")} table={<SeriesTable series={lines} xLabel={xAxis} />}>
               {(o) => <LineChart series={lines} {...chartProps(o)} xLabel={xAxis} markers={source === "eval"} yDomain={isPct ? [0, 1] : undefined} yFormat={isPct ? (v) => fmtPct(v, 0) : undefined} />}
             </ChartCard>
           );

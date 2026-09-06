@@ -4,9 +4,9 @@ import pytest
 from transformers import BatchEncoding
 
 from wavelet.configs.sft import LossMaskConfig
-from wavelet.data.loading import Example
-from wavelet.data.sft import _build_loss_mask_fast
-from wavelet.data.tokenization import (
+from wavelet.data.sft import (
+    Example,
+    _build_loss_mask_fast,
     build_sample,
     trainable_target_ids,
     validate_token_logprob_alignment,

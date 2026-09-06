@@ -1,13 +1,12 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
-export function Segmented<T extends string>({ value, options, onChange, size = "sm" }: { value: T; options: Array<{ value: T; label: ReactNode; title?: string }>; onChange: (value: T) => void; size?: "sm" | "xs" }) {
+export function Segmented<T extends string>({ value, options, onChange, size = "sm" }: { value: T; options: Array<{ value: T; label: ReactNode }>; onChange: (value: T) => void; size?: "sm" | "xs" }) {
   return (
     <div className="inline-flex gap-0.5 rounded-md bg-raised p-0.5">
       {options.map((option) => (
         <button
           key={option.value}
           type="button"
-          title={option.title}
           className={`${size === "xs" ? "px-2 py-0.5 text-[11px]" : "px-2.5 py-1 text-xs"} rounded transition-colors ${value === option.value ? "bg-surface font-medium text-ink shadow-[var(--shadow)]" : "text-ink2 hover:text-ink"}`}
           onClick={() => onChange(option.value)}
           aria-pressed={value === option.value}
@@ -32,6 +31,7 @@ export function Field({ label, children }: { label: string; children: ReactNode 
   );
 }
 
+export const smoothingLabel = (v: number) => (v === 0 ? "off" : v.toFixed(2));
 
 export function Slider({ value, min, max, step, onChange, format, label }: { value: number; min: number; max: number; step: number; onChange: (value: number) => void; format?: (v: number) => string; label?: string }) {
   return (

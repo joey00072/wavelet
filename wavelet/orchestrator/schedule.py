@@ -12,9 +12,7 @@ class PolicyStepReceiver(Protocol):
 
 
 def target_steps(config: RLConfig) -> int:
-    if config.max_steps is None:
-        return 1
-    return config.max_steps
+    return 1 if config.max_steps is None else config.max_steps
 
 
 def rollout_chunk_examples(config: RLConfig) -> int:

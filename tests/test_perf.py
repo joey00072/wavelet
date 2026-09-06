@@ -6,6 +6,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from wavelet.configs.rl_config import RLConfig
+from wavelet.monitor import emit_perf
 from wavelet.trainer.distributed import World
 from wavelet.trainer.perf import (
     estimate_active_matmul_parameters,
@@ -15,7 +16,6 @@ from wavelet.trainer.perf import (
     training_flop_metrics,
 )
 from wavelet.trainer.rl import RLTrainer
-from wavelet.utils.monitoring import emit_perf
 
 
 def test_emit_perf_preserves_line_shape(monkeypatch, capsys) -> None:

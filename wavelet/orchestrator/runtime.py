@@ -60,7 +60,7 @@ from wavelet.orchestrator.scheduler import (
     discard_rollout_batches_after_resume,
 )
 from wavelet.trainer.model import pre_download_model
-from wavelet.trainer.rl_trainer import RLTrainer
+from wavelet.trainer.rl import RLTrainer
 from wavelet.transport.queue import (
     FileSystemPolicyReceiver,
     FileSystemRolloutReceiver,
@@ -597,7 +597,6 @@ def _run_process_launcher(
     _write_subconfigs(rollout_config, config, config_dir=config_dir)
     trainer_config_path = config_dir / "rl_trainer.yaml"
     inference_config_path = config_dir / "rl_inference.yaml"
-    dump_yaml(inference_config_path, _role_config_payload(rollout_config))
     wandb_shared_env = _shared_wandb_environment(config)
     roles = _role_specs(
         config,
@@ -728,22 +727,21 @@ def _run_integrated_launcher(
 
     if config.orchestrator.enabled:
         queue_dir = config.transport.queue_dir or (config.output_dir / "rollouts")
-        trainer_config = config
-        _write_subconfigs(config, trainer_config, config_dir=config_dir)
-        trainer = RLTrainer(trainer_config)
+        _write_subconfigs(config, config_dir=config_dir)
+        trainer = RLTrainer(config)
         trainer.setup()
         if trainer.resume_checkpoint_dir is not None:
             discard_rollout_batches_after_resume(config, start_step=trainer.step)
         receiver = FileSystemRolloutReceiver(
             config.output_dir,
             config.transport,
-            start_step=getattr(trainer, "step", 0),
+            start_step=trainer.step,
             events_dir=config.output_dir / "events",
         )
         policy_receiver = FileSystemPolicyReceiver(
             config.output_dir,
             config.policy_transfer,
-            start_step=getattr(trainer, "step", 0),
+            start_step=trainer.step,
             events_dir=config.output_dir / "events",
         )
         inference_engine = create_policy_inference_engine(config)

@@ -66,7 +66,7 @@ def resolve_checkpoint_source(checkpoint: Path) -> CheckpointSource:
 def resolve_conversion_config(
     source: CheckpointSource,
     config_path: Path | None = None,
-) -> tuple[ConversionConfig, Path]:
+) -> ConversionConfig:
     """Load model details from an explicit or run-resolved config file."""
     if config_path is None:
         config_dir = get_config_dir(source.step_dir.parent)
@@ -106,7 +106,7 @@ def resolve_conversion_config(
     seq_len = raw_data.get("seq_len", 128) if isinstance(raw_data, dict) else 128
     if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len < 1:
         raise ValueError(f"Config '{config_path}' has an invalid data.seq_len.")
-    return ConversionConfig(model=model_config, seq_len=seq_len), config_path
+    return ConversionConfig(model=model_config, seq_len=seq_len)
 
 
 def _check_checkpoint_is_full_model(dcp_dir: Path) -> None:
@@ -183,7 +183,7 @@ def convert_checkpoint(
             "'uv run wavelet convert-checkpoint', not torchrun."
         )
     source = resolve_checkpoint_source(checkpoint)
-    conversion, _ = resolve_conversion_config(source, config_path)
+    conversion = resolve_conversion_config(source, config_path)
     _check_checkpoint_is_full_model(source.dcp_dir)
     if dtype not in OUTPUT_DTYPES:
         choices = ", ".join(OUTPUT_DTYPES)

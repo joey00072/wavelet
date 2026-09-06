@@ -4,6 +4,8 @@ import type { Point } from "../lib/series";
 import { AnimatedNumber } from "./AnimatedNumber";
 import { Sparkline } from "./Sparkline";
 
+const TONE_CLASS = { good: "text-good", warning: "text-warn", serious: "text-serious", critical: "text-critical" };
+
 export function StatTile({
   label,
   value,
@@ -13,7 +15,6 @@ export function StatTile({
   deltaGood,
   sub,
   trend,
-  icon,
   tone,
 }: {
   label: string;
@@ -24,26 +25,13 @@ export function StatTile({
   deltaGood?: boolean | null;
   sub?: ReactNode;
   trend?: Point[];
-  icon?: ReactNode;
-  tone?: "good" | "warning" | "serious" | "critical" | null;
+  tone?: keyof typeof TONE_CLASS | null;
 }) {
-  const toneClass =
-    tone === "good"
-      ? "text-good"
-      : tone === "warning"
-        ? "text-warn"
-        : tone === "serious"
-          ? "text-serious"
-          : tone === "critical"
-            ? "text-critical"
-            : "text-ink";
+  const toneClass = tone ? TONE_CLASS[tone] : "text-ink";
   return (
     <div className="tile">
       <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
-        <span className="flex items-center gap-1.5 truncate">
-          {icon}
-          {label}
-        </span>
+        <span className="flex items-center gap-1.5 truncate">{label}</span>
         {delta && (
           <span className={`tabular ${deltaGood === null || deltaGood === undefined ? "text-muted" : deltaGood ? "text-[var(--success-text)]" : "text-critical"}`}>
             {delta}

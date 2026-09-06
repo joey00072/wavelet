@@ -199,12 +199,12 @@ def test_parse_vllm_metrics_supports_current_and_legacy_kv_names() -> None:
 
 def test_parse_vllm_metrics_reads_capacity_and_capacity_queue() -> None:
     parsed = parse_vllm_metrics(
-        '''
+        """
         vllm:cache_config_info{block_size="16",num_gpu_blocks="2048"} 1
         vllm:num_requests_waiting 9
         vllm:num_requests_waiting_by_reason{reason="capacity"} 7
         vllm:kv_cache_usage_perc 0.4
-        '''
+        """
     )
 
     assert parsed.kv_capacity_tokens == 32_768

@@ -28,6 +28,10 @@ from wavelet.data.sft import (
 
 logger = logging.getLogger(__name__)
 LOSS_COMPONENTS = ("rl", "ce", "ref_kl")
+# Streams that every row in a packed bin must carry, and weight streams that
+# default to zero on rows that omit them.
+_SHARED_STREAMS = ("inference_logprobs", "teacher_logprobs", "sampling_masks")
+_WEIGHT_STREAMS = ("ce_weights", "ref_kl_weights")
 
 
 class RLSample(TypedDict):
@@ -97,11 +101,6 @@ class RLExample:
     source: str = "dataset"
 
 
-def rl_example_to_payload(record: RLExample) -> dict[str, Any]:
-    """Convert one rollout record to its JSON-compatible wire payload."""
-    return asdict(record)
-
-
 def rl_example_from_payload(payload: dict[str, Any]) -> RLExample:
     """Construct one rollout record from its wire payload."""
     return RLExample(
@@ -128,7 +127,7 @@ def rl_example_from_payload(payload: dict[str, Any]) -> RLExample:
 
 def rl_examples_to_payload(records: list[RLExample]) -> list[dict[str, Any]]:
     """Convert rollout records to wire payloads."""
-    return [rl_example_to_payload(record) for record in records]
+    return [asdict(record) for record in records]
 
 
 def rl_examples_from_payload(payloads: list[dict[str, Any]]) -> list[RLExample]:
@@ -293,11 +292,7 @@ def pack_samples(
     bin_streams: list[tuple[bool, bool, bool]] = []
     for sample in sorted_samples:
         sample_len = len(sample["input_ids"])
-        streams = (
-            "inference_logprobs" in sample,
-            "teacher_logprobs" in sample,
-            "sampling_masks" in sample,
-        )
+        streams = tuple(name in sample for name in _SHARED_STREAMS)
         for index, current_len in enumerate(bin_lengths):
             if bin_streams[index] == streams and current_len + sample_len <= seq_len:
                 bins[index].append(sample)
@@ -344,21 +339,15 @@ def _merge_samples(
     loss_mask: list[bool] = []
     advantages: list[float] = []
     rl_weights: list[float] = []
-    ce_weights: list[float] = []
-    ref_kl_weights: list[float] = []
-    inference_logprobs: list[float] = []
-    teacher_logprobs: list[float] = []
-    sampling_masks: list[list[int]] = []
     temperatures: list[float] = []
     rewards = [
         float(sample["reward"]) for sample in samples if sample["reward"] is not None
     ]
     sample_count = sum(int(sample.get("sample_count", 1)) for sample in samples)
-    has_inference = all("inference_logprobs" in sample for sample in samples)
-    has_teacher = all("teacher_logprobs" in sample for sample in samples)
-    has_sampling_mask = all("sampling_masks" in sample for sample in samples)
-    has_ce = any("ce_weights" in sample for sample in samples)
-    has_ref_kl = any("ref_kl_weights" in sample for sample in samples)
+    streams: dict[str, list[Any]] = {
+        **{k: [] for k in _SHARED_STREAMS if all(k in s for s in samples)},
+        **{k: [] for k in _WEIGHT_STREAMS if any(k in s for s in samples)},
+    }
 
     for sample in samples:
         input_ids.extend(sample["input_ids"])
@@ -368,19 +357,9 @@ def _merge_samples(
         advantages.extend(sample["advantages"])
         trainable_tokens = sum(sample["loss_mask"])
         rl_weights.extend(sample.get("rl_weights", [1.0] * trainable_tokens))
-        if has_ce:
-            ce_weights.extend(sample.get("ce_weights", [0.0] * trainable_tokens))
-        if has_ref_kl:
-            ref_kl_weights.extend(
-                sample.get("ref_kl_weights", [0.0] * trainable_tokens)
-            )
         temperatures.extend(sample["temperatures"])
-        if has_inference:
-            inference_logprobs.extend(sample["inference_logprobs"])
-        if has_teacher:
-            teacher_logprobs.extend(sample["teacher_logprobs"])
-        if has_sampling_mask:
-            sampling_masks.extend(sample["sampling_masks"])
+        for name, values in streams.items():
+            values.extend(sample.get(name, [0.0] * trainable_tokens))
 
     _pad_token_streams(
         input_ids,
@@ -400,16 +379,7 @@ def _merge_samples(
         "reward": sum(rewards) / len(rewards) if rewards else None,
         "sample_count": sample_count,
     }
-    if has_inference:
-        packed["inference_logprobs"] = inference_logprobs
-    if has_teacher:
-        packed["teacher_logprobs"] = teacher_logprobs
-    if has_sampling_mask:
-        packed["sampling_masks"] = sampling_masks
-    if has_ce:
-        packed["ce_weights"] = ce_weights
-    if has_ref_kl:
-        packed["ref_kl_weights"] = ref_kl_weights
+    packed.update(streams)  # type: ignore[typeddict-item]
     return packed
 
 
@@ -444,16 +414,9 @@ def _zero_loss_copy(source: RLSample) -> RLSample:
         "reward": None,
         "sample_count": 0,
     }
-    if "inference_logprobs" in source:
-        dummy["inference_logprobs"] = []
-    if "teacher_logprobs" in source:
-        dummy["teacher_logprobs"] = []
-    if "sampling_masks" in source:
-        dummy["sampling_masks"] = []
-    if "ce_weights" in source:
-        dummy["ce_weights"] = []
-    if "ref_kl_weights" in source:
-        dummy["ref_kl_weights"] = []
+    for key in (*_SHARED_STREAMS, *_WEIGHT_STREAMS):
+        if key in source:
+            dummy[key] = []  # type: ignore[literal-required]
     return dummy
 
 
@@ -520,27 +483,7 @@ def collate_rl_batch(
         (len(mask) for item in batch for mask in item.get("sampling_masks", [])),
         default=0,
     )
-    output: dict[str, list[torch.Tensor]] = {
-        "input_ids": [],
-        "attention_mask": [],
-        "position_ids": [],
-        "target_ids": [],
-        "labels": [],
-        "loss_mask": [],
-        "advantages": [],
-        "rl_weights": [],
-        "ce_weights": [],
-        "ref_kl_weights": [],
-        "sampling_mask_ids": [],
-        "sampling_mask_lengths": [],
-        "rewards": [],
-        "has_inference_logprobs": [],
-        "inference_logprobs": [],
-        "has_teacher_logprobs": [],
-        "teacher_logprobs": [],
-        "temperatures": [],
-        "sample_counts": [],
-    }
+    output: dict[str, list[torch.Tensor]] = {key: [] for key in RLBatch.__annotations__}
 
     for item in batch:
         _append_sample(
@@ -569,9 +512,6 @@ def _append_sample(
     trainable_tokens = sum(loss_mask)
     inference_logprobs = item.get("inference_logprobs")
     teacher_logprobs = item.get("teacher_logprobs")
-    rl_weights = item.get("rl_weights")
-    ce_weights = item.get("ce_weights")
-    ref_kl_weights = item.get("ref_kl_weights")
     sampling_masks = item.get("sampling_masks")
     if sampling_masks is not None and len(sampling_masks) != trainable_tokens:
         raise ValueError(
@@ -579,58 +519,27 @@ def _append_sample(
             "the sample"
         )
 
-    _validate_trainable_values(
-        item["advantages"],
-        field_name="advantages",
-        trainable_tokens=trainable_tokens,
+    # (stream, trainable-only values, non-trainable fill, padding fill)
+    value_streams = (
+        ("advantages", item["advantages"], 0.0, 0.0),
+        ("temperatures", item["temperatures"], 1.0, 1.0),
+        ("inference_logprobs", inference_logprobs, 0.0, 0.0),
+        ("teacher_logprobs", teacher_logprobs, 0.0, 0.0),
+        ("rl_weights", item.get("rl_weights"), 1.0, 0.0),
+        ("ce_weights", item.get("ce_weights"), 0.0, 0.0),
+        ("ref_kl_weights", item.get("ref_kl_weights"), 0.0, 0.0),
     )
-    _validate_trainable_values(
-        item["temperatures"],
-        field_name="temperatures",
-        trainable_tokens=trainable_tokens,
-    )
-    _validate_trainable_values(
-        inference_logprobs,
-        field_name="inference_logprobs",
-        trainable_tokens=trainable_tokens,
-    )
-    _validate_trainable_values(
-        teacher_logprobs,
-        field_name="teacher_logprobs",
-        trainable_tokens=trainable_tokens,
-    )
-    for field_name, values in (
-        ("rl_weights", rl_weights),
-        ("ce_weights", ce_weights),
-        ("ref_kl_weights", ref_kl_weights),
-    ):
+    for field_name, values, _, _ in value_streams:
         _validate_trainable_values(
             values,
             field_name=field_name,
             trainable_tokens=trainable_tokens,
         )
-
-    expanded_advantages = _expand_trainable_values(
-        item["advantages"], mask=loss_mask, default=0.0
-    )
-    expanded_inference = _expand_trainable_values(
-        inference_logprobs, mask=loss_mask, default=0.0
-    )
-    expanded_teacher = _expand_trainable_values(
-        teacher_logprobs, mask=loss_mask, default=0.0
-    )
-    expanded_temperatures = _expand_trainable_values(
-        item["temperatures"], mask=loss_mask, default=1.0
-    )
-    expanded_rl_weights = _expand_trainable_values(
-        rl_weights, mask=loss_mask, default=1.0
-    )
-    expanded_ce_weights = _expand_trainable_values(
-        ce_weights, mask=loss_mask, default=0.0
-    )
-    expanded_ref_kl_weights = _expand_trainable_values(
-        ref_kl_weights, mask=loss_mask, default=0.0
-    )
+    for field_name, values, default, pad_value in value_streams:
+        expanded = _expand_trainable_values(values, mask=loss_mask, default=default)
+        output[field_name].append(
+            torch.tensor(expanded + [pad_value] * padding, dtype=torch.float32)
+        )
     labels = [
         target_id if trainable else IGNORE_INDEX
         for target_id, trainable in zip(item["target_ids"], loss_mask, strict=True)
@@ -659,18 +568,6 @@ def _append_sample(
     )
     output["loss_mask"].append(
         torch.tensor(loss_mask + [False] * padding, dtype=torch.bool)
-    )
-    output["advantages"].append(
-        torch.tensor(expanded_advantages + [0.0] * padding, dtype=torch.float32)
-    )
-    output["rl_weights"].append(
-        torch.tensor(expanded_rl_weights + [0.0] * padding, dtype=torch.float32)
-    )
-    output["ce_weights"].append(
-        torch.tensor(expanded_ce_weights + [0.0] * padding, dtype=torch.float32)
-    )
-    output["ref_kl_weights"].append(
-        torch.tensor(expanded_ref_kl_weights + [0.0] * padding, dtype=torch.float32)
     )
     mask_ids = torch.zeros(
         (max_len, max_sampling_mask_size),
@@ -703,17 +600,8 @@ def _append_sample(
     output["has_inference_logprobs"].append(
         torch.tensor(inference_logprobs is not None, dtype=torch.bool)
     )
-    output["inference_logprobs"].append(
-        torch.tensor(expanded_inference + [0.0] * padding, dtype=torch.float32)
-    )
     output["has_teacher_logprobs"].append(
         torch.tensor(teacher_logprobs is not None, dtype=torch.bool)
-    )
-    output["teacher_logprobs"].append(
-        torch.tensor(expanded_teacher + [0.0] * padding, dtype=torch.float32)
-    )
-    output["temperatures"].append(
-        torch.tensor(expanded_temperatures + [1.0] * padding, dtype=torch.float32)
     )
 
 
@@ -733,7 +621,7 @@ def count_nonempty_jsonl_rows(
 
 
 def _check_trainable_stream_length(
-    value: list[float],
+    value: list[Any],
     *,
     num_trainable_tokens: int,
     field_name: str,
@@ -817,17 +705,12 @@ def _validate_sampling_mask(
 ) -> None:
     if value is None:
         return
-    if len(value) < num_trainable_tokens:
-        raise ValueError(
-            "sampling_mask is shorter than the number of trainable tokens "
-            f"({len(value)} < {num_trainable_tokens})."
-        )
-    if len(value) > num_trainable_tokens and not truncated:
-        raise ValueError(
-            "sampling_mask is longer than the number of trainable tokens "
-            f"({len(value)} > {num_trainable_tokens}); the tokenized completion "
-            "does not align with the source stream."
-        )
+    _check_trainable_stream_length(
+        value,
+        num_trainable_tokens=num_trainable_tokens,
+        field_name="sampling_mask",
+        truncated=truncated,
+    )
     for token_ids in value[:num_trainable_tokens]:
         if not isinstance(token_ids, list) or any(
             not isinstance(token_id, int) or token_id < 0 for token_id in token_ids
@@ -892,11 +775,6 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
     input_ids = [int(token_id) for token_id in record.input_ids[:seq_len]]
     target_ids = [int(token_id) for token_id in record.target_ids[:seq_len]]
     loss_mask = [bool(value) for value in record.loss_mask[:seq_len]]
-    if not (len(input_ids) == len(target_ids) == len(loss_mask)):
-        raise ValueError(
-            "Pretokenized RL row has mismatched input_ids, target_ids, and loss_mask "
-            f"lengths ({len(input_ids)}, {len(target_ids)}, {len(loss_mask)})."
-        )
     if sum(loss_mask) == 0:
         metadata = record.metadata or {}
         if not (
@@ -925,23 +803,20 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
 
 
 def _validate_rl_record_streams(record: RLExample) -> tuple[bool, bool, bool]:
-    _validate_numeric_stream(record.advantage, field_name="advantage")
-    _validate_numeric_stream(record.reward, field_name="reward")
-    _validate_numeric_stream(
-        record.inference_logprobs,
-        field_name="inference_logprobs",
-    )
-    _validate_numeric_stream(
-        record.teacher_logprobs,
-        field_name="teacher_logprobs",
-    )
-    _validate_numeric_stream(
-        record.temperatures,
-        field_name="temperatures",
-        strictly_positive=True,
-    )
-    _validate_numeric_stream(record.ce_weight, field_name="ce_weight")
-    _validate_numeric_stream(record.ref_kl_weight, field_name="ref_kl_weight")
+    for values, field_name in (
+        (record.advantage, "advantage"),
+        (record.reward, "reward"),
+        (record.inference_logprobs, "inference_logprobs"),
+        (record.teacher_logprobs, "teacher_logprobs"),
+        (record.temperatures, "temperatures"),
+        (record.ce_weight, "ce_weight"),
+        (record.ref_kl_weight, "ref_kl_weight"),
+    ):
+        _validate_numeric_stream(
+            values,
+            field_name=field_name,
+            strictly_positive=field_name == "temperatures",
+        )
     if record.sampling_mask is not None and not isinstance(record.sampling_mask, list):
         raise ValueError("sampling_mask must be a list when provided.")
     has_auxiliary_component = (
@@ -1002,38 +877,25 @@ def prepare_rl_sample(
         truncated=truncated,
         allow_missing=has_ce_component or has_ref_kl_component,
     )
-    inference_logprobs = _coerce_optional_sequence(
-        record.inference_logprobs,
-        num_trainable_tokens=num_trainable_tokens,
-        field_name="inference_logprobs",
-        truncated=truncated,
-    )
-    teacher_logprobs = _coerce_optional_sequence(
-        record.teacher_logprobs,
-        num_trainable_tokens=num_trainable_tokens,
-        field_name="teacher_logprobs",
-        truncated=truncated,
-    )
-    temperatures = _coerce_optional_sequence(
-        record.temperatures,
-        num_trainable_tokens=num_trainable_tokens,
-        field_name="temperature",
-        default=1.0,
-        truncated=truncated,
-    )
+    # Validation order is part of the contract: the first misaligned stream
+    # names the error, so keep temperatures between the logprob and weight rows.
+    streams: dict[str, list[float] | None] = {}
+    for key, value, field_name, default in (
+        ("inference_logprobs", record.inference_logprobs, "inference_logprobs", None),
+        ("teacher_logprobs", record.teacher_logprobs, "teacher_logprobs", None),
+        ("temperatures", record.temperatures, "temperature", 1.0),
+        ("ce_weights", record.ce_weight, "ce_weight", None),
+        ("ref_kl_weights", record.ref_kl_weight, "ref_kl_weight", None),
+    ):
+        streams[key] = _coerce_optional_sequence(
+            value,
+            num_trainable_tokens=num_trainable_tokens,
+            field_name=field_name,
+            default=default,
+            truncated=truncated,
+        )
+    temperatures = streams.pop("temperatures")
     assert temperatures is not None
-    ce_weights = _coerce_optional_sequence(
-        record.ce_weight,
-        num_trainable_tokens=num_trainable_tokens,
-        field_name="ce_weight",
-        truncated=truncated,
-    )
-    ref_kl_weights = _coerce_optional_sequence(
-        record.ref_kl_weight,
-        num_trainable_tokens=num_trainable_tokens,
-        field_name="ref_kl_weight",
-        truncated=truncated,
-    )
     sampling_masks = _coerce_sampling_mask(
         record.sampling_mask,
         num_trainable_tokens=num_trainable_tokens,
@@ -1055,26 +917,17 @@ def prepare_rl_sample(
         sample["sample_count"] = 0
     elif "_wavelet_rollout_count" in metadata:
         sample["sample_count"] = int(metadata["_wavelet_rollout_count"])
-    if inference_logprobs is not None:
-        sample["inference_logprobs"] = inference_logprobs
-    if teacher_logprobs is not None:
-        sample["teacher_logprobs"] = teacher_logprobs
-    if ce_weights is not None:
-        sample["ce_weights"] = ce_weights
-    if ref_kl_weights is not None:
-        sample["ref_kl_weights"] = ref_kl_weights
+    sample.update(  # type: ignore[typeddict-item]
+        {key: values for key, values in streams.items() if values is not None}
+    )
     if sampling_masks is not None:
         sample["sampling_masks"] = sampling_masks
     return sample
 
 
-def _normalize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLExample:
-    return deserialize_rl_record(payload, config)
-
-
 def load_rl_records(config: RLDataConfig) -> list[RLExample]:
     payloads = load_data_payloads(config)
-    rows = [_normalize_rl_record(payload, config) for payload in payloads]
+    rows = [deserialize_rl_record(payload, config) for payload in payloads]
     if config.max_examples is not None:
         rows = rows[: config.max_examples]
     if not rows:
@@ -1083,7 +936,9 @@ def load_rl_records(config: RLDataConfig) -> list[RLExample]:
 
 
 @dataclass
-class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
+class _RecordDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
+    """Record store, tokenizer, and partition shared by the RL datasets."""
+
     records: list[RLExample]
     tokenizer: PreTrainedTokenizerBase
     seq_len: int
@@ -1096,6 +951,11 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
     def __post_init__(self) -> None:
         self._initialize_iteration_state()
 
+    def _prepare(self, record: RLExample) -> RLSample | None:
+        return prepare_rl_sample(record, self.tokenizer, self.data_config, self.seq_len)
+
+
+class RLDataset(_RecordDataset):
     def loss_scale_for_next_local_batch(
         self,
         local_batch_size: int,
@@ -1132,12 +992,7 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
                 continue
 
             record_index = self._order_for_epoch(epoch)[sample_index]
-            sample = prepare_rl_sample(
-                self.records[record_index],
-                self.tokenizer,
-                self.data_config,
-                self.seq_len,
-            )
+            sample = self._prepare(self.records[record_index])
             if sample is None:
                 continue
             counts = component_normalization_counts(
@@ -1152,12 +1007,7 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
     def __iter__(self) -> Iterator[RLSample]:
         for record_index in self._local_record_indexes():
             record = self.records[record_index]
-            sample = prepare_rl_sample(
-                record,
-                self.tokenizer,
-                self.data_config,
-                self.seq_len,
-            )
+            sample = self._prepare(record)
             if sample is None:
                 self.skipped += 1
                 continue
@@ -1166,19 +1016,9 @@ class RLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
             yield sample
 
 
-@dataclass
-class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]):
-    records: list[RLExample]
-    tokenizer: PreTrainedTokenizerBase
-    seq_len: int
-    data_config: RLDataConfig
-    shuffle: bool = False
-    seed: int = 0
-    data_rank: int = 0
-    data_world_size: int = 1
-
+class PackedRLDataset(_RecordDataset):
     def __post_init__(self) -> None:
-        self._initialize_iteration_state()
+        super().__post_init__()
         self._epoch_bins: dict[int, list[RLSample]] = {}
         self._epoch_global_bins: dict[int, list[RLSample]] = {}
         self._next_bin_index = 0
@@ -1286,12 +1126,7 @@ class PackedRLDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample]
         samples: list[RLSample] = []
         for record_index in self._order_for_epoch(epoch):
             record = self.records[record_index]
-            sample = prepare_rl_sample(
-                record,
-                self.tokenizer,
-                self.data_config,
-                self.seq_len,
-            )
+            sample = self._prepare(record)
             if sample is None:
                 self.skipped += 1
                 continue
@@ -1393,18 +1228,10 @@ def setup_rl_dataset(
         or record.ref_kl_weight is not None
         for record in records
     )
-    if config.pack_sequences and has_training_targets:
-        return PackedRLDataset(
-            records=records,
-            tokenizer=tokenizer,
-            seq_len=config.seq_len,
-            data_config=config,
-            shuffle=config.shuffle,
-            seed=config.seed,
-            data_rank=data_rank,
-            data_world_size=data_world_size,
-        )
-    return RLDataset(
+    dataset_cls: type[_RecordDataset] = (
+        PackedRLDataset if config.pack_sequences and has_training_targets else RLDataset
+    )
+    return dataset_cls(
         records=records,
         tokenizer=tokenizer,
         seq_len=config.seq_len,

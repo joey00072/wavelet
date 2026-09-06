@@ -17,8 +17,7 @@ from wavelet.configs.rl_config import (
     RLConfig,
     RLCurriculumConfig,
 )
-from wavelet.data.rl_dataset import RLExample, _pretokenized_sample
-from wavelet.orchestrator.queue import FileSystemRolloutSender
+from wavelet.data.rl import RLExample, _pretokenized_sample
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.verifiers import (
     VerifierRolloutScheduler,
@@ -42,6 +41,58 @@ from wavelet.orchestrator.verifiers import (
     _VerifierFailureStats,
     _VerifierGroupState,
 )
+from wavelet.transport.queue import FileSystemRolloutSender
+
+
+def _bare_scheduler(**overrides: Any) -> VerifierRolloutScheduler:
+    """Build a scheduler with every ``__init__`` attribute defaulted, no env load."""
+    scheduler = object.__new__(VerifierRolloutScheduler)
+    policy_update_ready = asyncio.Event()
+    policy_update_ready.set()
+    attributes: dict[str, Any] = {
+        "vf": None,
+        "orchestrator": None,
+        "config": RLConfig(),
+        "env_runtimes": [],
+        "env": None,
+        "env_name": "verifier",
+        "model": "model",
+        "policy_step": None,
+        "rollout_step": None,
+        "rollout_count": 1,
+        "target_groups": None,
+        "target_tokens": None,
+        "clients": [object()],
+        "records": [RLExample(prompt=[], completion=[], advantage=None, reward=None)],
+        "record_cursor": 0,
+        "_record_order_epoch": None,
+        "_record_order": [],
+        "env_selection_cursor": 0,
+        "next_group_id": 0,
+        "groups": {},
+        "pending": {},
+        "ready_groups": [],
+        "ready_group_off_policy_steps": [],
+        "_admission_target_groups": None,
+        "_admission_accepted_groups": 0,
+        "requires_group_scoring": False,
+        "cancelled_rollouts_count": 0,
+        "rejected_groups_count": 0,
+        "last_batch_metrics": {},
+        "failure_stats": _VerifierFailureStats(),
+        "_policy_update_ready": policy_update_ready,
+        "policy_update_wait_seconds": 0.0,
+        "concurrency_controller": None,
+        "inference_metrics_scraper": None,
+        "inference_metrics_task": None,
+        "_inference_metrics_probed": False,
+        "adaptive_cancelled_rollouts": 0,
+        "admission": None,
+    }
+    attributes.update(overrides)
+    for name, value in attributes.items():
+        setattr(scheduler, name, value)
+    return scheduler
 
 
 def _trainable_trajectory() -> list[dict[str, Any]]:
@@ -210,7 +261,7 @@ def test_verifier_record_preserves_actual_generation_policy_step() -> None:
 
 
 def test_verifier_scheduler_snapshots_policy_when_request_completes() -> None:
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.policy_step = 4
 
     async def run() -> _PendingVerifierRequest:
@@ -601,7 +652,7 @@ def test_verifier_scheduler_uses_oversampling_without_async_multiplier() -> None
             "max_async_level": 8,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.target_groups = 32
     scheduler.clients = [object()] * 6
@@ -614,7 +665,7 @@ def test_verifier_scheduler_cycles_every_record_before_repeating() -> None:
         RLExample(prompt=[], completion=[], advantage=0.0, reward=0.0, source=str(i))
         for i in range(5)
     ]
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.records = records
     scheduler.config = RLConfig(data={"shuffle": False})
     scheduler.record_cursor = 0
@@ -633,7 +684,7 @@ def test_verifier_scheduler_shuffles_deterministically_per_epoch() -> None:
     ]
 
     def sample() -> list[str]:
-        scheduler = object.__new__(VerifierRolloutScheduler)
+        scheduler = _bare_scheduler()
         scheduler.records = records
         scheduler.config = RLConfig(data={"shuffle": True, "seed": 123})
         scheduler.record_cursor = 0
@@ -658,7 +709,7 @@ def test_verifier_scheduler_uses_explicit_pending_chunk_limit() -> None:
             "max_pending_rollout_chunks": 16,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.target_groups = 64
     scheduler.clients = [object()] * 4
@@ -675,7 +726,7 @@ def test_verifier_scheduler_rollout_capacity_uses_pending_chunk_limit() -> None:
             "max_pending_rollout_chunks": 16,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.target_groups = 64
     scheduler.rollout_count = 8
@@ -695,7 +746,7 @@ def test_pending_chunk_limit_is_not_expanded_by_oversampling() -> None:
             "oversampling_factor": 3.0,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.target_groups = 32
     scheduler.rollout_count = 8
@@ -714,7 +765,7 @@ def test_verifier_scheduler_uses_explicit_max_inflight_rollouts() -> None:
             "max_inflight_rollouts": 128,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.target_groups = 64
     scheduler.rollout_count = 8
@@ -732,7 +783,7 @@ def test_explicit_rollout_limit_is_hard_with_many_clients() -> None:
             "max_inflight_rollouts": 130,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.target_groups = 64
     scheduler.rollout_count = 8
@@ -744,9 +795,8 @@ def test_explicit_rollout_limit_is_hard_with_many_clients() -> None:
 
 def test_adaptive_concurrency_cancels_youngest_complete_group() -> None:
     async def run() -> None:
-        scheduler = object.__new__(VerifierRolloutScheduler)
+        scheduler = _bare_scheduler()
         scheduler.pending = {}
-        scheduler.pending_clients = {}
         scheduler.groups = {}
         scheduler.cancelled_rollouts_count = 0
         scheduler.adaptive_cancelled_rollouts = 0
@@ -760,7 +810,6 @@ def test_adaptive_concurrency_cancels_youngest_complete_group() -> None:
                 client_index=0,
                 rollout_count=1,
             )
-            scheduler.pending_clients[task] = 0
             scheduler.groups[group_id] = _VerifierGroupState(
                 example={"id": group_id},
                 rollouts_to_schedule=0,
@@ -791,7 +840,7 @@ def test_pending_chunk_limit_is_hard_with_many_clients() -> None:
             "max_pending_rollout_chunks": 2,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.target_groups = 64
     scheduler.rollout_count = 8
@@ -860,14 +909,13 @@ def test_verifier_scheduler_drains_done_tasks_and_buffers_extra_groups() -> None
             "filter_zero_advantage": False,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 1
     scheduler.target_groups = 1
     scheduler.clients = [object()]
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {}
     scheduler.ready_groups = []
 
@@ -890,7 +938,6 @@ def test_verifier_scheduler_drains_done_tasks_and_buffers_extra_groups() -> None
                 rollout_count=1,
                 policy_step=3,
             )
-            scheduler.pending_clients[task] = 0
             scheduler.groups[group_id] = _VerifierGroupState(
                 example={"example_id": group_id},
                 rollouts_to_schedule=0,
@@ -921,14 +968,13 @@ def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
             "filter_zero_advantage": True,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 2
     scheduler.target_groups = 2
     scheduler.clients = [object()]
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {}
     scheduler.ready_groups = []
     scheduler.ready_group_off_policy_steps = []
@@ -955,7 +1001,6 @@ def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
                 client_index=0,
                 rollout_count=2,
             )
-            scheduler.pending_clients[task] = 0
             scheduler.groups[group_id] = _VerifierGroupState(
                 example={"example_id": group_id},
                 rollouts_to_schedule=0,
@@ -995,7 +1040,7 @@ def test_verifier_batch_stats_report_unfiltered_generation_reward() -> None:
     stats.observe([{"reward": 0.0}, {"reward": 1.0}], admitted=True)
     stats.observe([{"reward": 1.0}, {"reward": 1.0}], admitted=False)
 
-    metrics = stats.metrics(rollouts_per_group=2)
+    metrics = stats.metrics()
 
     assert metrics["generation/groups/completed"] == 2.0
     assert metrics["generation/groups/admitted"] == 1.0
@@ -1007,7 +1052,7 @@ def test_verifier_batch_stats_report_unfiltered_generation_reward() -> None:
     assert metrics["generation/solve_all/rate"] == 0.5
     assert metrics["generation/effective_groups/rate"] == 0.5
 
-    empty_metrics = _VerifierBatchStats().metrics(rollouts_per_group=2)
+    empty_metrics = _VerifierBatchStats().metrics()
     assert "generation/reward/mean" not in empty_metrics
 
 
@@ -1422,7 +1467,7 @@ def test_verifier_scheduler_reschedules_failed_single_rollout() -> None:
             "filter_zero_advantage": False,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 2
@@ -1430,7 +1475,6 @@ def test_verifier_scheduler_reschedules_failed_single_rollout() -> None:
     scheduler.clients = [object()]
     scheduler.requires_group_scoring = False
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {
         0: _VerifierGroupState(
             example={"example_id": 0, "prompt": "x"},
@@ -1462,7 +1506,6 @@ def test_verifier_scheduler_reschedules_failed_single_rollout() -> None:
                 client_index=0,
                 rollout_count=1,
             )
-            self.pending_clients[task] = 0
             self._scheduled += 1
 
     scheduler._fill_inflight = MethodType(fill_inflight, scheduler)
@@ -1481,13 +1524,12 @@ def test_verifier_scheduler_cancels_incomplete_group_after_policy_change() -> No
             "filter_zero_advantage": False,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.rollout_count = 2
     scheduler.requires_group_scoring = False
     scheduler.policy_step = 3
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {
         0: _VerifierGroupState(
             example={"example_id": 0, "prompt": "x"},
@@ -1520,10 +1562,9 @@ def test_verifier_scheduler_cancels_incomplete_group_after_policy_change() -> No
 
 
 def test_verifier_scheduler_cancels_stale_off_policy_groups() -> None:
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = RLConfig(orchestrator={"max_off_policy_steps": 1})
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {
         0: _VerifierGroupState(
             example={"example_id": 0, "prompt": "x"},
@@ -1543,7 +1584,6 @@ def test_verifier_scheduler_cancels_stale_off_policy_groups() -> None:
             client_index=0,
             rollout_count=1,
         )
-        scheduler.pending_clients[task] = 0
 
         assert await scheduler.mark_policy_update() == 0
         assert scheduler.pending[task].off_policy_steps == 1
@@ -1558,11 +1598,10 @@ def test_verifier_scheduler_cancels_stale_off_policy_groups() -> None:
 
 
 def test_verifier_scheduler_uses_actual_policy_version_lag() -> None:
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = RLConfig(orchestrator={"max_off_policy_steps": 1})
     scheduler.policy_step = 5
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {
         0: _VerifierGroupState(
             example={"example_id": 0, "prompt": "x"},
@@ -1584,7 +1623,6 @@ def test_verifier_scheduler_uses_actual_policy_version_lag() -> None:
             rollout_count=1,
             policy_step=2,
         )
-        scheduler.pending_clients[task] = 0
         return await scheduler.mark_policy_update()
 
     assert asyncio.run(run()) == 1
@@ -1593,7 +1631,7 @@ def test_verifier_scheduler_uses_actual_policy_version_lag() -> None:
 
 
 def test_verifier_scheduler_ages_ready_groups_on_policy_update() -> None:
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = RLConfig(orchestrator={"max_off_policy_steps": 1})
     scheduler.pending = {}
     scheduler.ready_groups = [[{"example_id": 0}], [{"example_id": 1}]]
@@ -1609,10 +1647,9 @@ def test_verifier_scheduler_ages_ready_groups_on_policy_update() -> None:
 
 
 def test_verifier_scheduler_zero_off_policy_cancels_immediately() -> None:
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = RLConfig(orchestrator={"max_off_policy_steps": 0})
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {
         0: _VerifierGroupState(
             example={"example_id": 0, "prompt": "x"},
@@ -1632,7 +1669,6 @@ def test_verifier_scheduler_zero_off_policy_cancels_immediately() -> None:
             client_index=0,
             rollout_count=1,
         )
-        scheduler.pending_clients[task] = 0
 
         assert await scheduler.mark_policy_update() == 1
         assert task.cancelled()
@@ -1652,14 +1688,13 @@ def test_verifier_scheduler_pops_ready_group_age_when_consumed() -> None:
             "filter_zero_advantage": False,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 1
     scheduler.target_groups = 1
     scheduler.clients = [object()]
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {}
     scheduler.ready_groups = [
         [
@@ -1694,7 +1729,7 @@ def test_verifier_scheduler_stops_after_token_budget_and_buffers_extra_group() -
             "filter_zero_advantage": False,
         },
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 1
@@ -1702,7 +1737,6 @@ def test_verifier_scheduler_stops_after_token_budget_and_buffers_extra_group() -
     scheduler.target_tokens = 3
     scheduler.clients = [object()]
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {}
     scheduler.ready_groups = [
         [
@@ -1740,7 +1774,7 @@ def test_token_batch_covers_one_distributed_micro_batch() -> None:
             "filter_zero_advantage": False,
         },
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 2
@@ -1748,7 +1782,6 @@ def test_token_batch_covers_one_distributed_micro_batch() -> None:
     scheduler.target_tokens = 1
     scheduler.clients = [object()]
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {}
     scheduler.ready_groups = [
         [
@@ -1794,7 +1827,7 @@ def test_token_batch_retry_limit_counts_rejected_groups_not_short_groups() -> No
 
 
 def test_verifier_scheduler_salts_new_requests_with_loaded_policy() -> None:
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = RLConfig()
     scheduler.model = "base"
     scheduler.policy_step = None
@@ -1914,23 +1947,14 @@ def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
             "zero_advantage_max_retries": 1,
         }
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 1
     scheduler.target_groups = 1
     scheduler.clients = [object()]
     scheduler.pending = {}
-    scheduler.pending_clients = {}
-    scheduler.groups = {
-        0: type(
-            "Group",
-            (),
-            {
-                "completed_outputs": [],
-            },
-        )()
-    }
+    scheduler.groups = {0: _VerifierGroupState(example={}, rollouts_to_schedule=0)}
     scheduler._scheduled = 0
 
     async def zero_advantage_group() -> list[dict[str, float]]:
@@ -1945,20 +1969,13 @@ def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
     def fill_inflight(self) -> None:
         if self.pending:
             return
-        self.groups[0] = type(
-            "Group",
-            (),
-            {
-                "completed_outputs": [],
-            },
-        )()
+        self.groups[0] = _VerifierGroupState(example={}, rollouts_to_schedule=0)
         task = asyncio.create_task(zero_advantage_group())
         self.pending[task] = _PendingVerifierRequest(
             group_id=0,
             client_index=0,
             rollout_count=1,
         )
-        self.pending_clients[task] = 0
         self._scheduled += 1
 
     scheduler._fill_inflight = MethodType(fill_inflight, scheduler)
@@ -1979,7 +1996,7 @@ def test_verifier_scheduler_rejects_partial_batch_at_retry_limit() -> None:
 
 
 def test_policy_update_gate_blocks_new_rollout_submission() -> None:
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler._policy_update_ready = asyncio.Event()
     scheduler._policy_update_ready.set()
     scheduled = []
@@ -2003,7 +2020,7 @@ def _environment_runtime(
 ) -> _VerifierEnvRuntime:
     env_config = config.orchestrator.envs[index]
     return _VerifierEnvRuntime(
-        config=env_config,
+        spec=env_config,
         env=object(),
         env_name=env_config.resolved_name,
         records=records,
@@ -2049,15 +2066,13 @@ def _bounded_group_scheduler(
             "envs": [{"id": "verifier", "group_size": 16}],
         },
     )
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.rollout_count = 16
-    scheduler._minimum_rollout_count = 16
     scheduler.target_groups = 8
     scheduler.target_tokens = None
     scheduler.clients = [object()]
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {}
     scheduler.ready_groups = []
     scheduler.policy_step = 0
@@ -2084,7 +2099,6 @@ def _bounded_group_scheduler(
             rollout_count=16,
             policy_step=0,
         )
-        self.pending_clients[request] = 0  # type: ignore[index]
 
     scheduler._schedule_group_rollout = MethodType(
         schedule_group_rollout,
@@ -2104,7 +2118,6 @@ def _remove_bounded_candidate(
         if info.group_id == group_id
     )
     scheduler.pending.pop(request)
-    scheduler.pending_clients.pop(request)
     scheduler.groups.pop(group_id)
 
 
@@ -2266,7 +2279,7 @@ def test_verifier_scheduler_selects_weighted_environments_with_independent_curso
     None
 ):
     config = _mixed_environment_config()
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.env_selection_cursor = 0
     scheduler.record_cursor = 0
@@ -2292,7 +2305,7 @@ def test_verifier_scheduler_selects_weighted_environments_with_independent_curso
 
 def test_verifier_scheduler_tracks_absolute_environment_cursors_across_epochs() -> None:
     config = _mixed_environment_config()
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     runtime = _environment_runtime(
         config,
@@ -2310,13 +2323,12 @@ def test_verifier_scheduler_tracks_absolute_environment_cursors_across_epochs() 
 
 def test_verifier_scheduler_applies_group_size_and_algorithm_per_environment() -> None:
     config = _mixed_environment_config()
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 2
     scheduler.requires_group_scoring = False
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.groups = {}
     scheduler.ready_groups = []
     scheduler.ready_group_off_policy_steps = []
@@ -2403,13 +2415,12 @@ def test_verifier_scheduler_observes_curriculum_and_applies_gate() -> None:
     )
     curriculum = Mock()
     curriculum.on_result.return_value = False
-    scheduler = object.__new__(VerifierRolloutScheduler)
+    scheduler = _bare_scheduler()
     scheduler.config = config
     scheduler.orchestrator = RLOrchestrator(config)
     scheduler.rollout_count = 1
     scheduler.requires_group_scoring = False
     scheduler.pending = {}
-    scheduler.pending_clients = {}
     scheduler.ready_groups = []
     scheduler.ready_group_off_policy_steps = []
 

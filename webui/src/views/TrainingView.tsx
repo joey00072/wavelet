@@ -3,9 +3,8 @@ import { ListPlus, Settings2 } from "lucide-react";
 
 import { ChartCard, chartProps } from "../charts/ChartCard";
 import { LineChart, SeriesTable } from "../charts/LineChart";
-import { Popover, Segmented, Slider } from "../components/Controls";
+import { Popover, Segmented, Slider, smoothingLabel } from "../components/Controls";
 import { Drawer } from "../components/Drawer";
-import { Empty } from "../components/KeyValue";
 import { MetricPicker } from "../components/MetricPicker";
 import { fmt } from "../lib/format";
 import { updateParams } from "../lib/router";
@@ -64,7 +63,7 @@ export function ChartSettingsMenu({ settings, onChange, showLayout = true }: { s
       )}
     >
       <div className="space-y-4">
-        <Slider label="Smoothing" min={0} max={0.99} step={0.01} value={settings.smoothing} onChange={(v) => onChange({ smoothing: v })} format={(v) => (v === 0 ? "off" : v.toFixed(2))} />
+        <Slider label="Smoothing" min={0} max={0.99} step={0.01} value={settings.smoothing} onChange={(v) => onChange({ smoothing: v })} format={smoothingLabel} />
         <div className="flex items-center justify-between text-[11px] text-muted">
           <span className="w-20">X axis</span>
           <Segmented value={settings.xAxis} onChange={(v) => onChange({ xAxis: v })} size="xs" options={[{ value: "step", label: "step" }, { value: "time", label: "minutes" }]} />
@@ -94,7 +93,9 @@ export function ChartSettingsMenu({ settings, onChange, showLayout = true }: { s
 
 const NONE = "-";
 
-function MetricExplorer({ apiBase, runId, source, params, defaultKeys, title, live }: { apiBase: string; runId: string; source: "trainer" | "orchestrator"; params: URLSearchParams; defaultKeys: string[]; title: string; live: boolean }) {
+type ViewProps = { apiBase: string; runId: string; params: URLSearchParams; live: boolean };
+
+function MetricExplorer({ apiBase, runId, source, params, defaultKeys, title, live }: ViewProps & { source: "trainer" | "orchestrator"; defaultKeys: string[]; title: string }) {
   const keys = useMetricKeys(apiBase, runId);
   const external = usePoll<ExternalStatus[]>(runUrl(apiBase, runId, "/external"), live ? 15000 : 0);
   const externalReady = (external.data ?? []).filter((e) => e.status === "ready").map((e) => e.source);
@@ -194,10 +195,10 @@ function MetricExplorer({ apiBase, runId, source, params, defaultKeys, title, li
   );
 }
 
-export function TrainingView(props: { apiBase: string; runId: string; params: URLSearchParams; live: boolean }) {
+export function TrainingView(props: ViewProps) {
   return <MetricExplorer {...props} source="trainer" title="Trainer" defaultKeys={PRESETS.loss.concat(["entropy/mean", "optim/grad_norm", "kl/mismatch", "ipo/is_masked", "dppo/is_masked"])} />;
 }
 
-export function RolloutMetricsView(props: { apiBase: string; runId: string; params: URLSearchParams; live: boolean }) {
+export function RolloutMetricsView(props: ViewProps) {
   return <MetricExplorer {...props} source="orchestrator" title="Generation" defaultKeys={["reward/all/mean", "generation/reward/mean", "advantage/all/std", "is_truncated/all/mean", "decode_len/all/mean", "generation/groups/admission_rate", "generation/solve_none/rate", "off_policy/mean", "time/generate_completions"]} />;
 }

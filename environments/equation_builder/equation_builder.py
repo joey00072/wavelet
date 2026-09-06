@@ -209,22 +209,11 @@ def load_environment(
     import verifiers as vf
     from datasets import Dataset
 
-    def build_train_dataset() -> Dataset:
+    def build_dataset(count: int, dataset_seed: int) -> Dataset:
         return Dataset.from_list(
             build_examples(
-                num_examples=num_examples,
-                seed=seed,
-                num_numbers=num_numbers,
-                target_min=target_min,
-                target_max=target_max,
-            )
-        )
-
-    def build_eval_dataset() -> Dataset:
-        return Dataset.from_list(
-            build_examples(
-                num_examples=eval_examples,
-                seed=seed + 1,
+                num_examples=count,
+                seed=dataset_seed,
                 num_numbers=num_numbers,
                 target_min=target_min,
                 target_max=target_max,
@@ -255,8 +244,8 @@ def load_environment(
         parser=parser,
     )
     return vf.SingleTurnEnv(
-        dataset=build_train_dataset,
-        eval_dataset=build_eval_dataset,
+        dataset=lambda: build_dataset(num_examples, seed),
+        eval_dataset=lambda: build_dataset(eval_examples, seed + 1),
         system_prompt=SYSTEM_PROMPT,
         parser=parser,
         rubric=rubric,

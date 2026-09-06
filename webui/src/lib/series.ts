@@ -6,7 +6,7 @@ export type LineSeries = { id: string; label: string; points: Point[]; envelope?
 export function seriesToLines(
   series: Series | null,
   keys: string[],
-  options: { xAxis?: "step" | "time"; smoothing?: number; labels?: Record<string, string> } = {},
+  options: { xAxis?: "step" | "time"; labels?: Record<string, string> } = {},
 ): LineSeries[] {
   if (!series) return [];
   const xAxis = options.xAxis ?? "step";
@@ -24,16 +24,9 @@ export function seriesToLines(
       points.sort((a, b) => a.x - b.x);
       return points;
     };
-    const raw = pointsFor(values);
     const bounds = series.envelope?.[key];
     const envelope = bounds ? { min: pointsFor(bounds.min), max: pointsFor(bounds.max) } : undefined;
-    return {
-      id: key,
-      label: options.labels?.[key] ?? key,
-      points: options.smoothing && options.smoothing > 0 ? ema(raw, options.smoothing) : raw,
-      envelope,
-      colorIndex: index,
-    };
+    return { id: key, label: options.labels?.[key] ?? key, points: pointsFor(values), envelope, colorIndex: index };
   });
 }
 
@@ -65,6 +58,10 @@ function elapsedMinutes(stamp: string | null | undefined, start: number | null):
   return (time - start) / 60000;
 }
 
+function finiteValues(values: Array<number | null>): number[] {
+  return values.filter((value): value is number => value !== null && Number.isFinite(value));
+}
+
 export function lastFinite(values: Array<number | null> | undefined): number | null {
   if (!values) return null;
   for (let i = values.length - 1; i >= 0; i -= 1) {
@@ -74,15 +71,9 @@ export function lastFinite(values: Array<number | null> | undefined): number | n
   return null;
 }
 
-export function trailingMean(
-  values: Array<number | null> | undefined,
-  window = 5,
-): number | null {
+export function trailingMean(values: Array<number | null> | undefined, window = 5): number | null {
   if (!values || window < 1) return null;
-  const finite = values.filter(
-    (value): value is number => value !== null && Number.isFinite(value),
-  );
-  const tail = finite.slice(-window);
+  const tail = finiteValues(values).slice(-window);
   if (tail.length === 0) return null;
   return tail.reduce((sum, value) => sum + value, 0) / tail.length;
 }
@@ -94,7 +85,7 @@ export function num(row: MetricRow | null | undefined, key: string): number | nu
 
 export function windowDelta(values: Array<number | null> | undefined, window = 5): number | null {
   if (!values) return null;
-  const finite = values.filter((v): v is number => v !== null && Number.isFinite(v));
+  const finite = finiteValues(values);
   if (finite.length < 2) return null;
   const size = Math.min(window, Math.floor(finite.length / 2));
   if (size < 1) return null;

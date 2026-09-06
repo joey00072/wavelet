@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
+
+from wavelet.tools.verifier_data import import_verifiers, verifier_rows, write_jsonl
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,38 +40,12 @@ def env_args(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise SystemExit(
-            "The Qwen4B math example uses verifier environments. Install them "
-            "with `uv sync --extra verifiers --extra envs`."
-        ) from exc
-
+    vf = import_verifiers()
     env = vf.load_environment(args.env_id, **env_args(args))
-    dataset = env.get_dataset(n=args.examples or -1, seed=args.seed)
-    rows = []
-    for index, example in enumerate(dataset):
-        payload = dict(example)
-        payload.setdefault("example_id", index)
-        rows.append(
-            {
-                "prompt": payload["prompt"],
-                "completion": "",
-                "metadata": {
-                    "verifier_example": payload,
-                    "example_id": payload["example_id"],
-                },
-            }
-        )
-
+    rows = verifier_rows(env.get_dataset(n=args.examples or -1, seed=args.seed))
     if not rows:
         raise RuntimeError("Math verifier dataset returned no examples.")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row) + "\n")
+    write_jsonl(args.output, rows)
     print(f"Wrote {len(rows)} verifier examples to {args.output}")
     return 0
 

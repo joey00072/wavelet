@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.orchestrator.queue import (
+from wavelet.transport.queue import (
     ClaimRecord,
     ConsumedRecord,
     QueueEvent,

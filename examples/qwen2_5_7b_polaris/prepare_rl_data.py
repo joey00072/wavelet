@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
+
+from wavelet.tools.verifier_data import import_verifiers, verifier_rows, write_jsonl
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,13 +35,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise SystemExit(
-            "This example requires Verifiers. Install the verifiers extra first."
-        ) from exc
-
+    vf = import_verifiers()
     env = vf.load_environment(
         "polaris-math-tagged",
         min_difficulty=args.min_difficulty,
@@ -48,29 +43,10 @@ def main() -> int:
         exclude_proof_problems=not args.include_proof_problems,
         exclude_malformed_answers=not args.include_malformed_answers,
     )
-    dataset = env.get_dataset(n=args.examples or -1, seed=args.seed)
-    rows = []
-    for index, example in enumerate(dataset):
-        payload = dict(example)
-        payload.setdefault("example_id", index)
-        rows.append(
-            {
-                "prompt": payload["prompt"],
-                "completion": "",
-                "metadata": {
-                    "verifier_example": payload,
-                    "example_id": payload["example_id"],
-                },
-            }
-        )
-
+    rows = verifier_rows(env.get_dataset(n=args.examples or -1, seed=args.seed))
     if not rows:
         raise RuntimeError("Filtered Polaris returned no examples.")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row) + "\n")
+    write_jsonl(args.output, rows)
     print(f"Wrote {len(rows)} verifier examples to {args.output}")
     return 0
 

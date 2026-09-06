@@ -368,7 +368,7 @@ def _should_mask(role: str, loss_mask_config: LossMaskConfig) -> bool:
             raise ValueError(f"Unsupported message role: {role}")
 
 
-def _apply_chat_template(
+def apply_chat_template(
     tokenizer: PreTrainedTokenizerBase,
     messages: list[dict[str, str]],
     *,
@@ -466,7 +466,7 @@ def _build_loss_mask(
         add_generation_prompt = (
             index + 1 < len(messages) and messages[index + 1]["role"] == "assistant"
         )
-        current_ids = _apply_chat_template(
+        current_ids = apply_chat_template(
             tokenizer,
             messages[: index + 1],
             add_generation_prompt=add_generation_prompt,
@@ -501,7 +501,7 @@ def _build_loss_mask(
         if turn_mask and add_generation_prompt:
             # The trailing generation prompt is the next turn's header, so it
             # must not be trained as part of this assistant message.
-            content_ids = _apply_chat_template(
+            content_ids = apply_chat_template(
                 tokenizer,
                 messages[: index + 1],
                 add_generation_prompt=False,
@@ -543,7 +543,7 @@ def _maybe_append_assistant_prefill_delta(
     if messages[index]["role"] != "assistant":
         return None
 
-    prompt_ids = _apply_chat_template(
+    prompt_ids = apply_chat_template(
         tokenizer,
         messages[:index],
         add_generation_prompt=False,

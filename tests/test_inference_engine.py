@@ -9,7 +9,6 @@ from wavelet.inference.engine import (
     fit_generation_context,
     openai_payload_to_vllm_kwargs,
     openai_sampling_payload,
-    sampling_mask_required,
     vllm_sampling_kwargs,
 )
 
@@ -37,17 +36,15 @@ def test_sampling_mask_rows_align_with_generated_tokens() -> None:
 
 
 def test_sampling_mask_is_required_only_for_restricted_training_support() -> None:
-    assert not sampling_mask_required(RLConfig())
-    assert sampling_mask_required(RLConfig(inference={"sampling": {"top_k": 8}}))
-    assert not sampling_mask_required(
-        RLConfig(
-            inference={
-                "sampling": {"top_k": 8},
-                "vllm": {"return_sampling_mask": False},
-            },
-            orchestrator={"enabled": False},
-        )
-    )
+    assert not RLConfig().sampling_mask_required()
+    assert RLConfig(inference={"sampling": {"top_k": 8}}).sampling_mask_required()
+    assert not RLConfig(
+        inference={
+            "sampling": {"top_k": 8},
+            "vllm": {"return_sampling_mask": False},
+        },
+        orchestrator={"enabled": False},
+    ).sampling_mask_required()
 
 
 @pytest.mark.parametrize("token_key", [7, "7"])

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 /** Tweens between successive numeric values so live tiles glide instead of jumping. */
-export function AnimatedNumber({ value, format, duration = 500 }: { value: number | null | undefined; format: (v: number) => string; duration?: number }) {
+export function AnimatedNumber({ value, format }: { value: number | null | undefined; format: (v: number) => string }) {
   const [shown, setShown] = useState<number | null>(value ?? null);
   const from = useRef<number | null>(value ?? null);
   useEffect(() => {
@@ -19,7 +19,7 @@ export function AnimatedNumber({ value, format, duration = 500 }: { value: numbe
     const t0 = performance.now();
     let frame = 0;
     const tick = (now: number) => {
-      const t = Math.min(1, (now - t0) / duration);
+      const t = Math.min(1, (now - t0) / 500);
       const eased = 1 - (1 - t) ** 3;
       setShown(start + (value - start) * eased);
       if (t < 1) frame = requestAnimationFrame(tick);
@@ -27,6 +27,6 @@ export function AnimatedNumber({ value, format, duration = 500 }: { value: numbe
     };
     frame = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(frame);
-  }, [value, duration]);
+  }, [value]);
   return <>{shown === null ? "–" : format(shown)}</>;
 }

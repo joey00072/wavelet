@@ -1,4 +1,4 @@
-from wavelet.trainer.sft_runner import main
+from wavelet.trainer.trainer import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -25,6 +25,8 @@ from wavelet.orchestrator.scheduler import (
 )
 from wavelet.transport.queue import FileSystemRolloutSender
 
+from test_verifiers_rollouts import _bare_scheduler
+
 
 def _scheduler(
     config: RLConfig,
@@ -34,20 +36,14 @@ def _scheduler(
     rollout_count: int = 1,
     requires_group_scoring: bool = False,
 ) -> VerifierRolloutScheduler:
-    scheduler = object.__new__(VerifierRolloutScheduler)
-    scheduler.config = config
-    scheduler.pending = {}
-    scheduler.pending_clients = {}
-    scheduler.groups = {}
-    scheduler.ready_groups = []
-    scheduler.ready_group_off_policy_steps = []
-    scheduler.cancelled_rollouts_count = 0
-    scheduler.policy_step = policy_step
-    scheduler.rollout_step = rollout_step
-    scheduler.rollout_count = rollout_count
-    scheduler.requires_group_scoring = requires_group_scoring
-    scheduler.env_name = "env"
-    return scheduler
+    return _bare_scheduler(
+        config=config,
+        policy_step=policy_step,
+        rollout_step=rollout_step,
+        rollout_count=rollout_count,
+        requires_group_scoring=requires_group_scoring,
+        env_name="env",
+    )
 
 
 async def _finished_task(outputs: list[dict[str, Any]]) -> asyncio.Task:
@@ -68,7 +64,6 @@ def _consume(
     async def run() -> tuple[int, int, int]:
         task = await _finished_task(outputs)
         scheduler.pending[task] = request
-        scheduler.pending_clients[task] = request.client_index
         return scheduler._consume_completed_task(
             task,
             target_groups=1,
@@ -368,7 +363,7 @@ def test_eval_requests_route_to_the_served_policy_model(
     engine = SimpleNamespace(policy_model_name="policy-adapter")
 
     metrics = asyncio.run(
-        verifier_envs._evaluate_env_async(
+        verifier_envs.evaluate_env_async(
             orchestrator,  # type: ignore[arg-type]
             RLEvalEnvConfig(id="math-env"),
             step=4,
@@ -382,7 +377,7 @@ def test_eval_requests_route_to_the_served_policy_model(
     assert metrics["progress/policy_step"] == 4.0
 
     asyncio.run(
-        verifier_envs._evaluate_env_async(
+        verifier_envs.evaluate_env_async(
             orchestrator,  # type: ignore[arg-type]
             RLEvalEnvConfig(id="math-env"),
             step=4,

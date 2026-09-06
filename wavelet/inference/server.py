@@ -54,10 +54,9 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.inference.diagnostics import inference_debug_state
-from wavelet.inference.engine import sampling_mask_required
+from wavelet.debug import inference_debug_state
+from wavelet.monitor import emit_perf
 from wavelet.utils.config import load_config
-from wavelet.utils.monitoring import emit_perf
 
 _CONFIG: RLConfig | None = None
 router = APIRouter()
@@ -186,36 +185,11 @@ class ChatCompletionRequestWithTokens(ChatCompletionRequest):
 
 
 class OpenAIServingChatWithTokens(OpenAIServingChat):
-    async def create_chat_completion(
-        self,
-        request: ChatCompletionRequest,
-        raw_request: Request | None = None,
-    ):
-        fitted_request = request
+    async def _with_context_fit(self, request, attempt):
+        """Retry ``attempt`` with a context-fitted request when vLLM rejects it."""
         for _ in range(4):
             try:
-                return await super().create_chat_completion(
-                    fitted_request,
-                    raw_request,
-                )
-            except VLLMValidationError as exc:
-                next_request = _fit_chat_request_to_context(
-                    fitted_request,
-                    max_model_len=self.model_config.max_model_len,
-                    error=exc,
-                )
-                if next_request is fitted_request:
-                    raise
-                fitted_request = next_request
-        return await super().create_chat_completion(fitted_request, raw_request)
-
-    async def _render_with_context_fit(
-        self,
-        request: ChatCompletionRequestWithTokens,
-    ):
-        for _ in range(4):
-            try:
-                return request, await self.render_chat_request(request)
+                return await attempt(request)
             except VLLMValidationError as exc:
                 fitted_request = _fit_chat_request_to_context(
                     request,
@@ -225,7 +199,26 @@ class OpenAIServingChatWithTokens(OpenAIServingChat):
                 if fitted_request is request:
                     raise
                 request = fitted_request
-        return request, await self.render_chat_request(request)
+        return await attempt(request)
+
+    async def create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None = None,
+    ):
+        create = super().create_chat_completion
+        return await self._with_context_fit(
+            request, lambda fitted: create(fitted, raw_request)
+        )
+
+    async def _render_with_context_fit(
+        self,
+        request: ChatCompletionRequestWithTokens,
+    ):
+        async def render(fitted: ChatCompletionRequestWithTokens):
+            return fitted, await self.render_chat_request(fitted)
+
+        return await self._with_context_fit(request, render)
 
     def _output_parser(self, request, tokenizer) -> tuple[Any | None, dict]:
         chat_template_kwargs = self._effective_chat_template_kwargs(request)
@@ -548,7 +541,13 @@ def _prompt_tokens_from_validation_error(error: VLLMValidationError) -> int | No
     return int(match.group(1))
 
 
-def _base(request: Request) -> OpenAIServing:
+def _require_config() -> RLConfig:
+    if _CONFIG is None:
+        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    return _CONFIG
+
+
+def _tokenization_serving(request: Request) -> OpenAIServing:
     return request.app.state.openai_serving_tokenization
 
 
@@ -808,12 +807,11 @@ async def health(request: Request) -> dict[str, Any]:
 @router.get("/liveness", response_model=None)
 async def liveness(request: Request) -> dict[str, str] | JSONResponse:
     """Check that every vLLM worker can service a no-op RPC."""
-    if _CONFIG is None:
-        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    config = _require_config()
     try:
         await asyncio.wait_for(
             _engine_client(request).collective_rpc("liveness_probe"),
-            timeout=_CONFIG.inference.http.liveness_timeout_seconds,
+            timeout=config.inference.http.liveness_timeout_seconds,
         )
     except TimeoutError:
         return JSONResponse(
@@ -825,9 +823,7 @@ async def liveness(request: Request) -> dict[str, str] | JSONResponse:
 
 @router.get("/debug/state")
 async def debug_state(request: Request) -> dict[str, Any]:
-    if _CONFIG is None:
-        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
-    state = inference_debug_state(_CONFIG)
+    state = inference_debug_state(_require_config())
     state["runtime"] = {
         "policy_step": getattr(request.app.state, "policy_step", None),
         "policy_adapter_name": getattr(request.app.state, "policy_adapter_name", None),
@@ -839,32 +835,34 @@ async def debug_state(request: Request) -> dict[str, Any]:
     return state
 
 
+async def _set_generation_paused(
+    raw_request: Request, *, paused: bool
+) -> dict[str, str]:
+    client = _engine_client(raw_request)
+    method = "pause_generation" if paused else "resume_generation"
+    if not hasattr(client, method):
+        raise RuntimeError(
+            "This vLLM engine does not support safe policy updates because "
+            f"{method} is unavailable."
+        )
+    if paused:
+        await client.pause_generation(mode="keep", clear_cache=False)
+    else:
+        await client.resume_generation()
+    raw_request.app.state.generation_paused = paused
+    return {"status": "paused" if paused else "resumed"}
+
+
 @router.post("/pause")
 async def pause(raw_request: Request) -> dict[str, str]:
     """Drain active requests and hold new generation during a policy update."""
-    client = _engine_client(raw_request)
-    if not hasattr(client, "pause_generation"):
-        raise RuntimeError(
-            "This vLLM engine does not support safe policy updates because "
-            "pause_generation is unavailable."
-        )
-    await client.pause_generation(mode="keep", clear_cache=False)
-    raw_request.app.state.generation_paused = True
-    return {"status": "paused"}
+    return await _set_generation_paused(raw_request, paused=True)
 
 
 @router.post("/resume")
 async def resume(raw_request: Request) -> dict[str, str]:
     """Allow generation after a policy update transaction."""
-    client = _engine_client(raw_request)
-    if not hasattr(client, "resume_generation"):
-        raise RuntimeError(
-            "This vLLM engine does not support safe policy updates because "
-            "resume_generation is unavailable."
-        )
-    await client.resume_generation()
-    raw_request.app.state.generation_paused = False
-    return {"status": "resumed"}
+    return await _set_generation_paused(raw_request, paused=False)
 
 
 @router.post("/sleep")
@@ -894,16 +892,15 @@ async def sleep(payload: dict[str, Any], raw_request: Request) -> dict[str, Any]
 @router.post("/wake")
 async def wake(payload: dict[str, Any], raw_request: Request) -> dict[str, Any]:
     tags = payload.get("tags")
+    kwargs = {"tags": tags} if tags is not None else {}
     client = _engine_client(raw_request)
     if hasattr(client, "wake_up"):
-        kwargs = {"tags": tags} if tags is not None else {}
         await client.wake_up(**kwargs)
         status = "woke"
     elif hasattr(client, "resume_generation"):
         await client.resume_generation()
         status = "resumed"
     else:
-        kwargs = {"tags": tags} if tags is not None else {}
         try:
             await client.collective_rpc("wake_up", kwargs=kwargs)
         except TypeError:
@@ -915,23 +912,22 @@ async def wake(payload: dict[str, Any], raw_request: Request) -> dict[str, Any]:
 
 @router.post("/load_policy")
 async def load_policy(payload: dict[str, Any], raw_request: Request):
-    if _CONFIG is None:
-        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    config = _require_config()
     policy_dir = Path(payload["policy_dir"])
     step = int(payload["step"])
-    if _CONFIG.lora is None:
+    if config.lora is None:
         return await _load_full_model_policy(
             raw_request,
             policy_dir=policy_dir,
             step=step,
-            config=_CONFIG,
+            config=config,
         )
     return await _load_adapter_policy(
         raw_request,
         policy_dir=policy_dir,
         step=step,
         load_inplace=bool(payload.get("load_inplace", False)),
-        config=_CONFIG,
+        config=config,
     )
 
 
@@ -951,24 +947,20 @@ async def _load_full_model_policy(
         getattr(raw_request.app.state, "policy_step", None) == step
         and getattr(raw_request.app.state, "policy_weight_path", None) == weight_path
     )
-    if step == 0 or unchanged:
-        raw_request.app.state.policy_step = step
-        raw_request.app.state.policy_weight_path = weight_path
-        return response
-
-    client = _engine_client(raw_request)
-    if config.policy_transfer.type == "nccl":
-        await client.collective_rpc(
-            "init_broadcaster",
-            args=(
-                config.policy_transfer.nccl_host,
-                config.policy_transfer.nccl_port,
-                config.policy_transfer.nccl_rank_offset,
-                config.policy_transfer.nccl_inference_world_size,
-                config.policy_transfer.nccl_timeout_seconds,
-            ),
-        )
-    await client.collective_rpc("update_weights_from_path", args=(weight_path,))
+    if step != 0 and not unchanged:
+        client = _engine_client(raw_request)
+        if config.policy_transfer.type == "nccl":
+            await client.collective_rpc(
+                "init_broadcaster",
+                args=(
+                    config.policy_transfer.nccl_host,
+                    config.policy_transfer.nccl_port,
+                    config.policy_transfer.nccl_rank_offset,
+                    config.policy_transfer.nccl_inference_world_size,
+                    config.policy_transfer.nccl_timeout_seconds,
+                ),
+            )
+        await client.collective_rpc("update_weights_from_path", args=(weight_path,))
     raw_request.app.state.policy_step = step
     raw_request.app.state.policy_weight_path = weight_path
     return response
@@ -989,21 +981,16 @@ async def _load_adapter_policy(
 
     models = _models(raw_request)
     adapter_path = str(adapter_dir.resolve())
+    response = {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
     if (
         getattr(raw_request.app.state, "policy_step", None) == step
         and getattr(raw_request.app.state, "policy_adapter_name", None) == adapter_name
         and getattr(raw_request.app.state, "policy_adapter_path", None) == adapter_path
     ):
-        stored = models.lora_requests.get(adapter_name)
-        if stored is not None:
-            stored.load_inplace = False
-        return {
-            "status": "ok",
-            "policy_step": step,
-            "adapter_name": adapter_name,
-        }
+        _reset_load_inplace(models, adapter_name)
+        return response
     try:
-        response = await models.load_lora_adapter(
+        result = await models.load_lora_adapter(
             LoadLoRAAdapterRequest(
                 lora_name=adapter_name,
                 lora_path=adapter_path,
@@ -1011,50 +998,40 @@ async def _load_adapter_policy(
             )
         )
     finally:
-        stored = models.lora_requests.get(adapter_name)
-        if stored is not None:
-            stored.load_inplace = False
-    if isinstance(response, ErrorResponse):
+        _reset_load_inplace(models, adapter_name)
+    if isinstance(result, ErrorResponse):
         return JSONResponse(
-            content=response.model_dump(),
-            status_code=response.error.code,
+            content=result.model_dump(),
+            status_code=result.error.code,
         )
     raw_request.app.state.policy_step = step
     raw_request.app.state.policy_adapter_name = adapter_name
     raw_request.app.state.policy_adapter_path = adapter_path
-    return {
-        "status": "ok",
-        "policy_step": step,
-        "adapter_name": adapter_name,
-    }
+    return response
+
+
+def _reset_load_inplace(models: OpenAIServingModels, adapter_name: str) -> None:
+    """Stop a sticky load_inplace flag from forcing reloads on later requests."""
+    stored = models.lora_requests.get(adapter_name)
+    if stored is not None:
+        stored.load_inplace = False
 
 
 @router.post("/init_broadcaster")
 async def init_broadcaster(payload: dict[str, Any], raw_request: Request):
-    if _CONFIG is None:
-        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    transfer = _require_config().policy_transfer
     init_info = payload.get("init_info", payload)
     await _engine_client(raw_request).collective_rpc(
         "init_broadcaster",
         args=(
-            init_info.get("host", _CONFIG.policy_transfer.nccl_host),
-            int(init_info.get("port", _CONFIG.policy_transfer.nccl_port)),
-            int(
-                init_info.get(
-                    "rank_offset",
-                    _CONFIG.policy_transfer.nccl_rank_offset,
-                )
-            ),
-            int(
-                init_info.get(
-                    "inference_world_size",
-                    _CONFIG.policy_transfer.nccl_inference_world_size,
-                )
-            ),
-            int(
-                init_info.get(
-                    "timeout",
-                    _CONFIG.policy_transfer.nccl_timeout_seconds,
+            init_info.get("host", transfer.nccl_host),
+            *(
+                int(init_info.get(key, default))
+                for key, default in (
+                    ("port", transfer.nccl_port),
+                    ("rank_offset", transfer.nccl_rank_offset),
+                    ("inference_world_size", transfer.nccl_inference_world_size),
+                    ("timeout", transfer.nccl_timeout_seconds),
                 )
             ),
         ),
@@ -1167,7 +1144,7 @@ async def chat_completions_tokens(
 ):
     handler = _chat_with_tokens(raw_request)
     if handler is None:
-        return _base(raw_request).create_error_response(
+        return _tokenization_serving(raw_request).create_error_response(
             message="The model does not support Chat Completions API"
         )
     generator = await handler.create_chat_completion_with_tokens(request, raw_request)
@@ -1269,7 +1246,7 @@ def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
         argv.append("--trust-remote-code")
     if config.model.chat_template is not None:
         argv.extend(["--chat-template", config.model.chat_template])
-    if sampling_mask_required(config):
+    if config.sampling_mask_required():
         argv.append("--return-sampling-mask")
     hf_overrides = {}
     if vllm_config.enable_fp32_lm_head:
@@ -1348,9 +1325,9 @@ def _serve_argv(config: RLConfig) -> list[str]:
     _append_lora_serve_args(argv, config)
     _append_extra_serve_args(argv, config)
     worker_extension_cls = (
-        "wavelet.inference.vllm_weight_update.NCCLWeightUpdateWorker"
+        "wavelet.transport.policy.NCCLWeightUpdateWorker"
         if config.policy_transfer.type == "nccl"
-        else "wavelet.inference.vllm_weight_update.FileSystemWeightUpdateWorker"
+        else "wavelet.transport.policy.FileSystemWeightUpdateWorker"
     )
     argv.extend(["--worker-extension-cls", worker_extension_cls])
     return argv

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
 
 from wavelet.configs.rl_config import (
@@ -146,13 +146,7 @@ class DifficultyPoolSampler:
     def observe(self, task_key: str, outputs: list[dict[str, Any]]) -> None:
         if task_key not in self.task_keys:
             raise ValueError(f"Unknown curriculum task key: {task_key!r}.")
-        rewards = [
-            float(output["reward"])
-            for output in outputs
-            if isinstance(output.get("reward"), int | float)
-            and not isinstance(output.get("reward"), bool)
-            and math.isfinite(float(output["reward"]))
-        ]
+        rewards = _finite_numbers(output.get("reward") for output in outputs)
         if not rewards:
             return
         group_mean = sum(rewards) / len(rewards)
@@ -355,7 +349,11 @@ class Curriculum:
 
 def _output_advantages(output: dict[str, Any]) -> list[float]:
     raw = output.get("advantage")
-    values = raw if isinstance(raw, list) else [raw]
+    return _finite_numbers(raw if isinstance(raw, list) else [raw])
+
+
+def _finite_numbers(values: Iterable[object]) -> list[float]:
+    """Keep finite ints/floats (never bools) as floats, dropping everything else."""
     return [
         float(value)
         for value in values

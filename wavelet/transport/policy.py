@@ -8,7 +8,6 @@ import shutil
 from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic, sleep
 from typing import TYPE_CHECKING, Any
@@ -32,10 +31,9 @@ from wavelet.trainer.distributed import barrier
 from wavelet.transport.queue import (
     POLICY_META_FILENAME,
     STABLE_BATCH_MARKER,
-    QueueEvent,
-    append_event_best_effort,
     get_policy_step_dir,
     parse_step,
+    record_policy_export_event,
     resolve_policy_dir,
     utc_now,
 )
@@ -117,19 +115,13 @@ def _is_reusable_policy_snapshot(
     return False
 
 
-def _require_vllm_nccl() -> tuple[type[Any], type[Any]]:
+def _require_vllm_nccl(message: str) -> tuple[type[Any], type[Any]]:
     try:
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
     except ImportError as exc:
-        raise ImportError(
-            "NCCL weight broadcast requires vLLM NCCL internals. Install vLLM and "
-            "run this on CUDA workers."
-        ) from exc
-    return (
-        PyNcclCommunicator,
-        StatelessProcessGroup,
-    )
+        raise ImportError(message) from exc
+    return PyNcclCommunicator, StatelessProcessGroup
 
 
 _LAYER_KEY_RE = re.compile(
@@ -347,7 +339,10 @@ class NCCLWeightBroadcaster:
     def __post_init__(self) -> None:
         if not torch.cuda.is_available():
             raise RuntimeError("NCCL weight broadcast requires CUDA.")
-        communicator_type, process_group_type = _require_vllm_nccl()
+        communicator_type, process_group_type = _require_vllm_nccl(
+            "NCCL weight broadcast requires vLLM NCCL internals. Install vLLM and "
+            "run this on CUDA workers."
+        )
         self._device = _indexed_cuda_device(self.device)
         self._process_group = process_group_type.create(
             host=self.host,
@@ -381,8 +376,7 @@ class NCCLWeightBroadcaster:
                 device=self._device,
                 source=True,
             )
-            for dtype_name, tensors in _layer_groups(layer.items()).items():
-                del dtype_name
+            for tensors in _layer_groups(layer.items()).values():
                 flattened = [
                     tensor.detach().to(self._device).contiguous().view(-1)
                     for _, tensor in tensors
@@ -397,18 +391,6 @@ class NCCLWeightBroadcaster:
             _iter_layer_state_dicts(model),
             layer_count=len(_partition_state_dict(_model_named_tensors(model))),
         )
-
-
-def _require_vllm_receiver_nccl() -> tuple[type[object], type[object]]:
-    try:
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
-    except ImportError as exc:
-        raise ImportError(
-            "NCCL weight updates require vLLM NCCL internals. Install vLLM and "
-            "run the inference server on CUDA workers."
-        ) from exc
-    return PyNcclCommunicator, StatelessProcessGroup
 
 
 def _worker_model(worker: object) -> Module:
@@ -462,7 +444,10 @@ class NCCLWeightUpdateWorker(Worker):
             return
         if not torch.cuda.is_available():
             raise RuntimeError("NCCL weight updates require CUDA.")
-        communicator_type, process_group_type = _require_vllm_receiver_nccl()
+        communicator_type, process_group_type = _require_vllm_nccl(
+            "NCCL weight updates require vLLM NCCL internals. Install vLLM and "
+            "run the inference server on CUDA workers."
+        )
 
         device = getattr(self, "device", None)
         if device is None:
@@ -562,6 +547,10 @@ class PolicyExportMixin:
             )
             self._nccl_broadcaster_executor = None
 
+    def _barrier(self) -> None:
+        if self.world.world_size > 1:
+            barrier(self.world)
+
     def should_export_policy(self, step: int) -> bool:
         if step == 0:
             return self.config.policy_transfer.export_initial
@@ -588,8 +577,7 @@ class PolicyExportMixin:
             # produced (and, for NCCL, wait on a handshake nobody completes).
             if self.world.is_main:
                 prune_policy_snapshots_beyond(policy_dir, step=export_step)
-            if self.world.world_size > 1:
-                barrier(self.world)
+            self._barrier()
         if self.config.policy_transfer.type == "nccl":
             return self._export_nccl_policy(export_step)
 
@@ -614,8 +602,7 @@ class PolicyExportMixin:
             )
         tmp_dir = step_dir.with_name(f".{step_dir.name}.tmp")
         self._prepare_export_directory(tmp_dir, step_dir)
-        if self.world.world_size > 1:
-            barrier(self.world)
+        self._barrier()
         saved_path = self._save_filesystem_policy(tmp_dir)
         if self.world.is_main:
             self._write_policy_metadata(
@@ -696,7 +683,7 @@ class PolicyExportMixin:
             format_version=1,
             step=export_step,
             kind=kind,
-            created_at=datetime.now(UTC).isoformat(),
+            created_at=utc_now(),
             extra={"artifact": artifact} if artifact is not None else None,
         )
         (tmp_dir / POLICY_META_FILENAME).write_text(json.dumps(metadata))
@@ -708,14 +695,12 @@ class PolicyExportMixin:
         *,
         export_step: int,
     ) -> None:
-        if self.world.world_size > 1:
-            barrier(self.world)
+        self._barrier()
         if self.world.is_main:
             (tmp_dir / STABLE_BATCH_MARKER).touch()
             tmp_dir.replace(step_dir)
-            self._record_policy_export(export_step)
-        if self.world.world_size > 1:
-            barrier(self.world)
+            record_policy_export_event(self.config.output_dir, export_step)
+        self._barrier()
         if self.world.is_main:
             prune_policy_snapshots(
                 step_dir.parent,
@@ -749,23 +734,11 @@ class PolicyExportMixin:
             export_step=export_step,
         )
         self.offload_after_refit()
-        if self.world.world_size > 1:
-            barrier(self.world)
+        self._barrier()
         if self.world.is_main:
-            self._record_policy_export(export_step)
-        if self.world.world_size > 1:
-            barrier(self.world)
+            record_policy_export_event(self.config.output_dir, export_step)
+        self._barrier()
         return step_dir
-
-    def _nccl_export_layers(self) -> Iterator[dict[str, Tensor]]:
-        if self.model is None:
-            raise RuntimeError("Trainer not set up. Call setup() first.")
-        yield from _iter_layer_state_dicts(self.model)
-
-    def _nccl_export_layer_count(self) -> int:
-        if self.model is None:
-            raise RuntimeError("Trainer not set up. Call setup() first.")
-        return len(_partition_state_dict(_model_named_tensors(self.model)))
 
     def _write_nccl_export(
         self,
@@ -794,27 +767,14 @@ class PolicyExportMixin:
     ) -> None:
         if export_step == 0:
             return
-        layer_count = self._nccl_export_layer_count()
-        layers = self._nccl_export_layers()
         if self.world.is_main:
             self._wait_for_nccl_ready(step_dir)
-            self._nccl_broadcaster().broadcast_layers(
-                layers,
-                layer_count=layer_count,
-            )
+            self._nccl_broadcaster().broadcast_model(self.model)
         else:
-            for _ in layers:
+            # Non-source ranks still drive every layer gather so the FSDP
+            # collectives stay in lockstep with the broadcasting rank.
+            for _ in _iter_layer_state_dicts(self.model):
                 pass
-
-    def _record_policy_export(self, export_step: int) -> None:
-        append_event_best_effort(
-            self.config.output_dir / "events",
-            QueueEvent(
-                time=utc_now(),
-                kind="policy_export_completed",
-                policy_step=export_step,
-            ),
-        )
 
     def _wait_for_nccl_ready(self, step_dir: Path) -> None:
         ready_path = step_dir / NCCL_READY_MARKER

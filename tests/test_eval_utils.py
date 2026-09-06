@@ -9,15 +9,15 @@ import pytest
 
 from wavelet.configs.rl_config import RLConfig, RLEvalConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
-from wavelet.orchestrator.rollout_worker import _final_eval_policy_step
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.scheduler import (
+    _final_eval_policy_step,
     _initial_eval_steps,
     _run_evals,
     _run_evals_async,
     _run_final_evals,
     _select_final_eval_envs,
-    _VerifierPublisherStrategy,
+    _VerifierChunkPublisher,
 )
 from wavelet.orchestrator.verifiers import _eval_metrics, _run_eval_examples
 
@@ -299,7 +299,7 @@ def test_async_final_eval_cancels_unused_scheduler_work(
     scheduler.aclose = AsyncMock()
     run_evals = AsyncMock()
     monkeypatch.setattr("wavelet.orchestrator.scheduler._run_evals_async", run_evals)
-    context = object.__new__(_VerifierPublisherStrategy)
+    context = object.__new__(_VerifierChunkPublisher)
     context.config = config
     context.orchestrator = Mock()
     context.inference_engine = Mock()
@@ -372,7 +372,7 @@ def test_run_evals_publishes_metrics_to_monitor(monkeypatch) -> None:
     metrics = {"eval/aime/avg@8": 0.25}
     evaluate = Mock(return_value=metrics)
     log_metrics = Mock()
-    monkeypatch.setattr("wavelet.orchestrator.envs.evaluate_env", evaluate)
+    monkeypatch.setattr("wavelet.orchestrator.scheduler.evaluate_env", evaluate)
     monkeypatch.setattr(
         "wavelet.orchestrator.scheduler.log_eval_metrics",
         log_metrics,
@@ -408,7 +408,7 @@ def test_run_evals_async_publishes_metrics_to_monitor(monkeypatch) -> None:
     metrics = {"eval/aime/pass@8": 0.5}
     evaluate = AsyncMock(return_value=metrics)
     log_metrics = Mock()
-    monkeypatch.setattr("wavelet.orchestrator.envs.evaluate_env_async", evaluate)
+    monkeypatch.setattr("wavelet.orchestrator.scheduler.evaluate_env_async", evaluate)
     monkeypatch.setattr(
         "wavelet.orchestrator.scheduler.log_eval_metrics",
         log_metrics,
@@ -461,7 +461,7 @@ def test_background_eval_does_not_block_rollout_publishing(monkeypatch) -> None:
             "wavelet.orchestrator.scheduler._run_evals_async",
             evaluate,
         )
-        context = object.__new__(_VerifierPublisherStrategy)
+        context = object.__new__(_VerifierChunkPublisher)
         context.config = config
         context.orchestrator = Mock()
         context.inference_engine = Mock()
@@ -508,7 +508,7 @@ def test_background_eval_is_cancelled_before_new_policy(monkeypatch, tmp_path) -
             finally:
                 cancelled.set()
 
-        context = object.__new__(_VerifierPublisherStrategy)
+        context = object.__new__(_VerifierChunkPublisher)
         context.config = config
         context.pending_eval_task = asyncio.create_task(evaluate())
         context.pending_eval_policy_step = 3
@@ -543,7 +543,7 @@ def test_background_eval_can_delay_policy_update_instead_of_cancelling(
             }
         )
         release = asyncio.Event()
-        context = object.__new__(_VerifierPublisherStrategy)
+        context = object.__new__(_VerifierChunkPublisher)
         context.config = config
         context.pending_eval_task = asyncio.create_task(release.wait())
         context.pending_eval_policy_step = 3

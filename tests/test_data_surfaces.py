@@ -1,8 +1,6 @@
 from wavelet.data import rl, sft
-from wavelet.data.dataset import SFTDataset
-from wavelet.data.rl_dataset import PackedRLDataset
-from wavelet.data.rl_records import serialize_rl_record
-from wavelet.data.rl_types import RLExample
+from wavelet.data.rl import PackedRLDataset, RLExample, serialize_rl_record
+from wavelet.data.sft import SFTDataset
 
 
 def test_sft_surface_preserves_legacy_objects() -> None:

@@ -6,7 +6,7 @@ from dataclasses import replace
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
 

@@ -261,6 +261,8 @@ def test_adaptive_concurrency_validates_bounds_and_thresholds() -> None:
                 },
             }
         )
+
+
 def test_background_evals_require_streaming_verifier_scheduler() -> None:
     with pytest.raises(ValueError, match="Verifiers rollout source"):
         RLConfig(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from wavelet.data.rl_dataset import RLExample
+from wavelet.data.rl import RLExample
 from wavelet.orchestrator.algorithms import BaseAlgorithm, register_algorithm
 
 

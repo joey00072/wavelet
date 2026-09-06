@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.data.rl_dataset import RLExample
-from wavelet.inference.http import HTTPPolicyInferenceEngine
+from wavelet.data.rl import RLExample
+from wavelet.inference.engine import HTTPPolicyInferenceEngine
 
 
 def _record(index: int) -> RLExample:

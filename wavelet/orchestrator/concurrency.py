@@ -54,9 +54,7 @@ class AdaptiveConcurrencyController:
         self.config = config
         self.floor = max(config.min_inflight, minimum_burst)
         configured_ceiling = (
-            config.max_inflight
-            if config.max_inflight is not None
-            else fallback_limit
+            config.max_inflight if config.max_inflight is not None else fallback_limit
         )
         self.ceiling = max(self.floor, configured_ceiling)
         self.fallback_cost = max(fallback_cost, 1)
@@ -142,8 +140,7 @@ class AdaptiveConcurrencyController:
             signal = self._worst(signal, "soft")
 
         queue_over_threshold = (
-            total_running > 0
-            and total_queued > self.config.queue_ratio * total_running
+            total_running > 0 and total_queued > self.config.queue_ratio * total_running
         )
         if queue_over_threshold:
             self.queue_overload_polls += 1
@@ -164,9 +161,7 @@ class AdaptiveConcurrencyController:
         ):
             self.draining = False
         self.trim_cooldown = max(0, self.trim_cooldown - 1)
-        self.can_grow = (
-            signal == "clear" and total_queued == 0 and not self.draining
-        )
+        self.can_grow = signal == "clear" and total_queued == 0 and not self.draining
         self.can_grow_until = time.monotonic() + (
             self.config.poll_interval_seconds * self.config.growth_gate_polls
         )
@@ -189,17 +184,11 @@ class AdaptiveConcurrencyController:
         if preempted or queue_overload:
             if queue_overload:
                 self.queue_overload_polls = 0
-                target = int(
-                    self._clamp(
-                        inflight * self.config.queue_decrease_factor
-                    )
-                )
+                target = int(self._clamp(inflight * self.config.queue_decrease_factor))
                 reason = "queue overload"
             else:
                 target = int(
-                    self._clamp(
-                        inflight * self.config.preemption_decrease_factor
-                    )
+                    self._clamp(inflight * self.config.preemption_decrease_factor)
                 )
                 reason = "preemptions"
             decision = self._resize_down(
@@ -218,9 +207,7 @@ class AdaptiveConcurrencyController:
         ):
             hard = max_usage > self.config.hard_kv_cache_usage
             target = int(
-                self._clamp(
-                    inflight * self.config.target_kv_cache_usage / max_usage
-                )
+                self._clamp(inflight * self.config.target_kv_cache_usage / max_usage)
             )
             decision = self._resize_down(
                 target,
@@ -268,8 +255,7 @@ class AdaptiveConcurrencyController:
         self.adjustments += 1
         if reason is not None:
             logger.info(
-                "Adjusted verifier concurrency %s -> %s (%s); "
-                "turnover=%.1f signal=%s.",
+                "Adjusted verifier concurrency %s -> %s (%s); turnover=%.1f signal=%s.",
                 previous,
                 target,
                 reason,
@@ -294,7 +280,5 @@ class AdaptiveConcurrencyController:
             "generation/concurrency/turnover": self.turnover,
             "generation/concurrency/capacity_tokens": float(self.capacity or 0),
             "generation/concurrency/adjustments": float(self.adjustments),
-            "generation/concurrency/signal": float(
-                _SIGNAL_SEVERITY[self.signal]
-            ),
+            "generation/concurrency/signal": float(_SIGNAL_SEVERITY[self.signal]),
         }

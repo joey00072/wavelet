@@ -4,7 +4,6 @@ import itertools
 
 from wavelet.configs.rl_config import RLDataConfig
 from wavelet.configs.sft import LossMaskConfig
-from wavelet.data.loading import Example
 from wavelet.data.rl import (
     FakeRLDataset,
     PackedRLDataset,
@@ -13,8 +12,12 @@ from wavelet.data.rl import (
     pack_samples,
     prepare_rl_sample,
 )
-from wavelet.data.sft import _coerce_messages
-from wavelet.data.tokenization import build_sample, trainable_target_ids
+from wavelet.data.sft import (
+    Example,
+    _coerce_messages,
+    build_sample,
+    trainable_target_ids,
+)
 from wavelet.trainer.debug import build_debug_tokenizer
 
 

@@ -11,7 +11,7 @@ import pytest
 
 import wavelet.monitor as monitor_module
 from wavelet.configs.rl_config import RLConfig
-from wavelet.orchestrator.metrics import (
+from wavelet.monitor import (
     RolloutMetricInputs,
     log_eval_metrics,
     log_rollout_metrics,

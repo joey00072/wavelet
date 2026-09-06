@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import random
+from collections.abc import Iterable
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -142,10 +143,22 @@ class _Clock:
         return self.current.isoformat()
 
 
-def _append(path: Path, row: dict[str, Any]) -> None:
+def _write_jsonl(
+    path: Path, rows: Iterable[dict[str, Any]], mode: str = "w", sort_keys: bool = False
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, sort_keys=True) + "\n")
+    with path.open(mode, encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=sort_keys) + "\n")
+
+
+def _append(path: Path, row: dict[str, Any]) -> None:
+    _write_jsonl(path, [row], mode="a", sort_keys=True)
+
+
+def _link_latest(parent: Path) -> None:
+    if not (latest := parent / "latest").exists():
+        latest.symlink_to("attempt_1", target_is_directory=True)
 
 
 def _run_event(
@@ -164,9 +177,7 @@ def _write_config(
 ) -> None:
     config_dir = output_dir / "configs" / "attempt_1" / "resolved"
     config_dir.mkdir(parents=True, exist_ok=True)
-    latest = output_dir / "configs" / "latest"
-    if not latest.exists():
-        latest.symlink_to("attempt_1", target_is_directory=True)
+    _link_latest(output_dir / "configs")
     config = {
         "model": {"name": "Qwen/Qwen3-0.6B", "torch_dtype": "bfloat16"},
         "data": {"batch_size": groups * k, "micro_batch_size": 1, "seq_len": 2048},
@@ -383,9 +394,7 @@ def _write_rollout_batch(
     step_dir = get_step_dir(output_dir / "rollouts", step)
     step_dir.mkdir(parents=True, exist_ok=True)
     path = step_dir / "rollouts.jsonl"
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row) + "\n")
+    _write_jsonl(path, rows)
     rewards = [row["reward"] for row in rows]
     policy_step = min(row["metadata"]["policy_step"] for row in rows)
     manifest = RolloutManifest(
@@ -517,14 +526,11 @@ def _write_policy(
 
 
 def _write_queue_events(output_dir: Path, events: list[QueueEvent]) -> None:
-    path = output_dir / "events" / QUEUE_EVENT_FILENAME
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for event in sorted(events, key=lambda e: e.time):
-            handle.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+    rows = [asdict(event) for event in sorted(events, key=lambda e: e.time)]
+    _write_jsonl(output_dir / "events" / QUEUE_EVENT_FILENAME, rows, sort_keys=True)
 
 
-def _stats(values: list[float], prefix: str) -> dict[str, float]:
+def _series_metrics(values: list[float], prefix: str) -> dict[str, float]:
     if not values:
         return {}
     mean = sum(values) / len(values)
@@ -553,10 +559,10 @@ def _orchestrator_metrics(
     metrics: dict[str, Any] = {
         "timestamp": clock.now(),
         "step": step,
-        **_stats(rewards, "reward/all"),
-        **_stats(advantages, "advantage/all"),
-        **_stats(lengths, "decode_len/all"),
-        **_stats(lengths, "seq_len/all"),
+        **_series_metrics(rewards, "reward/all"),
+        **_series_metrics(advantages, "advantage/all"),
+        **_series_metrics(lengths, "decode_len/all"),
+        **_series_metrics(lengths, "seq_len/all"),
         "is_truncated/all/mean": sum(truncated) / len(truncated),
         "fate/all/produced": float(len(rows)),
         "fate/all/trainable": float(len(rows)),
@@ -606,7 +612,7 @@ def _orchestrator_metrics(
     for env in envs:
         env_rows = [row for row in rows if row["source"] == env]
         env_rewards = [row["reward"] for row in env_rows]
-        metrics.update(_stats(env_rewards, f"reward/{env}"))
+        metrics.update(_series_metrics(env_rewards, f"reward/{env}"))
         metrics[f"train/{env}/batch_fraction"] = len(env_rows) / len(rows)
         metrics[f"train/{env}/solve_all"] = rng.uniform(0.0, 0.3)
         metrics[f"train/{env}/solve_none"] = rng.uniform(0.0, 0.4)
@@ -739,10 +745,7 @@ def _write_eval(
                     }
                 )
         path = output_dir / "evals" / f"step-{step:06d}" / f"{env}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            for output in outputs:
-                handle.write(json.dumps(output) + "\n")
+        _write_jsonl(path, outputs)
         scored = [o["reward"] for o in outputs if "reward" in o]
         total = examples * rollouts
         by_example: dict[str, list[float]] = {}
@@ -791,9 +794,7 @@ def _write_eval(
 def _write_logs(output_dir: Path, *, steps: int, clock: _Clock) -> None:
     log_dir = output_dir / "logs" / "attempt_1"
     log_dir.mkdir(parents=True, exist_ok=True)
-    latest = output_dir / "logs" / "latest"
-    if not latest.exists():
-        latest.symlink_to("attempt_1", target_is_directory=True)
+    _link_latest(output_dir / "logs")
     for name, lines in {
         "rl_trainer.log": [
             f"step {step}: optimizer step complete" for step in range(steps)

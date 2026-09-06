@@ -6,12 +6,12 @@ from pathlib import Path
 import pytest
 
 from wavelet.configs.rl_config import RLConfig
-from wavelet.entrypoints.rl_debug import main as debug_main
-from wavelet.trainer.diagnostics import (
+from wavelet.debug import (
     build_runtime_parity_report,
     export_rollout_token_debug,
     inspect_rollout_batch,
 )
+from wavelet.entrypoints.rl_debug import main as debug_main
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> Path:

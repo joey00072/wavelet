@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from wavelet.trainer.lm_head import ChunkedLogprobLmHead
-from wavelet.trainer.rl_loss import (
+from wavelet.trainer.losses import (
+    ChunkedLogprobLmHead,
     selective_log_softmax,
     selective_log_softmax_with_sampling_mask,
 )

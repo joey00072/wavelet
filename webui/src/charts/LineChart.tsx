@@ -4,41 +4,37 @@ import type { LineSeries, Point } from "../lib/series";
 import { extent, logTicks, niceTicks, smooth, tickFormatter, type SmoothingType } from "../lib/series";
 import { fmt, fmtAxis } from "../lib/format";
 import { seriesColor } from "../lib/theme";
+import { toggleInSet } from "../lib/sets";
+import { EmptyChart } from "./EmptyChart";
 import { useMeasure } from "./useMeasure";
 
 export type Reference = { y: number; label: string; colorIndex?: number };
 
 const defaultYFormat = fmtAxis;
-const defaultXFormat = (x: number) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
-
+const xFormat = (x: number) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
+const lineColor = (s: LineSeries) => (s.deemphasize ? "var(--deemph)" : seriesColor(s.colorIndex ?? 0));
 
 export function LineChart({
   series,
   height = 200,
   xLabel = "step",
   yFormat = defaultYFormat,
-  xFormat = defaultXFormat,
-  logScale: logScaleProp = false,
+  logScale = false,
   xLog = false,
-  smoothing: smoothingProp = 0,
+  smoothing = 0,
   smoothingType = "ema",
   yMode = "auto",
   yMin,
   yMax,
   yDomain,
   references = [],
-  showLegend,
-  emptyText = "No data yet",
-  area = false,
   markers = false,
-  controls = true,
   xExtent,
 }: {
   series: LineSeries[];
   height?: number;
   xLabel?: string;
   yFormat?: (value: number) => string;
-  xFormat?: (value: number) => string;
   logScale?: boolean;
   xLog?: boolean;
   smoothing?: number;
@@ -49,53 +45,41 @@ export function LineChart({
   yMax?: number | null;
   yDomain?: [number, number];
   references?: Reference[];
-  showLegend?: boolean;
-  emptyText?: string;
-  area?: boolean;
   markers?: boolean;
-  controls?: boolean;
   /** Minimum x range to show even when the data covers less (e.g. a single eval point). */
   xExtent?: [number, number];
 }) {
   const [ref, size] = useMeasure<HTMLDivElement>();
   const [hoverX, setHoverX] = useState<number | null>(null);
   const [hidden, setHidden] = useState<Set<string>>(new Set());
-  const logScale = logScaleProp;
-  const smoothing = smoothingProp;
   const [xDomain, setXDomain] = useState<[number, number] | null>(null);
   const [drag, setDrag] = useState<{ start: number; current: number } | null>(null);
 
-  const prepared = useMemo(
-    () =>
-      series
-        .filter((s) => !hidden.has(s.id) && s.points.length > 0)
-        .map((s) => {
-          const base = xLog ? s.points.filter((p) => p.x > 0) : s.points;
-          const envelope = s.envelope ? {
-            min: s.envelope.min.filter((p) => !xLog || p.x > 0),
-            max: s.envelope.max.filter((p) => !xLog || p.x > 0),
-          } : undefined;
-          return { ...s, envelope, raw: base, points: smoothing > 0 ? smooth(base, smoothingType, smoothing) : base };
-        })
-        .filter((s) => s.points.length > 0),
-    [series, hidden, smoothing, smoothingType, xLog],
-  );
+  const prepared = useMemo(() => {
+    const keep = (p: Point) => !xLog || p.x > 0;
+    return series
+      .filter((s) => !hidden.has(s.id) && s.points.length > 0)
+      .map((s) => {
+        const base = s.points.filter(keep);
+        const envelope = s.envelope ? { min: s.envelope.min.filter(keep), max: s.envelope.max.filter(keep) } : undefined;
+        return { ...s, envelope, raw: base, points: smoothing > 0 ? smooth(base, smoothingType, smoothing) : base };
+      })
+      .filter((s) => s.points.length > 0);
+  }, [series, hidden, smoothing, smoothingType, xLog]);
   const visible = useMemo(() => {
     if (!xDomain) return prepared;
+    const keep = (p: Point) => p.x >= xDomain[0] && p.x <= xDomain[1];
     return prepared
       .map((s) => ({
         ...s,
-        points: s.points.filter((p) => p.x >= xDomain[0] && p.x <= xDomain[1]),
-        raw: s.raw.filter((p) => p.x >= xDomain[0] && p.x <= xDomain[1]),
-        envelope: s.envelope ? {
-          min: s.envelope.min.filter((p) => p.x >= xDomain[0] && p.x <= xDomain[1]),
-          max: s.envelope.max.filter((p) => p.x >= xDomain[0] && p.x <= xDomain[1]),
-        } : undefined,
+        points: s.points.filter(keep),
+        raw: s.raw.filter(keep),
+        envelope: s.envelope ? { min: s.envelope.min.filter(keep), max: s.envelope.max.filter(keep) } : undefined,
       }))
       .filter((s) => s.points.length > 0);
   }, [prepared, xDomain]);
 
-  const legend = showLegend ?? series.length > 1;
+  const legend = series.length > 1;
   const margin = { top: 10, right: 16, bottom: 26, left: 52 };
   const width = Math.max(size.width, 120);
   const plotW = width - margin.left - margin.right;
@@ -179,23 +163,17 @@ export function LineChart({
     return () => window.clearTimeout(timer);
   }, [seriesKey]);
 
-  if (!scales) {
-    return (
-      <div ref={ref} className="flex items-center justify-center text-xs text-muted" style={{ height }}>
-        {emptyText}
-      </div>
-    );
-  }
+  if (!scales) return <EmptyChart ref={ref} height={height} />;
 
   const { sx, sy, yTicks, xTicks, yTickFormat, xTickFormat } = scales;
   const axisY = yFormat === defaultYFormat ? yTickFormat : yFormat;
-  const axisX = xFormat === defaultXFormat ? (v: number) => (Number.isInteger(v) ? String(v) : xTickFormat(v)) : xFormat;
+  const axisX = (v: number) => (Number.isInteger(v) ? String(v) : xTickFormat(v));
   const tooltipLeft = hover ? Math.min(sx(hover.x) + 12, width - 190) : 0;
   const pixelX = (e: React.PointerEvent<SVGSVGElement>) => e.clientX - e.currentTarget.getBoundingClientRect().left;
 
   return (
     <div ref={ref} className="group relative w-full select-none">
-      {controls && xDomain && (
+      {xDomain && (
         <button type="button" className="absolute right-1 top-0 z-10 rounded bg-raised/90 px-2 py-0.5 text-[10.5px] text-ink2 backdrop-blur transition-colors hover:text-ink" onClick={(e) => { e.stopPropagation(); setXDomain(null); }} title="Reset zoom (or double-click)">
           reset zoom
         </button>
@@ -263,18 +241,14 @@ export function LineChart({
         </defs>
         <g clipPath={`url(#${clipId})`}>
           {visible.map((s) => {
-            const color = s.deemphasize ? "var(--deemph)" : seriesColor(s.colorIndex ?? 0);
-            const path = linePath(s.points, sx, sy);
+            const color = lineColor(s);
             const band = s.envelope ? envelopePath(s.envelope.min, s.envelope.max, sx, sy) : null;
-            const areaPath = area ? `${path} L${sx(s.points[s.points.length - 1].x)},${margin.top + plotH} L${sx(s.points[0].x)},${margin.top + plotH} Z` : null;
-            const showMarkers = markers || s.points.length <= 40;
             return (
               <g key={s.id}>
                 {band && <path d={band} fill={color} opacity={0.1} />}
-                {areaPath && <path d={areaPath} fill={color} opacity={0.1} />}
                 {smoothing > 0 && <path d={linePath(s.raw, sx, sy)} fill="none" stroke={color} strokeWidth={1} opacity={0.16} strokeLinejoin="round" strokeLinecap="round" />}
-                <path d={path} fill="none" stroke={color} strokeWidth={1.75} strokeLinejoin="round" strokeLinecap="round" />
-                {showMarkers &&
+                <path d={linePath(s.points, sx, sy)} fill="none" stroke={color} strokeWidth={1.75} strokeLinejoin="round" strokeLinecap="round" />
+                {(markers || s.points.length <= 40) &&
                   s.points.map((p) => (
                     <circle key={p.x} cx={sx(p.x)} cy={sy(p.y)} r={s.points.length <= 40 ? 3 : 2} fill={color} stroke="var(--surface-1)" strokeWidth={1.5} />
                   ))}
@@ -289,9 +263,7 @@ export function LineChart({
           <g>
             <line x1={sx(hover.x)} x2={sx(hover.x)} y1={margin.top} y2={margin.top + plotH} stroke="var(--ink-muted)" strokeWidth={1} />
             {hover.rows.map(({ series: s, point }) =>
-              point ? (
-                <circle key={s.id} cx={sx(point.x)} cy={sy(point.y)} r={4} fill={s.deemphasize ? "var(--deemph)" : seriesColor(s.colorIndex ?? 0)} stroke="var(--surface-1)" strokeWidth={2} />
-              ) : null,
+              point ? <circle key={s.id} cx={sx(point.x)} cy={sy(point.y)} r={4} fill={lineColor(s)} stroke="var(--surface-1)" strokeWidth={2} /> : null,
             )}
           </g>
         )}
@@ -304,7 +276,7 @@ export function LineChart({
           {hover.rows.map(({ series: s, point }) => (
             <div key={s.id} className="flex items-center justify-between gap-3">
               <span className="flex items-center gap-1.5 truncate text-ink2">
-                <span className="inline-block h-0.5 w-3 rounded" style={{ background: s.deemphasize ? "var(--deemph)" : seriesColor(s.colorIndex ?? 0) }} />
+                <span className="inline-block h-0.5 w-3 rounded" style={{ background: lineColor(s) }} />
                 <span className="truncate" style={{ maxWidth: 140 }}>{s.label}</span>
               </span>
               <span className="tabular font-semibold text-ink">{point ? yFormat(point.y) : "–"}</span>
@@ -321,17 +293,10 @@ export function LineChart({
                 key={s.id}
                 type="button"
                 className={`flex items-center gap-1.5 text-[11px] transition-opacity ${off ? "text-muted line-through opacity-60" : "text-ink2"}`}
-                onClick={() =>
-                  setHidden((prev) => {
-                    const next = new Set(prev);
-                    if (next.has(s.id)) next.delete(s.id);
-                    else next.add(s.id);
-                    return next;
-                  })
-                }
+                onClick={() => setHidden((prev) => toggleInSet(prev, s.id))}
                 title="Toggle series"
               >
-                <span className="inline-block h-0.5 w-3 rounded" style={{ background: s.deemphasize ? "var(--deemph)" : seriesColor(s.colorIndex ?? 0), opacity: off ? 0.4 : 1 }} />
+                <span className="inline-block h-0.5 w-3 rounded" style={{ background: lineColor(s), opacity: off ? 0.4 : 1 }} />
                 <span className="truncate" style={{ maxWidth: 220 }}>{s.label}</span>
               </button>
             );
@@ -358,11 +323,9 @@ function linePath(points: Point[], sx: (x: number) => number, sy: (y: number) =>
 
 function envelopePath(min: Point[], max: Point[], sx: (x: number) => number, sy: (y: number) => number): string | null {
   if (min.length === 0 || max.length === 0) return null;
-  const upper = linePath(max, sx, sy);
   const lower = [...min].reverse().map((point) => `L${sx(point.x).toFixed(1)},${sy(point.y).toFixed(1)}`).join(" ");
-  return `${upper} ${lower} Z`;
+  return `${linePath(max, sx, sy)} ${lower} Z`;
 }
-
 
 export function SeriesTable({ series, xLabel = "step", yFormat = (v: number) => fmt(v, 3) }: { series: LineSeries[]; xLabel?: string; yFormat?: (v: number) => string }) {
   const xs = [...new Set(series.flatMap((s) => s.points.map((p) => p.x)))].sort((a, b) => a - b);
@@ -384,9 +347,7 @@ export function SeriesTable({ series, xLabel = "step", yFormat = (v: number) => 
               <td className="td tabular">{x}</td>
               {series.map((s) => {
                 const p = s.points.find((q) => q.x === x);
-                return (
-                  <td key={s.id} className="td tabular">{p ? yFormat(p.y) : "–"}</td>
-                );
+                return <td key={s.id} className="td tabular">{p ? yFormat(p.y) : "–"}</td>;
               })}
             </tr>
           ))}

@@ -6,6 +6,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from wavelet.tools.verifier_data import import_verifiers, verifier_rows, write_jsonl
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -59,40 +61,13 @@ def get_dataset(env: Any, *, examples: int | None, seed: int) -> Iterable[Any]:
 
 def main() -> int:
     args = parse_args()
-    try:
-        import verifiers as vf
-    except ImportError as exc:
-        raise SystemExit(
-            "Verifier data preparation requires `uv sync --extra verifiers --extra envs`."
-        ) from exc
-
-    env_args = parse_env_args(args.env_arg)
-    env = vf.load_environment(args.env_id, **env_args)
+    vf = import_verifiers()
+    env = vf.load_environment(args.env_id, **parse_env_args(args.env_arg))
     dataset = get_dataset(env, examples=args.examples, seed=args.seed)
-    rows = []
-    for index, example in enumerate(dataset):
-        if args.examples is not None and index >= args.examples:
-            break
-        payload = dict(example)
-        payload.setdefault("example_id", index)
-        rows.append(
-            {
-                "prompt": payload["prompt"],
-                "completion": "",
-                "metadata": {
-                    "verifier_example": payload,
-                    "example_id": payload["example_id"],
-                },
-            }
-        )
-
+    rows = verifier_rows(dataset, limit=args.examples)
     if not rows:
         raise RuntimeError(f"{args.env_id} returned no examples.")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row) + "\n")
+    write_jsonl(args.output, rows)
     print(f"Wrote {len(rows)} verifier examples to {args.output}")
     return 0
 

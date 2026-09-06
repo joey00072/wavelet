@@ -48,9 +48,7 @@ def extract_tagged_answer(text: str) -> str:
     ):
         return ""
     match = _TAGGED_RESPONSE.fullmatch(text)
-    if match is None:
-        return ""
-    return match.group("answer").strip()
+    return "" if match is None else match.group("answer").strip()
 
 
 def normalize_problem(problem: object) -> str:
@@ -76,17 +74,15 @@ def is_malformed_answer(answer: object) -> bool:
 
 def format_aime_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Format the pinned Prime AIME 2024 task source for legacy Verifiers."""
-    formatted = []
-    for index, row in enumerate(rows):
-        formatted.append(
-            {
-                "question": str(row["problem"]),
-                "answer": str(int(row["answer"])),
-                "example_id": f"aime2024-{index:02d}",
-                "info": {"source": AIME_2024_DATASET},
-            }
-        )
-    return formatted
+    return [
+        {
+            "question": str(row["problem"]),
+            "answer": str(int(row["answer"])),
+            "example_id": f"aime2024-{index:02d}",
+            "info": {"source": AIME_2024_DATASET},
+        }
+        for index, row in enumerate(rows)
+    ]
 
 
 def build_polaris_rows(

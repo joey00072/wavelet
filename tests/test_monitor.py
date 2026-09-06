@@ -4,8 +4,8 @@ import logging
 import pytest
 
 import wavelet.monitor as canonical_monitor
-import wavelet.orchestrator.metrics as legacy_metrics
-import wavelet.utils.monitoring as legacy_monitoring
+import wavelet.monitor as legacy_metrics
+import wavelet.monitor as legacy_monitoring
 from wavelet.configs.sft import SFTConfig
 from wavelet.monitor import (
     read_jsonl,

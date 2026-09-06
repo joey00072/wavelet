@@ -55,14 +55,6 @@ export function normalizeApiBase(value: string): string {
   return value.trim().replace(/\/$/, "");
 }
 
-class ApiError extends Error {
-  status: number;
-  constructor(status: number, message: string) {
-    super(message);
-    this.status = status;
-  }
-}
-
 export async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   const response = await fetch(url, { signal, cache: "no-store" });
   if (!response.ok) {
@@ -73,7 +65,7 @@ export async function fetchJson<T>(url: string, signal?: AbortSignal): Promise<T
     } catch {
       // keep status text
     }
-    throw new ApiError(response.status, detail);
+    throw new Error(detail);
   }
   return (await response.json()) as T;
 }
