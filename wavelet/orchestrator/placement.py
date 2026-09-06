@@ -54,6 +54,32 @@ def http_ports(config: RLConfig, count: int) -> list[int]:
     return [config.inference.http.port + offset for offset in range(count)]
 
 
+def http_hosts(config: RLConfig, count: int) -> list[str]:
+    configured = config.inference.http.hosts
+    if configured is None:
+        return [config.inference.http.host] * count
+    if len(configured) != count:
+        raise ValueError(
+            "inference.http.hosts must have exactly "
+            f"{count} entries when launcher.inference_num_replicas={count}."
+        )
+    return configured
+
+
+def http_base_urls(config: RLConfig, count: int | None = None) -> list[str]:
+    if count is None:
+        count = len(config.inference.http.ports or []) or len(
+            config.inference.http.hosts or []
+        )
+        count = count or 1
+    endpoints = list(
+        zip(http_hosts(config, count), http_ports(config, count), strict=True)
+    )
+    if len(set(endpoints)) != len(endpoints):
+        raise ValueError("inference HTTP host/port pairs must be unique.")
+    return [f"http://{host}:{port}" for host, port in endpoints]
+
+
 def required_inference_devices(config: RLConfig) -> int:
     dp_size = (
         config.inference.vllm.data_parallel_size_local
@@ -100,7 +126,7 @@ def device_group_conflict_error(config: RLConfig) -> str | None:
     their whole device group, so overlapping groups only surface later as
     out-of-memory failures.
     """
-    if config.launcher.mode != "process":
+    if config.deployment.type == "multi_node" or config.launcher.mode != "process":
         return None
     replicas = config.launcher.inference_num_replicas
     inference_groups = device_groups(

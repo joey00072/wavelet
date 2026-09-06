@@ -31,6 +31,7 @@ from wavelet.inference.policy import (
     require_expected_served_model,
 )
 from wavelet.monitor import emit_perf, perf_enabled
+from wavelet.orchestrator.placement import http_base_urls
 from wavelet.trainer.model import setup_tokenizer
 from wavelet.transport.policy import NCCL_READY_MARKER
 
@@ -293,10 +294,7 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
 
     def __init__(self, config: RLConfig) -> None:
         super().__init__(config)
-        ports = config.inference.http.ports or [config.inference.http.port]
-        self.base_urls = [
-            f"http://{config.inference.http.host}:{port}" for port in ports
-        ]
+        self.base_urls = http_base_urls(config)
         self.base_url = self.base_urls[0]
         self.tokenizer = None
         self.policy_model_name = config.model.name

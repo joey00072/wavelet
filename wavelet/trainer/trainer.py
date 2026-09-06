@@ -89,9 +89,12 @@ from wavelet.trainer.telemetry import (
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.utils.config import load_config
 from wavelet.utils.pathing import (
+    create_launch_attempt,
     get_config_dir,
+    launch_config_paths,
     resolve_resume_checkpoint_source,
     validate_output_dir,
+    write_launch_artifacts,
 )
 from wavelet.utils.serialization import dump_yaml
 
@@ -1403,10 +1406,10 @@ class SFTTrainer(BaseTrainer):
         )
 
 
-def _distributed_local_rank() -> int | None:
+def _distributed_rank() -> int | None:
     if int(os.environ.get("WORLD_SIZE", "1")) <= 1:
         return None
-    return int(os.environ.get("LOCAL_RANK", "0"))
+    return int(os.environ.get("RANK", "0"))
 
 
 def _wait_for_main_config(config_path, *, timeout_seconds: float = 300.0) -> None:
@@ -1425,19 +1428,24 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(SFTConfig, argv)
     resuming = config.ckpt is not None and config.ckpt.is_resuming
-    local_rank = _distributed_local_rank()
-    config_path = get_config_dir(config.output_dir) / "sft.yaml"
-    if local_rank in {None, 0}:
-        data_paths = (
-            list(config.data.path)
-            if isinstance(config.data.path, list)
-            else [config.data.path]
-        )
+    data_paths = (
+        list(config.data.path)
+        if isinstance(config.data.path, list)
+        else [config.data.path]
+    )
+    protected_paths = (
+        config.model.adapter_path,
+        *data_paths,
+        *launch_config_paths(argv),
+    )
+    if config.slurm is not None:
+        from wavelet.deployment.slurm import launch_slurm
+
         validate_output_dir(
             config.output_dir,
             resuming=resuming,
             clean=config.clean_output_dir,
-            protected_paths=(config.model.adapter_path, *data_paths),
+            protected_paths=protected_paths,
         )
         if resuming:
             assert config.ckpt is not None
@@ -1446,12 +1454,45 @@ def main(argv: list[str] | None = None) -> int:
                 resume_step=config.ckpt.resume_step,
                 resume_dir=config.ckpt.resume_dir,
             )
+        attempt = create_launch_attempt(config.output_dir)
+        write_launch_artifacts(attempt, command="sft", argv=argv)
+        resolved_path = attempt.config_dir / "sft.yaml"
         dump_yaml(
-            config_path,
+            resolved_path,
             config.model_dump(mode="json", exclude_none=True),
         )
-    else:
-        _wait_for_main_config(config_path)
+        return launch_slurm(
+            config,
+            command="sft",
+            config_path=resolved_path,
+            script_path=attempt.config_attempt_dir / "job.sbatch",
+            log_path=attempt.log_dir / "slurm-%j.log",
+        )
+
+    output_prepared = os.environ.get("WAVELET_SLURM_OUTPUT_PREPARED") == "1"
+    rank = _distributed_rank()
+    config_path = get_config_dir(config.output_dir) / "sft.yaml"
+    if not output_prepared:
+        if rank in {None, 0}:
+            validate_output_dir(
+                config.output_dir,
+                resuming=resuming,
+                clean=config.clean_output_dir,
+                protected_paths=protected_paths,
+            )
+            if resuming:
+                assert config.ckpt is not None
+                resolve_resume_checkpoint_source(
+                    config.checkpoint_output_dir,
+                    resume_step=config.ckpt.resume_step,
+                    resume_dir=config.ckpt.resume_dir,
+                )
+            dump_yaml(
+                config_path,
+                config.model_dump(mode="json", exclude_none=True),
+            )
+        else:
+            _wait_for_main_config(config_path)
 
     if config.dry_run:
         print("Dry run - configuration loaded successfully")

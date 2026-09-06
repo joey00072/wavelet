@@ -29,7 +29,7 @@ training or inference runs.
 - [Dashboard](../webui/README.md): browser dashboard over live or completed run
   directories with training, generation, rollout inspection, evaluation,
   pipeline, infrastructure, config, and multi-run comparison views.
-- [Deployment](deployment.md): CUDA container use and the local/Ray launcher
+- [Deployment](deployment.md): CUDA containers and local, Ray, or SLURM launchers
   contract.
 - [Functionality register](functionality_register.md): preservation checks per
   surface and canonical implementation owners.

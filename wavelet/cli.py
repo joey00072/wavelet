@@ -40,6 +40,10 @@ PUBLIC_COMMANDS = {
 }
 
 INTERNAL_COMMANDS = {
+    "slurm-worker": (
+        "wavelet.entrypoints.slurm_worker",
+        "Run roles inside a Wavelet SLURM allocation",
+    ),
     "synth-run": (
         "wavelet.dashboard.synth",
         "Write a synthetic run directory for dashboard development",

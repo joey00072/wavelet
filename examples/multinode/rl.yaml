@@ -88,15 +88,25 @@ monitor:
   wandb:
     enabled: true
     project: wavelet-hendrycks-math-debug
-    name: wavelet-hendrycks-math-single-node
+    name: wavelet-hendrycks-math-multinode
     mode: online
 
 launcher:
   mode: process
   backend: local
-  inference_cuda_visible_devices: "0,1,2,3,4,5,6,7"
-  trainer_cuda_visible_devices: "0,1,2,3,4,5,6,7"
-  trainer_num_processes: 8
+
+deployment:
+  type: multi_node
+  num_train_nodes: 2
+  num_inference_nodes: 2
+  gpus_per_node: 8
+  trainer_master_port: 29500
+
+slurm:
+  job_name: wavelet-math-rl
+  project_dir: .
+  time_limit: "08:00:00"
+  shared_fs: true
 
 output_dir: outputs/multinode_math_rl
 clean_output_dir: true

@@ -16,6 +16,7 @@ filesystem artifacts carry state between independently restartable processes.
 | `wavelet.inference` | Native and vLLM policy inference, HTTP clients, policy loading, and diagnostics |
 | `wavelet.trainer` | Model/LoRA and distributed setup, RL/SFT training, losses, optimization, and checkpointing |
 | `wavelet.dashboard` | Read-only run artifact readers, the `/api/runs` router for the dashboard and live state server, W&B/Trackio history providers, and synthetic runs |
+| `wavelet.deployment` | SLURM script generation, allocation discovery, and multi-node role lifecycle |
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
 | `wavelet.utils` | Configuration loading and path helpers |
 
@@ -261,7 +262,8 @@ Every role writes under the configured `output_dir`; nothing outside it is the
 source of truth for a run:
 
 - `configs/attempt_<n>/` and the `configs/latest` symlink: resolved per-role
-  YAML for each launch attempt.
+  YAML for each launch attempt. Scheduler-backed runs also record the generated
+  `job.sbatch`, job ID, and resolved allocation map there.
 - `metrics.jsonl`, `orchestrator_metrics.jsonl`, and `eval_metrics.jsonl`:
   trainer, rollout-generation, and fixed-policy evaluation metrics keyed by
   step. `evals/step-XXXXXX/<env>.jsonl` keeps the per-example eval rollouts.

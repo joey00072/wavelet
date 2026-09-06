@@ -25,6 +25,7 @@ from wavelet.orchestrator.placement import (
     device_group_conflict_error,
     device_group_size,
     device_groups,
+    http_base_urls,
     http_ports,
     required_inference_devices,
     rollout_reward_mode_error,
@@ -965,8 +966,7 @@ class ContinuousBatchMetrics(_AsDictMixin):
 
 
 def base_urls(config: RLConfig) -> list[str]:
-    ports = config.inference.http.ports or [config.inference.http.port]
-    return [f"http://{config.inference.http.host}:{port}" for port in ports]
+    return http_base_urls(config)
 
 
 def inference_debug_state(config: RLConfig) -> dict[str, Any]:
@@ -1919,6 +1919,42 @@ def _trainer_process_count_check(
 
 
 def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
+    if config.deployment.type == "multi_node":
+        required = required_inference_devices(config)
+        available = config.deployment.gpus_per_node
+        inference_status: CheckStatus = "ok" if required <= available else "error"
+        checks = [
+            PreflightCheck(
+                name="slurm_trainer_world",
+                status="ok",
+                message=(
+                    "SLURM trainer world size resolves to "
+                    f"{config.deployment.num_train_nodes * available}."
+                ),
+                details={
+                    "nodes": config.deployment.num_train_nodes,
+                    "processes_per_node": available,
+                },
+            ),
+        ]
+        if config.inference.mode == "vllm_http":
+            checks.insert(
+                0,
+                PreflightCheck(
+                    name="slurm_inference_devices",
+                    status=inference_status,
+                    message=(
+                        f"Each SLURM inference node provides {available} GPU(s); "
+                        f"one vLLM replica requires {required}."
+                    ),
+                    details={
+                        "nodes": config.deployment.num_inference_nodes,
+                        "gpus_per_node": available,
+                        "required_devices_per_replica": required,
+                    },
+                ),
+            )
+        return checks
     checks: list[PreflightCheck] = []
     gpu_indices = _available_gpu_indices()
     replicas = config.launcher.inference_num_replicas
@@ -2035,6 +2071,20 @@ def _port_checks(config: RLConfig) -> list[PreflightCheck]:
                 name="inference_ports",
                 status="ok",
                 message="Inference mode does not start HTTP vLLM servers.",
+            )
+        ]
+    if config.deployment.type == "multi_node":
+        count = config.deployment.num_inference_nodes
+        ports = [config.inference.http.port + index for index in range(count)]
+        return [
+            PreflightCheck(
+                name="slurm_inference_ports",
+                status="ok",
+                message=(
+                    "Inference endpoints will be assigned after allocation on "
+                    f"ports {ports}."
+                ),
+                details={"replicas": count, "ports": ports},
             )
         ]
     try:
@@ -2283,6 +2333,16 @@ def _trainer_4bit_checks(config: RLConfig) -> list[PreflightCheck]:
 
 
 def _resolved_commands(config: RLConfig) -> list[dict[str, Any]]:
+    if config.deployment.type == "multi_node":
+        return [
+            {
+                "role": "slurm",
+                "command": "uv run python -m wavelet rl @ <provided config>",
+                "train_nodes": config.deployment.num_train_nodes,
+                "inference_nodes": config.deployment.num_inference_nodes,
+                "gpus_per_node": config.deployment.gpus_per_node,
+            }
+        ]
     if not config.orchestrator.enabled:
         return [
             {

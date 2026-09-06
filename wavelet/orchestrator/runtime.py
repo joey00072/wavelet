@@ -33,6 +33,9 @@ from wavelet.orchestrator.placement import (
     device_groups as _as_device_groups,
 )
 from wavelet.orchestrator.placement import (
+    http_hosts as _http_hosts,
+)
+from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
 )
 from wavelet.orchestrator.placement import (
@@ -139,8 +142,13 @@ def _trainer_config_for_rollouts(config: RLConfig, rollout_path) -> RLConfig:
     )
 
 
-def _vllm_base_urls(config: RLConfig, ports: list[int]) -> list[str]:
-    return [f"http://{config.inference.http.host}:{port}/v1" for port in ports]
+def _vllm_base_urls(
+    config: RLConfig,
+    ports: list[int],
+    hosts: list[str] | None = None,
+) -> list[str]:
+    hosts = _http_hosts(config, len(ports)) if hosts is None else hosts
+    return [f"http://{host}:{port}/v1" for host, port in zip(hosts, ports, strict=True)]
 
 
 def _config_with_nccl_inference_world_size(
@@ -196,10 +204,18 @@ def _inference_replica_config(
     )
 
 
-def _rollout_client_config(config: RLConfig, *, ports: list[int]) -> RLConfig:
+def _rollout_client_config(
+    config: RLConfig,
+    *,
+    ports: list[int],
+    hosts: list[str] | None = None,
+) -> RLConfig:
+    hosts = _http_hosts(config, len(ports)) if hosts is None else hosts
     inference = config.inference.model_copy(
         update={
-            "http": config.inference.http.model_copy(update={"ports": ports}),
+            "http": config.inference.http.model_copy(
+                update={"hosts": hosts, "ports": ports}
+            ),
         }
     )
     orchestrator = config.orchestrator
@@ -218,7 +234,7 @@ def _rollout_client_config(config: RLConfig, *, ports: list[int]) -> RLConfig:
         update={
             "inference": inference,
             "orchestrator": orchestrator.model_copy(
-                update={"verifier_base_url": _vllm_base_urls(config, ports)}
+                update={"verifier_base_url": _vllm_base_urls(config, ports, hosts)}
             ),
         }
     )
@@ -813,6 +829,17 @@ def main(argv: list[str] | None = None) -> int:
     attempt = create_launch_attempt(config.output_dir)
     write_launch_artifacts(attempt, command="rl", argv=argv)
     dump_yaml(attempt.config_dir / "rl.yaml", _role_config_payload(config))
+
+    if config.slurm is not None:
+        from wavelet.deployment.slurm import launch_slurm
+
+        return launch_slurm(
+            config,
+            command="rl",
+            config_path=attempt.config_dir / "rl.yaml",
+            script_path=attempt.config_attempt_dir / "job.sbatch",
+            log_path=attempt.log_dir / "slurm-%j.log",
+        )
 
     if config.dry_run:
         if config.orchestrator.enabled:

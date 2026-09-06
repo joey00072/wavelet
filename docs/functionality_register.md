@@ -23,6 +23,7 @@ run in the ordinary test suite.
 | HTTP, offline, and native inference | `uv run pytest tests/test_http_inference.py tests/test_native_inference_server.py tests/test_vllm_batching.py` |
 | Diagnostics, metrics, monitoring, state server | `uv run pytest tests/test_monitor.py tests/test_monitoring.py tests/test_inference_diagnostics.py tests/test_orchestrator_diagnostics.py tests/test_trainer_diagnostics.py tests/test_orchestrator_metrics.py tests/test_state_server.py` |
 | Launcher modes and placement | `uv run pytest tests/test_launcher.py tests/test_rl_launcher.py` |
+| Multi-node SLURM generation and role placement | `uv run pytest tests/test_slurm_deployment.py` and dry-run both configs under `examples/multinode/` |
 | MoE router metrics and expert parallelism | `uv run pytest tests/test_moe.py tests/integration/test_expert_parallel.py -q` |
 | Context parallel loss scaling and sampling-mask sharding | `uv run pytest tests/test_context_parallel.py` |
 | vLLM sampling-mask replay in RL | `uv run pytest tests/test_vllm_batching.py tests/test_rl_records.py tests/test_rl_trainer.py` |
@@ -40,6 +41,7 @@ run in the ordinary test suite.
 | NCCL policy transport | Run the dedicated two-GPU configuration and `uv run pytest tests/test_vllm_weight_update.py` |
 | Colocate and sleep choreography | Run the colocate and colocate-sleep smoke configs under `examples/qwen30b_math/` after checking GPU availability |
 | Ray launcher backend | Set `launcher.backend: ray` in a temporary process-mode config and run preflight plus the resolved launcher |
+| Native SLURM backend | Dry-run `examples/multinode/{sft,rl}.yaml`, inspect the generated sbatch scripts, then run the site-configured GPU smoke and verify `slurm_allocation.json` plus per-role logs |
 | Dashboard API and artifact readers | `uv run pytest tests/test_dashboard.py` |
 | Per-node trainer telemetry and heartbeat rank table | `uv run pytest tests/test_telemetry.py tests/test_monitoring.py` |
 | Web UI compatibility | `uv run wavelet synth-run --output outputs/demo_run`, `uv run wavelet dashboard --runs-root outputs`, then verify the current-run landing, older-runs list, overview, inspector, evals, pipeline, infra, config, and compare views; repeat against a live state server for a smoke run |
@@ -61,5 +63,6 @@ Each contract has one implementation owner:
 | Filesystem and NCCL policy transfer | `wavelet.transport.policy` |
 | Model loading, LoRA, and QLoRA | `wavelet.trainer.model` |
 | Distributed world and device meshes | `wavelet.trainer.distributed` |
+| SLURM submission and allocation lifecycle | `wavelet.deployment.slurm` |
 | Shared monitoring and JSONL readers | `wavelet.monitor` |
 | Read-only run artifact readers and the `/api/runs` dashboard router | `wavelet.dashboard.artifacts`, `wavelet.dashboard.server` |

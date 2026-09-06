@@ -50,7 +50,7 @@ uv run torchrun --standalone --nproc-per-node=N \
 | `wordle` | runnable after external env install | Requires the Wordle environment installed outside `uv sync`. |
 | `qwen30b_math` | adapted | Single-node prototype constrained to supported DP/TP dimensions. |
 | `qwen30b_swe` | adapted | Requires SWE environment; CP/EP remain disabled. |
-| `multinode` | adapted | Single-node prototype of a multi-node example. |
+| `multinode` | runnable | Native multi-node SLURM SFT and split RL examples. |
 | `intellect_3_1` | config only | Large-model workload using AdamW; CP/EP remain disabled. |
 | `minimax_m2_5_swe` | config only | Large-model workload; CP/EP remain disabled. |
 | `glm5_pd_disag` | config only | Disaggregated/MoE workload with EP disabled. |

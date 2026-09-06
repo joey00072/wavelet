@@ -390,6 +390,109 @@ class MonitorConfig(ConfigModel):
     samples: SampleLogConfig = SampleLogConfig()
 
 
+class DeploymentConfig(ConfigModel):
+    """Physical resources used by a scheduler-backed Wavelet run."""
+
+    type: Literal["single_node", "multi_node"] = "single_node"
+    num_train_nodes: int = Field(default=1, ge=1)
+    num_inference_nodes: int = Field(default=0, ge=0)
+    gpus_per_node: int = Field(default=1, ge=1)
+    trainer_master_port: int = Field(default=29500, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def validate_node_counts(self) -> "DeploymentConfig":
+        total_nodes = self.num_train_nodes + self.num_inference_nodes
+        if self.type == "single_node" and total_nodes != 1:
+            raise ValueError(
+                "deployment.type='single_node' requires exactly one train node "
+                "and no inference nodes."
+            )
+        if self.type == "multi_node" and total_nodes < 2:
+            raise ValueError(
+                "deployment.type='multi_node' requires at least two total nodes."
+            )
+        return self
+
+
+class SlurmConfig(ConfigModel):
+    """Site-neutral options used to render and submit an sbatch job."""
+
+    job_name: str = Field(default="wavelet", min_length=1)
+    project_dir: Path = Path(".")
+    partition: str | None = None
+    account: str | None = None
+    qos: str | None = None
+    time_limit: str | None = None
+    constraint: str | None = None
+    reservation: str | None = None
+    nodelist: str | None = None
+    exclude: str | None = None
+    cpus_per_task: int | None = Field(default=None, ge=1)
+    memory: str | None = None
+    exclusive: bool = False
+    shared_fs: bool = True
+    setup_commands: list[str] = Field(default_factory=list)
+    python_command: str = "uv run --no-sync python"
+    extra_directives: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_shell_values(self) -> "SlurmConfig":
+        scalar_values = {
+            "job_name": self.job_name,
+            "partition": self.partition,
+            "account": self.account,
+            "qos": self.qos,
+            "time_limit": self.time_limit,
+            "constraint": self.constraint,
+            "reservation": self.reservation,
+            "nodelist": self.nodelist,
+            "exclude": self.exclude,
+            "memory": self.memory,
+            "python_command": self.python_command,
+        }
+        for name, value in scalar_values.items():
+            if value is not None and any(character in value for character in "\r\n\0"):
+                raise ValueError(f"slurm.{name} cannot contain control characters.")
+        if not self.python_command.strip():
+            raise ValueError("slurm.python_command cannot be blank.")
+        for command in self.setup_commands:
+            if "\0" in command:
+                raise ValueError("slurm.setup_commands cannot contain NUL bytes.")
+        managed_directives = {
+            "--job-name",
+            "--nodes",
+            "--ntasks-per-node",
+            "--gpus-per-node",
+            "--output",
+            "--error",
+            "--partition",
+            "--account",
+            "--qos",
+            "--time",
+            "--constraint",
+            "--reservation",
+            "--nodelist",
+            "--exclude",
+            "--cpus-per-task",
+            "--mem",
+            "--exclusive",
+        }
+        for directive in self.extra_directives:
+            if not directive.startswith("--") or any(
+                character in directive for character in "\r\n\0"
+            ):
+                raise ValueError(
+                    "slurm.extra_directives entries must be single-line options "
+                    "beginning with '--'."
+                )
+            name = directive.split("=", maxsplit=1)[0].split(maxsplit=1)[0]
+            if name in managed_directives:
+                raise ValueError(
+                    f"slurm.extra_directives cannot override managed option {name}."
+                )
+        return self
+
+
 class TrainerConfig(ConfigModel):
     model: ModelConfig = ModelConfig()
     optim: OptimizerConfig = OptimizerConfig()
@@ -404,6 +507,8 @@ class TrainerConfig(ConfigModel):
     log: LogConfig = LogConfig()
     monitor: MonitorConfig = MonitorConfig()
     fsdp: FSDPConfig = FSDPConfig()
+    deployment: DeploymentConfig = DeploymentConfig()
+    slurm: SlurmConfig | None = None
     output_dir: Path = Field(
         default=Path("outputs/train"),
         description="Directory for checkpoints, metrics, logs, and run state.",
@@ -421,6 +526,23 @@ class TrainerConfig(ConfigModel):
     seed: int = 0
     dist_timeout_seconds: int = Field(default=1800, ge=1)
     activation_offloading: ActivationOffloadingConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_deployment_backend(self) -> "TrainerConfig":
+        if self.deployment.type == "multi_node" and self.slurm is None:
+            raise ValueError(
+                "deployment.type='multi_node' requires a slurm configuration."
+            )
+        if self.slurm is not None and self.deployment.type != "multi_node":
+            raise ValueError(
+                "slurm requires deployment.type='multi_node'; use the normal "
+                "launcher for a single-node run."
+            )
+        if self.slurm is not None and not self.slurm.shared_fs:
+            raise ValueError(
+                "Wavelet SLURM deployment currently requires slurm.shared_fs=true."
+            )
+        return self
 
     @property
     def checkpoint_output_dir(self) -> Path:
@@ -546,6 +668,12 @@ class SFTConfig(TrainerConfig):
                 "Context parallelism is currently supported for RLConfig only; "
                 "SFT token normalization is not CP-aware."
             )
+        return self
+
+    @model_validator(mode="after")
+    def validate_sft_deployment(self) -> "SFTConfig":
+        if self.deployment.num_inference_nodes != 0:
+            raise ValueError("SFT deployment does not use inference nodes.")
         return self
 
 
@@ -920,6 +1048,7 @@ class RLVLLMConfig(ConfigModel):
 
 class RLVLLMHTTPConfig(ConfigModel):
     host: str = "127.0.0.1"
+    hosts: list[str] | None = None
     port: int = Field(default=8000, ge=1, le=65535)
     ports: list[int] | None = None
     request_timeout_seconds: float = Field(default=300.0, gt=0.0)
@@ -927,7 +1056,13 @@ class RLVLLMHTTPConfig(ConfigModel):
     liveness_timeout_seconds: float = Field(default=10.0, gt=0.0)
 
     @model_validator(mode="after")
-    def validate_unique_ports(self) -> "RLVLLMHTTPConfig":
+    def validate_endpoints(self) -> "RLVLLMHTTPConfig":
+        if self.hosts is not None and (
+            not self.hosts or any(not host.strip() for host in self.hosts)
+        ):
+            raise ValueError(
+                "inference.http.hosts must list at least one non-blank host."
+            )
         if self.ports is None:
             return self
         if not self.ports:
@@ -935,10 +1070,19 @@ class RLVLLMHTTPConfig(ConfigModel):
         for port in self.ports:
             if not 1 <= port <= 65535:
                 raise ValueError(f"inference.http.ports entry {port} is out of range.")
-        if len(set(self.ports)) != len(self.ports):
+        if self.hosts is None and len(set(self.ports)) != len(self.ports):
             raise ValueError(
                 "inference.http.ports must be unique; replicas cannot share a port."
             )
+        if self.hosts is not None and len(self.hosts) != len(self.ports):
+            raise ValueError(
+                "inference.http.hosts and inference.http.ports must have the same "
+                "number of entries."
+            )
+        if self.hosts is not None and len(set(zip(self.hosts, self.ports))) != len(
+            self.ports
+        ):
+            raise ValueError("inference HTTP host/port pairs must be unique.")
         return self
 
 
@@ -1549,6 +1693,55 @@ class RLConfig(TrainerConfig):
         description="Directory for RL artifacts and per-launch attempt history.",
     )
     max_steps: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_rl_deployment(self) -> "RLConfig":
+        if self.deployment.type != "multi_node":
+            return self
+        if self.launcher.mode != "process" or self.launcher.backend != "local":
+            raise ValueError(
+                "Multi-node RL requires launcher.mode='process' and "
+                "launcher.backend='local'; SLURM owns placement."
+            )
+        if not self.orchestrator.enabled:
+            if self.deployment.num_inference_nodes != 0:
+                raise ValueError(
+                    "RL without an orchestrator does not use inference nodes."
+                )
+            return self
+        if self.inference.mode == "vllm_http":
+            if self.deployment.num_inference_nodes < 1:
+                raise ValueError(
+                    "Multi-node RL with vLLM requires at least one inference node."
+                )
+            if self.policy_transfer.type != "filesystem":
+                raise ValueError(
+                    "Multi-node RL currently requires policy_transfer.type="
+                    "'filesystem'."
+                )
+            required_gpus = self.inference.vllm.tensor_parallel_size * (
+                self.inference.vllm.data_parallel_size_local
+                or self.inference.vllm.data_parallel_size
+            )
+            if required_gpus > self.deployment.gpus_per_node:
+                raise ValueError(
+                    f"Each vLLM replica requires {required_gpus} GPU(s), but "
+                    "deployment.gpus_per_node="
+                    f"{self.deployment.gpus_per_node}."
+                )
+            last_port = (
+                self.inference.http.port + self.deployment.num_inference_nodes - 1
+            )
+            if last_port > 65535:
+                raise ValueError(
+                    "The per-node inference port range exceeds port 65535; "
+                    "lower inference.http.port."
+                )
+        elif self.deployment.num_inference_nodes != 0:
+            raise ValueError(
+                "Passthrough inference does not use dedicated inference nodes."
+            )
+        return self
 
     def resolved_train_sampling(
         self,

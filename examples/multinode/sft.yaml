@@ -44,8 +44,21 @@ monitor:
   wandb:
     enabled: true
     project: wavelet-hendrycks-math-debug
-    name: wavelet-hendrycks-math-sft-single-node
+    name: wavelet-hendrycks-math-sft-multinode
     mode: online
+
+deployment:
+  type: multi_node
+  num_train_nodes: 2
+  num_inference_nodes: 0
+  gpus_per_node: 8
+  trainer_master_port: 29500
+
+slurm:
+  job_name: wavelet-math-sft
+  project_dir: .
+  time_limit: "04:00:00"
+  shared_fs: true
 
 output_dir: outputs/multinode_math_sft
 clean_output_dir: true
