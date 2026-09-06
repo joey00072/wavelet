@@ -96,10 +96,20 @@ scraper also derives `generation_tokens_per_second` and
 per replica alongside trainer GPU memory, step timing, and per-node trainer
 throughput: `uv run wavelet dashboard --runs-root outputs`.
 
+The scraper also records `kv_capacity_tokens` and the served `max_model_len`.
+With `orchestrator.concurrency` enabled, their ratio seeds the in-flight cap;
+`generation/concurrency/{limit,turnover,capacity_tokens,signal}` explains later
+growth or load shedding. Set `initial_inflight` when a measured safe starting
+point is preferable to capacity-derived bootstrapping.
+Controller gains and pressure windows live under `orchestrator.concurrency`;
+change them only from observed KV, queue, preemption, and turnover metrics.
+
 ## What To Check
 
 - `inference.mode`: `vllm_http` probes the configured OpenAI-compatible vLLM
   server. The public RL path uses HTTP serving for continuous batching.
+- `inference.vllm.max_model_len`: unset lets vLLM use the model-native context;
+  set it explicitly only when the serving context should be capped.
 - `server_backend`: `openai` should expose `/v1/chat/completions/tokens`.
 - `policy_step`: must match the expected trainer export after policy load.
 - `generation_paused`: should be false outside a full-model or collective

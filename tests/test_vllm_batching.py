@@ -164,6 +164,33 @@ def test_vllm_setup_passes_sampling_mask_flag(
     assert captured_kwargs["return_sampling_mask"] is expected
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(None, None), (2_048, 2_048)],
+)
+def test_vllm_setup_only_passes_explicit_model_context(
+    monkeypatch,
+    configured: int | None,
+    expected: int | None,
+) -> None:
+    captured_kwargs: dict[str, object] = {}
+    vllm_module = ModuleType("vllm")
+
+    class FakeLLM:
+        def __init__(self, **kwargs: object) -> None:
+            captured_kwargs.update(kwargs)
+
+    vllm_module.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", vllm_module)
+    monkeypatch.setattr("wavelet.inference.vllm.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
+    vllm = {} if configured is None else {"max_model_len": configured}
+
+    VLLMPolicyInferenceEngine(RLConfig(inference={"vllm": vllm})).setup()
+
+    assert captured_kwargs.get("max_model_len") == expected
+
+
 def test_vllm_setup_passes_quantized_load_args(monkeypatch) -> None:
     captured_kwargs: dict[str, object] = {}
     vllm_module = ModuleType("vllm")

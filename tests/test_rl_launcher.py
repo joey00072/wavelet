@@ -541,6 +541,16 @@ def test_inference_server_returns_sampling_distribution_logprobs() -> None:
     assert "--return-sampling-mask" not in argv
 
 
+def test_inference_server_leaves_default_model_context_to_vllm() -> None:
+    assert "--max-model-len" not in _serve_argv(RLConfig())
+
+
+def test_inference_server_passes_explicit_model_context() -> None:
+    config = RLConfig(inference={"vllm": {"max_model_len": 2_048}})
+
+    assert _argv_value(_serve_argv(config), "--max-model-len") == "2048"
+
+
 def test_inference_server_auto_enables_sampling_masks_for_truncated_support() -> None:
     config = RLConfig(inference={"sampling": {"top_p": 0.9}})
 

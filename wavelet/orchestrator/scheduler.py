@@ -12,7 +12,10 @@ from wavelet.configs.rl_config import (
     RLTrainEnvConfig,
 )
 from wavelet.monitor import finish_orchestrator_wandb, setup_config_logger
-from wavelet.orchestrator.concurrency import AdaptiveConcurrencyController
+from wavelet.orchestrator.concurrency import (
+    AdaptiveConcurrencyController,
+    EngineLoadSample,
+)
 from wavelet.orchestrator.curriculum import Curriculum
 from wavelet.orchestrator.envs import (
     _algorithm_record_from_output as _algorithm_record_from_output,
@@ -684,21 +687,35 @@ class VerifierRolloutScheduler:
         self.concurrency_controller: AdaptiveConcurrencyController | None = None
         self.inference_metrics_scraper: InferenceMetricsScraper | None = None
         self.inference_metrics_task: asyncio.Task[None] | None = None
+        self._inference_metrics_probed = False
         self.adaptive_cancelled_rollouts = 0
+        minimum_concurrency_burst = max(
+            (
+                runtime.rollout_count
+                for runtime in self.env_runtimes
+                if runtime.requires_group_scoring
+            ),
+            default=1,
+        )
         concurrency_config = config.orchestrator.concurrency
         if concurrency_config is not None:
             self.concurrency_controller = AdaptiveConcurrencyController(
                 concurrency_config,
                 fallback_limit=self._static_max_inflight_rollouts,
-                minimum_burst=self.rollout_count,
+                minimum_burst=minimum_concurrency_burst,
+                fallback_cost=config.data.seq_len,
             )
             self.inference_metrics_scraper = InferenceMetricsScraper(
                 _verifier_base_urls(config),
                 timeout_seconds=concurrency_config.request_timeout_seconds,
             )
         self.admission = orchestrator.verifier_admission(
-            max_inflight=self.max_inflight_rollouts,
-            minimum_burst=self.rollout_count,
+            max_inflight=(
+                self.concurrency_controller.ceiling
+                if self.concurrency_controller is not None
+                else self.max_inflight_rollouts
+            ),
+            minimum_burst=minimum_concurrency_burst,
         )
 
     def set_policy_step(
@@ -780,7 +797,7 @@ class VerifierRolloutScheduler:
     ) -> list[RLExample]:
         """Build one batch for ``rollout_step`` from groups the trainer accepts."""
         started_at = perf_counter()
-        self._ensure_inference_metrics_task()
+        await self._ensure_inference_metrics_task()
         self.executor_concurrency = _scale_verifier_executors(
             self.max_inflight_rollouts
         )
@@ -1206,6 +1223,10 @@ class VerifierRolloutScheduler:
             return 0, 0, 0
 
         group_outputs = _completed_group_outputs(task)
+        self._record_concurrency_completions(
+            group_outputs,
+            completed_rollouts=request.rollout_count,
+        )
         rollout_count = getattr(group, "rollout_count", None) or self.rollout_count
         requires_group_scoring = (
             getattr(self, "requires_group_scoring", False)
@@ -1508,9 +1529,21 @@ class VerifierRolloutScheduler:
         self._fill_inflight()
         return True
 
-    def _ensure_inference_metrics_task(self) -> None:
+    async def _ensure_inference_metrics_task(self) -> None:
         if getattr(self, "inference_metrics_scraper", None) is None:
             return
+        if not getattr(self, "_inference_metrics_probed", False):
+            self._inference_metrics_probed = True
+            try:
+                samples = await self.inference_metrics_scraper.scrape()
+                self._apply_concurrency_samples(samples)
+            except Exception:
+                logger.warning(
+                    "Initial inference metrics probe failed; retaining rollout "
+                    "concurrency %s.",
+                    self.max_inflight_rollouts,
+                    exc_info=True,
+                )
         task = getattr(self, "inference_metrics_task", None)
         if task is None or task.done():
             self.inference_metrics_task = asyncio.create_task(
@@ -1519,7 +1552,7 @@ class VerifierRolloutScheduler:
 
     async def _poll_inference_metrics(self) -> None:
         scraper = self.inference_metrics_scraper
-        controller = self.concurrency_controller
+        controller = getattr(self, "concurrency_controller", None)
         if scraper is None or controller is None:
             return
         concurrency = self.config.orchestrator.concurrency
@@ -1529,19 +1562,7 @@ class VerifierRolloutScheduler:
         while True:
             try:
                 samples = await scraper.scrape()
-                decision = controller.observe(
-                    samples,
-                    inflight=self.inflight_rollout_count,
-                )
-                if decision.reason is not None:
-                    logger.info(
-                        "Adjusted verifier concurrency to %s (%s).",
-                        decision.limit,
-                        decision.reason,
-                    )
-                    _scale_verifier_executors(decision.limit)
-                if decision.cancel_rollouts > 0:
-                    self._cancel_youngest_requests(decision.cancel_rollouts)
+                self._apply_concurrency_samples(samples)
             except Exception:
                 logger.warning(
                     "Adaptive inference metrics poll failed; retaining rollout cap %s.",
@@ -1549,6 +1570,47 @@ class VerifierRolloutScheduler:
                     exc_info=True,
                 )
             await asyncio.sleep(interval)
+
+    def _apply_concurrency_samples(
+        self,
+        samples: list[EngineLoadSample],
+    ) -> None:
+        controller = getattr(self, "concurrency_controller", None)
+        if controller is None:
+            return
+        previous_limit = controller.limit
+        decision = controller.observe(
+            samples,
+            inflight=self.inflight_rollout_count,
+        )
+        if decision.limit != previous_limit:
+            _scale_verifier_executors(decision.limit)
+        if decision.cancel_rollouts > 0:
+            self._cancel_youngest_requests(decision.cancel_rollouts)
+
+    def _record_concurrency_completions(
+        self,
+        outputs: list[dict[str, Any]],
+        *,
+        completed_rollouts: int,
+    ) -> None:
+        controller = getattr(self, "concurrency_controller", None)
+        if controller is None:
+            return
+        remaining_active = self.inflight_rollout_count + completed_rollouts
+        previous_limit = controller.limit
+        for index in range(completed_rollouts):
+            tokens = (
+                self._outputs_token_count([outputs[index]])
+                if index < len(outputs)
+                else 0
+            )
+            controller.record_episode(
+                tokens=tokens,
+                inflight=max(remaining_active - index, 1),
+            )
+        if controller.limit != previous_limit:
+            _scale_verifier_executors(controller.limit)
 
     def _cancel_youngest_requests(self, rollout_target: int) -> int:
         """Cancel whole youngest groups until the overload target is met."""

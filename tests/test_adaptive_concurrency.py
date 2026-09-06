@@ -19,6 +19,9 @@ def _sample(
     running: int = 8,
     waiting: int = 0,
     preemptions: int = 0,
+    capacity: int | None = None,
+    max_model_len: int | None = None,
+    waiting_capacity: int | None = None,
 ) -> EngineLoadSample:
     return EngineLoadSample(
         replica="replica_0",
@@ -26,34 +29,34 @@ def _sample(
         running=running,
         waiting=waiting,
         preemptions_delta=preemptions,
+        kv_capacity_tokens=capacity,
+        max_model_len=max_model_len,
+        waiting_capacity=waiting_capacity,
     )
 
 
-def test_controller_additively_grows_and_multiplicatively_cuts() -> None:
+def test_controller_bootstraps_from_kv_capacity_and_model_context() -> None:
     controller = AdaptiveConcurrencyController(
         RLAdaptiveConcurrencyConfig(
             min_inflight=2,
             max_inflight=16,
-            initial_inflight=8,
-            additive_increase=2,
-            decrease_factor=0.5,
         ),
         fallback_limit=12,
         minimum_burst=2,
+        fallback_cost=128,
     )
 
-    grown = controller.observe([_sample(usage=0.2)], inflight=8)
-    cut = controller.observe([_sample(usage=0.95)], inflight=10)
+    decision = controller.observe(
+        [_sample(usage=0.2, capacity=1_000, max_model_len=100)],
+        inflight=2,
+    )
 
-    assert grown.limit == 10
-    assert grown.cancel_rollouts == 0
-    assert cut.limit == 5
-    assert cut.cancel_rollouts == 5
-    assert cut.reason == "KV cache pressure"
-    assert controller.metrics()["generation/concurrency/signal"] == 4.0
+    assert decision.limit == 10
+    assert controller.capacity == 1_000
+    assert controller.metrics()["generation/concurrency/capacity_tokens"] == 1_000
 
 
-def test_controller_keeps_static_fallback_without_samples() -> None:
+def test_controller_stays_at_safe_floor_without_engine_metrics() -> None:
     controller = AdaptiveConcurrencyController(
         RLAdaptiveConcurrencyConfig(),
         fallback_limit=24,
@@ -62,27 +65,63 @@ def test_controller_keeps_static_fallback_without_samples() -> None:
 
     decision = controller.observe([], inflight=24)
 
-    assert decision.limit == 24
+    assert decision.limit == 4
     assert decision.cancel_rollouts == 0
     assert controller.metrics()["generation/concurrency/signal"] == 0.0
 
 
-def test_controller_only_grows_while_limit_is_binding() -> None:
+def test_controller_grows_by_one_factor_per_pipeline_turnover() -> None:
     controller = AdaptiveConcurrencyController(
         RLAdaptiveConcurrencyConfig(
             min_inflight=2,
             max_inflight=16,
             initial_inflight=8,
-            additive_increase=2,
+            growth_factor_per_turnover=2.0,
         ),
         fallback_limit=12,
         minimum_burst=2,
     )
 
-    decision = controller.observe([_sample(usage=0.2)], inflight=3)
+    observed = controller.observe([_sample(usage=0.2)], inflight=8)
+    decisions = []
+    while controller.turnover < 1.0:
+        decisions.append(
+            controller.record_episode(tokens=10, inflight=controller.limit)
+        )
 
-    assert decision.limit == 8
-    assert decision.reason is None
+    assert observed.limit == 8
+    assert decisions[-1].limit == 16
+    assert controller.turnover >= 1.0
+
+
+def test_controller_growth_gate_lifetime_derives_from_poll_cadence(
+    monkeypatch,
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(
+        "wavelet.orchestrator.concurrency.time.monotonic",
+        lambda: now[0],
+    )
+    controller = AdaptiveConcurrencyController(
+        RLAdaptiveConcurrencyConfig(
+            max_inflight=16,
+            initial_inflight=8,
+            poll_interval_seconds=2.0,
+            growth_gate_polls=2,
+        ),
+        fallback_limit=16,
+        minimum_burst=1,
+    )
+    controller.observe([_sample(usage=0.2)], inflight=8)
+
+    now[0] = 3.9
+    controller.record_episode(tokens=10, inflight=8)
+    cap_before_expiry = controller.cap
+    now[0] = 4.1
+    controller.record_episode(tokens=10, inflight=8)
+
+    assert cap_before_expiry > 8.0
+    assert controller.cap == cap_before_expiry
 
 
 def test_controller_requires_persistent_queue_before_cutting() -> None:
@@ -91,18 +130,47 @@ def test_controller_requires_persistent_queue_before_cutting() -> None:
             max_inflight=16,
             initial_inflight=8,
             queue_persistence_polls=2,
+            queue_decrease_factor=0.75,
         ),
         fallback_limit=8,
         minimum_burst=1,
     )
 
-    first = controller.observe([_sample(usage=0.65, waiting=1)], inflight=8)
-    second = controller.observe([_sample(usage=0.65, waiting=1)], inflight=8)
+    first = controller.observe(
+        [_sample(usage=0.65, waiting=5, waiting_capacity=5)],
+        inflight=8,
+    )
+    second = controller.observe(
+        [_sample(usage=0.65, waiting=5, waiting_capacity=5)],
+        inflight=8,
+    )
 
     assert first.limit == 8
     assert first.reason is None
-    assert second.limit < 8
-    assert second.reason == "request queue"
+    assert second.limit == 6
+    assert second.cancel_rollouts == 2
+    assert second.reason == "queue overload"
+
+
+def test_controller_soft_trim_drains_and_hard_trim_cancels() -> None:
+    controller = AdaptiveConcurrencyController(
+        RLAdaptiveConcurrencyConfig(max_inflight=16, initial_inflight=10),
+        fallback_limit=16,
+        minimum_burst=1,
+    )
+
+    soft = controller.observe([_sample(usage=0.85)], inflight=10)
+
+    assert soft.limit == 8
+    assert soft.cancel_rollouts == 0
+    assert soft.reason == "KV headroom (usage 0.85, soft trim)"
+
+    controller.trim_cooldown = 0
+    hard = controller.observe([_sample(usage=0.95)], inflight=10)
+
+    assert hard.limit == 7
+    assert hard.cancel_rollouts == 3
+    assert hard.reason == "KV headroom (usage 0.95, hard trim)"
 
 
 def test_parse_vllm_metrics_supports_current_and_legacy_kv_names() -> None:
@@ -122,6 +190,20 @@ def test_parse_vllm_metrics_supports_current_and_legacy_kv_names() -> None:
     assert parsed.running == 7
     assert parsed.waiting == 2
     assert parsed.preemptions_total == 3
+
+
+def test_parse_vllm_metrics_reads_capacity_and_capacity_queue() -> None:
+    parsed = parse_vllm_metrics(
+        '''
+        vllm:cache_config_info{block_size="16",num_gpu_blocks="2048"} 1
+        vllm:num_requests_waiting 9
+        vllm:num_requests_waiting_by_reason{reason="capacity"} 7
+        vllm:kv_cache_usage_perc 0.4
+        '''
+    )
+
+    assert parsed.kv_capacity_tokens == 32_768
+    assert parsed.waiting_capacity == 7
 
 
 def test_scraper_tracks_preemption_deltas_and_replica_metrics(monkeypatch) -> None:
@@ -150,6 +232,35 @@ def test_scraper_tracks_preemption_deltas_and_replica_metrics(monkeypatch) -> No
         "inference/replica_0/preemptions_total": 5.0,
         "inference/replica_0/preemptions_delta": 2.0,
     }
+
+
+def test_scraper_exposes_kv_capacity_and_served_context(monkeypatch) -> None:
+    scraper = InferenceMetricsScraper(
+        ["http://localhost:8000/v1"],
+        timeout_seconds=1.0,
+    )
+    monkeypatch.setattr(
+        scraper,
+        "_fetch",
+        lambda _base_url: (
+            'vllm:cache_config_info{kv_cache_size_tokens="327680"} 1\n'
+            "vllm:kv_cache_usage_perc 0.2\n"
+        ),
+    )
+    monkeypatch.setattr(
+        scraper,
+        "_fetch_model_max_len",
+        lambda _base_url: 2_048,
+    )
+
+    samples = asyncio.run(scraper.scrape())
+
+    assert samples[0].kv_capacity_tokens == 327_680
+    assert samples[0].max_model_len == 2_048
+    assert scraper.latest_metrics["inference/replica_0/kv_capacity_tokens"] == (
+        327_680.0
+    )
+    assert scraper.latest_metrics["inference/replica_0/max_model_len"] == 2_048.0
 
 
 def test_scraper_requires_supported_metrics_from_every_replica(monkeypatch) -> None:

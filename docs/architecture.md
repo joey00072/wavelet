@@ -147,12 +147,20 @@ difficulty estimates advance atomically with published training data.
 
 ## Inference Scheduling
 
-Persistent process-mode Verifiers runs can opt into an AIMD concurrency
-controller with `orchestrator.concurrency`. A best-effort scraper reads vLLM's
-Prometheus endpoint per replica. Clear KV headroom grows the rollout cap
-additively; KV pressure, request queues, and preemptions reduce it
-multiplicatively. Hard overload sheds the youngest whole groups, while scrape
-failures retain the static scheduler cap.
+Persistent process-mode Verifiers runs can opt into adaptive concurrency with
+`orchestrator.concurrency`. Before dispatch, a vLLM metrics probe derives a
+conservative starting cap from total KV capacity divided by the engine's
+maximum context length. Completed rollouts then grow the cap multiplicatively
+per pipeline turnover while every engine is clear. Above 80% KV use, the cap
+soft-trims and lets work drain; above 90%, or after sustained queue pressure or
+preemption, it also sheds the youngest whole groups. The configured
+`min_inflight`, `initial_inflight`, and `max_inflight` values bound or override
+that runtime sizing. The growth factor, binding fraction, KV thresholds, queue
+ratio, backoff factors, and poll windows are validated configuration rather
+than scheduler constants. The growth-gate lifetime is derived from the poll
+cadence, and KV trims derive their target directly as
+`inflight * target_usage / observed_usage`. Without usable engine metrics, the
+safe minimum remains in effect.
 
 `wavelet.orchestrator.scheduler` owns the scheduling strategies behind one
 explicit source/publish-mode boundary:

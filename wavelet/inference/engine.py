@@ -825,9 +825,6 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
                 else vllm_config.trust_remote_code
             ),
             "dtype": _vllm_dtype(self.config),
-            "max_model_len": vllm_config.max_model_len
-            if vllm_config.max_model_len is not None
-            else self.config.data.seq_len + 1,
             "tensor_parallel_size": vllm_config.tensor_parallel_size,
             "gpu_memory_utilization": vllm_config.gpu_memory_utilization,
             "enforce_eager": vllm_config.enforce_eager,
@@ -838,6 +835,8 @@ class VLLMPolicyInferenceEngine(PolicyInferenceEngine):
             "max_cpu_loras": 1,
             "max_lora_rank": max_lora_rank,
         }
+        if vllm_config.max_model_len is not None:
+            kwargs["max_model_len"] = vllm_config.max_model_len
         if vllm_config.quantization is not None:
             kwargs["quantization"] = vllm_config.quantization
         if vllm_config.load_format is not None:

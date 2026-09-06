@@ -198,18 +198,23 @@ def test_adaptive_concurrency_requires_streaming_verifier_scheduler() -> None:
                 "concurrency": {},
             },
         )
-    with pytest.raises(ValueError, match="rollouts_per_example=8"):
-        RLConfig(
-            launcher={"mode": "process"},
-            orchestrator={
-                "custom_rollout_function": (
-                    "wavelet.orchestrator.verifiers:generate_rollouts"
-                ),
-                "max_async_level": 1,
-                "rollouts_per_example": 8,
-                "concurrency": {"min_inflight": 4},
-            },
-        )
+
+
+def test_adaptive_concurrency_allows_minimum_below_one_rollout_group() -> None:
+    config = RLConfig(
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "max_async_level": 1,
+            "rollouts_per_example": 8,
+            "concurrency": {"min_inflight": 4},
+        },
+    )
+
+    assert config.orchestrator.concurrency is not None
+    assert config.orchestrator.concurrency.min_inflight == 4
 
 
 def test_adaptive_concurrency_validates_bounds_and_thresholds() -> None:
@@ -252,6 +257,23 @@ def test_adaptive_concurrency_validates_bounds_and_thresholds() -> None:
                     "concurrency": {
                         "growth_kv_cache_usage": 0.8,
                         "target_kv_cache_usage": 0.7,
+                    },
+                },
+            }
+        )
+    with pytest.raises(ValueError, match="escalated_decrease_factor"):
+        RLConfig.model_validate(
+            {
+                "launcher": {"mode": "process"},
+                "orchestrator": {
+                    "custom_rollout_function": (
+                        "wavelet.orchestrator.verifiers:generate_rollouts"
+                    ),
+                    "max_async_level": 1,
+                    "concurrency": {
+                        "queue_decrease_factor": 0.8,
+                        "preemption_decrease_factor": 0.7,
+                        "escalated_decrease_factor": 0.75,
                     },
                 },
             }

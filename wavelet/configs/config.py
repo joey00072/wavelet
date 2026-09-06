@@ -842,7 +842,13 @@ _MANAGED_VLLM_ARGS = frozenset(
 class RLVLLMConfig(ConfigModel):
     server_backend: Literal["offline", "openai"] = "openai"
     gpu_memory_utilization: float = Field(default=0.35, gt=0.0, le=1.0)
-    max_model_len: int | None = Field(default=None, ge=8)
+    max_model_len: int | None = Field(
+        default=None,
+        ge=8,
+        description=(
+            "Optional vLLM context limit; unset uses the model-native limit."
+        ),
+    )
     quantization: str | None = None
     load_format: str | None = None
     tensor_parallel_size: int = Field(default=1, ge=1)
@@ -1109,19 +1115,26 @@ RLAlgorithmConfig = Annotated[
 
 
 class RLAdaptiveConcurrencyConfig(ConfigModel):
-    """Bounds and thresholds for verifier inference load control."""
+    """Bounds and pressure thresholds for adaptive rollout concurrency."""
 
     min_inflight: int = Field(default=1, ge=1)
     max_inflight: int | None = Field(default=None, ge=1)
     initial_inflight: int | None = Field(default=None, ge=1)
-    additive_increase: int = Field(default=1, ge=1)
-    decrease_factor: float = Field(default=0.8, gt=0.0, lt=1.0)
+    growth_factor_per_turnover: float = Field(default=1.25, gt=1.0)
+    binding_fraction: float = Field(default=0.9, gt=0.0, le=1.0)
+    growth_gate_polls: int = Field(default=3, ge=1)
     growth_kv_cache_usage: float = Field(default=0.6, ge=0.0, lt=1.0)
+    soft_kv_cache_usage: float = Field(default=0.8, gt=0.0, lt=1.0)
     target_kv_cache_usage: float = Field(default=0.7, gt=0.0, lt=1.0)
     hard_kv_cache_usage: float = Field(default=0.9, gt=0.0, le=1.0)
     max_waiting_requests: int = Field(default=0, ge=0)
-    queue_persistence_polls: int = Field(default=3, ge=1)
-    decrease_cooldown_polls: int = Field(default=2, ge=0)
+    queue_ratio: float = Field(default=0.5, ge=0.0)
+    queue_persistence_polls: int = Field(default=6, ge=1)
+    queue_decrease_factor: float = Field(default=0.9, gt=0.0, lt=1.0)
+    preemption_decrease_factor: float = Field(default=0.8, gt=0.0, lt=1.0)
+    escalated_decrease_factor: float = Field(default=0.5, gt=0.0, lt=1.0)
+    escalation_grace_polls: int = Field(default=6, ge=1)
+    decrease_cooldown_polls: int = Field(default=6, ge=0)
     poll_interval_seconds: float = Field(default=5.0, gt=0.0)
     request_timeout_seconds: float = Field(default=5.0, gt=0.0)
 
@@ -1151,10 +1164,20 @@ class RLAdaptiveConcurrencyConfig(ConfigModel):
         if not (
             self.growth_kv_cache_usage
             < self.target_kv_cache_usage
+            < self.soft_kv_cache_usage
             < self.hard_kv_cache_usage
         ):
             raise ValueError(
-                "concurrency KV thresholds must satisfy growth < target < hard."
+                "concurrency KV thresholds must satisfy growth < target < hard, "
+                "with target < soft < hard."
+            )
+        if self.escalated_decrease_factor > min(
+            self.queue_decrease_factor,
+            self.preemption_decrease_factor,
+        ):
+            raise ValueError(
+                "concurrency.escalated_decrease_factor must be no greater than "
+                "the queue and preemption decrease factors."
             )
         return self
 
@@ -1714,7 +1737,6 @@ class RLConfig(TrainerConfig):
             ]
         )
         limits = {
-            "min_inflight": concurrency.min_inflight,
             "initial_inflight": concurrency.initial_inflight,
             "max_inflight": concurrency.max_inflight,
         }

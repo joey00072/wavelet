@@ -41,10 +41,13 @@ orchestrator:
   verifier_client_type: openai_chat_completions_token
   examples_per_step: 16
   rollouts_per_example: 16
-  # Publish one constant 256-trace trainer batch per update. Generation
-  # still runs in 128-request waves because max_inflight_rollouts is 128.
+  # Publish one constant 256-trace trainer batch per update. Generation grows
+  # toward the 128-rollout ceiling as inference capacity permits.
   rollout_chunk_examples: 16
   max_inflight_rollouts: 128
+  # Bootstrap from vLLM KV capacity, then grow by completed-rollout turnover
+  # and trim before queueing or preemption causes inference thrash.
+  concurrency: {}
   filter_zero_advantage: true
   zero_advantage_max_retries: 128
   # The validated reference run observed policy lag 0-2; Wavelet's level
@@ -107,7 +110,6 @@ inference:
   vllm:
     server_backend: openai
     gpu_memory_utilization: 0.9
-    max_model_len: 2048
     enforce_eager: false
     max_lora_rank: 32
   http:

@@ -367,11 +367,14 @@ def test_alphabet_sort_8b_long_config_preserves_source_task_order() -> None:
     assert config.orchestrator.examples_per_step == 16
     assert config.orchestrator.rollouts_per_example == 16
     assert config.orchestrator.rollout_chunk_examples == 16
+    assert config.orchestrator.max_inflight_rollouts == 128
+    assert config.orchestrator.concurrency is not None
     assert config.orchestrator.filter_zero_advantage is True
     assert config.orchestrator.max_async_level == 3
     assert config.algo.normalize_advantages is False
     assert config.algo.epsilon == pytest.approx(1.0e-12)
     assert config.loss.type == "ipo"
+    assert config.inference.vllm.max_model_len is None
     assert config.lora is not None
     assert config.lora.optimization_dtype == "float32"
     assert config.max_steps == 100_000

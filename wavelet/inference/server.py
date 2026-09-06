@@ -1235,8 +1235,6 @@ def _base_serve_argv(config: RLConfig) -> list[str]:
         str(vllm_config.data_parallel_size),
         "--gpu-memory-utilization",
         str(vllm_config.gpu_memory_utilization),
-        "--max-model-len",
-        str(vllm_config.max_model_len or config.data.seq_len + 1),
         "--logprobs-mode",
         "processed_logprobs",
         "--generation-config",
@@ -1247,6 +1245,8 @@ def _base_serve_argv(config: RLConfig) -> list[str]:
 
 def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
     vllm_config = config.inference.vllm
+    if vllm_config.max_model_len is not None:
+        argv.extend(["--max-model-len", str(vllm_config.max_model_len)])
     if vllm_config.quantization is not None:
         argv.extend(["--quantization", vllm_config.quantization])
     if vllm_config.load_format is not None:

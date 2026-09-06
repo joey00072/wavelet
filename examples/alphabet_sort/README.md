@@ -41,7 +41,11 @@ uv run python -m wavelet rl @ examples/alphabet_sort/rl_8b_long.yaml
 `rl_8b_long.yaml` uses Qwen3-8B, 256-rollout GRPO/IPO, a rank-32 FP32 LoRA
 optimizer, a one-inference/one-trainer GPU layout, and source task order. It is
 a 100,000-step long-run recipe; use a CLI `--max_steps` override for a short
-validation.
+validation. Like the upstream recipe, it lets vLLM use the model-native context
+length. Its 128-rollout ceiling is conservatively bootstrapped from vLLM's KV
+capacity and then adjusted from completed-rollout turnover, queue pressure,
+preemptions, and KV usage. Set `inference.vllm.max_model_len` explicitly when a
+smaller serving context is intentional.
 
 Each row stores one verifier dataset example. During RL, Wavelet calls
 `wavelet.orchestrator.verifiers:generate_rollouts`, which runs
