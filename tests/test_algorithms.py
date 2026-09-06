@@ -180,7 +180,16 @@ def test_max_rl_algorithm_zeroes_groups_without_success() -> None:
         (RewardAlgorithmConfig(), RewardAlgorithm, "rollout"),
         (GRPOAlgorithmConfig(), GRPOAlgorithm, "group"),
         (MaxRLAlgorithmConfig(), MaxRLAlgorithm, "group"),
-        (OPDAlgorithmConfig(), OPDAlgorithm, "rollout"),
+        (
+            OPDAlgorithmConfig(
+                teacher={
+                    "name": "teacher",
+                    "base_url": "http://teacher:8001/v1",
+                }
+            ),
+            OPDAlgorithm,
+            "rollout",
+        ),
         (OPSDAlgorithmConfig(), OPSDAlgorithm, "rollout"),
         (SFTDistillAlgorithmConfig(), SFTDistillAlgorithm, "rollout"),
     ],
@@ -199,7 +208,16 @@ def test_build_algorithm_dispatches_named_config(
 @pytest.mark.parametrize(
     ("config", "field", "component"),
     [
-        (OPDAlgorithmConfig(), "ref_kl_weight", "ref_kl"),
+        (
+            OPDAlgorithmConfig(
+                teacher={
+                    "name": "teacher",
+                    "base_url": "http://teacher:8001/v1",
+                }
+            ),
+            "ref_kl_weight",
+            "ref_kl",
+        ),
         (OPSDAlgorithmConfig(), "ref_kl_weight", "ref_kl"),
         (SFTDistillAlgorithmConfig(), "ce_weight", "ce"),
     ],
@@ -221,41 +239,83 @@ def test_distillation_algorithms_route_tokens_without_scalar_advantage(
 
 
 def test_distillation_config_requires_the_correct_teacher_ownership() -> None:
-    teacher = {"model": "teacher", "base_url": "http://teacher:8000/v1"}
+    teacher = {"name": "teacher", "base_url": "http://teacher:8000/v1"}
     orchestrator = {
         "custom_rollout_function": "wavelet.orchestrator.verifiers:generate_rollouts",
         "verifier_env_id": "test-env",
     }
-    assert (
-        RLConfig(
-            algo={"type": "opd"}, teacher=teacher, orchestrator=orchestrator
-        ).teacher
-        is not None
+    config = RLConfig(
+        algo={"type": "opd", "teacher": teacher}, orchestrator=orchestrator
     )
+    assert isinstance(config.algo, OPDAlgorithmConfig)
+    assert config.algo.teacher.name == "teacher"
+    assert config.algo.teacher.model == "teacher"
+    assert config.algo.teacher.model_dump() == {
+        "name": "teacher",
+        "base_url": "http://teacher:8000/v1",
+        "api_key_var": "OPENAI_API_KEY",
+        "timeout_seconds": 120.0,
+    }
+    assert config.teacher is None
     assert (
         RLConfig(
-            algo={"type": "sft"}, teacher=teacher, orchestrator=orchestrator
+            algo={"type": "sft"},
+            teacher={"model": "teacher", "base_url": teacher["base_url"]},
+            orchestrator=orchestrator,
         ).teacher
         is not None
     )
 
-    with pytest.raises(ValueError, match="requires a teacher"):
+    with pytest.raises(ValueError, match="teacher"):
         RLConfig(algo={"type": "opd"})
-    with pytest.raises(ValueError, match="does not accept"):
+    with pytest.raises(ValueError, match="top-level teacher"):
         RLConfig(algo={"type": "opsd"}, teacher=teacher)
     with pytest.raises(ValueError, match="demonstration"):
         OPSDAlgorithmConfig(template="missing placeholder")
     with pytest.raises(ValueError, match="Verifiers rollout source"):
-        RLConfig(algo={"type": "opd"}, teacher=teacher)
-    with pytest.raises(ValueError, match="verifier_env_id"):
+        RLConfig(algo={"type": "opd", "teacher": teacher})
+    with pytest.raises(ValueError, match="orchestrator.envs"):
         RLConfig(
-            algo={"type": "opd"},
-            teacher=teacher,
+            algo={"type": "opd", "teacher": teacher},
             orchestrator={
                 "custom_rollout_function": (
                     "wavelet.orchestrator.verifiers:generate_rollouts"
                 )
             },
+        )
+
+
+def test_legacy_top_level_opd_teacher_moves_under_algorithm() -> None:
+    config = RLConfig.model_validate(
+        {
+            "algo": {"type": "opd"},
+            "teacher": {
+                "model": "teacher",
+                "base_url": "http://teacher:8000/v1",
+            },
+            "orchestrator": {
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                ),
+                "verifier_env_id": "test-env",
+            },
+        }
+    )
+
+    assert isinstance(config.algo, OPDAlgorithmConfig)
+    assert config.algo.teacher.model == "teacher"
+    assert config.teacher is None
+
+
+def test_opd_rejects_duplicate_legacy_and_algorithm_teachers() -> None:
+    teacher = {"model": "teacher", "base_url": "http://teacher:8000/v1"}
+
+    with pytest.raises(ValueError, match="only under algo.teacher"):
+        RLConfig.model_validate(
+            {
+                "algo": {"type": "opd", "teacher": teacher},
+                "teacher": teacher,
+            }
         )
 
 

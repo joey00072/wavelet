@@ -22,6 +22,7 @@ from wavelet.trainer.rl_trainer import (
     _packed_causal_attention_mask,
     _packed_training_attention_mask,
 )
+from wavelet.trainer.types import LossOutput, TrainOutput
 
 
 class _Config:
@@ -109,6 +110,29 @@ def test_rollout_reward_metric_is_weighted_by_rollout_count() -> None:
     assert metrics["reward_mean"] == 0.75
     assert "_reward_weighted_sum" not in metrics
     assert "_reward_weight" not in metrics
+
+
+def test_ref_kl_only_train_output_logs_without_rl_metrics() -> None:
+    trainer = RLTrainer(RLConfig())
+    trainer.monitor = Mock()
+    trainer.step = 1
+    progress = Mock()
+    output = TrainOutput(
+        loss=LossOutput(loss=torch.tensor(0.3)),
+        stepped=True,
+        metrics={
+            "loss": 0.3,
+            "ref_kl/unmasked_mismatch_kl": 0.002,
+        },
+    )
+
+    trainer._log_train_output(output, progress)
+
+    progress.set_postfix.assert_called_once_with(
+        loss="0.3000",
+        kl="0.0020",
+        lr="0.00e+00",
+    )
 
 
 def test_gradient_accumulation_loss_scale_divides_grads_once() -> None:

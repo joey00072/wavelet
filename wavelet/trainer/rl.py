@@ -339,9 +339,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self.monitor.log(
             metrics, self.step, ranks=getattr(self, "_latest_rank_telemetry", None)
         )
+        mismatch_kl = metrics.get(
+            "mismatch_kl",
+            metrics.get("ref_kl/unmasked_mismatch_kl", 0.0),
+        )
         progress.set_postfix(
             loss=f"{metrics['loss']:.4f}",
-            kl=f"{metrics['mismatch_kl']:.4f}",
+            kl=f"{mismatch_kl:.4f}",
             lr=f"{metrics['lr']:.2e}",
         )
 

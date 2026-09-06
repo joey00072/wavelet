@@ -944,8 +944,14 @@ def _validate_rl_record_streams(record: RLExample) -> tuple[bool, bool, bool]:
     _validate_numeric_stream(record.ref_kl_weight, field_name="ref_kl_weight")
     if record.sampling_mask is not None and not isinstance(record.sampling_mask, list):
         raise ValueError("sampling_mask must be a list when provided.")
+    has_auxiliary_component = (
+        record.ce_weight is not None or record.ref_kl_weight is not None
+    )
+    # Distillation rows retain environment rewards for observability. A reward
+    # only selects the legacy RL route when no explicit token-loss route exists.
     components = (
-        record.advantage is not None or record.reward is not None,
+        record.advantage is not None
+        or (record.reward is not None and not has_auxiliary_component),
         record.ce_weight is not None,
         record.ref_kl_weight is not None,
     )

@@ -14,7 +14,7 @@ run in the ordinary test suite.
 | Weighted multi-environment scheduling and resume cursors | `uv run pytest tests/test_rl_config.py tests/test_verifiers_rollouts.py tests/test_preflight.py tests/test_orchestrator_metrics.py` |
 | Curriculum sampling, admission gates, and state restore | `uv run pytest tests/test_curriculum.py tests/test_verifiers_rollouts.py tests/test_queue.py` |
 | Rewards and advantage algorithms | `uv run pytest tests/test_reward.py tests/test_algorithms.py` |
-| OPD, OPSD, and online SFT distillation | `uv run pytest tests/test_distillation.py tests/test_algorithms.py tests/test_rl_loss.py` |
+| OPD, OPSD, mixed RL/OPD routing, and online SFT distillation | `uv run pytest tests/test_distillation.py tests/test_algorithms.py tests/test_rl_config.py tests/test_rl_dataset.py tests/test_rl_loss.py` |
 | Agent trajectory token provenance | `uv run pytest tests/test_agent_trajectory.py` |
 | RL records, packing, and tokenization | `uv run pytest tests/test_rl_dataset.py tests/test_tokenization_alignment.py` |
 | Component RL/CE/ref-KL losses and trainer stepping | `uv run pytest tests/test_rl_loss.py tests/test_rl_trainer.py` |

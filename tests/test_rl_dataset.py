@@ -401,6 +401,62 @@ def test_ce_only_sample_preserves_component_weights_through_collation() -> None:
     assert batch["ref_kl_weights"].tolist() == [[0.0, 0.0, 0.0, 0.0]]
 
 
+def test_mixed_rl_and_opd_samples_keep_reference_scores_aligned() -> None:
+    rl_record = _record(0, length=4)
+    opd_record = _record(1, length=4)
+    opd_record.advantage = None
+    opd_record.teacher_logprobs = [-1.5] * 4
+    opd_record.ref_kl_weight = 1.0
+
+    samples = [
+        prepare_rl_sample(
+            record,
+            tokenizer=None,  # type: ignore[arg-type]
+            data_config=RLDataConfig(seq_len=8),
+            seq_len=8,
+        )
+        for record in (rl_record, opd_record)
+    ]
+    assert all(sample is not None for sample in samples)
+
+    batch = collate_rl_batch(
+        [sample for sample in samples if sample is not None],
+        pad_token_id=0,
+    )
+
+    assert batch["has_teacher_logprobs"].tolist() == [False, True]
+    assert batch["teacher_logprobs"].tolist() == [
+        [0.0, 0.0, 0.0, 0.0],
+        [-1.5, -1.5, -1.5, -1.5],
+    ]
+    assert batch["rl_weights"].tolist() == [
+        [1.0, 1.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ]
+    assert batch["ref_kl_weights"].tolist() == [
+        [0.0, 0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0],
+    ]
+    assert batch["rewards"].tolist() == [0.0, 1.0]
+
+
+def test_explicit_advantage_can_mix_rl_and_ref_kl_on_one_sample() -> None:
+    record = _record(0, length=4)
+    record.teacher_logprobs = [-1.5] * 4
+    record.ref_kl_weight = 1.0
+
+    sample = prepare_rl_sample(
+        record,
+        tokenizer=None,  # type: ignore[arg-type]
+        data_config=RLDataConfig(seq_len=8),
+        seq_len=8,
+    )
+
+    assert sample is not None
+    assert sample["rl_weights"] == [1.0, 1.0, 1.0, 1.0]
+    assert sample["ref_kl_weights"] == [1.0, 1.0, 1.0, 1.0]
+
+
 def test_component_weight_streams_must_align_with_source_tokens() -> None:
     record = _record(0, length=4)
     record.ref_kl_weight = [1.0, 1.0]

@@ -18,7 +18,11 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from wavelet.configs.rl_config import RLAlgorithmConfig, RLEvalEnvConfig
+from wavelet.configs.rl_config import (
+    OPDAlgorithmConfig,
+    RLAlgorithmConfig,
+    RLEvalEnvConfig,
+)
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.admission import RolloutAdmissionController
 from wavelet.orchestrator.advantage import (
@@ -77,7 +81,7 @@ class _VerifierFailureStats:
 
 
 class PrefillScoringClient:
-    """Score fixed token sequences through a Wavelet vLLM server."""
+    """Score fixed token sequences through a vLLM token endpoint."""
 
     def __init__(
         self,
@@ -93,37 +97,89 @@ class PrefillScoringClient:
         self.timeout_seconds = timeout_seconds
 
     def score(self, token_ids: list[int]) -> list[float]:
-        payload = json.dumps({"model": self.model, "token_ids": token_ids}).encode(
-            "utf-8"
-        )
+        payload = {
+            "model": self.model,
+            "token_ids": token_ids,
+            "sampling_params": {
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "prompt_logprobs": 1,
+            },
+        }
+        try:
+            result = self._post("/inference/v1/generate", payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise self._scoring_error(exc) from exc
+            try:
+                result = self._post(
+                    "/score",
+                    {"model": self.model, "token_ids": token_ids},
+                )
+            except urllib.error.HTTPError as fallback_exc:
+                raise self._scoring_error(fallback_exc) from fallback_exc
+        return _flatten_prompt_logprobs(result, token_ids)
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
-            f"{self.base_url}/score",
-            data=payload,
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=self.timeout_seconds,
-            ) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"Teacher prefill scoring failed with HTTP {exc.code}: {detail}"
-            ) from exc
-        values = result.get("prompt_logprobs")
-        if not isinstance(values, list) or len(values) != len(token_ids):
-            actual = len(values) if isinstance(values, list) else "missing"
-            raise ValueError(
-                "Teacher prompt logprobs must align with scored token ids "
-                f"({actual} != {len(token_ids)})."
-            )
-        return [float(value) for value in values]
+        with urllib.request.urlopen(
+            request,
+            timeout=self.timeout_seconds,
+        ) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if not isinstance(result, dict):
+            raise TypeError("Teacher prefill scoring response must be a JSON object.")
+        return result
+
+    @staticmethod
+    def _scoring_error(exc: urllib.error.HTTPError) -> RuntimeError:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return RuntimeError(
+            f"Teacher prefill scoring failed with HTTP {exc.code}: {detail}"
+        )
+
+
+def _flatten_prompt_logprobs(
+    result: dict[str, Any],
+    token_ids: list[int],
+) -> list[float]:
+    values = result.get("prompt_logprobs")
+    if not isinstance(values, list) or len(values) != len(token_ids):
+        actual = len(values) if isinstance(values, list) else "missing"
+        raise ValueError(
+            "Teacher prompt logprobs must align with scored token ids "
+            f"({actual} != {len(token_ids)})."
+        )
+
+    flattened: list[float] = []
+    for index, (token_id, value) in enumerate(zip(token_ids, values, strict=True)):
+        if value is None and index == 0:
+            flattened.append(0.0)
+            continue
+        if isinstance(value, (int, float)):
+            flattened.append(float(value))
+            continue
+        if isinstance(value, dict):
+            token_value = value.get(str(token_id), value.get(token_id))
+            if isinstance(token_value, dict):
+                logprob = token_value.get("logprob")
+                if isinstance(logprob, (int, float)):
+                    flattened.append(float(logprob))
+                    continue
+        raise ValueError(
+            f"Teacher prompt logprob at token index {index} does not contain "
+            f"the scored token id {token_id}."
+        )
+    return flattened
 
 
 def _ensure_verifier_openai_patches() -> None:
@@ -200,7 +256,10 @@ async def _evaluate_env_async(
         env_config.args,
         _verifier_extra_env_kwargs(config),
     )
-    examples = env.get_eval_dataset(n=env_config.num_examples).to_list()
+    examples = [
+        _normalize_verifier_example(example)
+        for example in env.get_eval_dataset(n=env_config.num_examples).to_list()
+    ]
     clients = _verifier_clients(
         vf,
         config,
@@ -526,7 +585,7 @@ def _verifier_base_urls(config) -> list[str]:
 
 def _verifier_model(config, inference_engine: Any | None = None) -> str:
     if algorithm_loss_component(config.algo) == "ce" and config.teacher is not None:
-        return config.teacher.model
+        return config.teacher.name
     policy_model_name = getattr(inference_engine, "policy_model_name", None)
     if isinstance(policy_model_name, str) and policy_model_name:
         return policy_model_name
@@ -1213,12 +1272,25 @@ def _verifier_example(record: RLExample) -> dict[str, Any]:
     metadata = record.metadata or {}
     example = metadata.get("verifier_example")
     if isinstance(example, dict):
-        return example
+        return _normalize_verifier_example(example)
     example_id = metadata.get("example_id")
     return {
         "example_id": example_id if example_id is not None else 0,
         "prompt": record.prompt,
     }
+
+
+def _normalize_verifier_example(example: dict[str, Any]) -> dict[str, Any]:
+    """Normalize legacy string task routes for current Verifiers inputs."""
+    normalized = dict(example)
+    task = normalized.get("task")
+    if isinstance(task, str):
+        info = normalized.get("info")
+        normalized_info = dict(info) if isinstance(info, dict) else {}
+        normalized_info.setdefault("env_id", task)
+        normalized["info"] = normalized_info
+        normalized.pop("task")
+    return normalized
 
 
 def _sampling_args(
@@ -1446,11 +1518,11 @@ def annotate_distillation_records(
         api_key_var = config.orchestrator.verifier_api_key_var
         timeout_seconds = config.orchestrator.verifier_timeout_seconds or 120.0
     else:
-        teacher = config.teacher
-        if teacher is None:
-            raise ValueError("OPD requires a configured teacher.")
+        if not isinstance(algorithm_config, OPDAlgorithmConfig):
+            raise TypeError("ref_kl scoring requires an OPD or OPSD algorithm.")
+        teacher = algorithm_config.teacher
         base_urls = [teacher.base_url]
-        model = teacher.model
+        model = teacher.name
         api_key_var = teacher.api_key_var
         timeout_seconds = teacher.timeout_seconds
 

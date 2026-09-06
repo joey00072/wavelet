@@ -1,0 +1,118 @@
+model:
+  name: "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+  torch_dtype: float32
+  attn_implementation: auto
+  activation_checkpointing:
+    mode: full
+
+data:
+  source: local
+  path: outputs/reverse_text_data/rl_train.jsonl
+  batch_size: 128
+  micro_batch_size: 1
+  pack_sequences: true
+  seq_len: 2048
+  shuffle: true
+  seed: 42
+
+loss:
+  type: ipo
+  ipo_epsilon: 0.1
+  adv_tau: 1.0
+  kl_tau: 0.001
+
+algo:
+  type: opd
+  teacher:
+    name: "PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL"
+    base_url: http://127.0.0.1:8001/v1
+
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: reverse-text
+  verifier_model: "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+  verifier_client_type: openai_chat_completions_token
+  examples_per_step: 8
+  rollouts_per_example: 16
+  filter_zero_advantage: false
+  max_async_level: 1
+  max_off_policy_steps: 8
+  state_server:
+    enabled: true
+    host: 0.0.0.0
+    port: 8765
+
+eval:
+  interval: 1
+  num_examples: 16
+  rollouts_per_example: 1
+  final_eval: true
+  env:
+    - id: reverse-text
+      name: reverse-text
+
+inference:
+  enabled: true
+  mode: vllm_http
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    max_completion_tokens: 128
+    do_sample: true
+    seed: null
+  vllm:
+    server_backend: openai
+    dtype: bfloat16
+    gpu_memory_utilization: 0.4
+    max_model_len: 2048
+    enforce_eager: false
+    max_lora_rank: 32
+  http:
+    request_timeout_seconds: 300.0
+    startup_timeout_seconds: 900.0
+
+reward:
+  mode: passthrough
+
+policy_transfer:
+  type: filesystem
+  export_initial: true
+
+optim:
+  type: adamw
+  implementation: fused
+  lr: 3e-6
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  cpu_offload: true
+
+scheduler:
+  type: constant
+
+lora: null
+
+max_grad_norm: 1.0
+max_steps: 15
+seed: 42
+
+monitor:
+  enabled: true
+  wandb:
+    enabled: false
+    project: wavelet-reverse-text
+    name: wavelet-reverse-text-opd-smoke
+    mode: offline
+
+launcher:
+  mode: process
+  backend: local
+  inference_cuda_visible_devices: "0"
+  trainer_cuda_visible_devices: "1"
+  trainer_num_processes: 1
+  inference_num_replicas: 1
+
+output_dir: outputs/reverse_text_opd_smoke
+clean_output_dir: true

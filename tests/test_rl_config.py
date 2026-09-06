@@ -5,6 +5,7 @@ import pytest
 from wavelet.configs.rl_config import (
     GRPOAlgorithmConfig,
     LinearLengthPenaltyConfig,
+    OPDAlgorithmConfig,
     RLConfig,
     TokensLengthPenaltyConfig,
     TruncationLengthPenaltyConfig,
@@ -317,6 +318,39 @@ def test_rl_replays_sampling_support_masks(field_value: tuple[str, float]) -> No
     assert getattr(config.inference.sampling, field) == pytest.approx(value)
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "sampling"),
+    [
+        (
+            {
+                "type": "opd",
+                "teacher": {
+                    "name": "teacher",
+                    "base_url": "http://teacher:8001/v1",
+                },
+            },
+            {"top_p": 0.9},
+        ),
+        ({"type": "opsd"}, {"top_k": 20}),
+        ({"type": "opsd"}, {"min_p": 0.1}),
+    ],
+)
+def test_ref_kl_distillation_rejects_truncated_sampling(
+    algorithm: dict[str, object], sampling: dict[str, float]
+) -> None:
+    with pytest.raises(ValueError, match="not supported with truncated train sampling"):
+        RLConfig(
+            algo=algorithm,
+            orchestrator={
+                "custom_rollout_function": (
+                    "wavelet.orchestrator.verifiers:generate_rollouts"
+                ),
+                "verifier_env_id": "test-env",
+            },
+            inference={"sampling": sampling},
+        )
+
+
 def test_rl_rejects_disabling_required_sampling_masks() -> None:
     with pytest.raises(ValueError, match="return_sampling_mask=true"):
         RLConfig(
@@ -547,14 +581,37 @@ def test_multiple_training_environments_validate_effective_sampling() -> None:
     assert config.orchestrator.envs[1].sampling.top_p == pytest.approx(0.9)
 
 
-def test_multiple_training_environments_require_compatible_loss_components() -> None:
-    with pytest.raises(ValueError, match="same trainer loss component"):
+def test_multiple_training_environments_reject_mixed_sft_generation() -> None:
+    with pytest.raises(ValueError, match="SFT distillation cannot be mixed"):
         _multi_environment_config(
             envs=[
                 {"id": "math"},
                 {"id": "distill", "algo": {"type": "sft"}},
             ]
         )
+
+
+def test_multiple_training_environments_allow_mixed_reward_and_opd() -> None:
+    config = _multi_environment_config(
+        envs=[
+            {"id": "reward"},
+            {
+                "id": "distill",
+                "algo": {
+                    "type": "opd",
+                    "teacher": {
+                        "name": "teacher",
+                        "base_url": "http://teacher:8001/v1",
+                    },
+                },
+            },
+        ]
+    )
+
+    assert config.orchestrator.envs[0].algo is None
+    distill = config.orchestrator.envs[1].algo
+    assert isinstance(distill, OPDAlgorithmConfig)
+    assert distill.teacher.name == "teacher"
 
 
 def test_curriculum_parses_difficulty_pool_and_advantage_gate() -> None:

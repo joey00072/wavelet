@@ -169,15 +169,46 @@ the one-sided reference-KL component:
 ```yaml
 algo:
   type: opd
-teacher:
-  model: Qwen/Qwen3-8B
-  base_url: http://127.0.0.1:8100
-  api_key_var: OPENAI_API_KEY
-  timeout_seconds: 120
+  teacher:
+    name: Qwen/Qwen3-8B
+    base_url: http://127.0.0.1:8100/v1
+    api_key_var: OPENAI_API_KEY
+    timeout_seconds: 120
 ```
 
-SFT distillation uses the same `teacher` block, but sends rollout generation to
-the teacher and applies ordinary next-token cross entropy to its completions:
+The teacher belongs to the OPD algorithm, so each environment can select its
+own frozen scoring model. The former top-level `teacher` form is accepted for a
+top-level OPD algorithm and normalized to `algo.teacher`; new configurations
+should use the nested form. `name` matches the hosted model identifier; the
+legacy `model` spelling is also accepted.
+
+OPD and ordinary RL environments may share a run. The trainer routes and
+normalizes their `ref_kl` and `rl` tokens independently:
+
+```yaml
+algo:
+  type: grpo
+orchestrator:
+  envs:
+    - id: math-env
+      name: math-grpo
+    - id: math-env
+      name: math-opd
+      algo:
+        type: opd
+        teacher:
+          name: Qwen/Qwen3-8B
+          base_url: http://127.0.0.1:8100/v1
+```
+
+OPD and OPSD require full-distribution training samples: keep `top_p: 1`,
+`top_k: -1`, and `min_p: 0`. Reference prefill scores use the full vocabulary,
+so combining them with truncated, renormalized policy logprobs would bias the
+reverse-KL signal and is rejected during configuration validation.
+
+SFT distillation keeps its teacher at the top level because that model owns
+rollout generation, then applies ordinary next-token cross entropy to its
+completions:
 
 ```yaml
 algo:
@@ -188,11 +219,13 @@ teacher:
 ```
 
 For either configuration, run a separate Wavelet `inference-server` whose
-`model.name` equals `teacher.model`; `teacher.base_url` may include or omit the
-trailing `/v1`. The teacher server exposes fixed-token prefill scoring at
-`POST /score`. It returns one prompt logprob per supplied token, with a leading
-zero for the first token, and performs scoring with temperature 1. Keep the
-student's normal inference server configured under `inference.http`.
+`model.name` equals the configured teacher `name` (or legacy `model`);
+`base_url` may include or omit the trailing `/v1`. Wavelet uses vLLM's canonical
+`POST /inference/v1/generate` token protocol for fixed-token prefill scoring and
+falls back to Wavelet's legacy `POST /score` endpoint when necessary. Both
+return one prompt logprob per supplied token, with a leading zero for the first
+token, and scoring uses temperature 1. Keep the student's normal inference
+server configured under `inference.http`.
 
 OPSD needs no teacher process. It obtains an expert demonstration from the
 Verifiers input example, renders it as a system-message prefix, and asks the

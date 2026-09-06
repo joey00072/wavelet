@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.rl_config import OPDAlgorithmConfig, RLConfig
 from wavelet.configs.sft import SFTConfig
 from wavelet.utils.serialization import load_yaml
 
@@ -79,6 +79,35 @@ def test_reverse_text_rl_matches_reference_training_shape() -> None:
     assert config.inference.vllm.gpu_memory_utilization == pytest.approx(0.9)
     assert config.optim.type == "adamw"
     assert config.optim.lr == pytest.approx(3e-6)
+
+
+def test_reverse_text_opd_smoke_matches_reference_training_shape() -> None:
+    config = RLConfig.model_validate(
+        load_yaml(Path("examples/reverse_text/rl_opd_smoke.yaml"))
+    )
+
+    assert isinstance(config.algo, OPDAlgorithmConfig)
+    assert config.algo.teacher.name == ("PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL")
+    assert config.teacher is None
+    assert config.inference.sampling.top_p == pytest.approx(1.0)
+    assert config.inference.sampling.top_k == -1
+    assert config.inference.sampling.min_p == pytest.approx(0.0)
+    assert config.data.batch_size == 128
+    assert config.orchestrator.examples_per_step == 8
+    assert config.orchestrator.rollouts_per_example == 16
+    assert config.orchestrator.max_async_level == 1
+    assert config.orchestrator.max_off_policy_steps == 8
+    assert config.eval.interval == 1
+    assert config.eval.num_examples == 16
+    assert config.eval.rollouts_per_example == 1
+    assert config.inference.vllm.gpu_memory_utilization == pytest.approx(0.4)
+    assert config.max_steps == 15
+    assert config.loss.type == "ipo"
+    assert config.optim.cpu_offload is True
+    assert config.lora is None
+    assert config.launcher.mode == "process"
+    assert config.launcher.inference_cuda_visible_devices == "0"
+    assert config.launcher.trainer_cuda_visible_devices == "1"
 
 
 def test_hendrycks_sanity_rl_matches_reference_training_shape() -> None:

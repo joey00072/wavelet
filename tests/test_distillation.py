@@ -1,4 +1,7 @@
 import asyncio
+import json
+import urllib.error
+import urllib.request
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -51,13 +54,180 @@ def test_opd_prefill_scoring_selects_only_trainable_target_logprobs(
 
     monkeypatch.setattr(envs.PrefillScoringClient, "score", score)
     config = _config(
-        algo={"type": "opd"},
-        teacher={"model": "teacher", "base_url": "http://teacher:8000/v1"},
+        algo={
+            "type": "opd",
+            "teacher": {
+                "name": "teacher",
+                "base_url": "http://teacher:8000/v1",
+            },
+        },
     )
 
     annotated = envs.annotate_distillation_records([_record()], config)
 
     assert seen == [[10, 11, 12]]
+    assert annotated[0].teacher_logprobs == [-2.0]
+
+
+def test_prefill_client_uses_vllm_token_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return json.dumps(
+                {
+                    "prompt_logprobs": [
+                        None,
+                        {
+                            "11": {"logprob": -2.5},
+                            "7": {"logprob": -0.5},
+                        },
+                    ]
+                }
+            ).encode()
+
+    def urlopen(request, *, timeout):
+        seen["url"] = request.full_url
+        seen["payload"] = json.loads(request.data)
+        seen["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    client = envs.PrefillScoringClient(
+        base_url="http://teacher:8000/v1",
+        model="teacher",
+        api_key="EMPTY",
+        timeout_seconds=12.0,
+    )
+
+    assert client.score([10, 11]) == [0.0, -2.5]
+    assert seen == {
+        "url": "http://teacher:8000/inference/v1/generate",
+        "payload": {
+            "model": "teacher",
+            "token_ids": [10, 11],
+            "sampling_params": {
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "prompt_logprobs": 1,
+            },
+        },
+        "timeout": 12.0,
+    }
+
+
+def test_prefill_client_falls_back_to_wavelet_score_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, dict[str, object]]] = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def read() -> bytes:
+            return json.dumps({"prompt_logprobs": [0.0, -2.5]}).encode()
+
+    def urlopen(request, *, timeout):
+        del timeout
+        payload = json.loads(request.data)
+        seen.append((request.full_url, payload))
+        if request.full_url.endswith("/inference/v1/generate"):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                404,
+                "not found",
+                {},
+                None,
+            )
+        return Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    client = envs.PrefillScoringClient(
+        base_url="http://teacher:8000/v1",
+        model="teacher",
+        api_key="EMPTY",
+        timeout_seconds=12.0,
+    )
+
+    assert client.score([10, 11]) == [0.0, -2.5]
+    assert seen == [
+        (
+            "http://teacher:8000/inference/v1/generate",
+            {
+                "model": "teacher",
+                "token_ids": [10, 11],
+                "sampling_params": {
+                    "max_tokens": 1,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "prompt_logprobs": 1,
+                },
+            },
+        ),
+        (
+            "http://teacher:8000/score",
+            {"model": "teacher", "token_ids": [10, 11]},
+        ),
+    ]
+
+
+def test_per_environment_opd_uses_its_own_teacher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, list[int]]] = []
+
+    def score(client, token_ids: list[int]) -> list[float]:
+        seen.append((client.model, token_ids))
+        return [0.0, -1.0, -2.0]
+
+    monkeypatch.setattr(envs.PrefillScoringClient, "score", score)
+    config = _config(
+        algo={"type": "reward"},
+        launcher={"mode": "process"},
+        orchestrator={
+            "custom_rollout_function": (
+                "wavelet.orchestrator.verifiers:generate_rollouts"
+            ),
+            "max_async_level": 1,
+            "envs": [
+                {
+                    "id": "test-env",
+                    "algo": {
+                        "type": "opd",
+                        "teacher": {
+                            "name": "environment-teacher",
+                            "base_url": "http://teacher:8000/v1",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+    algorithm = config.orchestrator.envs[0].algo
+    assert algorithm is not None
+
+    annotated = envs.annotate_distillation_records(
+        [_record()],
+        config,
+        algorithm_config=algorithm,
+    )
+
+    assert seen == [("environment-teacher", [10, 11, 12])]
     assert annotated[0].teacher_logprobs == [-2.0]
 
 

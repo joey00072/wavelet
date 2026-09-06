@@ -87,6 +87,41 @@ def _mixed_environment_config() -> RLConfig:
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
 
 
+def test_verifier_example_moves_legacy_task_route_to_info() -> None:
+    record = RLExample(
+        prompt=[{"role": "user", "content": "abc"}],
+        completion=[],
+        advantage=None,
+        reward=None,
+        metadata={
+            "verifier_example": {
+                "example_id": 7,
+                "prompt": [{"role": "user", "content": "abc"}],
+                "task": "reverse-text",
+                "info": {"split": "train"},
+            }
+        },
+    )
+
+    example = verifier_envs._verifier_example(record)
+
+    assert "task" not in example
+    assert example["info"] == {"split": "train", "env_id": "reverse-text"}
+
+
+def test_verifier_example_preserves_structured_task_payload() -> None:
+    task = {"name": "solve", "arguments": {"value": 3}}
+    record = RLExample(
+        prompt=[],
+        completion=[],
+        advantage=None,
+        reward=None,
+        metadata={"verifier_example": {"task": task}},
+    )
+
+    assert verifier_envs._verifier_example(record)["task"] == task
+
+
 def test_verifier_step_converts_to_trainable_record() -> None:
     output = {
         "example_id": 7,

@@ -1,7 +1,14 @@
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    model_validator,
+)
 
 
 class ConfigModel(BaseModel):
@@ -1035,8 +1042,24 @@ class MaxRLAlgorithmConfig(_StrictConfig):
     type: Literal["max_rl"] = "max_rl"
 
 
+class RLTeacherConfig(ConfigModel):
+    name: str = Field(
+        min_length=1,
+        validation_alias=AliasChoices("name", "model"),
+    )
+    base_url: str = Field(min_length=1)
+    api_key_var: str = Field(default="OPENAI_API_KEY", min_length=1)
+    timeout_seconds: float = Field(default=120.0, gt=0.0)
+
+    @property
+    def model(self) -> str:
+        """Return the legacy spelling for callers migrating to ``name``."""
+        return self.name
+
+
 class OPDAlgorithmConfig(_StrictConfig):
     type: Literal["opd"] = "opd"
+    teacher: RLTeacherConfig
 
 
 class OPSDAlgorithmConfig(_StrictConfig):
@@ -1083,13 +1106,6 @@ RLAlgorithmConfig = Annotated[
     | CustomAlgorithmConfig,
     Field(discriminator="type"),
 ]
-
-
-class RLTeacherConfig(ConfigModel):
-    model: str = Field(min_length=1)
-    base_url: str = Field(min_length=1)
-    api_key_var: str = Field(default="OPENAI_API_KEY", min_length=1)
-    timeout_seconds: float = Field(default=120.0, gt=0.0)
 
 
 class RLAdaptiveConcurrencyConfig(ConfigModel):
@@ -1479,6 +1495,23 @@ def _normalize_algorithm_config(value: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _normalize_opd_teacher_config(value: dict[str, Any]) -> dict[str, Any]:
+    """Move the legacy top-level OPD teacher into the algorithm block."""
+    normalized = dict(value)
+    algo = normalized.get("algo")
+    teacher = normalized.get("teacher")
+    if not isinstance(algo, dict) or algo.get("type") != "opd" or teacher is None:
+        return normalized
+    if algo.get("teacher") is not None:
+        raise ValueError(
+            "Configure the OPD teacher only under algo.teacher; do not also set "
+            "the legacy top-level teacher block."
+        )
+    normalized["algo"] = {**algo, "teacher": teacher}
+    normalized.pop("teacher", None)
+    return normalized
+
+
 class RLConfig(TrainerConfig):
     data: RLDataConfig = RLDataConfig()
     loss: RLLossConfig = RLLossConfig()
@@ -1515,45 +1548,33 @@ class RLConfig(TrainerConfig):
             for env in self.orchestrator.envs
         ]
 
+    def train_algorithm_configs(self) -> list[tuple[str, RLAlgorithmConfig]]:
+        if not self.orchestrator.envs:
+            return [("train", self.algo)]
+        return [
+            (env.resolved_name, env.algo or self.algo) for env in self.orchestrator.envs
+        ]
+
     @model_validator(mode="before")
     @classmethod
     def normalize_legacy_algorithm_config(cls, value: object) -> object:
         if not isinstance(value, dict):
             return value
-        return _normalize_algorithm_config(value)
+        return _normalize_opd_teacher_config(_normalize_algorithm_config(value))
 
     @model_validator(mode="after")
     def validate_environment_algorithms(self) -> "RLConfig":
-        def loss_component(algorithm: RLAlgorithmConfig) -> str:
-            if isinstance(algorithm, SFTDistillAlgorithmConfig):
-                return "ce"
-            if isinstance(algorithm, (OPDAlgorithmConfig, OPSDAlgorithmConfig)):
-                return "ref_kl"
-            return "rl"
-
-        top_component = loss_component(self.algo)
-        incompatible = [
-            env.resolved_name
-            for env in self.orchestrator.envs
-            if env.algo is not None and loss_component(env.algo) != top_component
-        ]
-        if incompatible:
+        algorithms = [config for _, config in self.train_algorithm_configs()]
+        has_sft = any(
+            isinstance(config, SFTDistillAlgorithmConfig) for config in algorithms
+        )
+        if has_sft and not all(
+            isinstance(config, SFTDistillAlgorithmConfig) for config in algorithms
+        ):
             raise ValueError(
-                "Per-environment algorithms must use the same trainer loss "
-                f"component as algo.type='{self.algo.type}': "
-                f"{', '.join(incompatible)}."
+                "SFT distillation cannot be mixed with policy-sampled algorithms "
+                "because its frozen teacher owns rollout generation."
             )
-        if top_component != "rl":
-            different_distillation = [
-                env.resolved_name
-                for env in self.orchestrator.envs
-                if env.algo is not None and env.algo.type != self.algo.type
-            ]
-            if different_distillation:
-                raise ValueError(
-                    "Distillation environments must use the top-level algorithm "
-                    f"type '{self.algo.type}': {', '.join(different_distillation)}."
-                )
         return self
 
     @model_validator(mode="after")
@@ -1603,25 +1624,30 @@ class RLConfig(TrainerConfig):
 
     @model_validator(mode="after")
     def validate_distillation_teacher(self) -> "RLConfig":
-        is_distillation = isinstance(
-            self.algo,
-            (OPDAlgorithmConfig, OPSDAlgorithmConfig, SFTDistillAlgorithmConfig),
+        algorithms = [config for _, config in self.train_algorithm_configs()]
+        is_distillation = any(
+            isinstance(
+                config,
+                (OPDAlgorithmConfig, OPSDAlgorithmConfig, SFTDistillAlgorithmConfig),
+            )
+            for config in algorithms
         )
-        if (
-            isinstance(self.algo, (OPDAlgorithmConfig, SFTDistillAlgorithmConfig))
-            and self.teacher is None
-        ):
-            raise ValueError(f"algo.type='{self.algo.type}' requires a teacher block.")
-        if isinstance(self.algo, OPSDAlgorithmConfig) and self.teacher is not None:
+        has_sft = any(
+            isinstance(config, SFTDistillAlgorithmConfig) for config in algorithms
+        )
+        if has_sft and self.teacher is None:
+            raise ValueError("algo.type='sft' requires a top-level teacher block.")
+        if self.teacher is not None and not has_sft:
             raise ValueError(
-                "algo.type='opsd' self-distills from the live policy and does not "
-                "accept a teacher block."
+                "The top-level teacher block is only used by algo.type='sft'. "
+                "Configure an OPD teacher under algo.teacher or "
+                "orchestrator.envs[].algo.teacher."
             )
         if is_distillation and self.orchestrator.custom_rollout_function != (
             "wavelet.orchestrator.verifiers:generate_rollouts"
         ):
             raise ValueError(
-                f"algo.type='{self.algo.type}' requires the Verifiers rollout source."
+                "Distillation algorithms require the Verifiers rollout source."
             )
         if (
             is_distillation
@@ -1629,7 +1655,7 @@ class RLConfig(TrainerConfig):
             and not self.orchestrator.envs
         ):
             raise ValueError(
-                f"algo.type='{self.algo.type}' requires orchestrator.envs or "
+                "Distillation algorithms require orchestrator.envs or "
                 "orchestrator.verifier_env_id."
             )
         return self
@@ -1756,10 +1782,22 @@ class RLConfig(TrainerConfig):
             "top_k",
             "top_p",
         }
+        algorithms = dict(self.train_algorithm_configs())
         for env_name, sampling in self.train_sampling_configs():
             requires_sampling_mask = (
                 sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
             )
+            if requires_sampling_mask and isinstance(
+                algorithms[env_name],
+                (OPDAlgorithmConfig, OPSDAlgorithmConfig),
+            ):
+                raise ValueError(
+                    f"algo.type='{algorithms[env_name].type}' is not supported with "
+                    f"truncated train sampling for '{env_name}': teacher prefill "
+                    "logprobs use the full vocabulary while sampling replay "
+                    "renormalizes policy logprobs over the sampled support. Use "
+                    "top_p=1, top_k=-1, and min_p=0."
+                )
             if (
                 requires_sampling_mask
                 and self.inference.vllm.return_sampling_mask is False

@@ -41,7 +41,7 @@ uv run torchrun --standalone --nproc-per-node=N \
 | --- | --- | --- |
 | `alphabet_sort` | working | 4B LoRA RL plus a 2-GPU Qwen3-8B long-run recipe. |
 | `equation_builder` | working | Local 3–5 number `+`/`-` environment; 0.6B LoRA plus 7B QLoRA smoke and BF16 LoRA long-run configs with rollout auditing. |
-| `reverse_text` | working | 0.6B LoRA RL plus SFT with periodic validation loss; includes a 2-GPU INT4 QLoRA 4B experiment. |
+| `reverse_text` | working | 0.6B LoRA RL plus SFT with periodic validation loss; includes two-GPU OPD and INT4 QLoRA smoke configs. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
 | `qwen2_5_7b_polaris` | runnable | 7B LoRA GRPO on filtered Polaris with strict tags, diverse group sampling, a zero-step AIME 2024 baseline, and held-out 100-step evals. |
@@ -102,6 +102,22 @@ The canonical named-algorithm example is `examples/reverse_text/rl.yaml`. Its
 `algo` block can be changed to `type: max_rl` to use mean-normalized MaxRL
 advantages while keeping the same rollout and trainer path. See
 [RL algorithms](../docs/algorithms.md) for the full configuration contract.
+
+The 15-step OPD comparison mirrors the upstream integration run: batch size
+128 as 8 examples × 16 policy rollouts, full-distribution sampling, evaluation
+after every step, full-model training with CPU-offloaded AdamW, and learning
+rate `3e-6`. GPU 0 shares policy inference with the externally started frozen
+teacher at 40% vLLM memory each; GPU 1 trains the student. Prepare reverse-text
+data, start the teacher, then launch Wavelet in another terminal:
+
+```bash
+uv run python examples/reverse_text/prepare_rl_data.py
+CUDA_VISIBLE_DEVICES=0 uv run wavelet inference-server \
+  @ examples/reverse_text/rl_opd_smoke.yaml \
+  --model.name PrimeIntellect/Qwen3-0.6B-Reverse-Text-RL \
+  --inference.http.port 8001
+uv run wavelet rl @ examples/reverse_text/rl_opd_smoke.yaml
+```
 
 Environment-specific blockers found locally:
 
