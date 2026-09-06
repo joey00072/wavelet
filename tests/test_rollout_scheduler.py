@@ -6,10 +6,10 @@ from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.scheduler import (
     IntegratedRolloutScheduler,
     PublishMode,
+    _BatchedPublisher,
     _NativeChunkPublisher,
     _resume_optimizer_step,
     _reusable_rollout_batch,
-    _BatchedPublisher,
     resolve_rollout_schedule,
 )
 from wavelet.orchestrator.sources import RolloutSourceKind

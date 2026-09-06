@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from test_verifiers_rollouts import _bare_scheduler
 
 import wavelet.orchestrator.envs as verifier_envs
 from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
@@ -24,8 +25,6 @@ from wavelet.orchestrator.scheduler import (
     _VerifierGroupState,
 )
 from wavelet.transport.queue import FileSystemRolloutSender
-
-from test_verifiers_rollouts import _bare_scheduler
 
 
 def _scheduler(

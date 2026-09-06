@@ -839,7 +839,22 @@ def save_model(
     else:
         target = output_dir / ("adapter" if is_peft else "model")
         extra = {} if state_dict is None else {"state_dict": state_dict}
-        model.save_pretrained(target, is_main_process=is_main_process, **extra)
+        tp_size = getattr(model, "_tp_size", None)
+        state_is_already_gathered = (
+            state_dict is not None
+            and parallel_dims is not None
+            and parallel_dims.tp_enabled
+        )
+        if state_is_already_gathered:
+            # FSDP export has already gathered every mesh dimension. Letting
+            # Transformers gather the supplied CPU state again asks NCCL to
+            # operate on CPU tensors.
+            model._tp_size = None
+        try:
+            model.save_pretrained(target, is_main_process=is_main_process, **extra)
+        finally:
+            if state_is_already_gathered:
+                model._tp_size = tp_size
     if is_main_process:
         tokenizer.save_pretrained(target)
     return target

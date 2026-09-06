@@ -3,14 +3,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from test_verifiers_rollouts import _bare_scheduler
+
 from wavelet.configs.rl_config import RLConfig
 from wavelet.orchestrator.scheduler import (
     VerifierRolloutScheduler,
     _PendingVerifierRequest,
     _VerifierGroupState,
 )
-
-from test_verifiers_rollouts import _bare_scheduler
 
 
 def _scheduler(

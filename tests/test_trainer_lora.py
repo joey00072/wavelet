@@ -12,6 +12,51 @@ class _FakePeftModel:
     pass
 
 
+def test_full_tp_save_does_not_gather_an_already_full_state_again(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class Model:
+        _tp_size = 2
+
+        def save_pretrained(self, path: Path, **kwargs: object) -> None:
+            calls["path"] = path
+            calls["tp_size_during_save"] = self._tp_size
+            calls.update(kwargs)
+
+    class Tokenizer:
+        def save_pretrained(self, path: Path) -> None:
+            calls["tokenizer_path"] = path
+
+    class ParallelDims:
+        tp_enabled = True
+
+    monkeypatch.setattr(lora_utils, "PeftModel", _FakePeftModel)
+    model = Model()
+    state_dict = {"weight": torch.ones(1)}
+
+    result = lora_utils.save_model(
+        model,
+        Tokenizer(),
+        tmp_path,
+        state_dict=state_dict,
+        is_main_process=True,
+        parallel_dims=ParallelDims(),
+    )
+
+    assert result == tmp_path / "model"
+    assert model._tp_size == 2
+    assert calls == {
+        "path": tmp_path / "model",
+        "tp_size_during_save": None,
+        "state_dict": state_dict,
+        "is_main_process": True,
+        "tokenizer_path": tmp_path / "model",
+    }
+
+
 def test_final_tp_lora_save_uses_adapter_gather_path(
     monkeypatch,
     tmp_path: Path,
