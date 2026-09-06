@@ -1584,7 +1584,7 @@ class VerifierRolloutScheduler:
             inflight=self.inflight_rollout_count,
         )
         if decision.limit != previous_limit:
-            _scale_verifier_executors(decision.limit)
+            self.executor_concurrency = _scale_verifier_executors(decision.limit)
         if decision.cancel_rollouts > 0:
             self._cancel_youngest_requests(decision.cancel_rollouts)
 
@@ -1610,7 +1610,7 @@ class VerifierRolloutScheduler:
                 inflight=max(remaining_active - index, 1),
             )
         if controller.limit != previous_limit:
-            _scale_verifier_executors(controller.limit)
+            self.executor_concurrency = _scale_verifier_executors(controller.limit)
 
     def _cancel_youngest_requests(self, rollout_target: int) -> int:
         """Cancel whole youngest groups until the overload target is met."""

@@ -61,6 +61,7 @@ def test_controller_stays_at_safe_floor_without_engine_metrics() -> None:
         RLAdaptiveConcurrencyConfig(),
         fallback_limit=24,
         minimum_burst=4,
+        fallback_cost=128,
     )
 
     decision = controller.observe([], inflight=24)
@@ -80,6 +81,7 @@ def test_controller_grows_by_one_factor_per_pipeline_turnover() -> None:
         ),
         fallback_limit=12,
         minimum_burst=2,
+        fallback_cost=128,
     )
 
     observed = controller.observe([_sample(usage=0.2)], inflight=8)
@@ -111,6 +113,7 @@ def test_controller_growth_gate_lifetime_derives_from_poll_cadence(
         ),
         fallback_limit=16,
         minimum_burst=1,
+        fallback_cost=128,
     )
     controller.observe([_sample(usage=0.2)], inflight=8)
 
@@ -134,6 +137,7 @@ def test_controller_requires_persistent_queue_before_cutting() -> None:
         ),
         fallback_limit=8,
         minimum_burst=1,
+        fallback_cost=128,
     )
 
     first = controller.observe(
@@ -157,6 +161,7 @@ def test_controller_soft_trim_drains_and_hard_trim_cancels() -> None:
         RLAdaptiveConcurrencyConfig(max_inflight=16, initial_inflight=10),
         fallback_limit=16,
         minimum_burst=1,
+        fallback_cost=128,
     )
 
     soft = controller.observe([_sample(usage=0.85)], inflight=10)

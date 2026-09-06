@@ -220,13 +220,7 @@ def extract_vllm_sampling_mask(
 
 
 def sampling_mask_required(config: RLConfig) -> bool:
-    configured = config.inference.vllm.return_sampling_mask
-    if configured is not None:
-        return configured
-    return any(
-        sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
-        for _, sampling in config.train_sampling_configs()
-    )
+    return config.sampling_mask_required()
 
 
 def extract_vllm_prompt_logprobs(

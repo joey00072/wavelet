@@ -1127,14 +1127,11 @@ class RLAdaptiveConcurrencyConfig(ConfigModel):
     soft_kv_cache_usage: float = Field(default=0.8, gt=0.0, lt=1.0)
     target_kv_cache_usage: float = Field(default=0.7, gt=0.0, lt=1.0)
     hard_kv_cache_usage: float = Field(default=0.9, gt=0.0, le=1.0)
-    max_waiting_requests: int = Field(default=0, ge=0)
     queue_ratio: float = Field(default=0.5, ge=0.0)
     queue_persistence_polls: int = Field(default=6, ge=1)
     queue_decrease_factor: float = Field(default=0.9, gt=0.0, lt=1.0)
     preemption_decrease_factor: float = Field(default=0.8, gt=0.0, lt=1.0)
-    escalated_decrease_factor: float = Field(default=0.5, gt=0.0, lt=1.0)
-    escalation_grace_polls: int = Field(default=6, ge=1)
-    decrease_cooldown_polls: int = Field(default=6, ge=0)
+    kv_trim_cooldown_polls: int = Field(default=6, ge=0)
     poll_interval_seconds: float = Field(default=5.0, gt=0.0)
     request_timeout_seconds: float = Field(default=5.0, gt=0.0)
 
@@ -1170,14 +1167,6 @@ class RLAdaptiveConcurrencyConfig(ConfigModel):
             raise ValueError(
                 "concurrency KV thresholds must satisfy growth < target < hard, "
                 "with target < soft < hard."
-            )
-        if self.escalated_decrease_factor > min(
-            self.queue_decrease_factor,
-            self.preemption_decrease_factor,
-        ):
-            raise ValueError(
-                "concurrency.escalated_decrease_factor must be no greater than "
-                "the queue and preemption decrease factors."
             )
         return self
 
@@ -1570,6 +1559,16 @@ class RLConfig(TrainerConfig):
             (env.resolved_name, self.resolved_train_sampling(env))
             for env in self.orchestrator.envs
         ]
+
+    def sampling_mask_required(self) -> bool:
+        """Return whether truncated sampling needs its support set recorded."""
+        configured = self.inference.vllm.return_sampling_mask
+        if configured is not None:
+            return configured
+        return any(
+            sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
+            for _, sampling in self.train_sampling_configs()
+        )
 
     def train_algorithm_configs(self) -> list[tuple[str, RLAlgorithmConfig]]:
         if not self.orchestrator.envs:

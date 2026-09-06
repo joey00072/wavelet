@@ -261,25 +261,6 @@ def test_adaptive_concurrency_validates_bounds_and_thresholds() -> None:
                 },
             }
         )
-    with pytest.raises(ValueError, match="escalated_decrease_factor"):
-        RLConfig.model_validate(
-            {
-                "launcher": {"mode": "process"},
-                "orchestrator": {
-                    "custom_rollout_function": (
-                        "wavelet.orchestrator.verifiers:generate_rollouts"
-                    ),
-                    "max_async_level": 1,
-                    "concurrency": {
-                        "queue_decrease_factor": 0.8,
-                        "preemption_decrease_factor": 0.7,
-                        "escalated_decrease_factor": 0.75,
-                    },
-                },
-            }
-        )
-
-
 def test_background_evals_require_streaming_verifier_scheduler() -> None:
     with pytest.raises(ValueError, match="Verifiers rollout source"):
         RLConfig(

@@ -72,16 +72,6 @@ from wavelet.utils.monitoring import emit_perf, setup_config_logger
 logger = logging.getLogger(__name__)
 
 
-def _sampling_mask_required(config: RLConfig) -> bool:
-    configured = config.inference.vllm.return_sampling_mask
-    if configured is not None:
-        return configured
-    return any(
-        sampling.top_p < 1.0 or sampling.top_k > 0 or sampling.min_p > 0.0
-        for _, sampling in config.train_sampling_configs()
-    )
-
-
 SUM_SYNCED_METRIC_KEYS = {
     "rollout/count",
     "micro_batch/count",
@@ -1110,7 +1100,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             sampling_mask_ids = loss_mask.new_zeros(
                 (*loss_mask.shape, 0), dtype=torch.long
             )
-        if _sampling_mask_required(self.config):
+        if self.config.sampling_mask_required():
             missing_masks = loss_mask.bool() & (sampling_mask_lengths == 0)
             if missing_masks.any():
                 raise RuntimeError(

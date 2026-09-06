@@ -49,7 +49,7 @@ class AdaptiveConcurrencyController:
         *,
         fallback_limit: int,
         minimum_burst: int,
-        fallback_cost: int | None = None,
+        fallback_cost: int,
     ) -> None:
         self.config = config
         self.floor = max(config.min_inflight, minimum_burst)
@@ -59,7 +59,7 @@ class AdaptiveConcurrencyController:
             else fallback_limit
         )
         self.ceiling = max(self.floor, configured_ceiling)
-        self.fallback_cost = max(fallback_cost or fallback_limit, 1)
+        self.fallback_cost = max(fallback_cost, 1)
 
         initial = config.initial_inflight or self.floor
         self.cap = self._clamp(float(initial))
@@ -72,12 +72,9 @@ class AdaptiveConcurrencyController:
         self.signal: ConcurrencySignal = "clear"
         self.can_grow = False
         self.can_grow_until = 0.0
-        self.previous_waiting: dict[str, int] = {}
         self.queue_overload_polls = 0
         self.trim_cooldown = 0
-        self.escalation_grace = 0
         self.draining = False
-        self.escalated = False
         self.adjustments = 0
 
     @property
@@ -134,8 +131,6 @@ class AdaptiveConcurrencyController:
             if sample.preemptions_delta > 0:
                 preempted = True
                 signal = "hard"
-            if sample.waiting > 0 and self.previous_waiting.get(sample.replica, 0) > 0:
-                signal = self._worst(signal, "soft")
             max_usage = max(max_usage, sample.kv_cache_usage)
             total_running += sample.running
             total_queued += (
@@ -143,13 +138,11 @@ class AdaptiveConcurrencyController:
                 if sample.waiting_capacity is not None
                 else sample.waiting
             )
-        self.previous_waiting = {
-            sample.replica: sample.waiting for sample in decode_samples
-        }
+        if total_queued > 0:
+            signal = self._worst(signal, "soft")
 
         queue_over_threshold = (
             total_running > 0
-            and total_queued > self.config.max_waiting_requests
             and total_queued > self.config.queue_ratio * total_running
         )
         if queue_over_threshold:
@@ -170,11 +163,6 @@ class AdaptiveConcurrencyController:
             and not queue_overload
         ):
             self.draining = False
-            self.escalation_grace = self.config.escalation_grace_polls
-        if not self.draining and self.escalated:
-            self.escalation_grace -= 1
-            if self.escalation_grace <= 0:
-                self.escalated = False
         self.trim_cooldown = max(0, self.trim_cooldown - 1)
         self.can_grow = (
             signal == "clear" and total_queued == 0 and not self.draining
@@ -187,7 +175,7 @@ class AdaptiveConcurrencyController:
             self.bootstrapped = True
             episode_cost = float(self.engine_max_len or self.fallback_cost)
             self.cap = self._clamp(self.capacity / episode_cost)
-            decision = self._apply_limit(int(self.cap))
+            self._apply_limit(int(self.cap))
             logger.info(
                 "Derived initial verifier concurrency %s from %s KV-cache "
                 "tokens / %.0f tokens per rollout.",
@@ -195,30 +183,22 @@ class AdaptiveConcurrencyController:
                 self.capacity,
                 episode_cost,
             )
-            if self.draining:
-                return decision
-
         if self.draining:
             return ConcurrencyDecision(limit=self.limit)
 
         if preempted or queue_overload:
-            cut_fraction = (
-                self.config.escalated_decrease_factor if self.escalated else None
-            )
             if queue_overload:
                 self.queue_overload_polls = 0
                 target = int(
                     self._clamp(
-                        inflight
-                        * (cut_fraction or self.config.queue_decrease_factor)
+                        inflight * self.config.queue_decrease_factor
                     )
                 )
                 reason = "queue overload"
             else:
                 target = int(
                     self._clamp(
-                        inflight
-                        * (cut_fraction or self.config.preemption_decrease_factor)
+                        inflight * self.config.preemption_decrease_factor
                     )
                 )
                 reason = "preemptions"
@@ -229,7 +209,6 @@ class AdaptiveConcurrencyController:
                 cancel=True,
             )
             self.draining = True
-            self.escalated = True
             return decision
 
         if (
@@ -252,7 +231,7 @@ class AdaptiveConcurrencyController:
                 ),
                 cancel=hard,
             )
-            self.trim_cooldown = self.config.decrease_cooldown_polls
+            self.trim_cooldown = self.config.kv_trim_cooldown_polls
             return decision
 
         return ConcurrencyDecision(limit=self.limit)

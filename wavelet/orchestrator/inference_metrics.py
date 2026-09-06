@@ -90,7 +90,7 @@ def parse_vllm_metrics(text: str) -> ParsedVLLMMetrics:
 
     usage_values = [value for name in _KV_USAGE_NAMES for value in values.get(name, ())]
     return ParsedVLLMMetrics(
-        recognized=bool(values),
+        recognized=bool(values or waiting_capacity or cache_capacities),
         kv_cache_usage=max(usage_values, default=0.0),
         running=int(summed(_RUNNING_NAMES)),
         waiting=int(summed(_WAITING_NAMES)),

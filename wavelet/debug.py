@@ -33,6 +33,9 @@ from wavelet.orchestrator.placement import (
     http_ports as _http_ports,
 )
 from wavelet.orchestrator.placement import (
+    required_inference_devices as _required_inference_devices,
+)
+from wavelet.orchestrator.placement import (
     rollout_reward_mode_error as _rollout_reward_mode_error,
 )
 from wavelet.orchestrator.placement import (
@@ -2323,14 +2326,6 @@ def _resolved_commands(config: RLConfig) -> list[dict[str, Any]]:
 
 def _trainer_device_group(config: RLConfig) -> str | None:
     return trainer_device_group(config, strict=False)
-
-
-def _required_inference_devices(config: RLConfig) -> int:
-    dp_size = (
-        config.inference.vllm.data_parallel_size_local
-        or config.inference.vllm.data_parallel_size
-    )
-    return config.inference.vllm.tensor_parallel_size * dp_size
 
 
 def _available_gpu_indices() -> set[str] | None:
