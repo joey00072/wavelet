@@ -19,7 +19,7 @@ from wavelet.data.rl import (
     PackedRLDataset,
     RLDataset,
     _pretokenized_sample,
-    count_nonempty_jsonl_rows,
+    count_rollout_rows,
     deserialize_rl_record,
     setup_rl_dataloader,
     setup_rl_dataset,
@@ -72,6 +72,7 @@ from wavelet.transport.queue import (
     prune_consumed_rollout_batches,
     record_rollout_claim,
     record_rollout_consumed,
+    training_rollout_path,
     validate_rollout_manifest,
 )
 from wavelet.utils.config import load_config
@@ -327,8 +328,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def load_rollout_path(self, rollout_path: Path) -> None:
         rollout_path = Path(rollout_path)
-        rollout_count = count_nonempty_jsonl_rows(
-            rollout_path,
+        data_path = training_rollout_path(rollout_path)
+        rollout_count = count_rollout_rows(
+            data_path,
             description="Rollout batch",
         )
         optimizer_batch_size = rollout_count
@@ -357,7 +359,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 "data": self.config.data.model_copy(
                     update={
                         "source": "local",
-                        "path": rollout_path,
+                        "path": data_path,
                         "batch_size": optimizer_batch_size,
                         "pack_sequences": pack_sequences,
                     }
@@ -1410,8 +1412,8 @@ def main(argv: list[str] | None = None) -> int:
                     batch = receiver.wait()
                     wait_seconds = perf_counter() - wait_started_at
                     trainer_step_before = trainer.step
-                    row_count = count_nonempty_jsonl_rows(
-                        batch.path,
+                    row_count = count_rollout_rows(
+                        batch.training_path,
                         description="Rollout batch",
                     )
                     trainer.validate_rollout_batch(
@@ -1498,8 +1500,8 @@ def _run_streaming_rollout_training(
         wait_seconds = perf_counter() - wait_started_at
         step_wait_seconds += wait_seconds
         trainer_step_before = trainer.step
-        row_count = count_nonempty_jsonl_rows(
-            batch.path,
+        row_count = count_rollout_rows(
+            batch.training_path,
             description="Rollout chunk",
         )
         _validate_streaming_rollout_batch(
@@ -1533,8 +1535,8 @@ def _run_streaming_rollout_training(
             chunk_index=accumulator.chunk_index,
             min_rows=min_loadable_rows,
         )
-        row_count = count_nonempty_jsonl_rows(
-            rollout_path,
+        row_count = count_rollout_rows(
+            training_rollout_path(rollout_path),
             description="Rollout chunk",
         )
         _, loaded_batches, loaded_chunks = accumulator.drain_pending_batches()
@@ -1757,7 +1759,8 @@ def _combined_rollout_path(
     min_rows: int,
 ) -> Path:
     row_count = sum(
-        count_nonempty_jsonl_rows(path, description="Rollout chunk") for path in paths
+        count_rollout_rows(training_rollout_path(path), description="Rollout chunk")
+        for path in paths
     )
     target_rows = _padded_row_count(row_count, multiple=min_rows)
     if len(paths) == 1 and row_count == target_rows:

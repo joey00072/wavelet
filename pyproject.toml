@@ -14,6 +14,7 @@ dependencies = [
     "wandb-workspaces>=0.4.3",
     "tqdm>=4.66",
     "datasets>=2.18",
+    "msgpack>=1.1.2",
     "accelerate>=0.28",
     "peft>=0.10",
     "torchdata>=0.7",

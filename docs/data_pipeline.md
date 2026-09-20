@@ -140,3 +140,26 @@ provenance validation. Token and mask coercion uses bulk builtin iterators to
 reduce Python loop overhead without changing conversion or truncation semantics.
 Trajectory segment construction performs token coercion once at the validated
 `TokenSegment` boundary.
+
+## Binary trainer payloads
+
+The async verifier publisher retains complete JSONL records for dashboards and
+sample logs, and writes `<rollout_filename>.train.msgpack` for trainer reads.
+The binary file is a MessagePack array of the same training rows with only the
+duplicated `metadata.verifier_example` task payload omitted. Chat messages,
+policy provenance, accounting flags, multimodal data, and all loss streams stay
+intact. Distillation annotations are completed before publication.
+
+Both payloads must be written before the queue's stable marker is created. The
+array length must match the published row count, and incomplete/corrupt binary
+payloads fail loading. Retries cannot reuse an abandoned binary sidecar. Legacy
+batches without a sidecar still use JSONL. Metadata integers outside MessagePack's
+64-bit range also fall back to JSONL without losing their values. Single streaming
+chunks take the binary path; when several chunks need merging/padding, the existing JSONL merge
+path preserves their full records. Retention removes both files together.
+
+Publication events expose `training_payload_bytes`; their transfer time includes
+encoding and writing it. Manifest `payload_bytes` remains the JSONL artifact
+size. Trainer receive events report the selected payload's size. `msgpack` is a
+direct dependency because trainer-only installations must support this format
+without relying on inference packages to install the encoder.

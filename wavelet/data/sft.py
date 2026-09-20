@@ -8,6 +8,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, TypedDict
 
+import msgpack
 import torch
 from datasets import Dataset, interleave_datasets, load_dataset
 from torch import Tensor
@@ -156,6 +157,12 @@ def _paths(value: Path | list[Path]) -> list[Path]:
 
 
 def _load_payloads(path: Path) -> list[dict[str, Any]]:
+    if path.suffix == ".msgpack":
+        with path.open("rb") as handle:
+            payload = msgpack.unpack(handle, raw=False, strict_map_key=False)
+        if not isinstance(payload, list):
+            raise ValueError(f"Expected {path} to contain a MessagePack list.")
+        return [{**dict(row), "__source": path.name} for row in payload]
     if path.suffix == ".json":
         payload = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(payload, list):

@@ -381,12 +381,15 @@ class RLOrchestrator:
                 )
         return output_path
 
-    def _serialize_record(self, record: RLExample) -> dict[str, object]:
+    def _serialize_record(
+        self, record: RLExample, *, for_training: bool = False
+    ) -> dict[str, object]:
         return serialize_rl_record(
             record,
             self.config.data,
             task=self.config.reward.mode,
             example_id=self._example_id(record),
+            for_training=for_training,
         )
 
     def trim_to_step_examples(self, records: list[RLExample]) -> list[RLExample]:

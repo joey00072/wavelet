@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
+import msgpack
+
 from wavelet.configs.config import RLPolicyTransferConfig, RLTransportConfig
 from wavelet.monitor import tail_jsonl
 from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
@@ -26,6 +28,13 @@ MANIFEST_FILENAME = "manifest.json"
 CLAIM_FILENAME = "claim.json"
 CONSUMED_FILENAME = "consumed.json"
 QUEUE_EVENT_FILENAME = "queue.jsonl"
+TRAINING_PAYLOAD_SUFFIX = ".train.msgpack"
+
+
+def training_rollout_path(path: Path) -> Path:
+    """Prefer a published binary payload while retaining legacy JSONL support."""
+    binary = path.with_name(path.name + TRAINING_PAYLOAD_SUFFIX)
+    return binary if binary.is_file() else path
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +42,10 @@ class RolloutBatch:
     step: int
     path: Path
     step_dir: Path
+
+    @property
+    def training_path(self) -> Path:
+        return training_rollout_path(self.path)
 
 
 @dataclass(frozen=True, slots=True)
@@ -621,7 +634,10 @@ class FileSystemRolloutSender:
         reward_mean: float | None = None,
         producer_id: str | None = None,
         events_dir: Path | None = None,
+        training_records: Iterable[dict[str, Any]] | None = None,
     ) -> RolloutBatch:
+        if training_records is not None and rows is None:
+            raise ValueError("Binary trainer publication requires a row count.")
         step_dir = get_step_dir(self.queue_dir, step)
         existing = self.stable_batch(step)
         if existing is not None:
@@ -634,6 +650,39 @@ class FileSystemRolloutSender:
         tmp_path = step_dir / f"{self.config.rollout_filename}.tmp"
         payload_bytes, transfer_seconds = _copy_payload(Path(source_path), tmp_path)
         tmp_path.replace(target_path)
+        training_path = target_path.with_name(
+            target_path.name + TRAINING_PAYLOAD_SUFFIX
+        )
+        training_payload_bytes = None
+        if training_records is not None:
+            started_at = time.perf_counter()
+            training_tmp = training_path.with_suffix(".tmp")
+            packer = msgpack.Packer(use_bin_type=True)
+            count = 0
+            try:
+                with training_tmp.open("wb") as handle:
+                    handle.write(packer.pack_array_header(rows))
+                    for record in training_records:
+                        handle.write(packer.pack(record))
+                        count += 1
+            except OverflowError:
+                # JSON supports arbitrary-size integers; MessagePack does not.
+                training_tmp.unlink(missing_ok=True)
+                training_path.unlink(missing_ok=True)
+                logger.warning(
+                    "Trainer payload integer exceeds MessagePack range; using JSONL."
+                )
+            else:
+                if count != rows:
+                    raise ValueError(
+                        "Trainer payload row count must match published rows."
+                    )
+                training_tmp.replace(training_path)
+                training_payload_bytes = training_path.stat().st_size
+            transfer_seconds += time.perf_counter() - started_at
+        else:
+            # A retry of an incomplete publication must not reuse an old sidecar.
+            training_path.unlink(missing_ok=True)
         metadata_provided = any(
             value is not None
             for value in (
@@ -685,6 +734,7 @@ class FileSystemRolloutSender:
                     details={
                         "payload_bytes": payload_bytes,
                         "transfer_seconds": transfer_seconds,
+                        "training_payload_bytes": training_payload_bytes,
                     },
                 ),
             )
@@ -786,7 +836,7 @@ class FileSystemRolloutReceiver:
     ) -> None:
         consumer_id = self.consumer_id or process_identity("rl-trainer")
         try:
-            payload_bytes = batch.path.stat().st_size
+            payload_bytes = batch.training_path.stat().st_size
         except OSError:
             payload_bytes = None
         manifest = _read_manifest_best_effort(batch)

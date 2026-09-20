@@ -1045,3 +1045,47 @@ def test_rollout_sample_logging_empty_file(tmp_path):
         RLTrainer._sample_rollout_rows(SimpleNamespace(config=RLConfig(), step=0), path)
         == []
     )
+
+
+def test_trainer_uses_binary_payload_and_logs_original_trace(tmp_path):
+    import json
+    from types import SimpleNamespace
+
+    from wavelet.data.rl import load_rl_records
+    from wavelet.transport.queue import FileSystemRolloutSender
+
+    row = {
+        "prompt": [],
+        "completion": [],
+        "reward": 1.0,
+        "advantage": 0.5,
+        "input_ids": [1, 2],
+        "target_ids": [2, 3],
+        "loss_mask": [False, True],
+        "temperature": 1.0,
+        "source": "test",
+    }
+    full = {**row, "metadata": {"verifier_example": {"task": "trace only"}}}
+    path = tmp_path / "materialized.jsonl"
+    path.write_text(json.dumps(full) + "\n")
+    config = RLConfig(output_dir=tmp_path, data={"pack_sequences": True})
+    batch = FileSystemRolloutSender(tmp_path, config.transport).publish(
+        path, step=0, rows=1, training_records=[row]
+    )
+    loaded = []
+    logged = []
+    trainer = SimpleNamespace(
+        config=config,
+        world=None,
+        _setup_data=lambda: loaded.extend(load_rl_records(trainer.config.data)),
+        _maybe_log_rollout_samples=logged.append,
+        _current_micro_batch_count=lambda count: count,
+        _validate_reference_policy_support=lambda: None,
+    )
+    RLTrainer.load_rollout_path(trainer, batch.path)
+    assert trainer.config.data.path == batch.training_path
+    assert trainer.config.data.batch_size == 1
+    assert logged == [batch.path]
+    assert loaded[0].input_ids == row["input_ids"]
+    assert loaded[0].metadata is None
+    assert json.loads(batch.path.read_text())["metadata"] == full["metadata"]

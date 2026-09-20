@@ -2743,6 +2743,10 @@ class _VerifierChunkPublisher:
             environment_next_record_cursors=environment_cursors,
             environment_selection_cursor=environment_selection_cursor,
             curriculum_state=self.scheduler.curriculum_state_snapshot(),
+            training_records=(
+                self.orchestrator._serialize_record(record, for_training=True)
+                for record in records
+            ),
         )
         publish_seconds = perf_counter() - publish_started_at
         self._record_published_chunk(

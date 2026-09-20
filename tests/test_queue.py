@@ -216,3 +216,65 @@ def test_policy_receiver_records_wait_metrics(tmp_path: Path) -> None:
     assert trace["event"] == "policy_received"
     assert trace["policy_step"] == 0
     assert trace["details"]["consumer_id"] == "inference"
+
+
+def test_binary_training_payload_retains_trace_and_accounts_transfer(tmp_path):
+    import msgpack
+
+    from wavelet.data.rl import count_rollout_rows
+
+    config = RLTransportConfig()
+    source = _write_source(tmp_path / "source.jsonl", '{"trace":"complete"}\n')
+    sender = FileSystemRolloutSender(tmp_path, config)
+    batch = sender.publish(source, step=0, rows=1, training_records=[{"reward": 1.0}])
+    received = FileSystemRolloutReceiver(tmp_path, config).wait()
+    assert received.path.read_text() == source.read_text()
+    assert msgpack.unpackb(received.training_path.read_bytes()) == [{"reward": 1.0}]
+    assert count_rollout_rows(received.training_path) == 1
+    assert read_manifest(batch.step_dir).rows == 1
+    events, errors = tail_events(tmp_path / "events", limit=10)
+    assert not errors
+    published = next(event for event in events if event.kind == "rollout_published")
+    assert (
+        published.details["training_payload_bytes"]
+        == received.training_path.stat().st_size
+    )
+
+
+def test_failed_binary_publication_is_invisible_and_retry_clears_sidecar(
+    tmp_path, monkeypatch
+):
+    from wavelet.transport import queue
+
+    config = RLTransportConfig()
+    source = _write_source(tmp_path / "source.jsonl", "{}\n")
+    sender = FileSystemRolloutSender(tmp_path, config)
+    with pytest.raises(ValueError, match="row count"):
+        sender.publish(source, step=0, training_records=[{}])
+    with pytest.raises(ValueError, match="row count"):
+        sender.publish(source, step=0, rows=2, training_records=[{}])
+    assert sender.stable_batch(0) is None
+    original = queue.write_manifest
+
+    def fail_manifest(*args):
+        raise OSError("disk error")
+
+    monkeypatch.setattr(queue, "write_manifest", fail_manifest)
+    with pytest.raises(OSError, match="disk error"):
+        sender.publish(source, step=0, rows=1, training_records=[{"old": True}])
+    assert sender.stable_batch(0) is None
+    monkeypatch.setattr(queue, "write_manifest", original)
+    batch = sender.publish(source, step=0, rows=1)
+    assert batch.training_path == batch.path
+
+
+def test_binary_payload_falls_back_to_json_for_large_integer_metadata(tmp_path):
+    config = RLTransportConfig()
+    row = {"metadata": {"large_answer": 10**100}}
+    source = _write_source(tmp_path / "source.jsonl", json.dumps(row) + "\n")
+    batch = FileSystemRolloutSender(tmp_path, config).publish(
+        source, step=0, rows=1, training_records=[row]
+    )
+    assert batch.training_path == batch.path
+    assert json.loads(batch.path.read_text()) == row
+    assert FileSystemRolloutReceiver(tmp_path, config).wait() == batch

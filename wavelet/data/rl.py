@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict, cast
 
+import msgpack
 import torch
 from torch import Tensor
 from torch.utils.data import IterableDataset
@@ -156,8 +157,9 @@ def serialize_rl_record(
     *,
     task: str,
     example_id: str,
+    for_training: bool = False,
 ) -> dict[str, object]:
-    """Serialize a rollout into the trainer JSONL contract."""
+    """Serialize a rollout into the shared JSONL/binary training contract."""
     payload: dict[str, object] = {
         config.prompt_column: record.prompt,
         config.completion_column: record.completion,
@@ -172,6 +174,11 @@ def serialize_rl_record(
         config.ce_weight_column: record.ce_weight,
         config.ref_kl_weight_column: record.ref_kl_weight,
     }
+    metadata = record.metadata
+    if for_training and metadata is not None:
+        metadata = {
+            key: value for key, value in metadata.items() if key != "verifier_example"
+        }
     optional = {
         "input_ids": record.input_ids,
         "target_ids": record.target_ids,
@@ -181,7 +188,7 @@ def serialize_rl_record(
         config.sampling_mask_column: record.sampling_mask,
         config.tools_column: record.tools,
         config.chat_template_kwargs_column: record.chat_template_kwargs,
-        config.metadata_column: record.metadata,
+        config.metadata_column: metadata,
         "mm_kwargs": _serialize_mm_kwargs(record.mm_kwargs),
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
@@ -680,6 +687,17 @@ def _append_sample(
     output["has_teacher_logprobs"].append(
         torch.tensor(teacher_logprobs is not None, dtype=torch.bool)
     )
+
+
+def count_rollout_rows(path: Path, *, description: str = "Rollout batch") -> int:
+    """Read a binary array header or count legacy JSONL rows."""
+    if path.suffix != ".msgpack":
+        return count_nonempty_jsonl_rows(path, description=description)
+    with path.open("rb") as handle:
+        rows = msgpack.Unpacker(handle).read_array_header()
+    if rows == 0:
+        raise ValueError(f"{description} '{path}' contains no rows.")
+    return rows
 
 
 def count_nonempty_jsonl_rows(
