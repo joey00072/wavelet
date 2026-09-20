@@ -61,6 +61,7 @@ const METRIC_COLORS: Record<MetricSource, string> = {
 const OVERVIEW_KEYS: Record<MetricSource, string[]> = {
   trainer: [
     "reward/all/mean",
+    "rollout/count",
     "train/loss",
     "train/policy_loss",
     "optim/grad_norm",
@@ -74,6 +75,10 @@ const OVERVIEW_KEYS: Record<MetricSource, string[]> = {
     "time/step",
   ],
   orchestrator: [
+    "reward/episodes/all/mean",
+    "reward/episodes/all/count",
+    "reward/episodes/trainable/mean",
+    "reward/episodes/trainable/count",
     "reward/all/mean",
     "generation/reward/mean",
     "generation/tokens_per_second",
@@ -82,6 +87,12 @@ const OVERVIEW_KEYS: Record<MetricSource, string[]> = {
     "policy/lag",
     "generation/rollouts/cancelled_total",
     "generation/effective_groups/rate",
+    "generation/groups/completed",
+    "generation/groups/rejected",
+    "fate/all/filtered_rate",
+    "fate/all/errored_rate",
+    "off_policy/in_flight/mean",
+    "off_policy/in_queue/mean",
     "is_truncated/all/mean",
     "time/step",
   ],
@@ -341,6 +352,9 @@ function MetricsView({ apiBase, runId, interval, summary, runs }: ViewProps & { 
       next.trainer = next.trainer.filter((key) => key !== "reward/all/mean");
       next.orchestrator = next.orchestrator.filter((key) => key !== "generation/reward/mean");
     }
+    if (next.orchestrator.includes("reward/episodes/all/mean")) {
+      next.orchestrator = next.orchestrator.filter((key) => key !== "reward/all/mean");
+    }
     next.eval = (available.eval ?? []).map(({ key }) => key).filter((key) => /avg@|pass@|reward/.test(key)).slice(0, 2);
     setSelected(next);
   }, [keysState.data, customized]);
@@ -466,7 +480,9 @@ function MetricSections({ selected, series, comparison, compareRun, search, smoo
                 key={`${source}:${key}`}
                 color={METRIC_COLORS[source]}
                 axis={axis}
-                label={metricLabel(key)}
+                label={metricLabel(key, source)}
+                description={metricDescription(key, source)}
+                stepLabel={source === "trainer" ? "Optimizer step" : source === "eval" ? "Evaluation step" : "Rollout queue step"}
                 name={key}
                 data={series[source]}
                 comparisonData={comparison[source]}
@@ -959,11 +975,31 @@ function InlineError({ children }: { children: ReactNode }) {
 }
 
 
-function metricLabel(name: string): string {
-  return name
+function metricLabel(name: string, source: MetricSource): string {
+  const labels: Record<string, string> = {
+    "reward/episodes/all/mean": "Reward · all episodes",
+    "reward/episodes/all/count": "Reward denominator · all episodes",
+    "reward/episodes/trainable/mean": "Reward · trainable episodes",
+    "reward/episodes/trainable/count": "Reward denominator · trainable episodes",
+    "reward/all/mean": source === "trainer" ? "Reward · all episodes" : "Reward · problem average",
+    "generation/reward/mean": "Reward · all scored candidates",
+    "rollout/count": "Episodes in optimizer batch",
+  };
+  return labels[name] ?? name
     .replace(/^train\//, "")
     .replace(/^generation\//, "gen/")
     .replace(/^inference\//, "infer/");
+}
+
+function metricDescription(name: string, source: MetricSource): string {
+  const origin = source === "trainer" ? "Trainer" : source === "eval" ? "Evaluation" : "Orchestrator";
+  if (name.startsWith("reward/episodes/trainable/")) return `${origin} · Episodes with training tokens, excluding filtered, dummy and errored rows. Continuation branches do not count twice. This selected subset is not an overall solve rate.`;
+  if (name.startsWith("reward/episodes/all/")) return `${origin} · Episode-weighted reward over the published batch, including filtered episodes. The count is the reward denominator, not the number of token rows.`;
+  if (name === "reward/all/mean") return source === "trainer"
+    ? "Trainer · Episode-weighted reward including filtered episodes. Optimizer step 1 consumes the first published batch."
+    : "Orchestrator · Mean of per-problem rollout rewards, including filtered episodes. The first queue batch is step 0; this is not a filtered training reward.";
+  if (name === "generation/reward/mean") return "Orchestrator · All scored candidate episodes, including groups rejected before publication.";
+  return origin;
 }
 
 function sectionTitle(section: string, trainEnvs: string[], evalEnvs: string[]): string {

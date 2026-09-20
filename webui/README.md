@@ -128,3 +128,11 @@ Only retained queue payloads are browseable. Training rows may represent branche
 of one episode; do not infer distinct episode counts from the table. The dashboard
 does not synthesize token overlays, physical branch graphs, or timed replay from
 rows without the required recorded annotations.
+
+Reward overview charts distinguish all episodes from the trainable subset and
+show each recorded denominator. Chart descriptions identify the population and
+source; step axes distinguish optimizer updates from rollout queue indices.
+Older runs retain their original problem-average reward series. Missing cohort
+metrics are not reconstructed or shown as zero. See
+[`docs/evaluation_and_live_traces.md`](../docs/evaluation_and_live_traces.md) for
+population and step semantics.

@@ -403,3 +403,5 @@ tbody tr:focus-visible { box-shadow: inset 2px 0 0 var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+.chart-context { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 4px 12px; }

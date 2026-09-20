@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import type { Series } from "./api/types";
-import { fmt } from "./lib/format";
+import { fmt, fmtInt } from "./lib/format";
 
 export type ChartAxis = "step" | "elapsed";
 
 /** Keep offscreen SVGs unmounted, including charts inside collapsed sections. */
-export function MetricChart({ name, label, data, smoothing, color, axis, comparisonData, comparisonLabel, onRemove }: {
+export function MetricChart({ name, label, data, smoothing, color, axis, comparisonData, comparisonLabel, onRemove, description, stepLabel = "Logged step" }: {
+  description?: string; stepLabel?: string;
   name: string; label: string; data: Series | null; smoothing: number;
   color: string; axis: ChartAxis; comparisonData: Series | null; comparisonLabel: string; onRemove?: () => void;
 }) {
@@ -60,11 +61,12 @@ export function MetricChart({ name, label, data, smoothing, color, axis, compari
     const link = document.createElement("a"); link.href = url; link.download = `${name.replace(/\//g, "-")}.csv`; link.click(); URL.revokeObjectURL(url);
   };
   return <article data-metric={name} className={`chart-card${expanded ? " chart-expanded" : ""}`} ref={host}>
-    <header><div><span title={name}>{label}</span></div><div className="chart-latest">{fmt(points[points.length - 1]?.value ?? null)}</div>
+    <header><div><span title={name}>{label}</span></div><div className="chart-latest">{(name.endsWith("/count") ? fmtInt : fmt)(points[points.length - 1]?.value ?? null)}</div>
       <button type="button" title="Download raw and smoothed values" aria-label={`Download ${name}`} onClick={download}>CSV</button>
       <button type="button" aria-label={`Expand ${name}`} onClick={() => setExpanded(!expanded)}>{expanded ? "−" : "+"}</button>
       {onRemove && <button type="button" aria-label={`Remove ${name}`} onClick={onRemove}>×</button>}
     </header>
+    {description && <p className="chart-context">{description}</p>}
     {visible && shown.length ? <>
       <svg style={{height}} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${name} chart`} tabIndex={0}
         onPointerMove={(e) => setHover(coordinate(e))} onPointerLeave={() => { if (drag === null) setHover(null); }}
@@ -83,7 +85,7 @@ export function MetricChart({ name, label, data, smoothing, color, axis, compari
         <text x={pad.left} y={height - 6}>{fmt(xmin, 1)}</text><text className="x-end" x={width - pad.right} y={height - 6}>{fmt(xmax, 1)}</text>
       </svg>
       {comparisonLabel && <div className="chart-legend" title={comparisonLabel}>Dashed: {comparisonLabel}{!compareShown.length ? " · no matching metric" : ""}</div>}
-      <div className="chart-readout" aria-live="polite">{cursor ? `Step ${cursor.step ?? "–"} · ${data?.downsampled ? "bucket mean" : "raw"} ${fmt(cursor.value, 5)}${data?.downsampled ? ` · min ${fmt(cursor.min, 5)} / max ${fmt(cursor.max, 5)}` : ""}${smoothing > 1 ? ` · smoothed ${fmt(cursor.smooth, 5)}` : ""}` : `${axis === "step" ? "Logged step" : "Elapsed minutes"} · drag to zoom`}{range && <button type="button" onClick={() => setRange(null)}>Reset zoom</button>}</div>
+      <div className="chart-readout" aria-live="polite">{cursor ? `${stepLabel} ${cursor.step ?? "–"} · ${data?.downsampled ? "bucket mean" : "raw"} ${fmt(cursor.value, 5)}${data?.downsampled ? ` · min ${fmt(cursor.min, 5)} / max ${fmt(cursor.max, 5)}` : ""}${smoothing > 1 ? ` · smoothed ${fmt(cursor.smooth, 5)}` : ""}` : `${axis === "step" ? stepLabel : "Elapsed minutes"} · drag to zoom`}{range && <button type="button" onClick={() => setRange(null)}>Reset zoom</button>}</div>
     </> : <div className="chart-empty">{visible ? "no data yet" : "Chart loads when visible"}</div>}
   </article>;
 }

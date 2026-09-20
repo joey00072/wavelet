@@ -177,3 +177,31 @@ test("hidden browser tabs stop polling and refresh when visible", async ({ page 
   await page.evaluate(() => { Object.defineProperty(document, "hidden", {configurable:true,get:()=>false}); document.dispatchEvent(new Event("visibilitychange")); });
   await expect.poll(()=>summaries).toBeGreaterThan(before);
 });
+
+test("reward cohorts show denominators and queue-step semantics", async ({ page }) => {
+  const values: Record<string, number> = {
+    "reward/episodes/all/mean": 0.15234375,
+    "reward/episodes/all/count": 256,
+    "reward/episodes/trainable/mean": 0.3482142857,
+    "reward/episodes/trainable/count": 112,
+    "reward/all/mean": 0.15234375,
+  };
+  await page.route("**/metrics/keys", route => route.fulfill({
+    json: { trainer: [], orchestrator: Object.keys(values).map(key => ({ key })), eval: [] },
+  }));
+  await page.route("**/series?*", route => {
+    const keys = new URL(route.request().url()).searchParams.get("keys")?.split(",") ?? [];
+    return route.fulfill({ json: { steps: [0], timestamps: ["2026-09-20T00:00:00Z"], series: Object.fromEntries(keys.map(key => [key, [values[key]]])) } });
+  });
+  await page.goto("/");
+  const all = page.locator('[data-metric="reward/episodes/all/mean"]');
+  await expect(all).toContainText("Reward · all episodes");
+  await expect(all).toContainText("including filtered episodes");
+  await expect(all).toContainText("Rollout queue step");
+  const trainable = page.locator('[data-metric="reward/episodes/trainable/mean"]');
+  await trainable.scrollIntoViewIfNeeded();
+  await expect(trainable).toContainText("not an overall solve rate");
+  await expect(page.locator('[data-metric="reward/episodes/all/count"] .chart-latest')).toHaveText("256");
+  await expect(page.locator('[data-metric="reward/episodes/trainable/count"] .chart-latest')).toHaveText("112");
+  await expect(page.locator('[data-metric="reward/all/mean"]')).toHaveCount(0);
+});
