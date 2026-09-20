@@ -530,6 +530,19 @@ def _write_queue_events(output_dir: Path, events: list[QueueEvent]) -> None:
     _write_jsonl(output_dir / "events" / QUEUE_EVENT_FILENAME, rows, sort_keys=True)
 
 
+def _episode_reward_metrics(
+    all_rewards: list[float], effective_rewards: list[float]
+) -> dict[str, float]:
+    """Mirror the orchestrator's episode cohorts: counts always, means when non-empty."""
+    metrics: dict[str, float] = {}
+    for cohort, values in (("all", all_rewards), ("effective", effective_rewards)):
+        prefix = f"reward/episodes/{cohort}"
+        metrics[f"{prefix}/count"] = float(len(values))
+        if values:
+            metrics[f"{prefix}/mean"] = sum(values) / len(values)
+    return metrics
+
+
 def _series_metrics(values: list[float], prefix: str) -> dict[str, float]:
     if not values:
         return {}
@@ -556,10 +569,18 @@ def _orchestrator_metrics(
     lengths = [float(row["metadata"]["completion_token_count"]) for row in rows]
     truncated = [1.0 if row["metadata"]["is_truncated"] else 0.0 for row in rows]
     lags = [float(step - row["metadata"]["policy_step"]) for row in rows]
+    effective = [
+        row["reward"]
+        for row in rows
+        if row["metadata"]["completion_token_count"] > 0
+        and row["metadata"].get("error") is None
+        and not row["metadata"].get("_wavelet_filtered_rollout")
+    ]
     metrics: dict[str, Any] = {
         "timestamp": clock.now(),
         "step": step,
         **_series_metrics(rewards, "reward/all"),
+        **_episode_reward_metrics(rewards, effective),
         **_series_metrics(advantages, "advantage/all"),
         **_series_metrics(lengths, "decode_len/all"),
         **_series_metrics(lengths, "seq_len/all"),

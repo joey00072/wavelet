@@ -66,8 +66,8 @@ test("the first reward observation has a visible chart marker", async ({ page })
     });
   });
   await page.goto("/");
-  await page.locator('[data-metric="reward/all/mean"]').first().scrollIntoViewIfNeeded();
-  const reward = page.getByRole("img", { name: "reward/all/mean chart", exact: true }).first();
+  await page.locator('[data-metric="reward/episodes/effective/mean"]').first().scrollIntoViewIfNeeded();
+  const reward = page.getByRole("img", { name: "reward/episodes/effective/mean chart", exact: true }).first();
   await expect(reward.locator("circle")).toBeVisible();
   await expect(reward.locator("circle title")).toHaveText("step 1: 0.3125");
 });
@@ -95,7 +95,7 @@ test("mobile layout does not overflow", async ({ page }, testInfo) => {
 test("charts support regex selection, inspection, and zoom", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.getByRole("searchbox", { name: "Filter metrics" }).fill("^reward/|^train/loss$");
-  const chart = page.getByRole("img", { name: "reward/all/mean chart", exact: true }).first();
+  const chart = page.getByRole("img", { name: "reward/episodes/effective/mean chart", exact: true }).first();
   await expect(chart).toBeVisible();
   await chart.focus();
   await page.keyboard.press("ArrowRight");
@@ -146,7 +146,7 @@ test("trace pages are bounded, details are on demand, and tool calls survive", a
 test("comparison overlays use a second run without replacing the selected run", async ({ page }) => {
   await page.goto("/?run=synthetic-a");
   await page.getByRole("combobox", { name: "Compare run" }).selectOption("synthetic-b");
-  await page.locator('[data-metric="reward/all/mean"]').first().scrollIntoViewIfNeeded();
+  await page.locator('[data-metric="reward/episodes/effective/mean"]').first().scrollIntoViewIfNeeded();
   await expect(page.locator(".comparison-line").first()).toBeVisible();
   await expect(page.getByRole("combobox", { name: "Run", exact: true })).toHaveValue("synthetic-a");
   await expect(page.locator(".chart-legend").first()).toContainText("synthetic-b");
@@ -158,8 +158,8 @@ test("downsampled graphs retain spike envelopes and label bucket means", async (
     return route.fulfill({json:{steps:[1,10],timestamps:[null,null],downsampled:true,series:Object.fromEntries(keys.map(k=>[k,[2,3]])),envelope:Object.fromEntries(keys.map(k=>[k,{min:[0,1],max:[90,100]}]))}});
   });
   await page.goto("/");
-  await page.locator('[data-metric="reward/all/mean"]').first().scrollIntoViewIfNeeded();
-  const chart = page.getByRole("img", {name:"reward/all/mean chart",exact:true}).first();
+  await page.locator('[data-metric="reward/episodes/effective/mean"]').first().scrollIntoViewIfNeeded();
+  const chart = page.getByRole("img", {name:"reward/episodes/effective/mean chart",exact:true}).first();
   await expect(chart.locator(".metric-envelope")).toBeVisible();
   await chart.focus();await page.keyboard.press("ArrowRight");
   await expect(chart.locator("..").locator(".chart-readout")).toContainText("bucket mean");
@@ -234,13 +234,12 @@ test("chart descriptions do not shift neighboring plots", async ({ page }) => {
   expect(new Set(headers).size).toBe(1);
 });
 
-test("historical overview separates missing effective reward from all episode reward", async ({ page }) => {
+test("historical overview shows only the recorded reward without a placeholder", async ({ page }) => {
   await page.route("**/metrics/keys", route => route.fulfill({json:{trainer:[{key:"reward/all/mean"}],orchestrator:[{key:"reward/all/mean"}],eval:[]}}));
   await page.route("**/series?*", route => route.fulfill({json:{steps:[1],timestamps:[null],series:{"reward/all/mean":[0.15234375]}}}));
   await page.goto("/");
-  const missing = page.locator('[data-metric="reward/episodes/effective/mean"]');
-  await expect(missing).toContainText("effective/agent/reward");
-  await expect(missing).toContainText("Not recorded");
+  await expect(page.locator('[data-metric="reward/episodes/effective/mean"]')).toHaveCount(0);
+  await expect(page.getByText("Not recorded")).toHaveCount(0);
   const all = page.locator('[data-metric="reward/all/mean"]');
   await expect(all).toHaveCount(1);
   await expect(all).toContainText("all/agent/reward");

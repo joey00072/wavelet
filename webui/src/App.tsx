@@ -482,11 +482,6 @@ function MetricSections({ showBlocks, selected, series, comparison, compareRun, 
         <details className="metric-section" key={`${section}:${open}`} open={open}>
           <summary>{sectionTitle(section)}{["train", "eval"].includes(section) && <span className="section-env" title={(section === "train" ? trainEnvs : evalEnvs).join(", ")}>{(section === "train" ? trainEnvs : evalEnvs).join(", ") || "No environment configured"}</span>}</summary>
           <div className="chart-grid">
-            {showBlocks && section === "train" && !charts.some(({ key }) => key === "reward/episodes/effective/mean") && <article className="chart-card" data-metric="reward/episodes/effective/mean">
-              <header><span className="chart-title">effective/agent/reward</span><span className="chart-latest">–</span></header>
-              <div className="chart-empty missing-metric">Not recorded for this run<span>Requires rewards for episodes selected for training.</span></div>
-              <div className="chart-footer">Unavailable · not zero</div>
-            </article>}
             {groups.get(section)?.map(({ source, key }) => (
               <MetricChart
                 key={`${source}:${key}`}
@@ -504,7 +499,7 @@ function MetricSections({ showBlocks, selected, series, comparison, compareRun, 
               />
             ))}
           </div>
-          {!groups.has(section) && section !== "train" && <div className="section-empty">{section === "eval" ? "No evaluation metrics recorded" : "No inference telemetry recorded"}</div>}
+          {!groups.has(section) && <div className="section-empty">{section === "eval" ? "No evaluation metrics recorded" : section === "inference" ? "No inference telemetry recorded" : "No training metrics recorded"}</div>}
         </details>
       ))}
       {charts.length === 0 && search && <Empty title="No metrics match" detail={search} />}

@@ -412,6 +412,3 @@ tbody tr:focus-visible { box-shadow: inset 2px 0 0 var(--accent); }
 
 .section-env { min-width: 0; max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); text-transform: none; letter-spacing: normal; }
 .section-empty { min-height: 110px; display: grid; place-items: center; color: var(--muted); font: 11px var(--mono); }
-.missing-metric { padding: 24px; text-align: center; align-content: center; gap: 8px; }
-.missing-metric span { max-width: 220px; font-size: 11px; }
-.missing-metric + .chart-footer { color: var(--muted); font: 10px var(--mono); padding-left: 12px; }
