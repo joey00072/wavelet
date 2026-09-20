@@ -1089,3 +1089,82 @@ def test_trainer_uses_binary_payload_and_logs_original_trace(tmp_path):
     assert loaded[0].input_ids == row["input_ids"]
     assert loaded[0].metadata is None
     assert json.loads(batch.path.read_text())["metadata"] == full["metadata"]
+
+
+@pytest.mark.parametrize(
+    ("batch_scale", "gradient_scale", "expected_loss"),
+    [(None, None, 3.0), (8.0, None, 6.0), (None, 4.0, 1.5)],
+)
+def test_step_metrics_defer_scalar_reads_and_preserve_reductions(
+    monkeypatch, batch_scale, gradient_scale, expected_loss
+):
+    trainer = RLTrainer(RLConfig())
+    trainer._optimizer_batch_loss_scale = batch_scale
+    trainer._gradient_accumulation_loss_scale = gradient_scale
+    monkeypatch.setattr(trainer, "_batch_rollout_metrics", lambda batch: {})
+    monkeypatch.setattr(trainer, "_estimate_optimizer_batch_loss_scales", lambda: None)
+    leaf = torch.tensor(2.0, requires_grad=True)
+    outputs = [
+        LossOutput(
+            loss=leaf * multiplier,
+            metrics={
+                "entropy/min": torch.tensor(multiplier, dtype=torch.bfloat16),
+                "entropy/max": torch.tensor(multiplier + 2.0),
+                "_entropy_sum": torch.tensor(multiplier * 3.0),
+                "_entropy_count": torch.tensor(3),
+                **(
+                    {"optional": torch.tensor(1.0000000001, dtype=torch.float64)}
+                    if multiplier == 1
+                    else {}
+                ),
+            },
+        )
+        for multiplier in (1, 2)
+    ]
+
+    def forbidden_item(self, *args, **kwargs):
+        raise AssertionError("Diagnostics must not read individual device scalars")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", forbidden_item)
+        for output in outputs:
+            trainer._record_micro_batch_metrics({}, output)
+        assert all(not value.requires_grad for value in trainer._train_loss_accum)
+        assert all(
+            not value.requires_grad
+            for row in trainer._train_metric_accum
+            for value in row.values()
+        )
+        metrics = trainer._complete_optimizer_step(None)
+    assert metrics["loss"] == expected_loss
+    assert metrics["entropy/min"] == 1.0
+    assert metrics["entropy/max"] == 4.0
+    assert metrics["entropy/mean"] == 1.5
+    assert metrics["optional"] == 1.0000000001
+    assert not trainer._train_loss_accum
+    assert not trainer._train_metric_accum
+    assert leaf.grad is None
+
+
+def test_component_weights_reuse_supplied_tensors_without_default_allocations(
+    monkeypatch,
+):
+    batch = {
+        "loss_mask": torch.ones(2, 4, dtype=torch.bool),
+        "rl_weights": torch.ones(2, 4),
+        "ce_weights": torch.zeros(2, 4),
+        "ref_kl_weights": torch.zeros(2, 4),
+    }
+
+    def forbidden_allocation(*args, **kwargs):
+        raise AssertionError("Supplied weights must not allocate defaults")
+
+    monkeypatch.setattr(torch, "zeros_like", forbidden_allocation)
+    monkeypatch.setattr(torch.Tensor, "to", forbidden_allocation)
+    result = RLTrainer._component_weights(batch)
+    assert all(
+        actual is batch[key]
+        for actual, key in zip(
+            result, ("rl_weights", "ce_weights", "ref_kl_weights"), strict=True
+        )
+    )

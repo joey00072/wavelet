@@ -168,3 +168,11 @@ Liger dispatch uses the checkpoint's actual `model_type`, rather than its path
 or name. The supported Liger families are Qwen3, Qwen2, Llama and Mistral;
 other architectures, including Qwen3.5, VLMs and native DeepSeek-V4, require
 `loss_impl: torch` and fail early if a Liger mode is requested.
+
+RL loss diagnostics accumulate as detached device scalars during gradient
+accumulation. At the optimizer boundary the trainer reads them together, then
+applies the existing mean/sum/min/max and cross-rank reductions. This avoids
+per-diagnostic device synchronization on each microbatch without retaining the
+autograd graph or changing loss normalization. Rollout statistics and finite-loss
+checks retain their existing timing. Supplied component-weight tensors are reused;
+default RL/CE/reference-KL weights are allocated only when absent.

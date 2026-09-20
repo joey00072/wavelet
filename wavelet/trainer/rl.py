@@ -236,8 +236,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         super().__init__(config)
         self._accumulated_micro_batches = 0
         self._rollout_metric_accum: list[dict[str, float]] = []
-        self._train_loss_accum: list[float] = []
-        self._train_metric_accum: list[dict[str, float]] = []
+        self._train_loss_accum: list[Tensor] = []
+        self._train_metric_accum: list[dict[str, Tensor]] = []
         self._optimizer_batch_loss_scale: float | None = None
         self._optimizer_batch_loss_scales: dict[str, float] | None = None
         self._gradient_accumulation_loss_scale: float | None = None
@@ -893,12 +893,15 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def _component_weights(batch: dict[str, Tensor]) -> tuple[Tensor, Tensor, Tensor]:
         loss_mask = batch["loss_mask"]
         return (
-            batch.get("rl_weights", loss_mask.to(dtype=torch.float32)),
-            batch.get("ce_weights", torch.zeros_like(loss_mask, dtype=torch.float32)),
-            batch.get(
-                "ref_kl_weights",
-                torch.zeros_like(loss_mask, dtype=torch.float32),
-            ),
+            batch["rl_weights"]
+            if "rl_weights" in batch
+            else loss_mask.to(dtype=torch.float32),
+            batch["ce_weights"]
+            if "ce_weights" in batch
+            else torch.zeros_like(loss_mask, dtype=torch.float32),
+            batch["ref_kl_weights"]
+            if "ref_kl_weights" in batch
+            else torch.zeros_like(loss_mask, dtype=torch.float32),
         )
 
     def _backward_rl_loss(self, loss: Tensor) -> None:
@@ -912,12 +915,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     ) -> None:
         rollout_metrics = self._batch_rollout_metrics(batch)
         self._rollout_metric_accum.append(rollout_metrics)
-        self._train_loss_accum.append(float(loss_output.loss.detach().item()))
+        self._train_loss_accum.append(loss_output.loss.detach())
         self._train_metric_accum.append(
-            {
-                key: float(value.detach().item())
-                for key, value in loss_output.metrics.items()
-            }
+            {key: value.detach() for key, value in loss_output.metrics.items()}
         )
 
     def _apply_optimizer_step(self) -> float | None:
@@ -940,17 +940,34 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def _complete_optimizer_step(self, grad_norm: float | None) -> dict[str, float]:
         """Aggregate, sync, and reset the metrics accumulated for one optimizer step."""
+        # Keep detached diagnostics on-device until the optimizer boundary, then
+        # read every scalar in one transfer without retaining autograd graphs.
+        scalars = [
+            *self._train_loss_accum,
+            *(value for row in self._train_metric_accum for value in row.values()),
+        ]
+        values = (
+            torch.stack([value.to(dtype=torch.float64) for value in scalars]).tolist()
+            if scalars
+            else []
+        )
+        losses = values[: len(self._train_loss_accum)]
+        metric_values = iter(values[len(self._train_loss_accum) :])
+        micro_metrics = [
+            {key: next(metric_values) for key in row}
+            for row in self._train_metric_accum
+        ]
         if self._gradient_accumulation_loss_scale is not None:
-            logged_loss = sum(self._train_loss_accum) / max(
+            logged_loss = sum(losses) / max(
                 self._gradient_accumulation_loss_scale,
                 1.0,
             )
         elif self._optimizer_batch_loss_scale is None:
-            logged_loss = _mean(self._train_loss_accum)
+            logged_loss = _mean(losses)
         else:
-            logged_loss = sum(self._train_loss_accum)
+            logged_loss = sum(losses)
         metrics = {"loss": logged_loss}
-        metrics.update(self._aggregate_train_metrics(self._train_metric_accum))
+        metrics.update(self._aggregate_train_metrics(micro_metrics))
         self._train_loss_accum.clear()
         self._train_metric_accum.clear()
         if self._rollout_metric_accum:
