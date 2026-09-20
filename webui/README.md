@@ -136,3 +136,9 @@ Older runs retain their original problem-average reward series. Missing cohort
 metrics are not reconstructed or shown as zero. See
 [`docs/evaluation_and_live_traces.md`](../docs/evaluation_and_live_traces.md) for
 population and step semantics.
+
+Metric cards keep plots aligned with a fixed header and compact step-axis label.
+Use the ⓘ button for the metric's source, reward population, and denominator
+semantics; explanations do not displace the plot. Hover or focus a card to
+show CSV export and expand controls. Rollout queue and policy freshness metrics
+have their own section. Charts and trace details continue to load lazily.

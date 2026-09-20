@@ -196,13 +196,39 @@ test("reward cohorts show denominators and queue-step semantics", async ({ page 
   await page.goto("/");
   const all = page.locator('[data-metric="reward/episodes/all/mean"]');
   await expect(all).toContainText("Reward · all episodes");
-  await expect(all).toContainText("including filtered episodes");
+  await expect(all.getByRole("note")).toHaveCount(0);
+  await all.getByRole("button", { name: "About reward/episodes/all/mean", exact: true }).click();
+  await expect(all.getByRole("note")).toContainText("including filtered episodes");
+  await all.getByRole("button", { name: "Close", exact: true }).click();
   await all.scrollIntoViewIfNeeded();
   await expect(all).toContainText("Rollout queue step");
   const trainable = page.locator('[data-metric="reward/episodes/effective/mean"]');
   await trainable.scrollIntoViewIfNeeded();
-  await expect(trainable).toContainText("not an overall solve rate");
+  await trainable.getByRole("button", { name: "About reward/episodes/effective/mean", exact: true }).click();
+  await expect(trainable.getByRole("note")).toContainText("not an overall solve rate");
   await expect(page.locator('[data-metric="reward/episodes/all/count"] .chart-latest')).toHaveText("256");
   await expect(page.locator('[data-metric="reward/episodes/effective/count"] .chart-latest')).toHaveText("112");
   await expect(page.locator('[data-metric="reward/all/mean"]')).toHaveCount(0);
+});
+
+test("chart descriptions do not shift neighboring plots", async ({ page }) => {
+  await page.goto("/");
+  const cards = page.locator(".chart-card");
+  const first = cards.first();
+  await first.scrollIntoViewIfNeeded();
+  const plot = first.locator("svg");
+  await expect(plot).toBeVisible();
+  const geometry = () => plot.evaluate(node => {
+    const plot = node.getBoundingClientRect();
+    const card = node.closest("article")!.getBoundingClientRect();
+    return { top: plot.top - card.top, width: plot.width, height: plot.height, cardHeight: card.height };
+  });
+  const before = await geometry();
+  await first.getByRole("button", { name: /^About / }).click();
+  await expect(first.getByRole("note")).toBeVisible();
+  const after = await geometry();
+  expect(after).toEqual(before);
+  await first.getByRole("button", { name: "Close", exact: true }).click();
+  const headers = await cards.locator("header").evaluateAll(nodes => nodes.map(n => n.getBoundingClientRect().height));
+  expect(new Set(headers).size).toBe(1);
 });

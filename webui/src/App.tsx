@@ -433,13 +433,14 @@ function MetricsView({ apiBase, runId, interval, summary, runs }: ViewProps & { 
   );
 }
 
-const SECTION_ORDER = ["train", "eval", "stability", "inference", "performance", "other"];
+const SECTION_ORDER = ["train", "eval", "stability", "inference", "performance", "queue", "other"];
 
 function metricSection(source: MetricSource, key: string): string {
   if (source === "eval" || key.startsWith("eval/")) return "eval";
   if (key.startsWith("inference/")) return "inference";
   if (/^(optim|entropy|mismatch|kl|ipo|dppo|grad)/.test(key)) return "stability";
   if (/^(perf|time|memory|system|node)/.test(key) || key.includes("tokens_per_second")) return "performance";
+  if (/^(off_policy|policy\/lag|generation\/(rollouts|groups|effective_groups))/.test(key)) return "queue";
   if (source === "orchestrator" || /^(train|reward|loss|generation|advantage|fate|off_policy|policy)/.test(key)) return "train";
   return "other";
 }
@@ -476,7 +477,7 @@ function MetricSections({ selected, series, comparison, compareRun, search, smoo
     <div className="metric-sections">
       {SECTION_ORDER.filter((section) => groups.has(section)).map((section) => (
         <details className="metric-section" key={`${section}:${open}`} open={open}>
-          <summary>{sectionTitle(section, trainEnvs, evalEnvs)}</summary>
+          <summary title={[...trainEnvs, ...evalEnvs].join(", ")}>{sectionTitle(section)}</summary>
           <div className="chart-grid">
             {groups.get(section)?.map(({ source, key }) => (
               <MetricChart
@@ -1005,10 +1006,8 @@ function metricDescription(name: string, source: MetricSource): string {
   return origin;
 }
 
-function sectionTitle(section: string, trainEnvs: string[], evalEnvs: string[]): string {
-  if (section === "train" && trainEnvs.length === 1) return `train/${trainEnvs[0]}`;
-  if (section === "eval" && evalEnvs.length === 1) return `eval/${evalEnvs[0]}`;
-  return section;
+function sectionTitle(section: string): string {
+  return ({ train: "Training", eval: "Evaluation", stability: "Stability", inference: "Inference", performance: "Performance", queue: "Rollout queue & policy freshness", other: "Other metrics" } as Record<string, string>)[section] ?? section;
 }
 
 function runDuration(summary: RunSummary): string {

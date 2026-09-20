@@ -209,22 +209,28 @@ main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .metric-section > summary::after { content: ""; order: 3; margin-left: 0; width: 6px; height: 6px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg) translateY(-2px); transition: transform 160ms var(--ease); }
 .metric-section:not([open]) > summary::after { transform: rotate(-45deg) translateX(-2px); }
 .metric-section > .chart-grid { margin-top: 8px; }
-.chart-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(236px, 1fr)); gap: 1px; padding: 1px; }
-.chart-card { min-width: 0; background: var(--canvas); box-shadow: 0 0 0 1px var(--line); overflow: hidden; }
-.chart-card:hover { background: var(--panel); }
-.chart-card header { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; padding: 12px 8px 2px 14px; }
-.chart-card header > div:first-child { order: 10; flex-basis: 100%; min-width: 0; display: flex; align-items: center; overflow: hidden; color: var(--muted); font-family: var(--mono); font-size: 11.5px; }
-.chart-card header > div:first-child span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.chart-card header button { flex-shrink: 0; height: 22px; width: auto; min-width: 22px; padding: 0 5px; border: 0; color: var(--muted); font-size: 11px; opacity: 0; }
-.chart-card:hover header button, .chart-card:focus-within header button { opacity: 0.8; }
-.chart-card header button:hover { color: var(--bright); background: var(--panel-2); opacity: 1; }
-.chart-latest { order: 1; flex: 1; min-width: 0; color: var(--bright); font-family: var(--mono); font-size: 18px; line-height: 1.2; letter-spacing: -0.01em; }
-.chart-card header button { order: 2; }
+.chart-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 12px; }
+.chart-card { position: relative; min-width: 0; background: var(--panel); border: 1px solid var(--line-strong); border-radius: var(--radius-s); overflow: hidden; }
+.chart-card header { height: 42px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 12px; font-family: var(--mono); }
+.chart-title { min-width: 0; color: var(--text); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chart-latest { flex-shrink: 0; color: var(--bright); font-size: 12px; font-weight: 600; }
+.chart-footer { display: flex; align-items: center; min-height: 30px; padding: 0 6px; }
+.chart-footer .chart-readout { flex: 1; min-width: 0; padding: 0 6px; overflow: hidden; white-space: nowrap; display: block; text-overflow: ellipsis; line-height: 28px; }
+.chart-footer .chart-readout.is-inspecting { position: absolute; bottom: 30px; left: 8px; right: 8px; z-index: 2; background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: var(--radius-s); padding: 6px 8px; white-space: normal; line-height: 1.5; pointer-events: none; }
+.chart-tools { flex-shrink: 0; display: flex; gap: 2px; margin-left: auto; }
+.chart-tools button { height: 24px; padding: 0 5px; border: 0; font-size: 11px; color: var(--muted); }
+.chart-tools button:not(:first-child) { display: none; }
+.chart-card:hover .chart-tools button, .chart-card:focus-within .chart-tools button { display: block; }
+.chart-context { position: absolute; z-index: 3; inset: 42px 8px auto; padding: 12px; background: var(--panel-2); border: 1px solid var(--line-strong); border-radius: var(--radius-s); box-shadow: 0 6px 20px var(--shadow); font-size: 12px; }
+.chart-context p { margin: 8px 0; }
+.chart-context code { display: block; color: var(--muted); overflow-wrap: anywhere; font-size: 10px; }
+.chart-context button { margin-top: 8px; }
 .chart-card svg { display: block; width: 100%; height: 150px; touch-action: pan-y; cursor: crosshair; }
 .main-line { animation: draw 700ms var(--ease); }
 @keyframes draw { from { stroke-dasharray: 1; stroke-dashoffset: 1; } to { stroke-dasharray: 1; stroke-dashoffset: 0; } }
 .chart-card svg text { fill: var(--muted); font-family: var(--mono); font-size: 10.5px; text-anchor: end; }
 .chart-card svg .x-label { text-anchor: start; }
+.chart-card svg .x-middle { text-anchor: middle; }
 .chart-card svg .x-end { text-anchor: end; }
 .grid-line { stroke: var(--line); stroke-width: 1; }
 .metric-line { fill: none; stroke-width: 1.6; vector-effect: non-scaling-stroke; stroke-linejoin: round; stroke-linecap: round; }
@@ -236,7 +242,7 @@ main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .chart-readout { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; padding: 0 12px 6px; color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .chart-readout button { height: 22px; font-size: 11px; }
 .chart-empty { height: 150px; display: grid; place-items: center; color: var(--muted); font-size: 12px; }
-.chart-card .chart-empty { height: 180px; min-height: 180px; }
+.chart-card .chart-empty { height: 190px; min-height: 190px; }
 .chart-card.chart-expanded { grid-column: 1 / -1; }
 .chart-card.chart-expanded svg { height: 360px; }
 
@@ -403,5 +409,3 @@ tbody tr:focus-visible { box-shadow: inset 2px 0 0 var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
-
-.chart-context { color: var(--muted); font-size: 11px; line-height: 1.4; margin: 4px 12px; }

@@ -17,6 +17,7 @@ export function MetricChart({ name, label, data, smoothing, color, axis, compari
   const [range, setRange] = useState<[number, number] | null>(null);
   const [drag, setDrag] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
   useEffect(() => {
     const observer = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting), { rootMargin: "200px" });
     if (host.current) observer.observe(host.current);
@@ -41,7 +42,7 @@ export function MetricChart({ name, label, data, smoothing, color, axis, compari
   const comparison = collect(comparisonData);
   const shown = points.filter((p) => !range || (p.x >= range[0] && p.x <= range[1]));
   const compareShown = comparison.filter((p) => !range || (p.x >= range[0] && p.x <= range[1]));
-  const height = expanded ? 360 : 180;
+  const height = expanded ? 360 : 190;
   const pad = { left: 52, right: 16, top: 18, bottom: 30 };
   const xs = [...shown, ...compareShown].map((p) => p.x), ys = [...shown, ...compareShown].flatMap((p) => [p.min, p.max, p.value, p.smooth]);
   const xmin = Math.min(...xs), xmax = Math.max(...xs);
@@ -61,12 +62,14 @@ export function MetricChart({ name, label, data, smoothing, color, axis, compari
     const link = document.createElement("a"); link.href = url; link.download = `${name.replace(/\//g, "-")}.csv`; link.click(); URL.revokeObjectURL(url);
   };
   return <article data-metric={name} className={`chart-card${expanded ? " chart-expanded" : ""}`} ref={host}>
-    <header><div><span title={name}>{label}</span></div><div className="chart-latest">{(name.endsWith("/count") ? fmtInt : fmt)(points[points.length - 1]?.value ?? null)}</div>
-      <button type="button" title="Download raw and smoothed values" aria-label={`Download ${name}`} onClick={download}>CSV</button>
-      <button type="button" aria-label={`Expand ${name}`} onClick={() => setExpanded(!expanded)}>{expanded ? "−" : "+"}</button>
-      {onRemove && <button type="button" aria-label={`Remove ${name}`} onClick={onRemove}>×</button>}
+    <header>
+      <span className="chart-title" title={name}>{label}</span>
+      <span className="chart-latest">{(name.endsWith("/count") ? fmtInt : fmt)(points[points.length - 1]?.value ?? null)}</span>
     </header>
-    {description && <p className="chart-context">{description}</p>}
+    {showInfo && <div className="chart-context" role="note" onKeyDown={e => { if (e.key === "Escape") setShowInfo(false); }}>
+      <strong>{label}</strong><p>{description}</p><code>{name}</code>
+      <button type="button" onClick={() => setShowInfo(false)}>Close</button>
+    </div>}
     {visible && shown.length ? <>
       <svg style={{height}} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${name} chart`} tabIndex={0}
         onPointerMove={(e) => setHover(coordinate(e))} onPointerLeave={() => { if (drag === null) setHover(null); }}
@@ -82,10 +85,20 @@ export function MetricChart({ name, label, data, smoothing, color, axis, compari
         {shown.length === 1 && <circle cx={x(shown[0].x)} cy={y(shown[0].smooth)} r={4} style={{ fill: color }}><title>{`step ${shown[0].step}: ${shown[0].value}`}</title></circle>}
         {cursor && <g className="chart-cursor"><line x1={x(cursor.x)} x2={x(cursor.x)} y1={pad.top} y2={height - pad.bottom} /><circle cx={x(cursor.x)} cy={y(cursor.smooth)} r={4} style={{ fill: color }} /></g>}
         {drag !== null && hover !== null && <rect className="chart-selection" x={x(Math.min(drag, hover))} y={pad.top} width={Math.abs(x(hover) - x(drag))} height={height - pad.top - pad.bottom} />}
-        <text x={pad.left} y={height - 6}>{fmt(xmin, 1)}</text><text className="x-end" x={width - pad.right} y={height - 6}>{fmt(xmax, 1)}</text>
+        {(xmin === xmax ? [0] : [0, .25, .5, .75, 1]).map(fraction => <text key={fraction} className={fraction === 0 ? "x-label" : fraction === 1 ? "x-end" : "x-middle"} x={x(xmin + fraction * (xmax - xmin))} y={height - 6}>{axis === "step" ? fmtInt(xmin + fraction * (xmax - xmin)) : fmt(xmin + fraction * (xmax - xmin), 1)}</text>)}
       </svg>
       {comparisonLabel && <div className="chart-legend" title={comparisonLabel}>Dashed: {comparisonLabel}{!compareShown.length ? " · no matching metric" : ""}</div>}
-      <div className="chart-readout" aria-live="polite">{cursor ? `${stepLabel} ${cursor.step ?? "–"} · ${data?.downsampled ? "bucket mean" : "raw"} ${fmt(cursor.value, 5)}${data?.downsampled ? ` · min ${fmt(cursor.min, 5)} / max ${fmt(cursor.max, 5)}` : ""}${smoothing > 1 ? ` · smoothed ${fmt(cursor.smooth, 5)}` : ""}` : `${axis === "step" ? stepLabel : "Elapsed minutes"} · drag to zoom`}{range && <button type="button" onClick={() => setRange(null)}>Reset zoom</button>}</div>
+
     </> : <div className="chart-empty">{visible ? "no data yet" : "Chart loads when visible"}</div>}
+    <div className="chart-footer">
+      <div className={`chart-readout${cursor ? " is-inspecting" : ""}`} title="Drag to zoom · double-click to reset · arrow keys to inspect" aria-live="polite">{cursor ? `${stepLabel} ${cursor.step ?? "–"} · ${data?.downsampled ? "bucket mean" : "raw"} ${fmt(cursor.value, 5)}${data?.downsampled ? ` · min ${fmt(cursor.min, 5)} / max ${fmt(cursor.max, 5)}` : ""}${smoothing > 1 ? ` · smoothed ${fmt(cursor.smooth, 5)}` : ""}` : `${axis === "step" ? stepLabel : "Elapsed minutes"}`}</div>
+    <div className="chart-tools">
+      {description && <button type="button" aria-label={`About ${name}`} aria-expanded={showInfo} onClick={() => setShowInfo(!showInfo)}>ⓘ</button>}
+      <button type="button" title="Download raw and smoothed values" aria-label={`Download ${name}`} onClick={download}>CSV</button>
+      <button type="button" aria-label={`Expand ${name}`} onClick={() => setExpanded(!expanded)}>{expanded ? "−" : "+"}</button>
+      {onRemove && <button type="button" aria-label={`Remove ${name}`} onClick={onRemove}>×</button>}
+      {range && <button type="button" onClick={() => setRange(null)}>Reset zoom</button>}
+    </div>
+    </div>
   </article>;
 }
