@@ -132,3 +132,49 @@ def test_redact_and_series_stats():
         "mean": 2.0,
         "std": 1.0,
     }
+
+
+def test_episode_reward_cohorts_expose_denominators_without_branch_double_counting():
+    from wavelet.monitor import RolloutMetricInputs, rollout_metrics
+
+    rows = [
+        {"example_id": "a", "reward": 1.0, "loss_mask": [True]},
+        {"example_id": "a", "reward": 0.0, "loss_mask": [True]},
+        {
+            "example_id": "b",
+            "reward": 0.0,
+            "loss_mask": [False],
+            "metadata": {
+                "_wavelet_filtered_rollout": True,
+                "_wavelet_rollout_count": 2,
+            },
+        },
+        {
+            "example_id": "a",
+            "reward": 1.0,
+            "loss_mask": [True],
+            "metadata": {"_wavelet_rollout_count": 0},
+        },
+        {"example_id": "c", "reward": 0.0, "loss_mask": [True], "error": "failed"},
+    ]
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=2, step=0)
+    )
+    assert metrics["reward/episodes/all/count"] == 5
+    assert metrics["reward/episodes/all/mean"] == 0.2
+    assert metrics["reward/episodes/trainable/count"] == 2
+    assert metrics["reward/episodes/trainable/mean"] == 0.5
+    # Existing problem-weighted series keeps its historical definition.
+    assert metrics["reward/all/mean"] == pytest.approx(1 / 6)
+
+
+def test_empty_reward_cohort_does_not_report_fake_zero_mean():
+    from wavelet.monitor import RolloutMetricInputs, rollout_metrics
+
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=[], rollouts_per_example=16, step=0)
+    )
+    assert metrics["reward/episodes/all/count"] == 0
+    assert metrics["reward/episodes/trainable/count"] == 0
+    assert "reward/episodes/all/mean" not in metrics
+    assert "reward/episodes/trainable/mean" not in metrics

@@ -42,3 +42,27 @@ publishing terminal state, so it cannot race a stale snapshot into the same file
 Synchronous callers retain synchronous publication. On shared filesystems,
 `eval.live_traces: false` and `orchestrator.live_traces: false` provide a useful
 performance control; completed rollout artifacts and metrics remain available.
+
+### Reward populations and step labels
+
+The dashboard distinguishes episode-weighted rewards from filtered training
+rewards. New orchestrator logs publish `reward/episodes/all/{mean,count}` and
+`reward/episodes/trainable/{mean,count}`. Counts are the denominators of those
+means, using rollout ownership metadata so continuation branches do not count
+again. The trainable subset requires training tokens and excludes filtered,
+dummy, and errored rows. Missing rewards do not enter either denominator; an
+empty subset has count zero and no mean. These describe the published batch,
+not every attempted or rejected candidate in the generation pipeline.
+
+`generation/reward/mean` covers all scored candidates, including groups rejected
+before publication. Historical orchestrator `reward/all/mean` is an average of
+per-problem means; trainer `reward/all/mean` is episode-weighted and includes
+filtered episodes. They coincide for equally sized complete groups, but need
+not coincide for unequal groups. A filtered reward is not an overall solve rate
+and should not be used by itself to claim learning improvement.
+
+Charts retain the recorded step values. The orchestrator starts with rollout
+queue step 0; the trainer records optimizer step 1 after consuming its first
+batch. Chunked runs can have multiple queue steps per optimizer update, so the
+UI does not shift queue indices by one. Historical runs keep their original
+series and explicit labels; new cohort metrics are not fabricated retroactively.
