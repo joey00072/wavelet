@@ -5,7 +5,7 @@ from typing import Any
 
 from test_verifiers_rollouts import _bare_scheduler
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.orchestrator.scheduler import (
     VerifierRolloutScheduler,
     _PendingVerifierRequest,

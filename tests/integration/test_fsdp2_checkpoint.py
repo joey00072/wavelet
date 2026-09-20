@@ -12,7 +12,7 @@ from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from transformers import LlamaConfig, LlamaForCausalLM
 
-from wavelet.configs.sft import FSDPConfig, LoRAConfig, ModelConfig
+from wavelet.configs.config import FSDPConfig, LoRAConfig, ModelConfig
 from wavelet.trainer.ckpt import AppState
 from wavelet.trainer.distributed import ParallelDims, World
 from wavelet.trainer.model import (

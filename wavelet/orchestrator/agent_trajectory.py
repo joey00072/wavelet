@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from bisect import bisect_left
-from dataclasses import dataclass
-from functools import cache
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -59,8 +58,9 @@ class TrajectorySample:
     temperatures: list[float]
     turn_ids: list[str | None]
     sampling_masks: list[list[int] | None]
+    terminal_segment_index: int | None = None
 
-    def as_dict(self) -> dict[str, list[Any]]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "input_ids": self.input_ids,
             "target_ids": self.target_ids,
@@ -69,6 +69,7 @@ class TrajectorySample:
             "temperatures": self.temperatures,
             "turn_ids": self.turn_ids,
             "sampling_masks": self.sampling_masks,
+            "terminal_segment_index": self.terminal_segment_index,
         }
 
 
@@ -77,6 +78,7 @@ class _ActiveSample:
     prefix_ids: list[int]
     sample: TrajectorySample
     segments: list[TokenSegment]
+    terminal_segment_index: int
 
 
 def merge_token_segments(
@@ -87,8 +89,12 @@ def merge_token_segments(
 ) -> list[TrajectorySample]:
     """Merge turns with exact prefixes or unambiguous rerendered output spans."""
     active: list[_ActiveSample] = []
-    for segment in segments:
+    for segment_index, segment in enumerate(segments):
         for active_index, item in enumerate(active):
+            if (segment.metadata or {}).get("media_fingerprint") != (
+                item.segments[-1].metadata or {}
+            ).get("media_fingerprint"):
+                continue
             prefix_len = len(item.prefix_ids)
             if segment.prompt_ids[:prefix_len] == item.prefix_ids:
                 sample = _extend_sample(
@@ -111,6 +117,7 @@ def merge_token_segments(
                 prefix_ids=segment.prompt_ids + segment.output_ids,
                 sample=sample,
                 segments=[*item.segments, segment],
+                terminal_segment_index=segment_index,
             )
             break
         else:
@@ -123,9 +130,14 @@ def merge_token_segments(
                         mask_outputs=mask_outputs,
                     ),
                     segments=[segment],
+                    terminal_segment_index=segment_index,
                 )
             )
-    return [item.sample for item in active if item.sample.input_ids]
+    return [
+        replace(item.sample, terminal_segment_index=item.terminal_segment_index)
+        for item in active
+        if item.sample.input_ids
+    ]
 
 
 def _sample_from_segment(
@@ -214,45 +226,50 @@ def _unique_ordered_output_matches(
     if any(not output_ids for output_ids in outputs):
         return None
 
-    occurrences = [
-        [
-            start
-            for start in range(len(prompt_ids) - len(output_ids) + 1)
-            if prompt_ids[start : start + len(output_ids)] == output_ids
-        ]
-        for output_ids in outputs
-    ]
+    occurrences = [_token_occurrences(output, prompt_ids) for output in outputs]
+    matches = []
+    cursor = 0
+    for output, starts in zip(outputs, occurrences, strict=True):
+        index = bisect_left(starts, cursor)
+        if index == len(starts):
+            return None
+        matches.append(starts[index])
+        cursor = starts[index] + len(output)
 
-    @cache
-    def search(
-        output_index: int,
-        cursor: int,
-    ) -> tuple[int, tuple[int, ...] | None]:
-        if output_index == len(outputs):
-            return 1, ()
-        solution_count = 0
-        unique_matches: tuple[int, ...] | None = None
-        output_ids = outputs[output_index]
-        starts = occurrences[output_index]
-        for start in starts[bisect_left(starts, cursor) :]:
-            child_count, child_matches = search(
-                output_index + 1,
-                start + len(output_ids),
-            )
-            if child_count == 0:
-                continue
-            if solution_count == 0 and child_count == 1:
-                assert child_matches is not None
-                unique_matches = (start, *child_matches)
-            else:
-                unique_matches = None
-            solution_count = min(solution_count + child_count, 2)
-            if solution_count > 1:
-                break
-        return solution_count, unique_matches
+    # Ordered nonoverlapping placements are unique exactly when the earliest
+    # and latest feasible placements agree for every span.
+    cursor = len(prompt_ids)
+    for output, starts, earliest in reversed(
+        list(zip(outputs, occurrences, matches, strict=True))
+    ):
+        latest = starts[bisect_right(starts, cursor - len(output)) - 1]
+        if latest != earliest:
+            return None
+        cursor = latest
+    return matches
 
-    solution_count, matches = search(0, 0)
-    return list(matches) if solution_count == 1 and matches is not None else None
+
+def _token_occurrences(pattern: list[int], tokens: list[int]) -> list[int]:
+    """Find overlapping exact spans in linear time with prefix fallback."""
+    fallback = [0] * len(pattern)
+    matched = 0
+    for index in range(1, len(pattern)):
+        while matched and pattern[index] != pattern[matched]:
+            matched = fallback[matched - 1]
+        if pattern[index] == pattern[matched]:
+            matched += 1
+        fallback[index] = matched
+    starts = []
+    matched = 0
+    for index, token in enumerate(tokens):
+        while matched and token != pattern[matched]:
+            matched = fallback[matched - 1]
+        if token == pattern[matched]:
+            matched += 1
+        if matched == len(pattern):
+            starts.append(index + 1 - matched)
+            matched = fallback[matched - 1]
+    return starts
 
 
 def _extend_sample(

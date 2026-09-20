@@ -45,6 +45,7 @@ bench*
 !benchmarks/baselines/
 !benchmarks/baselines/README.md
 !wavelet/tools/benchmark.py
+!.github/workflows/benchmarks.yaml
 dev*
 tmp/
 temp/

@@ -6,7 +6,7 @@ from fractions import Fraction
 from functools import lru_cache
 from typing import Any
 
-from wavelet.configs.rl_config import RLRewardConfig
+from wavelet.configs.config import RLRewardConfig
 from wavelet.data.rl import RLExample
 
 _NUMBER_RE = re.compile(

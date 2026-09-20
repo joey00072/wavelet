@@ -3,8 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.sft import SFTConfig
+from wavelet.configs.config import RLConfig, SFTConfig
 from wavelet.data.rl import PackedRLDataset, RLExample
 from wavelet.trainer.distributed import ParallelDims, World
 from wavelet.trainer.rl import RLTrainer

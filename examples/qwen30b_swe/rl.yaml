@@ -1,7 +1,11 @@
 model:
-  name: "Qwen/Qwen3-30B-A3B-Thinking-2507"
+  name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
   torch_dtype: bfloat16
-  attn_implementation: auto
+  attn_implementation: flash_attention_2
+  meta_device_init: true
+  experts_implementation: grouped_mm
+  moe_router_dtype: float32
+  freeze_moe_router: true
   trust_remote_code: true
   activation_checkpointing:
     mode: full
@@ -10,53 +14,81 @@ model:
 data:
   source: local
   path: outputs/qwen30b_swe_data/rl_train.jsonl
-  batch_size: 512
+  batch_size: 8
   micro_batch_size: 1
   pack_sequences: true
   seq_len: 32768
-  shuffle: true
+  shuffle: false
   seed: 42
 
 loss:
-  type: dppo
+  type: ipo
+  ipo_epsilon: 0.1
+  kl_tau: 0.001
 
 algo:
   type: grpo
+  normalize_advantages: false
 
 orchestrator:
   enabled: true
   custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
-  verifier_env_id: mini-swe-agent-plus
-  verifier_env_args:
-    max_turns: 200
-    cpu_cores: 2
-    memory_gb: 4
-    disk_size_gb: 4
-    labels: ["mini-swe-agent-plus"]
-    total_timeout_minutes: 720
-    sandbox_client_max_workers: 256
-    max_command_timeouts: 3
-    sandbox_command_timeout: 30
-  verifier_model: Qwen/Qwen3-30B-A3B-Thinking-2507
+  verifier_env_id: examples.qwen30b_swe.bridge_env
+  verifier_env_args: &native_args
+    native_python: .venv-native/bin/python
+    env_config: outputs/qwen30b_swe_data/train-env.json
+    dataset_path: outputs/qwen30b_swe_data/rl_train.jsonl
+    bridge_dir: outputs/qwen30b_swe_rl/logs/native
+    base_model: Qwen/Qwen3-30B-A3B-Instruct-2507
+    renderer: {name: qwen3}
+  verifier_model: Qwen/Qwen3-30B-A3B-Instruct-2507
   verifier_client_type: openai_chat_completions_token
-  examples_per_step: 64
-  rollouts_per_example: 8
-  oversampling_factor: 2.0
-  max_async_level: 8
-  max_off_policy_steps: 16
+  examples_per_step: 4
+  rollouts_per_example: 2
+  rollout_chunk_examples: 4
+  filter_zero_advantage: true
+  refill_zero_advantage: false
+  max_inflight_rollouts: 8
+  max_async_level: 3
+  max_off_policy_steps: 2
+
+eval:
+  eval_base_model: true
+  final_eval: true
+  interval: 2
+  num_examples: 4
+  rollouts_per_example: 1
+  sampling: &sampling
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    max_completion_tokens: 8192
+  env:
+    - id: examples.qwen30b_swe.bridge_env
+      name: swebench-fixed
+      args:
+        <<: *native_args
+        env_config: outputs/qwen30b_swe_data/eval-env.json
+        dataset_path: outputs/qwen30b_swe_data/rl_eval.jsonl
+        training: false
 
 inference:
   enabled: true
   mode: vllm_http
-  sampling:
-    max_completion_tokens: 32768
+  sampling: *sampling
   vllm:
     server_backend: openai
-    gpu_memory_utilization: 0.9
+    gpu_memory_utilization: 0.65
+    dtype: bfloat16
+    max_lora_rank: 32
     max_model_len: 32768
     tensor_parallel_size: 4
-    data_parallel_size: 2
-    data_parallel_size_local: 2
+    data_parallel_size: 1
+    data_parallel_size_local: 1
+    extra_args:
+      disable_custom_all_reduce: true
+      max_num_seqs: 64
+      moe_backend: triton
     enforce_eager: false
   http:
     request_timeout_seconds: 7200.0
@@ -74,16 +106,15 @@ fsdp:
   enabled: true
   backend: nccl
   dp_replicate: 1
-  dp_shard: -1
-  # Expert and context parallelism require explicit FSDP2 settings and are not
-  # enabled by this baseline recipe.
+  dp_shard: 8
   cp: 1
-  ep: 1
+  ep: 8
+  impl: fsdp2
 
 optim:
   type: adamw
   implementation: fused
-  lr: 1e-6
+  lr: 1e-5
 
 scheduler:
   type: constant
@@ -92,8 +123,15 @@ lora:
   rank: 32
   alpha: 64.0
   dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  optimization_dtype: float32
 
-max_steps: 500
+max_steps: 2
+
+ckpt:
+  mode: async
+  interval: 2
+  keep_last: 1
 seed: 42
 
 monitor:
@@ -101,15 +139,26 @@ monitor:
   wandb:
     enabled: true
     project: wavelet-qwen30b-swe
-    name: wavelet-qwen30b-swe-single-node
+    name: wavelet-qwen30b-swe-smoke
     mode: online
 
 launcher:
   mode: process
   backend: local
-  inference_cuda_visible_devices: "0,1,2,3,4,5,6,7"
-  trainer_cuda_visible_devices: "0,1,2,3,4,5,6,7"
-  trainer_num_processes: 8
+
+deployment:
+  type: multi_node
+  num_train_nodes: 1
+  num_inference_nodes: 1
+  gpus_per_node: 8
+  inference_replicas_per_node: 2
+slurm:
+  job_name: wavelet-swe-smoke
+  partition: gpu-nodes
+  time_limit: "04:00:00"
+  shared_fs: true
+  inference_cpus_per_replica: 16
+  inference_memory_per_replica: 512G
 
 output_dir: outputs/qwen30b_swe_rl
-clean_output_dir: true
+clean_output_dir: false

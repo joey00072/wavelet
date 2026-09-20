@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import (
     rl_examples_from_payload,
     rl_examples_to_payload,

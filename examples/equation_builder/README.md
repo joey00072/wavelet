@@ -92,9 +92,9 @@ uv run wavelet dashboard --runs-root outputs --port 8766
 ```
 
 Open `http://<host>:8766/`. To read the live state server directly instead,
-open the dashboard with `?api=http://<host>:8765`. The Inspector view sorts and
-filters rollouts by reward, advantage, and truncation; the Evals view tracks
-`avg@k` and `pass@k` per policy step. See the
+open the dashboard with `?api=http://<host>:8765`. The Traces tab filters saved
+episodes and opens their transcript and metadata; the Report tab tracks
+aggregate evaluation metrics and retained per-example results. See the
 [dashboard guide](../../webui/README.md).
 
 The smaller `rl.yaml` example instead uses process mode and assigns vLLM to GPU

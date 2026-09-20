@@ -92,9 +92,9 @@ replica's vLLM Prometheus load as `inference/replica_<n>/kv_cache_usage`,
 `requests_running`, `requests_waiting`, and `preemptions_delta` in
 `orchestrator_metrics.jsonl`. When the server exposes the token counters, the
 scraper also derives `generation_tokens_per_second` and
-`prompt_tokens_per_second` per replica. The dashboard's Infra view charts them
-per replica alongside trainer GPU memory, step timing, and per-node trainer
-throughput: `uv run wavelet dashboard --runs-root outputs`.
+`prompt_tokens_per_second` per replica. The dashboard's Metrics tab can search
+and chart those signals alongside trainer GPU memory, step timing, and per-node
+trainer throughput: `uv run wavelet dashboard --runs-root outputs`.
 
 The scraper also records `kv_capacity_tokens` and the served `max_model_len`.
 With `orchestrator.concurrency` enabled, their ratio seeds the in-flight cap;
@@ -115,8 +115,10 @@ change them only from observed KV, queue, preemption, and turnover metrics.
   128, 256, 320, or 512) and rejects ranks above 512 during config validation.
 - `server_backend`: `openai` should expose `/v1/chat/completions/tokens`.
 - `policy_step`: must match the expected trainer export after policy load.
-- `generation_paused`: should be false outside a full-model or collective
-  update. LoRA refreshes are quiesced by the rollout scheduler instead.
+- `generation_paused`: should be false outside a full-model or native-backend
+  update. OpenAI/vLLM LoRA refreshes hot-swap without pausing decoding or waiting
+  for agent episodes to finish; the scheduler advances only after all replicas
+  acknowledge the requested policy version.
 - `policy_adapter_path` or `policy_weight_path`: must point at the intended
   policy snapshot, not an old run.
 - `records_with_inference_logprobs`: should equal `records` for RL generation.

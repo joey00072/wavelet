@@ -10,8 +10,7 @@ import torch
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
-from wavelet.configs.config import CheckpointConfig
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import CheckpointConfig, RLConfig
 from wavelet.kernels.lora import LoRA_W
 from wavelet.kernels.smart_gc import WaveletCheckpointFunction
 from wavelet.trainer import model as model_module

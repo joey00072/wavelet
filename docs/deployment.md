@@ -101,6 +101,17 @@ config, generated `job.sbatch`, submitted job ID, allocation map, and per-role
 logs under the run directory. The submission command returns after `sbatch`
 accepts the job.
 
+The generated script invokes `python -m wavelet slurm-worker` inside the
+allocation; this internal command dispatches through the same CLI as the public
+training commands.
+
+Startup prints the allocated trainer/inference hosts, pending endpoints, and
+readiness times. OpenAI-compatible inference is ready only after `/health`,
+worker `/liveness`, and `/v1/models` checks succeed with the expected model.
+This establishes serving readiness; the orchestrator still waits for the
+trainer's initial policy export before generating training rollouts. Per-role
+logs identify the component to inspect when either phase stalls.
+
 SFT uses one torchrun agent per train node and one trainer process per GPU:
 
 ```yaml
@@ -156,6 +167,19 @@ slurm:
 `launcher.trainer_num_processes` remain single-node placement options. SLURM
 sets device visibility and the multi-node worker derives trainer process counts
 from `deployment.gpus_per_node`.
+Preflight validates FSDP against the total allocated trainer GPU count, regardless
+of the single-node `launcher.trainer_num_processes` setting.
+
+With online W&B enabled, the SLURM worker gives the trainer and orchestrator one
+shared run ID, recorded in `wandb_run_id.txt`. Supply credentials through the job
+environment or a private file sourced by `slurm.setup_commands`; do not embed API
+keys in YAML. Role environment values are redacted in resolved config artifacts,
+so they are not a credential transport across SLURM submission.
+The trainer owns shared run metadata. Both trainer and orchestrator flush their
+logs without setting final status; the launcher marks success or failure after
+joining and cleaning up all roles. This also applies to the local process
+launcher and prevents a late checkpoint save from leaving a completed run marked
+as crashed. Finalization failures are reported without masking a training error.
 
 Use `dry_run: true` to validate the config and write `job.sbatch` without
 calling `sbatch`. Inspect the exact script before allocating GPUs:
@@ -165,13 +189,33 @@ uv run python -m wavelet rl @ examples/multinode/rl.yaml --dry-run
 cat outputs/multinode_math_rl/configs/latest/job.sbatch
 ```
 
-The initial native backend intentionally has three explicit constraints:
+The native backend has these constraints:
 
 - the repository, environment, model/data inputs, and output directory must be
   visible at the same paths on every node (`slurm.shared_fs: true`);
-- split RL uses `policy_transfer.type: filesystem`;
+- LoRA split RL uses `policy_transfer.type: filesystem`; full-model runs can
+  use `policy_transfer.type: nccl`. The worker resolves a default loopback
+  broadcast address to the first trainer host, counts every inference GPU, and
+  assigns disjoint NCCL rank ranges to inference replicas. An explicit non-loopback
+  `nccl_host` is preserved and must route to the first trainer;
 - `tensor_parallel_size * (data_parallel_size_local or data_parallel_size)`
-  for one vLLM replica cannot exceed `deployment.gpus_per_node`.
+  multiplied by `deployment.inference_replicas_per_node` cannot exceed
+  `deployment.gpus_per_node`.
+
+`deployment.inference_replicas_per_node` defaults to one. For two independent
+four-GPU servers on an eight-GPU inference node, set it to `2`, set
+`inference.vllm.tensor_parallel_size: 4`, and set both `data_parallel_size` and
+`data_parallel_size_local` to `1`. SLURM allocates disjoint GPU subsets to the
+exclusive server steps; each replica gets its own endpoint and policy-sync rank
+range. This differs from one vLLM server with internal data parallelism, whose
+MoE workers may share communication across replicas. Measure both layouts for
+the intended batch/concurrency, especially when one replica becomes idle.
+Multiple replicas also require `slurm.inference_memory_per_replica` (for
+example `128G`) so one step cannot reserve the whole node's job memory. Set
+`slurm.inference_cpus_per_replica` for each server's CPU needs (default `1`).
+The allocation must have enough memory and CPUs for all simultaneous replicas.
+Server steps explicitly override the job's GPU-per-node reservation as well as
+its GPU-per-task count.
 
 Cluster-specific setup stays declarative. Use the typed partition, account,
 QoS, constraint, reservation, node list, CPU, memory, and time fields where

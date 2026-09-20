@@ -6,7 +6,6 @@ import json
 import os
 import re
 import sys
-import time
 import uuid
 from argparse import Namespace
 from http import HTTPStatus
@@ -53,7 +52,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.debug import inference_debug_state
 from wavelet.monitor import emit_perf
 from wavelet.utils.config import load_config
@@ -608,110 +607,6 @@ def _patch_load_lora_adapter() -> None:
     OpenAIServingModels.load_lora_adapter = patched_load_lora_adapter
 
 
-def _patch_lru_cache_worker_lora_manager() -> None:
-    from vllm.lora.request import LoRARequest
-    from vllm.lora.worker_manager import (
-        LRUCacheLoRAModelManager,
-        LRUCacheWorkerLoRAManager,
-    )
-
-    def patched_apply_adapters(
-        self: LRUCacheWorkerLoRAManager,
-        lora_requests: set[LoRARequest],
-    ) -> None:
-        loras_map = {
-            lora_request.lora_int_id: lora_request
-            for lora_request in lora_requests
-            if lora_request
-        }
-        if len(loras_map) > self._adapter_manager.lora_slots:
-            raise RuntimeError(
-                f"Number of requested LoRAs ({len(loras_map)}) is greater "
-                "than the number of GPU LoRA slots "
-                f"({self._adapter_manager.lora_slots})."
-            )
-        for lora in loras_map.values():
-            self.add_adapter(lora, force_load=False)
-
-    def patched_add_adapter(
-        self: LRUCacheWorkerLoRAManager,
-        lora_request: LoRARequest,
-        force_load: bool = True,
-    ) -> bool:
-        started_at = time.perf_counter()
-        loaded_paths = getattr(self, "_wavelet_loaded_lora_paths", None)
-        if loaded_paths is None:
-            loaded_paths = {}
-            self._wavelet_loaded_lora_paths = loaded_paths
-        loaded_path = loaded_paths.get(lora_request.lora_int_id)
-        should_load = (
-            lora_request.lora_int_id not in self.list_adapters()
-            or force_load
-            or (loaded_path is not None and loaded_path != lora_request.lora_path)
-        )
-        if should_load:
-            load_started_at = time.perf_counter()
-            lora = self._load_adapter(lora_request)
-            load_elapsed = time.perf_counter() - load_started_at
-
-            self._adapter_manager.remove_adapter(lora.id)
-
-            if len(self._adapter_manager) + 1 > self._adapter_manager.capacity:
-                assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
-                self._adapter_manager.remove_oldest_adapter()
-            add_started_at = time.perf_counter()
-            loaded = self._adapter_manager.add_adapter(lora)
-            add_elapsed = time.perf_counter() - add_started_at
-            if loaded:
-                loaded_paths[lora_request.lora_int_id] = lora_request.lora_path
-        else:
-            load_elapsed = 0.0
-            add_elapsed = 0.0
-            loaded = (
-                self._adapter_manager.get_adapter(lora_request.lora_int_id) is not None
-            )
-        activate_started_at = time.perf_counter()
-        self._adapter_manager.activate_adapter(lora_request.lora_int_id)
-        _log_lora_add_adapter_perf(
-            lora_request,
-            lora_id=lora_request.lora_int_id,
-            mode="load" if should_load else "touch",
-            load_elapsed=load_elapsed,
-            add_elapsed=add_elapsed,
-            activate_elapsed=time.perf_counter() - activate_started_at,
-            total_elapsed=time.perf_counter() - started_at,
-        )
-        return loaded
-
-    LRUCacheWorkerLoRAManager._apply_adapters = patched_apply_adapters
-    LRUCacheWorkerLoRAManager.add_adapter = patched_add_adapter
-
-
-def _log_lora_add_adapter_perf(
-    lora_request: Any,
-    *,
-    lora_id: int,
-    mode: str,
-    load_elapsed: float,
-    add_elapsed: float,
-    activate_elapsed: float,
-    total_elapsed: float,
-) -> None:
-    if lora_request.lora_name != "policy" or mode == "touch":
-        return
-    emit_perf(
-        "lora_add_adapter",
-        force=True,
-        name=lora_request.lora_name,
-        id=lora_id,
-        mode=mode,
-        load=load_elapsed,
-        add=add_elapsed,
-        activate=activate_elapsed,
-        total=total_elapsed,
-    )
-
-
 def _patch_lora_cpu_pin_memory() -> None:
     from vllm.lora import lora_model, lora_weights, model_manager
 
@@ -947,7 +842,7 @@ async def _load_full_model_policy(
         getattr(raw_request.app.state, "policy_step", None) == step
         and getattr(raw_request.app.state, "policy_weight_path", None) == weight_path
     )
-    if step != 0 and not unchanged:
+    if (step != 0 or config.policy_transfer.type == "nccl") and not unchanged:
         client = _engine_client(raw_request)
         if config.policy_transfer.type == "nccl":
             await client.collective_rpc(
@@ -1360,7 +1255,6 @@ def main(argv: list[str] | None = None) -> int:
     transformers_v5_compat()
     os.environ.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True")
     _patch_load_lora_adapter()
-    _patch_lru_cache_worker_lora_manager()
     _patch_skip_lora_module_warnings()
     _patch_lora_cpu_pin_memory()
     _patch_noisy_tool_parser_errors()

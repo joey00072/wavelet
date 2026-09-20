@@ -11,7 +11,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import wavelet.orchestrator.envs as verifier_envs
-from wavelet.configs.rl_config import RLConfig
+import wavelet.trainer.rl as trainer_runtime
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
 from wavelet.inference import server as inference_server
 from wavelet.inference.engine import (
@@ -342,6 +343,90 @@ def test_streaming_rollout_steps_on_chunk_boundary_with_variable_rows() -> None:
     assert steps == 100
     assert accumulator.accumulated_rows == 0
     assert accumulator.accumulated_chunks == 0
+
+
+def test_streaming_step_timing_includes_every_chunk_and_resets(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = RLConfig(
+        output_dir=tmp_path,
+        data={"batch_size": 2, "micro_batch_size": 1},
+        orchestrator={
+            "examples_per_step": 2,
+            "rollouts_per_example": 1,
+            "rollout_chunk_examples": 1,
+            "max_async_level": 2,
+        },
+    )
+    source = tmp_path / "source.jsonl"
+    source.write_text("{}\n")
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    batches = iter(
+        sender.publish(
+            source,
+            step=index,
+            optimizer_step=index // 2,
+            chunk_index=index % 2,
+            policy_step=index // 2,
+            rows=1,
+        )
+        for index in range(4)
+    )
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(trainer_runtime, "perf_counter", lambda: clock.now)
+
+    def advance(seconds: float) -> None:
+        clock.now += seconds
+
+    def receive():
+        advance(5.0)
+        return next(batches)
+
+    trainer = SimpleNamespace(
+        step=0,
+        world=SimpleNamespace(world_size=1, is_main=True),
+        dataset=SimpleNamespace(records=[]),
+        monitor=Mock(),
+        _optimizer_batch_loss_scale=1.0,
+        _loaded_micro_batch_count=1,
+        _accumulated_micro_batches=0,
+        _set_optimizer_batch_loss_scales=Mock(),
+        record_rollout_claim=Mock(),
+        record_rollout_consumed=Mock(),
+        load_rollout_path=lambda _path: advance(1.0),
+        prepare_for_training=Mock(),
+        offload_after_refit=Mock(),
+        export_policy=lambda **_kwargs: advance(3.0),
+    )
+
+    def train():
+        advance(2.0)
+        trainer._accumulated_micro_batches += 1
+        if trainer._accumulated_micro_batches < trainer.accumulation_steps:
+            return None
+        trainer.step += 1
+        trainer._accumulated_micro_batches = 0
+        return {"tokens/train": 200.0, "tokens/model": 400.0}
+
+    trainer.train_loaded_rollouts_once = train
+    _run_streaming_rollout_training(
+        config,
+        trainer,
+        receiver=SimpleNamespace(wait=receive),
+        target_step=2,
+    )
+    assert trainer.monitor.log.call_count == 2
+    for step, call in enumerate(trainer.monitor.log.call_args_list, start=1):
+        metrics = call.args[0]
+        assert call.kwargs["step"] == step
+        assert metrics["perf/train_seconds"] == 4.0
+        assert metrics["perf/rollout_wait_seconds"] == 10.0
+        assert metrics["perf/rollout_load_seconds"] == 2.0
+        assert metrics["perf/policy_export_seconds"] == 3.0
+        assert metrics["time/step"] == 19.0
+        assert metrics["perf/throughput"] == 100.0
+        assert metrics["perf/step_tokens_per_second"] == pytest.approx(400 / 19)
 
 
 def test_streaming_rollout_waits_for_full_chunk_group_when_rows_overshoot() -> None:
@@ -782,7 +867,7 @@ def test_process_roles_share_one_online_wandb_run(monkeypatch, tmp_path: Path) -
     assert trainer.env_vars["WANDB_SHARED_LABEL"] == "trainer"
     assert trainer.env_vars["WANDB_SHARED_PRIMARY"] == "trainer"
     assert orchestrator.env_vars["WANDB_SHARED_LABEL"] == "orchestrator"
-    assert orchestrator.env_vars["WANDB_SHARED_FINISHER"] == "orchestrator"
+    assert orchestrator.env_vars["WANDB_SHARED_FINISHER"] == "launcher"
     assert "WANDB_RUN_ID" not in inference_server.env_vars
     assert (tmp_path / "wandb_run_id.txt").read_text() == shared_env["WANDB_RUN_ID"]
 
@@ -1206,7 +1291,7 @@ def test_http_openai_load_policy_uses_immutable_snapshot_path(
 
     engine.load_policy(policy_dir, step=7)
 
-    payload = calls[0][2]
+    payload = next(call[2] for call in calls if call[1] == "/load_policy")
     assert payload is not None
     assert Path(payload["policy_dir"]) == policy_dir
     assert payload["adapter_name"] == "policy"

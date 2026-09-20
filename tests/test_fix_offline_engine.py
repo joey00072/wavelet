@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from vllm.lora.request import LoRARequest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
 from wavelet.inference import engine as engine_module
 from wavelet.inference.engine import VLLMPolicyInferenceEngine

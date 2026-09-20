@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.sft import OptimizerConfig
+from wavelet.configs.config import OptimizerConfig, RLConfig
 
 
 def test_legacy_optimizer_normalization_does_not_mutate_input() -> None:

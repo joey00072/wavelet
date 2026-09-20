@@ -36,7 +36,11 @@ RL records use `RLExample` from `wavelet.data.rl`. The stages are:
 4. RL packing helpers pack prepared samples and pad the bin count to a
    multiple of `data_world_size * micro_batch_size` with explicit zero-loss
    samples, so every rank's epoch splits into whole micro-batches and the last
-   micro-batch never pulls bins from the next epoch.
+   micro-batch never pulls bins from the next epoch. Rank assignment balances
+   estimated linear model work plus quadratic attention work for each packed
+   sequence, reusing the trainer's FLOP estimates. Models without an estimate
+   fall back to token counts. Assignment preserves every bin and gives each
+   rank the same number of micro-batches.
 5. `collate_rl_batch` pads a local micro-batch and aligns trainable-token value
    streams with the full token sequence.
 
@@ -70,15 +74,28 @@ sampled `inference_logprobs` belong to the original token stream. A row whose
 trainable tokens all fall beyond `seq_len` is kept as a zero-loss row (with a
 warning) rather than skipped: skipping would pull the next epoch's row into the
 current optimizer batch and duplicate rollouts. Internally marked dummy and
-filtered rollout rows are retained the same way so distributed batch counts and
-rollout metrics stay correct, while their empty loss mask prevents optimizer
-impact. Only rows that were actually cut at `seq_len` may carry value streams
+filtered rollout rows remain in the batch so distributed counts and rollout
+metrics stay correct. Filtered text rows with no trainable tokens are compacted
+to one zero-loss token after validation, preserving their reward and sample count
+without forwarding the discarded context. Rows carrying multimodal tensors keep
+their original shape. Only rows that were actually cut at `seq_len` may carry value streams
 longer than their remaining trainable tokens.
 
 Packing never places rows with and without `inference_logprobs` (or
 `teacher_logprobs`) in the same bin, since a merged bin can only carry a stream
 for all of its rows or none. `data.pad_to_multiple_of` must divide
 `data.seq_len` so padded bins never exceed the configured length.
+Packed reward means are weighted by rollout counts. Continuation branches with
+`metadata._wavelet_rollout_count: 0` retain their training tokens but contribute
+no additional reward observation; branching and bin placement must not change
+the rollout reward mean. Both trainer reward metric names derive from the same
+globally weighted result rather than separate micro-batch accumulators.
+
+Rerendered multi-turn prompts merge earlier sampled spans only when their exact
+ordered placement is unambiguous. Span search uses linear-time prefix fallback;
+comparing the earliest and latest valid placements detects ambiguity without
+recursive enumeration. Repeated tokens and overlapping candidate spans preserve
+the same conservative branch separation, masks, and sampled logprobs.
 
 For chat data, the generation prompt is rendered whenever the next message is an
 assistant turn, so assistant headers are never trainable regardless of whether a
@@ -101,3 +118,10 @@ For local code changes, the fastest focused verification is:
 ```bash
 uv run pytest tests/test_rl_dataset.py tests/test_tokenization_alignment.py
 ```
+
+Verifier trace metadata identifies a training branch with `rollout_key`. When
+an environment supplies `trajectory_id`, the key includes the group, trajectory,
+and branch index, so separate episodes in one group remain distinguishable.
+`group_key` still identifies the reward/advantage group. Environments without a
+trajectory ID retain the group-and-branch fallback; that fallback is not a unique
+episode identifier.

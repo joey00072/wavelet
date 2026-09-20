@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from types import MethodType
+from inspect import unwrap
+from types import MethodType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -10,8 +11,9 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+from torch.utils.hooks import RemovableHandle
 
-from wavelet.configs.sft import ModelConfig
+from wavelet.configs.config import ModelConfig
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -22,6 +24,9 @@ HF_MOE_ROUTER_CLASS_NAMES = frozenset(
     {
         "GptOssTopKRouter",
         "Qwen3MoeTopKRouter",
+        "Qwen3_5MoeTopKRouter",
+        "NemotronHTopKRouter",
+        "NemotronHTopkRouter",
     }
 )
 
@@ -29,6 +34,8 @@ HF_MOE_EXPERT_CLASS_NAMES = frozenset(
     {
         "GptOssExperts",
         "Qwen3MoeExperts",
+        "Qwen3_5MoeExperts",
+        "NemotronHExperts",
     }
 )
 
@@ -115,6 +122,8 @@ def hf_moe_experts(model: nn.Module) -> list[nn.Module]:
 def configure_hf_moe_expert_parallel(
     model: nn.Module,
     parallel_dims: ParallelDims,
+    *,
+    grouped_mm: bool = False,
 ) -> int:
     """Shard supported HF experts and install token dispatch across EP ranks."""
     if not parallel_dims.ep_enabled:
@@ -129,6 +138,7 @@ def configure_hf_moe_expert_parallel(
     ep_mesh = parallel_dims.get_mesh("ep")
     for expert_module in experts:
         _configure_expert_module(expert_module, ep_mesh)
+        expert_module._wavelet_ep_grouped_mm = grouped_mm
     return len(experts)
 
 
@@ -149,7 +159,9 @@ def _configure_expert_module(module: nn.Module, ep_mesh: DeviceMesh) -> None:
             [Shard(0)],
             src_data_rank=None,
         )
-        module.register_parameter(name, nn.Parameter(sharded))
+        module.register_parameter(
+            name, nn.Parameter(sharded, requires_grad=parameter.requires_grad)
+        )
 
     object.__setattr__(module, "_wavelet_ep_group", ep_mesh.get_group())
     object.__setattr__(module, "_wavelet_ep_size", ep_size)
@@ -231,39 +243,33 @@ def _run_local_experts(
     hidden_states: Tensor,
     expert_indices: Tensor,
 ) -> Tensor:
-    output = torch.zeros_like(hidden_states)
-    local_experts = int(module._wavelet_ep_local_experts)  # type: ignore[attr-defined]
-    gate_up_proj = _local_parameter(module, "gate_up_proj")
-    down_proj = _local_parameter(module, "down_proj")
-    is_gpt_oss = type(module).__name__ == "GptOssExperts"
-    for expert_index in range(local_experts):
-        positions = torch.where(expert_indices == expert_index)[0]
-        if positions.numel() == 0:
-            continue
-        current = hidden_states[positions]
-        if is_gpt_oss:
-            gate_up = current @ gate_up_proj[expert_index]
-            gate_up = (
-                gate_up + _local_parameter(module, "gate_up_proj_bias")[expert_index]
-            )
-            activated = module._apply_gate(gate_up)  # type: ignore[attr-defined]
-            current_output = activated @ down_proj[expert_index]
-            current_output = (
-                current_output
-                + _local_parameter(module, "down_proj_bias")[expert_index]
-            )
-        else:
-            gate, up = nn.functional.linear(
-                current,
-                gate_up_proj[expert_index],
-            ).chunk(2, dim=-1)
-            activated = module.act_fn(gate) * up  # type: ignore[attr-defined]
-            current_output = nn.functional.linear(
-                activated,
-                down_proj[expert_index],
-            )
-        output.index_copy_(0, positions, current_output.to(output.dtype))
-    return output
+    from transformers.integrations.moe import grouped_mm_experts_forward
+
+    # Use HF's expert implementations with local shards. Each dispatched row
+    # already belongs to one expert, so routing weights here are all one.
+    local = SimpleNamespace(
+        num_experts=module._wavelet_ep_local_experts,
+        has_gate=getattr(module, "gate_up_proj", None) is not None,
+        has_bias=getattr(module, "down_proj_bias", None) is not None,
+        is_transposed=type(module).__name__ == "GptOssExperts",
+        act_fn=getattr(module, "act_fn", None),
+        _apply_gate=getattr(module, "_apply_gate", None),
+        **{
+            name: _local_parameter(module, name)
+            for name, _ in module.named_parameters(recurse=False)
+        },
+    )
+    forward = (
+        grouped_mm_experts_forward
+        if getattr(module, "_wavelet_ep_grouped_mm", False)
+        else unwrap(type(module).forward)
+    )
+    return forward(
+        local,
+        hidden_states,
+        expert_indices.unsqueeze(-1),
+        hidden_states.new_ones((len(hidden_states), 1)),
+    )
 
 
 def configure_hf_moe_routers(model: nn.Module, config: ModelConfig) -> int:
@@ -281,6 +287,9 @@ def configure_hf_moe_routers(model: nn.Module, config: ModelConfig) -> int:
         # silently add the Transformers auxiliary router loss to fused SFT.
         if hasattr(model.config, "router_aux_loss_coef"):
             model.config.router_aux_loss_coef = 0.0
+        for owner in model.modules():
+            if hasattr(owner, "router_aux_loss_coef"):
+                owner.router_aux_loss_coef = 0.0
 
     for router in routers:
         if config.freeze_moe_router:
@@ -289,6 +298,66 @@ def configure_hf_moe_routers(model: nn.Module, config: ModelConfig) -> int:
         if config.moe_router_dtype == "float32":
             _configure_fp32_router(router)
     return len(routers)
+
+
+@torch.no_grad()
+def update_moe_selection_bias(
+    model: nn.Module,
+    *,
+    process_group: Any | None = None,
+) -> int:
+    """Apply the reference auxiliary-loss-free routing update.
+
+    For each native DeepSeek MoE layer, the update is
+    ``coeff * sign(mean(counts) - counts)``, centered to zero, then the
+    nonpersistent usage counter is cleared.  Counts are reduced before the
+    update when a process group is supplied (or when the default group is
+    initialized), so every rank applies the same bias.
+    """
+    layers = [
+        module for module in model.modules() if hasattr(module, "tokens_per_expert")
+    ]
+    if not layers:
+        return 0
+    for layer in layers:
+        counts = layer.tokens_per_expert
+        can_update_bias = (
+            hasattr(layer, "router")
+            and getattr(layer.router, "selection_bias", None) is not None
+            and getattr(layer, "load_balance_coeff", None) is not None
+        )
+        if can_update_bias and (process_group is not None or dist.is_initialized()):
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=process_group)
+        if can_update_bias and counts.numel() and bool(counts.sum() > 0):
+            delta = float(layer.load_balance_coeff) * torch.sign(counts.mean() - counts)
+            delta.sub_(delta.mean())
+            layer.router.selection_bias.add_(delta.to(layer.router.selection_bias))
+        counts.zero_()
+    return len(layers)
+
+
+def install_moe_load_balance_hook(
+    optimizer: torch.optim.Optimizer,
+    model: nn.Module,
+    *,
+    process_group: Any | None = None,
+) -> RemovableHandle:
+    """Install selection-bias updates immediately before optimizer steps."""
+    mark_moe_buffers_ddp_ignored(model)
+
+    def _hook(*_args: Any, **_kwargs: Any) -> None:
+        update_moe_selection_bias(model, process_group=process_group)
+
+    return optimizer.register_step_pre_hook(_hook)
+
+
+def mark_moe_buffers_ddp_ignored(model: nn.Module) -> None:
+    """Mark usage counters so DDP does not broadcast rank-local accumulation."""
+    ignored = set(getattr(model, "_ddp_params_and_buffers_to_ignore", set()))
+    for name, _buffer in model.named_buffers():
+        if name.endswith("tokens_per_expert"):
+            ignored.add(name)
+    model._ddp_params_and_buffers_to_ignore = ignored
 
 
 def _configure_fp32_router(router: nn.Module) -> None:

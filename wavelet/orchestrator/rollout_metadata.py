@@ -14,11 +14,17 @@ def rollout_task_harness_metadata(
     example_id = output.get("example_id")
     harness_name = str(output.get("harness_name") or task_name)
     harness_type = str(output.get("harness_type") or "environment")
-    rollout_key = f"{group_key}:{sample_index}"
+    trajectory_id = output.get("trajectory_id")
+    rollout_key = (
+        f"{group_key}:{trajectory_id}:{sample_index}"
+        if trajectory_id is not None
+        else f"{group_key}:{sample_index}"
+    )
     trajectory = output.get("trajectory")
     trajectory = trajectory if isinstance(trajectory, list) else []
     timing_seconds = _timing_seconds(output.get("timing"))
     return {
+        "rollout_key": rollout_key,
         "task": {
             "name": task_name,
             "example_id": example_id,

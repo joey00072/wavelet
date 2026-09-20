@@ -24,7 +24,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
-from wavelet.configs.sft import FSDPConfig, SFTConfig
+from wavelet.configs.config import FSDPConfig, SFTConfig
 from wavelet.data.sft import Example, load_records, setup_dataloader, setup_dataset
 from wavelet.kernels.patch import (
     patch_fused_mlp,
@@ -58,16 +58,24 @@ from wavelet.trainer.model import (
     compile_transformer_layers,
     enforce_single_lora_adapter,
     export_model_for_save,
+    freeze_vision_encoder,
     load_fsdp2_model_from_hf,
     maybe_wrap_ddp,
     maybe_wrap_fsdp,
+    multimodal_forward_kwargs,
     prepare_hf_tp_lora_for_training,
     save_model,
     setup_model,
+    setup_processor,
     setup_tokenizer,
     sync_hf_tp_lora_replicated_grads,
+    validate_lora_trainability,
 )
-from wavelet.trainer.moe import configure_hf_moe_routers, moe_load_balance_metrics
+from wavelet.trainer.moe import (
+    configure_hf_moe_routers,
+    install_moe_load_balance_hook,
+    moe_load_balance_metrics,
+)
 from wavelet.trainer.optim import (
     OffloadActivations,
     enable_optimizer_state_offload,
@@ -99,7 +107,7 @@ from wavelet.utils.pathing import (
 from wavelet.utils.serialization import dump_yaml
 
 if TYPE_CHECKING:
-    from wavelet.configs.rl_config import RLConfig
+    from wavelet.configs.config import RLConfig
 
 
 logger = logging.getLogger(__name__)
@@ -195,6 +203,7 @@ class BaseTrainer:
     def __init__(self, config: SFTConfig | RLConfig) -> None:
         self.config = config
         self.tokenizer: PreTrainedTokenizerBase | None = None
+        self.processor: Any | None = None
         self.model: PreTrainedModel | None = None
         self.dataset: IterableDataset | None = None
         self.optimizer: Optimizer | None = None
@@ -227,6 +236,7 @@ class BaseTrainer:
         self._setup_seed()
         self._setup_distributed()
         self._setup_tokenizer()
+        self.processor = setup_processor(self.config.model)
         self._setup_model()
         self._setup_data()
         self._setup_optimizer()
@@ -367,7 +377,7 @@ class BaseTrainer:
                     self._maybe_start_step_profiler(self.step + 1)
                     prepared_batch = self._prepare_batch(batch)
                     output = self._train_step(prepared_batch)
-                    self._record_progress(prepared_batch)
+                    self._record_progress(prepared_batch, output)
                     if not output.stepped:
                         continue
                     self._after_optimizer_step()
@@ -563,7 +573,11 @@ class BaseTrainer:
     def _setup_model(self) -> None:
         # Apply Liger kernel patches before from_pretrained so the class methods
         # are in place when model weights are loaded.
-        apply_liger_kernel(self.config.loss_impl, self.config.model.name)
+        apply_liger_kernel(
+            self.config.loss_impl,
+            self.config.model.name,
+            trust_remote_code=self.config.model.trust_remote_code,
+        )
         fsdp_config = self.config.fsdp
         use_fsdp2_meta_init = self._use_fsdp2_meta_init(fsdp_config)
         self._validate_model_execution_mode(fsdp_config)
@@ -579,6 +593,11 @@ class BaseTrainer:
             parallel_dims=self.parallel_dims,
             initialize_on_meta=use_fsdp2_meta_init,
         )
+        if (
+            getattr(model.config, "model_type", None) == "deepseek_v4"
+            and self.config.loss_impl != "torch"
+        ):
+            raise ValueError('Native eager DeepSeek-V4 requires loss_impl="torch".')
         # Keep the compatibility default aligned with the base model while allowing
         # explicit FP32 adapter parameters for higher-fidelity optimizer updates.
         # "auto" + "model" aligns to whatever dtype the base weights loaded as.
@@ -596,6 +615,11 @@ class BaseTrainer:
             match_base_dtype=(lora_dtype is None and cfg_dtype == "auto"),
         )
         configure_hf_moe_routers(model, self.config.model)
+        if (
+            self.config.model.vlm is not None
+            and self.config.model.vlm.freeze_vision_encoder
+        ):
+            freeze_vision_encoder(model, self.config.model.vlm.vision_encoder_attr)
         self._model_flops_per_token = estimate_training_flops_per_token(
             model,
             seq_len=self.config.data.seq_len,
@@ -626,6 +650,8 @@ class BaseTrainer:
                 world=self._require_world(),
                 cpu_offload=bool(fsdp_config.cpu_offload),
             )
+        if self.config.lora is not None:
+            validate_lora_trainability(self.model)
 
     def _tp_enabled(self) -> bool:
         return self.parallel_dims is not None and self.parallel_dims.tp_enabled
@@ -746,6 +772,7 @@ class BaseTrainer:
             self.config.data,
             data_rank=data_rank,
             data_world_size=data_world_size,
+            processor=self.processor,
         )
 
     def _data_partition(self) -> tuple[int, int]:
@@ -789,6 +816,7 @@ class BaseTrainer:
             self.config.optim,
             self.model.named_parameters(),
         )
+        install_moe_load_balance_hook(self.optimizer, self.model)
         if self.config.optim.cpu_offload:
             enable_optimizer_state_offload(self.optimizer)
 
@@ -955,7 +983,9 @@ class BaseTrainer:
             total_samples=self.total_samples,
         )
 
-    def _record_progress(self, batch: dict[str, torch.Tensor]) -> None:
+    def _record_progress(
+        self, batch: dict[str, torch.Tensor], output: TrainOutput
+    ) -> None:
         input_ids = batch.get("input_ids")
         if input_ids is None:
             return
@@ -1059,7 +1089,7 @@ class BaseTrainer:
         if self.world is None or self.model is None or self.tokenizer is None:
             return
         saveable_model, state_dict = export_model_for_save(self.model)
-        save_model(
+        target = save_model(
             saveable_model,
             self.tokenizer,
             self.output_dir,
@@ -1068,7 +1098,9 @@ class BaseTrainer:
             parallel_dims=self.parallel_dims,
         )
         if self.world.is_main:
-            logger.info("Model saved to %s", self.output_dir)
+            if self.processor is not None:
+                self.processor.save_pretrained(target)
+            logger.info("Model saved to %s", target)
 
 
 class SFTTrainer(BaseTrainer):
@@ -1080,6 +1112,7 @@ class SFTTrainer(BaseTrainer):
         self._validated_steps: set[int] = set()
         self._step_started_at: float | None = None
         self._sft_moe_metric_accum: list[dict[str, float]] = []
+        self._sft_accumulated_tokens = 0.0
 
     def _setup_data(self) -> None:
         super()._setup_data()
@@ -1109,6 +1142,7 @@ class SFTTrainer(BaseTrainer):
             data_world_size=data_world_size,
             records=self._val_records,
             max_epochs_per_iteration=1,
+            processor=self.processor,
         )
         return setup_dataloader(
             self.val_dataset,
@@ -1158,20 +1192,27 @@ class SFTTrainer(BaseTrainer):
                     batch = self._prepare_batch(raw_batch)
                     with self._context_parallel_batch(batch):
                         loss_output = self._forward_loss(batch)
-                    token_count = (batch["labels"] != -100).sum()
+                    token_count = loss_output.metrics.pop(
+                        "_token_count", (batch["labels"] != -100).sum()
+                    )
                     if token_count.item() == 0:
                         continue
-                    loss = loss_output.loss.detach()
+                    loss = loss_output.metrics.pop(
+                        "_loss_sum", loss_output.loss.detach() * token_count
+                    )
                     if not torch.isfinite(loss).all():
                         nonfinite_batches += 1
                         continue
-                    total_loss += loss.float() * token_count
+                    total_loss += loss.float()
                     total_tokens += token_count
 
             if torch.distributed.is_initialized():
+                reduction_group = None
+                if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+                    reduction_group = self.parallel_dims.get_mesh("dp_cp").get_group()
                 for value in (total_loss, total_tokens, nonfinite_batches):
                     torch.distributed.all_reduce(
-                        value, op=torch.distributed.ReduceOp.SUM
+                        value, op=torch.distributed.ReduceOp.SUM, group=reduction_group
                     )
             if nonfinite_batches.item() > 0:
                 logger.warning(
@@ -1194,13 +1235,13 @@ class SFTTrainer(BaseTrainer):
         self.val_dataloader = self._build_validation_dataloader()
 
     def _setup_accumulation_steps(self) -> None:
-        world_size = self._require_world().world_size
-        global_micro_batch = self.config.data.micro_batch_size * world_size
+        data_world_size = self._data_parallel_world_size()
+        global_micro_batch = self.config.data.micro_batch_size * data_world_size
         if self.config.data.batch_size % global_micro_batch != 0:
             raise ValueError(
                 "SFT data.batch_size is the global optimizer batch size and must be "
-                "divisible by data.micro_batch_size * world_size "
-                f"({self.config.data.micro_batch_size} * {world_size})."
+                "divisible by data.micro_batch_size * data_world_size "
+                f"({self.config.data.micro_batch_size} * {data_world_size})."
             )
         self.accumulation_steps = self.config.data.batch_size // global_micro_batch
 
@@ -1232,7 +1273,17 @@ class SFTTrainer(BaseTrainer):
 
             self._require_finite_loss(loss, label="SFT loss")
 
-            (loss / self.accumulation_steps).backward()
+            if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+                group = self.parallel_dims.get_mesh("dp_cp").get_group()
+                count = (batch["labels"] != -100).sum().float()
+                torch.distributed.all_reduce(count, group=group)
+                average_count = float(count.item()) / torch.distributed.get_world_size(
+                    group
+                )
+                self._sft_accumulated_tokens += average_count
+                (loss * average_count).backward()
+            else:
+                (loss / self.accumulation_steps).backward()
 
         self._sft_moe_metric_accum.append(
             {
@@ -1244,6 +1295,16 @@ class SFTTrainer(BaseTrainer):
 
         self._micro_step += 1
         if self._micro_step % self.accumulation_steps == 0:
+            if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
+                denominator = (
+                    self._sft_accumulated_tokens
+                    if self._sft_accumulated_tokens > 0
+                    else 1.0
+                )
+                for parameter in self.model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(denominator)
+                self._sft_accumulated_tokens = 0.0
             sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
             grad_norm = (
                 self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
@@ -1258,11 +1319,7 @@ class SFTTrainer(BaseTrainer):
                 stepped=True,
                 metrics={
                     "loss": float(loss.detach().item()),
-                    **(
-                        {"optim/grad_norm": grad_norm}
-                        if grad_norm is not None
-                        else {}
-                    ),
+                    **({"optim/grad_norm": grad_norm} if grad_norm is not None else {}),
                     **moe_metrics,
                     **self._finish_step_performance_metrics(),
                 },
@@ -1333,30 +1390,45 @@ class SFTTrainer(BaseTrainer):
         attn_mask = batch.get("attention_mask")
         if attn_mask is not None and attn_mask.all():
             attn_mask = None
+        position_ids = (
+            None
+            if getattr(self.config.model, "vlm", None) is not None
+            else batch["position_ids"]
+        )
 
-        if self.config.loss_impl == "liger_fused":
+        if self.config.loss_impl == "liger_fused" and (batch["labels"] != -100).any():
             # Wavelet's labels are pre-shifted, so shift_labels avoids a
             # second shift inside Liger's fused linear cross-entropy.
             with self._model_forward_context():
                 outputs = self.model(
                     input_ids=batch["input_ids"],
                     attention_mask=attn_mask,
-                    position_ids=batch["position_ids"],
+                    position_ids=position_ids,
                     shift_labels=batch["labels"],
+                    **multimodal_forward_kwargs(batch),
                 )
+            metrics = moe_load_balance_metrics(
+                self.model,
+                outputs,
+                token_mask=batch.get("attention_mask"),
+            )
+            metrics.update(
+                {
+                    "_token_count": (batch["labels"] != -100).sum().detach(),
+                    "_loss_sum": outputs.loss.detach()
+                    * (batch["labels"] != -100).sum().detach(),
+                }
+            )
             return LossOutput(
-                loss=outputs.loss,
-                metrics=moe_load_balance_metrics(
-                    self.model,
-                    outputs,
-                    token_mask=batch.get("attention_mask"),
-                ),
+                loss=self._normalize_fused_loss(outputs.loss, batch["labels"]),
+                metrics=metrics,
             )
         with self._model_forward_context():
             outputs = self.model(
                 input_ids=batch["input_ids"],
                 attention_mask=attn_mask,
-                position_ids=batch["position_ids"],
+                position_ids=position_ids,
+                **multimodal_forward_kwargs(batch),
             )
         result = self.compute_loss(outputs.logits, batch["labels"])
         result.metrics.update(
@@ -1367,6 +1439,24 @@ class SFTTrainer(BaseTrainer):
             )
         )
         return result
+
+    def _normalize_fused_loss(self, loss: Tensor, labels: Tensor) -> Tensor:
+        """Convert a CP-local fused mean into the global-token objective."""
+        if not self.parallel_dims or not self.parallel_dims.cp_enabled:
+            return loss
+        group = self.parallel_dims.get_mesh("dp_cp").get_group()
+        local_count = (labels != -100).sum().detach()
+        global_count = local_count.clone()
+        torch.distributed.all_reduce(
+            global_count, op=torch.distributed.ReduceOp.SUM, group=group
+        )
+        group_size = torch.distributed.get_world_size(group)
+        scale = torch.where(
+            global_count > 0,
+            local_count.float() * group_size / global_count.float(),
+            torch.zeros_like(global_count, dtype=loss.dtype),
+        )
+        return loss * scale
 
     def compute_loss(
         self,
@@ -1385,9 +1475,32 @@ class SFTTrainer(BaseTrainer):
         flat_labels = labels.view(-1)
         total_loss = logits.new_zeros(())
         valid = (flat_labels != -100).sum()
+        normalization_count = valid
+        normalization_group_size = 1
+        if (
+            self.parallel_dims is not None
+            and self.parallel_dims.cp_enabled
+            and torch.distributed.is_initialized()
+        ):
+            normalization_count = valid.detach().clone()
+            normalization_group = self.parallel_dims.get_mesh("dp_cp").get_group()
+            normalization_group_size = torch.distributed.get_world_size(
+                normalization_group
+            )
+            torch.distributed.all_reduce(
+                normalization_count,
+                op=torch.distributed.ReduceOp.SUM,
+                group=normalization_group,
+            )
         if valid == 0:
             # Keep the zero attached to the graph so backward() still works.
-            return LossOutput(loss=logits.sum() * 0.0)
+            return LossOutput(
+                loss=logits.sum() * 0.0,
+                metrics={
+                    "_loss_sum": total_loss.detach(),
+                    "_token_count": valid.detach(),
+                },
+            )
 
         for start in range(0, B * L, chunk):
             end = min(start + chunk, B * L)
@@ -1399,10 +1512,18 @@ class SFTTrainer(BaseTrainer):
             total_loss = total_loss + chunk_loss
 
         del logits
-        loss = total_loss / valid.float()
+        # CP shards the sequence, so each rank sees only a fraction of
+        # supervised tokens. Normalize by the global count to keep the update
+        # invariant with the equivalent non-CP batch.
+        loss = total_loss * normalization_group_size / normalization_count.float()
         return LossOutput(
             loss=loss,
-            metrics={"nll": loss.detach(), "tokens/train": valid.detach()},
+            metrics={
+                "nll": loss.detach(),
+                "tokens/train": valid.detach(),
+                "_loss_sum": total_loss.detach(),
+                "_token_count": valid.detach(),
+            },
         )
 
 

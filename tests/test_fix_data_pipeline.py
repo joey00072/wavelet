@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import itertools
 
-from wavelet.configs.rl_config import RLDataConfig
-from wavelet.configs.sft import LossMaskConfig
+from wavelet.configs.config import LossMaskConfig, RLDataConfig
 from wavelet.data.rl import (
     FakeRLDataset,
     PackedRLDataset,

@@ -122,6 +122,23 @@ def context_parallel_batch(
         yield
         return
 
+    if extra_buffers and any(buffer.ndim >= 4 for buffer, _ in extra_buffers):
+        raise ValueError(
+            "Context parallelism currently does not support explicit 4D "
+            "attention bias/masks with the experimental ring backend."
+        )
+
+    attention_mask = batch.get("attention_mask")
+    if (
+        attention_mask is not None
+        and attention_mask.ndim == 2
+        and not bool(attention_mask.all())
+    ):
+        raise ValueError(
+            "Context parallelism currently requires an all-ones 2D attention "
+            "mask; padding masks are unsupported by the experimental ring backend."
+        )
+
     from torch.distributed.tensor.experimental import context_parallel
 
     buffers = [

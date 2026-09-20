@@ -13,7 +13,7 @@ from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any, ClassVar
 
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
     RLAlgorithmConfig,
     RLConfig,
     RLEvalEnvConfig,
@@ -42,6 +42,7 @@ from wavelet.orchestrator.curriculum import Curriculum
 # ``wavelet.orchestrator.verifiers`` aliases this module, so a few env helpers
 # are re-exported here for that public path even when unused below.
 from wavelet.orchestrator.envs import (
+    LiveTraceContext,
     _assign_group_advantages,
     _assign_rollout_advantages,  # noqa: F401
     _completed_group_outputs,
@@ -340,6 +341,7 @@ def generate_rollouts(
         env_id,
         config.orchestrator.verifier_env_args,
         _verifier_extra_env_kwargs(config),
+        model_config=config.model if config.model.vlm is not None else None,
     )
     env_load_seconds = perf_counter() - env_started_at
     clients = _verifier_clients(vf, config, base_urls=base_urls)
@@ -377,6 +379,13 @@ def generate_rollouts(
             env_name=_env_name(env, fallback=env_id),
             admission=admission,
             failure_stats=failure_stats,
+            live_trace=LiveTraceContext(
+                config.output_dir,
+                _env_name(env, fallback=env_id),
+                None,
+                policy_step,
+                enabled=getattr(config.orchestrator, "live_traces", True),
+            ),
         )
     )
     orchestrator.add_rollout_metrics(failure_stats.consume_metrics())
@@ -386,7 +395,13 @@ def generate_rollouts(
             output["_wavelet_policy_end_step"] = policy_step
     rollout_seconds = perf_counter() - rollout_started_at
     convert_started_at = perf_counter()
-    records = [record for output in outputs for record in _records_from_output(output)]
+    records = [
+        record
+        for output in outputs
+        for record in _records_from_output(
+            output, require_multimodal_capture=config.model.vlm is not None
+        )
+    ]
     records = annotate_distillation_records(
         records,
         config,
@@ -450,6 +465,7 @@ class VerifierRolloutScheduler:
                 spec.id,
                 spec.args,
                 _verifier_extra_env_kwargs(config),
+                model_config=config.model if config.model.vlm is not None else None,
             )
             data_config = config.data
             if spec.data_path is not None:
@@ -751,6 +767,8 @@ class VerifierRolloutScheduler:
                     if self._has_trainable_batch(outputs):
                         break
                     attempt += 1
+                    accepted_groups = 0
+                    accepted_tokens = 0
                     self._raise_if_retries_exhausted(
                         completed_groups=completed_groups,
                         max_completed_groups=max_completed_groups,
@@ -758,11 +776,9 @@ class VerifierRolloutScheduler:
                         target_groups=target_groups,
                         accepted_tokens=accepted_tokens,
                         target_tokens=target_tokens,
-                        rejected_groups=rejected_groups,
+                        rejected_groups=completed_groups,
                     )
                     outputs = []
-                    accepted_groups = 0
-                    accepted_tokens = 0
 
                 await self._wait_for_policy_update()
                 self._set_group_admission_target(
@@ -860,7 +876,11 @@ class VerifierRolloutScheduler:
 
     def _has_trainable_batch(self, outputs: list[dict[str, Any]]) -> bool:
         records = [
-            record for output in outputs for record in _records_from_output(output)
+            record
+            for output in outputs
+            for record in _records_from_output(
+                output, require_multimodal_capture=self.config.model.vlm is not None
+            )
         ]
         records = self._finalize_environment_records(records, distill=False)
         return _has_trainable_rollout_record(records)
@@ -962,7 +982,11 @@ class VerifierRolloutScheduler:
     ) -> list[RLExample]:
         convert_started_at = perf_counter()
         records = [
-            record for output in outputs for record in _records_from_output(output)
+            record
+            for output in outputs
+            for record in _records_from_output(
+                output, require_multimodal_capture=self.config.model.vlm is not None
+            )
         ]
         records = self._finalize_environment_records(records, distill=True)
         self.last_batch_metrics = batch_stats.metrics()
@@ -1185,7 +1209,10 @@ class VerifierRolloutScheduler:
         is_usable = curriculum_admitted and _is_usable_training_group(
             completed_outputs,
             expected_rollouts=rollout_count,
-            filter_zero_advantage=self.config.orchestrator.filter_zero_advantage,
+            filter_zero_advantage=(
+                self.config.orchestrator.filter_zero_advantage
+                and self.config.orchestrator.refill_zero_advantage
+            ),
             advantage_epsilon=algorithm_epsilon(algorithm_config),
             loss_component=algorithm_loss_component(algorithm_config),
         )
@@ -1605,6 +1632,15 @@ class VerifierRolloutScheduler:
                         max_retries=self.config.orchestrator.verifier_max_retries,
                         algorithm_config=algorithm_config,
                         failure_stats=self.failure_stats,
+                        live_trace=LiveTraceContext(
+                            self.config.output_dir,
+                            group.env_name,
+                            self.rollout_step,
+                            group.policy_step,
+                            enabled=getattr(
+                                self.config.orchestrator, "live_traces", True
+                            ),
+                        ),
                     ),
                 )
             )
@@ -1623,6 +1659,15 @@ class VerifierRolloutScheduler:
                         sampling_args=sampling_args,
                         max_retries=self.config.orchestrator.verifier_max_retries,
                         failure_stats=self.failure_stats,
+                        live_trace=LiveTraceContext(
+                            self.config.output_dir,
+                            group.env_name,
+                            self.rollout_step,
+                            group.policy_step,
+                            enabled=getattr(
+                                self.config.orchestrator, "live_traces", True
+                            ),
+                        ),
                     ),
                 )
             )
@@ -1762,6 +1807,7 @@ def _preload_rollout_resources(config: RLConfig) -> None:
             env_config.id,
             env_config.args,
             _verifier_extra_env_kwargs(config),
+            model_config=config.model if config.model.vlm is not None else None,
         )
 
 
@@ -2520,28 +2566,15 @@ class _VerifierChunkPublisher:
     ) -> tuple[float, float]:
         started_at = perf_counter()
         await self._settle_pending_eval(for_policy_update=True)
-        previous_policy_step = self.loaded_policy_step
         self.scheduler.begin_policy_update()
-        try:
-            await _discard_stale_requests(self.scheduler, optimizer_step)
-            await self.scheduler.drain_policy_update_requests()
-            self.loaded_policy_step = await _load_policy_async(
-                self.config,
-                self.inference_engine,
-                self.policy_receiver,
-                policy_step,
-            )
-            self.scheduler.set_policy_step(
-                self.loaded_policy_step,
-                model_name=_current_policy_model_name(self.inference_engine),
-            )
-            if (
-                previous_policy_step is not None
-                and self.loaded_policy_step != previous_policy_step
-            ):
-                await self.scheduler.mark_policy_update()
-        finally:
-            self.scheduler.finish_policy_update()
+        self.loaded_policy_step = await _load_policy_and_update_scheduler(
+            self.config,
+            self.inference_engine,
+            self.policy_receiver,
+            policy_step,
+            self.scheduler,
+            rollout_step=optimizer_step,
+        )
         await self._record_loaded_policy(optimizer_step)
         elapsed = perf_counter() - started_at
         return elapsed, elapsed
@@ -2670,7 +2703,7 @@ class _VerifierChunkPublisher:
             if self.config.orchestrator.token_batch_size is not None
             else rollout_groups_for_chunk(self.config, chunk_index)
         )
-        records = await self.scheduler.generate_batch(
+        records = await self._generate_batch(
             target_groups=chunk_groups,
             rollout_step=optimizer_step,
             prewarm_rollout_step=(queue_step + 1) // self.chunks_per_step,
@@ -2738,6 +2771,22 @@ class _VerifierChunkPublisher:
         )
         print(batch.path)
 
+    async def _generate_batch(self, **kwargs) -> list[RLExample]:
+        """Watch published policies while tools and rollout requests are active."""
+        generation = asyncio.create_task(self.scheduler.generate_batch(**kwargs))
+        try:
+            while not generation.done():
+                await asyncio.wait(
+                    [generation],
+                    timeout=self.config.transport.poll_interval_seconds,
+                )
+                await self.prepare_policy(kwargs["rollout_step"])
+            return await generation
+        finally:
+            if not generation.done():
+                generation.cancel()
+                await asyncio.gather(generation, return_exceptions=True)
+
     def _record_published_chunk(
         self,
         queue_step: int,
@@ -2772,11 +2821,33 @@ class _VerifierChunkPublisher:
         )
 
     async def finish_pending_policy(self, optimizer_step: int) -> None:
-        if self.pending_policy_update is None:
-            return
-        self.loaded_policy_step = await self.pending_policy_update
-        self.pending_policy_update = None
-        await self._record_loaded_policy(optimizer_step)
+        if self.pending_policy_update is not None:
+            self.loaded_policy_step = await self.pending_policy_update
+            self.pending_policy_update = None
+            await self._record_loaded_policy(optimizer_step)
+        if self.config.policy_transfer.type == "nccl":
+            await self._settle_pending_eval(for_policy_update=True)
+            await self.scheduler.aclose()
+            final_step = _final_eval_policy_step(self.config, optimizer_step)
+            if final_step is not None:
+                await self._receive_policy_through(final_step)
+
+    async def _receive_policy_through(self, target_step: int) -> None:
+        steps = [target_step]
+        if self.config.policy_transfer.type == "nccl":
+            # Each export rendezvous must finish before the trainer can publish
+            # its successor, including when final evaluation is disabled.
+            interval = self.config.policy_transfer.export_every_steps
+            first = ((self.loaded_policy_step or 0) // interval + 1) * interval
+            steps = list(range(first, target_step + 1, interval))
+        for step in steps:
+            self.loaded_policy_step = await _load_policy_async(
+                self.config, self.inference_engine, self.policy_receiver, step
+            )
+        self.scheduler.set_policy_step(
+            self.loaded_policy_step,
+            model_name=_current_policy_model_name(self.inference_engine),
+        )
 
     async def run_final_evals(self, target_step: int) -> None:
         await self._settle_pending_eval(for_policy_update=False)
@@ -2811,16 +2882,7 @@ class _VerifierChunkPublisher:
             self.loaded_policy_step is None
             or self.loaded_policy_step < final_policy_step
         ):
-            policy = await asyncio.to_thread(
-                self.policy_receiver.wait_for_step,
-                final_policy_step,
-            )
-            _load_policy_into_engine(self.config, self.inference_engine, policy)
-            self.loaded_policy_step = policy.step
-            self.scheduler.set_policy_step(
-                policy.step,
-                model_name=_current_policy_model_name(self.inference_engine),
-            )
+            await self._receive_policy_through(final_policy_step)
         else:
             _wake_for_colocated_sleep(self.config, self.inference_engine)
         await _run_evals_async(
@@ -2835,7 +2897,8 @@ class _VerifierChunkPublisher:
 
     async def close(self) -> None:
         if self.pending_policy_update is not None:
-            self.pending_policy_update.cancel()
+            # Cancelling to_thread does not stop a running collective. Finish
+            # the transfer before dismantling its receiving runtime.
             await asyncio.gather(
                 self.pending_policy_update,
                 return_exceptions=True,
@@ -3037,7 +3100,11 @@ async def _load_policy_and_update_scheduler(
 ) -> int:
     try:
         await _discard_stale_requests(scheduler, rollout_step)
-        await scheduler.drain_policy_update_requests()
+        # HTTP updates pause all vLLM replicas themselves. Waiting
+        # for whole agent episodes here also waits for tools/tests and can
+        # deadlock the trainer's NCCL rendezvous.
+        if config.inference.mode != "vllm_http":
+            await scheduler.drain_policy_update_requests()
         loaded_step = await _load_policy_async(
             config,
             inference_engine,

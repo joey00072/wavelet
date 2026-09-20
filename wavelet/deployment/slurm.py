@@ -177,7 +177,13 @@ def _worker_config(config: TrainerConfig) -> TrainerConfig:
     )
 
 
-def _srun_prefix(hosts: list[str], *, gpus_per_task: int) -> list[str]:
+def _srun_prefix(
+    hosts: list[str],
+    *,
+    gpus_per_task: int,
+    cpus_per_task: int | None = None,
+    memory: str | None = None,
+) -> list[str]:
     return [
         "srun",
         "--nodes",
@@ -190,6 +196,10 @@ def _srun_prefix(hosts: list[str], *, gpus_per_task: int) -> list[str]:
         ",".join(hosts),
         "--gpus-per-task",
         str(gpus_per_task),
+        "--gpus-per-node",
+        str(gpus_per_task),
+        *(["--cpus-per-task", str(cpus_per_task)] if cpus_per_task else []),
+        *(["--mem", memory] if memory else []),
         "--kill-on-bad-exit=1",
         "--exclusive",
     ]
@@ -313,10 +323,16 @@ def _wait_for_http_servers(
     endpoints: list[str],
     *,
     timeout_seconds: float,
+    expected_model_names: set[str] | None = None,
 ) -> None:
+    from wavelet.inference.policy import require_expected_served_model
+
+    started_at = time.monotonic()
     deadline = time.monotonic() + timeout_seconds
+    next_status_at = started_at + 30.0
     pending = set(endpoints)
     last_error: Exception | None = None
+    print(f"Waiting for inference workers: {', '.join(endpoints)}", flush=True)
     while pending and time.monotonic() < deadline:
         for managed in processes:
             if (code := managed.process.poll()) is not None:
@@ -326,14 +342,35 @@ def _wait_for_http_servers(
                 )
         for endpoint in list(pending):
             try:
-                with urllib.request.urlopen(
-                    f"{endpoint}/health", timeout=5.0
-                ) as response:
-                    if response.status == 200:
-                        pending.remove(endpoint)
+                with urllib.request.urlopen(f"{endpoint}/health", timeout=5.0):
+                    pass
+                if expected_model_names is not None:
+                    with urllib.request.urlopen(f"{endpoint}/liveness", timeout=5.0):
+                        pass
+                    with urllib.request.urlopen(
+                        f"{endpoint}/v1/models", timeout=5.0
+                    ) as response:
+                        models = json.loads(response.read().decode("utf-8"))
+                    require_expected_served_model(
+                        models, expected_names=expected_model_names, server=endpoint
+                    )
+                pending.remove(endpoint)
+                print(
+                    f"Inference ready: {endpoint} "
+                    f"({time.monotonic() - started_at:.1f}s)",
+                    flush=True,
+                )
             except (OSError, urllib.error.URLError) as exc:
                 last_error = exc
         if pending:
+            if time.monotonic() >= next_status_at:
+                print(
+                    f"Still waiting for inference: {', '.join(sorted(pending))} "
+                    f"({time.monotonic() - started_at:.1f}s elapsed; "
+                    f"last error: {last_error})",
+                    flush=True,
+                )
+                next_status_at = time.monotonic() + 30.0
             time.sleep(1.0)
     if pending:
         raise TimeoutError(
@@ -381,6 +418,7 @@ def _record_allocation(
             hosts[: config.deployment.num_inference_nodes] if command == "rl" else []
         ),
         "gpus_per_node": config.deployment.gpus_per_node,
+        "inference_replicas_per_node": config.deployment.inference_replicas_per_node,
     }
     path = config_dir / "slurm_allocation.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -414,10 +452,22 @@ def run_sft_worker(
     )
 
 
-def _role_environment(config: RLConfig, role: str) -> dict[str, str]:
+def _role_environment(
+    config: RLConfig,
+    role: str,
+    *,
+    wandb_shared_env: dict[str, str] | None = None,
+) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("CUDA_VISIBLE_DEVICES", None)
     env.update(config.launcher.env_vars.for_role(role))
+    if wandb_shared_env and role in {"trainer", "orchestrator"}:
+        env.update(wandb_shared_env)
+        env["WANDB_SHARED_LABEL"] = role
+        env["WANDB_SHARED_PRIMARY"] = (
+            "orchestrator" if config.max_steps == 0 else "trainer"
+        )
+        env["WANDB_SHARED_FINISHER"] = "launcher"
     return env
 
 
@@ -427,16 +477,30 @@ def run_rl_worker(
     hosts: list[str],
     config_dir: Path | None = None,
 ) -> int:
+    from wavelet.inference.policy import expected_served_model_names
+    from wavelet.monitor import finish_shared_wandb_run
     from wavelet.orchestrator.runtime import (
         _config_path_for_role,
         _inference_replica_config,
         _rollout_client_config,
+        _shared_wandb_environment,
         _write_subconfigs,
     )
 
     inference_count = config.deployment.num_inference_nodes
     inference_hosts = hosts[:inference_count]
     trainer_hosts = hosts[inference_count:]
+    replica_hosts = [
+        host
+        for host in inference_hosts
+        for _ in range(config.deployment.inference_replicas_per_node)
+    ]
+    replica_count = len(replica_hosts)
+    print(
+        f"SLURM placement: trainers={trainer_hosts}, inference={inference_hosts}, "
+        f"GPUs per node={config.deployment.gpus_per_node}",
+        flush=True,
+    )
     if len(trainer_hosts) != config.deployment.num_train_nodes:
         raise RuntimeError("SLURM allocation does not contain the requested trainers.")
     required_gpus = required_inference_devices(config)
@@ -478,16 +542,32 @@ def run_rl_worker(
     worker_config = worker_config.model_copy(
         update={
             "launcher": worker_config.launcher.model_copy(
-                update={"inference_num_replicas": max(1, inference_count)}
+                update={"inference_num_replicas": max(1, replica_count)}
             )
         }
     )
-    ports = [config.inference.http.port + index for index in range(inference_count)]
+    if worker_config.policy_transfer.type == "nccl":
+        transfer = worker_config.policy_transfer
+        broadcast_host = transfer.nccl_host
+        if broadcast_host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+            broadcast_host = trainer_hosts[0]
+        worker_config = worker_config.model_copy(
+            update={
+                "policy_transfer": transfer.model_copy(
+                    update={
+                        "nccl_host": broadcast_host,
+                        "nccl_inference_world_size": replica_count * required_gpus,
+                        "nccl_rank_offset": 1,
+                    }
+                )
+            }
+        )
+    ports = [config.inference.http.port + index for index in range(replica_count)]
     rollout_config = (
         _rollout_client_config(
             worker_config,
             ports=ports,
-            hosts=inference_hosts,
+            hosts=replica_hosts,
         )
         if config.inference.mode == "vllm_http"
         else worker_config
@@ -498,15 +578,21 @@ def run_rl_worker(
         config_dir=config_dir,
     )
     log_dir = config.output_dir / "logs" / config_dir.parent.name
+    wandb_shared_env = _shared_wandb_environment(config)
     processes: list[_ManagedProcess] = []
+    exit_code = 1
     try:
         server_command = (
             "inference-server"
             if config.inference.vllm.server_backend == "openai"
             else "native-inference-server"
         )
-        for index, (host, port) in enumerate(zip(inference_hosts, ports, strict=True)):
-            replica_config = _inference_replica_config(worker_config, port=port)
+        for index, (host, port) in enumerate(zip(replica_hosts, ports, strict=True)):
+            replica_config = _inference_replica_config(
+                worker_config,
+                port=port,
+                nccl_rank_offset=1 + index * required_gpus,
+            )
             replica_config = replica_config.model_copy(
                 update={
                     "inference": replica_config.inference.model_copy(
@@ -530,7 +616,9 @@ def run_rl_worker(
                     [
                         *_srun_prefix(
                             [host],
-                            gpus_per_task=config.deployment.gpus_per_node,
+                            gpus_per_task=required_gpus,
+                            cpus_per_task=config.slurm.inference_cpus_per_replica,
+                            memory=config.slurm.inference_memory_per_replica,
                         ),
                         sys.executable,
                         "-m",
@@ -547,14 +635,23 @@ def run_rl_worker(
             )
         endpoints = [
             f"http://{host}:{port}"
-            for host, port in zip(inference_hosts, ports, strict=True)
+            for host, port in zip(replica_hosts, ports, strict=True)
         ]
         _wait_for_http_servers(
             processes,
             endpoints,
             timeout_seconds=config.inference.http.startup_timeout_seconds,
+            expected_model_names=(
+                expected_served_model_names(config)
+                if config.inference.vllm.server_backend == "openai"
+                else None
+            ),
         )
 
+        print(
+            f"Inference pool ready; starting trainer and orchestrator. Logs: {log_dir}",
+            flush=True,
+        )
         if config.max_steps != 0:
             trainer_path = config_dir / "rl_trainer.yaml"
             processes.append(
@@ -568,10 +665,14 @@ def run_rl_worker(
                     ),
                     log_path=log_dir / "rl_trainer.log",
                     cwd=project_dir,
-                    env=_role_environment(config, "trainer"),
+                    env=_role_environment(
+                        config, "trainer", wandb_shared_env=wandb_shared_env
+                    ),
                 )
             )
-        orchestrator_env = _role_environment(config, "orchestrator")
+        orchestrator_env = _role_environment(
+            config, "orchestrator", wandb_shared_env=wandb_shared_env
+        )
         orchestrator_env["CUDA_VISIBLE_DEVICES"] = ""
         processes.append(
             _start_process(
@@ -593,6 +694,7 @@ def run_rl_worker(
             processes,
             poll_seconds=config.launcher.poll_interval_seconds,
         )
+        exit_code = 0
     finally:
         try:
             for managed in processes:
@@ -600,10 +702,11 @@ def run_rl_worker(
         finally:
             for managed in processes:
                 managed.close()
+            finish_shared_wandb_run(config, wandb_shared_env, exit_code=exit_code)
     return 0
 
 
-def worker_main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] not in {"rl", "sft"}:
         print("Usage: wavelet slurm-worker {rl|sft} @ <config.yaml>")

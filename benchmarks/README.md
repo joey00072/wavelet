@@ -29,3 +29,24 @@ lower-is-better metric rises beyond the threshold. A missing baseline metric is
 also a regression. Run directories and generated result JSON files are artifacts
 and should not be committed; only reviewed baseline JSON belongs in
 `benchmarks/baselines/`.
+
+The GPU test workflow runs nightly and on manual dispatch on a self-hosted
+runner with `linux` and `gpu` labels. The GPU benchmark workflow runs weekly
+and on manual dispatch using `benchmarks/configs/sft.yaml`: 20 full-parameter
+SFT steps on Qwen3-0.6B with synthetic data, excluding five warmup steps.
+The runner needs a CUDA GPU with sufficient free memory and access to the model.
+Both workflows retain diagnostics as GitHub artifacts, including on failure.
+Scheduled workflows execute the default branch; a runner must be provisioned
+before these checks can run.
+
+To enable regression gating, review repeated benchmark results on the chosen
+runner hardware and commit one as `benchmarks/baselines/sft-ci.json`. Until that
+baseline exists, the workflow records measurements without claiming performance
+parity. A baseline from different hardware, Torch, or config fails comparison
+and must be remeasured. Do not promote a baseline automatically.
+
+Scheduled GPU jobs are opt-in to avoid consuming scarce GPUs. Set repository
+variable `ENABLE_SCHEDULED_GPU_BENCHMARKS=true` to enable the weekly benchmark;
+`ENABLE_SCHEDULED_GPU_CHECKS=true` enables nightly GPU tests. Manual dispatch
+remains available. Neither variable is enabled by this change, and no GPU run
+was launched during implementation.

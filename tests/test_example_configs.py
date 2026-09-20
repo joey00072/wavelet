@@ -4,8 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.configs.rl_config import OPDAlgorithmConfig, RLConfig
-from wavelet.configs.sft import SFTConfig
+from wavelet.configs.config import OPDAlgorithmConfig, RLConfig, SFTConfig
 from wavelet.utils.serialization import load_yaml
 
 RL_CONFIGS = [

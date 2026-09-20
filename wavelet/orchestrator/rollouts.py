@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample, load_rl_records, serialize_rl_record
 from wavelet.inference.policy import RLInference
 from wavelet.orchestrator.admission import RolloutAdmissionController

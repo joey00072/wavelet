@@ -357,6 +357,7 @@ def test_compact_row_summarizes_tokens_and_filters_match() -> None:
             "is_truncated": False,
             "completion_token_count": 3,
             "task": {"name": "reverse-text", "example_id": "ex-1"},
+            "rollout": {"timing_seconds": {"total": 2.5}},
         },
     }
 
@@ -366,6 +367,7 @@ def test_compact_row_summarizes_tokens_and_filters_match() -> None:
     assert compact["trainable_tokens"] == 3
     assert compact["logprob_min"] == -0.5
     assert compact["example_id"] == "ex-1"
+    assert compact["duration_seconds"] == 2.5
     assert RowFilters(search="reverse").matches(compact)
     assert not RowFilters(min_reward=1.5).matches(compact)
     assert RowFilters(truncated=False, advantage_sign="positive").matches(compact)
@@ -456,7 +458,7 @@ def test_live_state_server_mounts_run_api(synthetic_run: Path) -> None:
     from fastapi import FastAPI, HTTPException, Query
     from fastapi.middleware.cors import CORSMiddleware
 
-    from wavelet.configs.rl_config import RLConfig
+    from wavelet.configs.config import RLConfig
     from wavelet.orchestrator.state_server import (
         OrchestratorRunState,
         _build_state_app,
@@ -709,7 +711,7 @@ def test_normalize_messages_parses_repr_serialized_chat_messages() -> None:
 def test_trackio_source_reads_sqlite_history(tmp_path: Path) -> None:
     import sqlite3
 
-    from wavelet.configs.rl_config import RLConfig
+    from wavelet.configs.config import RLConfig
     from wavelet.dashboard.external import trackio_source
 
     root = tmp_path / "trackio"
@@ -793,3 +795,96 @@ def test_external_status_reports_disabled_wandb(synthetic_run: Path) -> None:
     assert "disabled" in status["wandb"]["reason"]
     assert status["trackio"]["status"] == "unavailable"
     assert "wandb" not in reader.metric_keys()
+
+
+def test_indexed_trace_detail_reads_only_selected_row(tmp_path: Path, monkeypatch):
+    import wavelet.dashboard.rows as rows_module
+    from wavelet.dashboard.rows import CompactRowCache
+
+    path = tmp_path / "rows.jsonl"
+    path.write_text(
+        "\ninvalid\n"
+        + "\n".join(
+            json.dumps({"prompt": "λ" * 500, "reward": i, "input_ids": [1, 2]})
+            for i in range(100)
+        )
+        + "\n"
+    )
+    cache = CompactRowCache()
+    cache.rows(path, kind="rollout")
+    original = json.loads
+    calls = []
+
+    def recording_loads(value):
+        calls.append(len(value))
+        return original(value)
+
+    monkeypatch.setattr(rows_module.json, "loads", recording_loads)
+    detail = cache.detail(path, 101, kind="rollout")
+    assert detail["reward"] == 99
+    assert detail["arrays"]["input_ids"]["length"] == 2
+    assert len(calls) == 1
+    assert cache.detail(path, 0, kind="rollout") is None
+    assert cache.detail(path, -1, kind="rollout") is None
+    path.write_text(json.dumps({"reward": 9}) + "\n")
+    assert cache.detail(path, 0, kind="rollout")["reward"] == 9
+    assert cache.detail(path, 101, kind="rollout") is None
+
+
+def test_compact_run_picker_does_not_transfer_metrics(client: TestClient):
+    response = client.get("/api/runs?compact=true")
+    assert response.status_code == 200
+    row = response.json()[0]
+    assert row["id"] == "demo"
+    assert "latest" not in row
+    assert set(row) == {
+        "id",
+        "status",
+        "is_current",
+        "model",
+        "trainer_step",
+        "target_step",
+    }
+
+
+def test_slow_trace_scan_does_not_block_health(client: TestClient, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    entered, release = Event(), Event()
+
+    def blocked_rows(self, *args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return {"available": True, "rows": []}
+
+    monkeypatch.setattr(RunArtifacts, "rollout_rows", blocked_rows)
+    with ThreadPoolExecutor() as pool:
+        request = pool.submit(client.get, "/api/runs/demo/rollouts/rows")
+        try:
+            assert entered.wait(3)
+            assert client.get("/api/health").status_code == 200
+        finally:
+            release.set()
+        assert request.result().status_code == 200
+
+
+def test_trace_list_can_omit_text_without_changing_cached_search(client: TestClient):
+    small = client.get("/api/runs/demo/rollouts/rows?include_text=false&limit=2").json()
+    full = client.get("/api/runs/demo/rollouts/rows?limit=2").json()
+    assert len(small["rows"]) == 2
+    assert "prompt" not in small["rows"][0]
+    assert "prompt" in full["rows"][0]
+    assert small["rows"][0]["row_index"] == full["rows"][0]["row_index"]
+
+
+def test_dashboard_finds_latest_attempt_without_symlink(tmp_path: Path):
+    for attempt in [2, 10]:
+        p = tmp_path / "configs" / f"attempt_{attempt}" / "resolved"
+        p.mkdir(parents=True)
+        (p / "rl.yaml").write_text("model: {name: demo}\n")
+    reader = RunArtifacts("demo", tmp_path)
+    assert (
+        reader._resolved_config_path()
+        == tmp_path / "configs/attempt_10/resolved/rl.yaml"
+    )

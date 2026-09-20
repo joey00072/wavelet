@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.orchestrator.state_server import OrchestratorRunState
 from wavelet.transport.queue import FileSystemRolloutSender
 

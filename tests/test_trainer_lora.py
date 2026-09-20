@@ -12,6 +12,17 @@ class _FakePeftModel:
     pass
 
 
+def test_lora_trainability_guard_rejects_unfrozen_base_weights():
+    model = torch.nn.Module()
+    model.base_layer = torch.nn.Linear(4, 4)
+    model.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(4, 2)})
+    model.modules_to_save = torch.nn.ModuleDict({"default": torch.nn.Linear(4, 4)})
+    with pytest.raises(RuntimeError, match="base_layer.weight"):
+        lora_utils.validate_lora_trainability(model)
+    model.base_layer.requires_grad_(False)
+    lora_utils.validate_lora_trainability(model)
+
+
 def test_full_tp_save_does_not_gather_an_already_full_state_again(
     monkeypatch,
     tmp_path: Path,
@@ -240,13 +251,13 @@ def test_fused_lora_parameters_reject_multiple_active_adapters() -> None:
 
 def test_saved_lora_keys_strip_nested_fsdp_wrapped_module_segments() -> None:
     assert (
-        lora_utils._strip_fsdp_wrapped_module_segments(
+        lora_utils._strip_training_wrapper_segments(
             "base_model.model.layers.0._fsdp_wrapped_module.mlp.up_proj.lora_A.weight"
         )
         == "base_model.model.layers.0.mlp.up_proj.lora_A.weight"
     )
     assert (
-        lora_utils._strip_fsdp_wrapped_module_segments(
+        lora_utils._strip_training_wrapper_segments(
             "_fsdp_wrapped_module.base_model.model.layers.0.self_attn.q_proj."
             "lora_B.weight"
         )

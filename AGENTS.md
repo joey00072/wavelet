@@ -21,8 +21,9 @@ Guidance for coding agents working in this repository.
 
 - `pyproject.toml`: project metadata and Python requirement.
 - `wavelet/`: package directory for app code, CLI, trainer, inference, and orchestration.
-- `wavelet/entrypoints/`: CLI entrypoints for RL, SFT, trainer, inference, and
-  vLLM server processes.
+- `wavelet/cli.py`: lazy CLI dispatch directly to subsystem `main` functions.
+- `wavelet/entrypoints/`: commands requiring additional parsing or process setup;
+  do not add forwarding-only modules.
 - `wavelet/configs/`: Pydantic config models and legacy normalization.
 - `wavelet/orchestrator/`: rollout scheduling and sources, verifier environments,
   rewards, algorithms, metrics, state inspection, and launcher utilities.

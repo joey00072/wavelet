@@ -11,7 +11,7 @@ import psutil
 import torch
 from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, distribute_tensor
 from torch.optim import SGD, Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import (
     ConstantLR,
@@ -23,7 +23,7 @@ from torch.optim.lr_scheduler import (
 )
 from torch.utils.hooks import RemovableHandle
 
-from wavelet.configs.sft import OptimizerConfig, SchedulerConfig
+from wavelet.configs.config import OptimizerConfig, SchedulerConfig
 from wavelet.trainer.types import lora_adapter_name_from_key
 
 
@@ -64,6 +64,130 @@ class SignSGD(Optimizer):
         return loss
 
 
+class Muon(Optimizer):
+    """Muon orthogonalized momentum for matrix weights.
+
+    Muon is applied to tensors with two or more dimensions; vectors and
+    scalars use the AdamW update so embedding and normalization parameters
+    remain well behaved.  The state is deliberately ordinary torch tensors,
+    which keeps this implementation compatible with checkpointing and the
+    existing offloader.
+    """
+
+    def __init__(
+        self,
+        params: Iterable[nn.Parameter],
+        *,
+        lr: float = 1e-3,
+        momentum: float = 0.95,
+        weight_decay: float = 0.0,
+        betas: tuple[float, float] = (0.9, 0.999),
+        matrix_params: set[nn.Parameter] | None = None,
+        nesterov: bool = False,
+        rms_normalize: bool = True,
+    ) -> None:
+        if lr < 0 or not 0 <= momentum < 1 or weight_decay < 0:
+            raise ValueError("invalid Muon hyperparameters")
+        if not all(0 <= beta < 1 for beta in betas):
+            raise ValueError("invalid AdamW fallback betas")
+        super().__init__(
+            params,
+            {
+                "lr": lr,
+                "momentum": momentum,
+                "weight_decay": weight_decay,
+                "betas": betas,
+                "nesterov": nesterov,
+                "rms_normalize": rms_normalize,
+            },
+        )
+        self._matrix_params = matrix_params
+
+    @staticmethod
+    def _orthogonalize(matrix: torch.Tensor) -> torch.Tensor:
+        # Newton-Schulz gives a stable, inexpensive approximation to the polar
+        # factor and avoids an SVD in every optimizer step.
+        # Form the Gram matrix on the smaller dimension.  The old condition
+        # made tall matrices construct an unnecessarily huge rows x rows gram.
+        transposed = matrix.shape[-2] > matrix.shape[-1]
+        x = matrix.transpose(-2, -1) if transposed else matrix
+        batch = x.reshape(-1, x.shape[-2], x.shape[-1])
+        batch = batch / (batch.norm(dim=(1, 2), keepdim=True) + 1e-7)
+        for _ in range(5):
+            gram = batch @ batch.transpose(1, 2)
+            batch = (
+                3.4445 * batch
+                - 4.775 * (gram @ batch)
+                + 2.0315 * (gram @ (gram @ batch))
+            )
+        x = batch.reshape_as(x)
+        return x.transpose(-2, -1) if transposed else x
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            lr = float(group["lr"])
+            beta = float(group["momentum"])
+            decay = float(group["weight_decay"])
+            for parameter in group["params"]:
+                if parameter.grad is None:
+                    continue
+                grad = parameter.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Muon does not support sparse gradients")
+                state = self.state[parameter]
+                use_muon = parameter.ndim >= 2 and group.get(
+                    "use_muon",
+                    self._matrix_params is None or parameter in self._matrix_params,
+                )
+                if use_muon:
+                    momentum = state.setdefault("momentum", torch.zeros_like(parameter))
+                    momentum.mul_(beta).add_(grad, alpha=1 - beta)
+                    if isinstance(parameter, DTensor):
+                        source = momentum.full_tensor()
+                        if group["nesterov"]:
+                            source = grad.full_tensor() + beta * source
+                        update = self._orthogonalize(source)
+                        update = distribute_tensor(
+                            update, parameter.device_mesh, parameter.placements
+                        )
+                    else:
+                        source = (
+                            grad.add(momentum, alpha=beta)
+                            if group["nesterov"]
+                            else momentum
+                        )
+                        update = self._orthogonalize(source)
+                    if group["rms_normalize"]:
+                        update = update * (grad.norm() / update.norm().clamp_min(1e-7))
+                else:
+                    # Muon's matrix rule is not meaningful for vectors,
+                    # embeddings, heads, or scalar normalization weights.
+                    # Apply the standard decoupled AdamW update instead.
+                    beta1, beta2 = group["betas"]
+                    step = state.get("step", 0) + 1
+                    state["step"] = step
+                    exp_avg = state.setdefault("exp_avg", torch.zeros_like(parameter))
+                    exp_avg_sq = state.setdefault(
+                        "exp_avg_sq", torch.zeros_like(parameter)
+                    )
+                    exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                    update = (
+                        exp_avg
+                        / (1 - beta1**step)
+                        / (exp_avg_sq / (1 - beta2**step)).sqrt().add_(1e-8)
+                    )
+                if decay:
+                    parameter.mul_(1 - lr * decay)
+                parameter.add_(update, alpha=-lr)
+        return loss
+
+
 class OptimizerStateOffloader:
     """Keep optimizer state in pinned CPU memory between optimizer steps."""
 
@@ -71,6 +195,8 @@ class OptimizerStateOffloader:
         self.optimizer = optimizer
         self.pin_memory = pin_memory
         self._handles: list[RemovableHandle] = []
+        self._cpu_buffers: dict[tuple[int, str], torch.Tensor] = {}
+        self._pending_cuda_devices: set[int] = set()
 
     def install(self) -> None:
         if self._handles:
@@ -85,6 +211,13 @@ class OptimizerStateOffloader:
         ]
         self.move_to_cpu()
 
+    def remove(self) -> None:
+        """Remove hooks and release reusable pinned buffers."""
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self._cpu_buffers.clear()
+
     def move_to_parameters(self) -> None:
         for parameter, state in self.optimizer.state.items():
             for key, value in list(state.items()):
@@ -96,13 +229,86 @@ class OptimizerStateOffloader:
 
     def move_to_cpu(self) -> None:
         should_pin = self.pin_memory and torch.cuda.is_available()
-        for state in self.optimizer.state.values():
+        for parameter, state in self.optimizer.state.items():
             for key, value in list(state.items()):
-                state[key] = _move_optimizer_state_value(
+                state[key] = self._to_cpu_reused(
                     value,
-                    torch.device("cpu"),
+                    parameter_id=id(parameter),
+                    path=(key,),
                     pin_memory=should_pin,
                 )
+        # A non-blocking CUDA D2H copy may otherwise still be in flight when a
+        # checkpoint serializer reads the returned state dict.
+        if should_pin:
+            # State can span devices in model parallel runs; synchronize all
+            # D2H copies before a checkpoint serializer reads the buffers.
+            for device_index in self._pending_cuda_devices:
+                torch.cuda.synchronize(device_index)
+            self._pending_cuda_devices.clear()
+
+    def _to_cpu_reused(
+        self,
+        value: object,
+        *,
+        parameter_id: int,
+        path: tuple[object, ...],
+        pin_memory: bool,
+    ) -> object:
+        if isinstance(value, DTensor):
+            local = self._to_cpu_reused(
+                value._local_tensor,
+                parameter_id=parameter_id,
+                path=path + ("local",),
+                pin_memory=pin_memory,
+            )
+            moved = copy.copy(value)
+            moved._local_tensor = local
+            return moved
+        if torch.is_tensor(value):
+            if value.is_cuda:
+                self._pending_cuda_devices.add(value.device.index or 0)
+            buffer_key = (parameter_id, repr(path))
+            target = self._cpu_buffers.get(buffer_key)
+            if (
+                target is None
+                or target.shape != value.shape
+                or target.dtype != value.dtype
+            ):
+                target = torch.empty_like(value, device="cpu", pin_memory=pin_memory)
+                self._cpu_buffers[buffer_key] = target
+            target.copy_(value, non_blocking=pin_memory)
+            return target
+        if isinstance(value, dict):
+            return {
+                key: self._to_cpu_reused(
+                    item,
+                    parameter_id=parameter_id,
+                    path=path + (key,),
+                    pin_memory=pin_memory,
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                self._to_cpu_reused(
+                    item,
+                    parameter_id=parameter_id,
+                    path=path + (index,),
+                    pin_memory=pin_memory,
+                )
+                for index, item in enumerate(value)
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                self._to_cpu_reused(
+                    item,
+                    parameter_id=parameter_id,
+                    path=path + (index,),
+                    pin_memory=pin_memory,
+                )
+                for index, item in enumerate(value)
+            )
+        return value
 
     def _after_state_dict(
         self,
@@ -194,6 +400,32 @@ def setup_optimizer(
 
     if config.type == "sign_sgd":
         return SignSGD(params, lr=config.lr, weight_decay=config.weight_decay)
+    if config.type == "muon":
+        matrix_params = {
+            parameter
+            for name, parameter in named_params
+            if parameter.requires_grad
+            and parameter.ndim >= 2
+            and "embed" not in name.lower()
+            and "lm_head" not in name.lower()
+        }
+        muon_params = [parameter for parameter in params if parameter in matrix_params]
+        fallback_params = [
+            parameter for parameter in params if parameter not in matrix_params
+        ]
+        groups = [
+            {"params": muon_params, "use_muon": True},
+            {"params": fallback_params, "use_muon": False},
+        ]
+        return Muon(
+            groups,
+            lr=config.lr,
+            momentum=getattr(config, "muon_momentum", config.betas1),
+            betas=(config.betas1, config.betas2),
+            weight_decay=config.weight_decay,
+            matrix_params=matrix_params,
+            nesterov=getattr(config, "nesterov", False),
+        )
     if config.type == "sgd":
         return _build_optimizer(
             SGD,

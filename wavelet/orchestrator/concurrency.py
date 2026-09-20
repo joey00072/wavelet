@@ -65,9 +65,11 @@ class AdaptiveConcurrencyController:
         self.bootstrapped = config.initial_inflight is not None
         self.engine_max_len: int | None = None
         self.capacity_by_replica: dict[str, int] = {}
+        self.prev_waiting: dict[str, int] = {}
 
         self.turnover = 0.0
         self.signal: ConcurrencySignal = "clear"
+        self.growth_multiplier = 1.0
         self.can_grow = False
         self.can_grow_until = 0.0
         self.queue_overload_polls = 0
@@ -92,7 +94,7 @@ class AdaptiveConcurrencyController:
             and active >= self.config.binding_fraction * self.limit
         ):
             self.cap = self._clamp(
-                self.cap * self.config.growth_factor_per_turnover**fraction
+                self.cap * self.growth_multiplier**fraction
             )
             return self._apply_limit(int(self.cap))
         return ConcurrencyDecision(limit=self.limit)
@@ -136,7 +138,22 @@ class AdaptiveConcurrencyController:
                 if sample.waiting_capacity is not None
                 else sample.waiting
             )
-        if total_queued > 0:
+        # A one-poll queue is normal turn completion noise.  Match the
+        # engine controller's persistence semantics for the soft signal.
+        effective_waiting = {
+            sample.replica: (
+                sample.waiting_capacity
+                if sample.waiting_capacity is not None
+                else sample.waiting
+            )
+            for sample in decode_samples
+        }
+        persistent_queue = any(
+            waiting > 0 and self.prev_waiting.get(replica, 0) > 0
+            for replica, waiting in effective_waiting.items()
+        )
+        self.prev_waiting = effective_waiting
+        if persistent_queue:
             signal = self._worst(signal, "soft")
 
         queue_over_threshold = (
@@ -149,9 +166,16 @@ class AdaptiveConcurrencyController:
         queue_overload = (
             self.queue_overload_polls >= self.config.queue_persistence_polls
         )
-        if queue_overload or max_usage > self.config.growth_kv_cache_usage:
-            signal = self._worst(signal, "hard" if queue_overload else "soft")
+        if queue_overload:
+            signal = self._worst(signal, "hard")
         self.signal = signal
+        # Taper growth as KV pressure rises.  Keep the configured factor as
+        # the zero-usage ceiling and reach unity at the soft boundary.
+        soft = max(float(self.config.soft_kv_cache_usage), 1e-6)
+        pressure = min(max_usage / soft, 1.0)
+        self.growth_multiplier = 1.0 + (
+            float(self.config.growth_factor_per_turnover) - 1.0
+        ) * (1.0 - pressure)
 
         if (
             self.draining
@@ -161,7 +185,16 @@ class AdaptiveConcurrencyController:
         ):
             self.draining = False
         self.trim_cooldown = max(0, self.trim_cooldown - 1)
-        self.can_grow = signal == "clear" and total_queued == 0 and not self.draining
+        # Growth is tapered continuously up to the soft boundary.  The
+        # legacy growth_kv_cache_usage threshold must not freeze growth in the
+        # useful 0.6..0.8 headroom band.
+        self.can_grow = (
+            max_usage <= self.config.soft_kv_cache_usage
+            and total_queued == 0
+            and not preempted
+            and not queue_overload
+            and not self.draining
+        )
         self.can_grow_until = time.monotonic() + (
             self.config.poll_interval_seconds * self.config.growth_gate_polls
         )
@@ -281,4 +314,5 @@ class AdaptiveConcurrencyController:
             "generation/concurrency/capacity_tokens": float(self.capacity or 0),
             "generation/concurrency/adjustments": float(self.adjustments),
             "generation/concurrency/signal": float(_SIGNAL_SEVERITY[self.signal]),
+            "generation/concurrency/growth_multiplier": self.growth_multiplier,
         }

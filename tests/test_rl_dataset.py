@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from wavelet.configs.rl_config import RLDataConfig
+from wavelet.configs.config import RLDataConfig
 from wavelet.data.rl import (
     PackedRLDataset,
     RLExample,
@@ -10,6 +10,7 @@ from wavelet.data.rl import (
     _coerce_optional_sequence,
     collate_rl_batch,
     component_normalization_counts,
+    pad_bins_for_distribution,
     prepare_rl_sample,
     setup_rl_dataloader,
 )
@@ -103,6 +104,36 @@ def test_packed_rl_dataset_allows_dummy_only_distributed_ranks() -> None:
     assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(0.0)
 
 
+@pytest.mark.parametrize("world_size,micro_batch_size", [(8, 1), (4, 2)])
+def test_distributed_packing_splits_real_samples_before_padding(
+    world_size: int, micro_batch_size: int
+) -> None:
+    records = [_record(i, length=i + 2) for i in range(8)]
+    dataset = PackedRLDataset(
+        records=records,
+        tokenizer=None,
+        seq_len=64,
+        data_config=RLDataConfig(
+            seq_len=64, pack_sequences=True, micro_batch_size=micro_batch_size
+        ),
+        data_rank=0,
+        data_world_size=world_size,
+    )
+    bins = dataset._global_bins_for_epoch(0)
+    assert len(bins) == 8
+    assert all(sample["sample_count"] == 1 for sample in bins)
+    assert sum(len(sample["input_ids"]) for sample in bins) == 44
+    by_first_token = {sample["input_ids"][0]: sample for sample in bins}
+    for record in records:
+        sample = by_first_token[record.input_ids[0]]
+        assert sample["input_ids"] == record.input_ids
+        assert sample["target_ids"] == record.target_ids
+        assert sample["loss_mask"] == record.loss_mask
+        assert sample["inference_logprobs"] == record.inference_logprobs
+        assert sample["advantages"] == [record.advantage] * len(record.input_ids)
+    assert dataset.micro_batch_count() == micro_batch_size
+
+
 def test_pretokenized_dummy_rollout_keeps_zero_loss_sample() -> None:
     record = _record(0)
     record.loss_mask = [False] * len(record.loss_mask)
@@ -147,6 +178,32 @@ def test_pretokenized_filtered_rollout_keeps_metric_sample() -> None:
     assert sample["temperatures"] == []
     assert sample["reward"] == 0.0
     assert sample.get("sample_count", 1) == 1
+    assert sample["input_ids"] == record.input_ids[:1]
+    assert sample["target_ids"] == record.target_ids[:1]
+    assert sample["position_ids"] == [0]
+    assert sample["loss_mask"] == [False]
+
+
+def test_filtered_metric_rows_preserve_distributed_counts_and_training_tokens():
+    records = [_record(1, length=6), _record(0, length=32)]
+    filtered = records[1]
+    filtered.loss_mask = [False] * 32
+    filtered.advantage = 0.0
+    filtered.inference_logprobs = []
+    filtered.temperatures = []
+    filtered.metadata = {"_wavelet_filtered_rollout": True}
+    dataset = PackedRLDataset(
+        records=records,
+        tokenizer=None,
+        seq_len=64,
+        data_config=RLDataConfig(pack_sequences=True, seq_len=64),
+        data_world_size=2,
+    )
+    bins = dataset._global_bins_for_epoch(0)
+    assert sum(len(sample["input_ids"]) for sample in bins) == 7
+    assert sum(sum(sample["loss_mask"]) for sample in bins) == 6
+    assert sum(sample["sample_count"] for sample in bins) == 2
+    assert sorted(sample["reward"] for sample in bins) == [0.0, 1.0]
 
 
 def test_pretokenized_rollout_count_metadata_sets_sample_count() -> None:
@@ -162,6 +219,35 @@ def test_pretokenized_rollout_count_metadata_sets_sample_count() -> None:
 
     assert sample is not None
     assert sample["sample_count"] == 0
+
+
+def test_packed_reward_counts_branched_rollout_once():
+    records = [_record(1), _record(1), _record(0)]
+    records[1].metadata = {"_wavelet_rollout_count": 0}
+    dataset = PackedRLDataset(
+        records=records,
+        tokenizer=None,
+        seq_len=64,
+        data_config=RLDataConfig(pack_sequences=True, seq_len=64),
+    )
+    (sample,) = dataset._global_bins_for_epoch(0)
+    assert sample["sample_count"] == 2
+    assert sample["reward"] == 0.5
+
+
+def test_packed_continuation_branch_has_no_independent_reward():
+    record = _record(1)
+    record.metadata = {"_wavelet_rollout_count": 0}
+    dataset = PackedRLDataset(
+        records=[record],
+        tokenizer=None,
+        seq_len=64,
+        data_config=RLDataConfig(pack_sequences=True, seq_len=64),
+    )
+    (sample,) = dataset._global_bins_for_epoch(0)
+    assert sample["sample_count"] == 0
+    assert sample["reward"] is None
+    assert sum(sample["loss_mask"]) == len(record.input_ids)
 
 
 def test_pretokenized_source_lengths_are_checked_before_truncation() -> None:
@@ -304,6 +390,57 @@ def test_packed_rl_dataset_pads_bins_to_whole_micro_batches() -> None:
     assert trained_tokens == 30
     assert dataset.loss_scale_for_next_local_batch(1) == pytest.approx(30.0)
     assert dataset.epoch == 1
+
+
+def test_unavoidable_distributed_padding_uses_shortest_real_bin():
+    config = RLDataConfig(pack_sequences=True, seq_len=8, micro_batch_size=1)
+    dataset = PackedRLDataset(
+        records=[_record(0, length=8), _record(1, length=2)],
+        tokenizer=None,
+        seq_len=8,
+        data_config=config,
+        data_world_size=4,
+    )
+    bins = dataset._global_bins_for_epoch(0)
+    dummy = [sample for sample in bins if sample.get("sample_count") == 0]
+    assert len(dummy) == 2
+    assert all(len(sample["input_ids"]) == 2 for sample in dummy)
+    assert all(not any(sample["loss_mask"]) for sample in dummy)
+
+
+def test_distributed_bins_balance_tokens_without_changing_samples():
+    bins = [{"input_ids": list(range(length))} for length in [10, 8, 6, 4]]
+    balanced = pad_bins_for_distribution(bins, data_world_size=2)
+    assert sorted(map(id, balanced)) == sorted(map(id, bins))
+    loads = [sum(len(row["input_ids"]) for row in balanced[r::2]) for r in range(2)]
+    assert loads == [14, 14]
+    assert balanced == pad_bins_for_distribution(bins, data_world_size=2)
+
+
+def test_distributed_bins_balance_sequence_compute_without_changing_samples():
+    bins = [
+        {"input_ids": list(range(8)), "position_ids": positions}
+        for positions in [list(range(8)), [0, 1] * 4] * 2
+    ]
+    balanced = pad_bins_for_distribution(
+        bins, data_world_size=2, micro_batch_size=2, packing_cost=(2, 1)
+    )
+    assert sorted(map(id, balanced)) == sorted(map(id, bins))
+
+    def loads(rows):
+        return [
+            sum(
+                3 * len(row["input_ids"]) + 2 * sum(row["position_ids"])
+                for row in rows[r::2]
+            )
+            for r in range(2)
+        ]
+
+    assert loads(bins) == [160, 64]
+    assert loads(balanced) == [112, 112]
+    assert balanced == pad_bins_for_distribution(
+        bins, data_world_size=2, micro_batch_size=2, packing_cost=(2, 1)
+    )
 
 
 def test_token_streams_longer_than_trainable_tokens_are_rejected() -> None:

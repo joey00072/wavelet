@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
+from wavelet.configs.config import RLPolicyTransferConfig, RLTransportConfig
 from wavelet.transport.queue import (
     FileSystemPolicyReceiver,
     FileSystemRolloutReceiver,

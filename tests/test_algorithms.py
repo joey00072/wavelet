@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
     AlgorithmScope,
     CustomAlgorithmConfig,
     GRPOAlgorithmConfig,

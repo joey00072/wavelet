@@ -1,6 +1,6 @@
 import pytest
 
-from wavelet.configs.rl_config import RLConfig, RLSamplingConfig
+from wavelet.configs.config import RLConfig, RLSamplingConfig
 from wavelet.inference.engine import (
     VLLMPolicyInferenceEngine,
     extract_vllm_generation_logprobs,

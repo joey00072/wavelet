@@ -1,7 +1,6 @@
 from itertools import islice
 
-from wavelet.configs.rl_config import RLDataConfig
-from wavelet.configs.sft import LossMaskConfig
+from wavelet.configs.config import LossMaskConfig, RLDataConfig
 from wavelet.data.rl import PackedRLDataset, RLDataset, RLExample
 from wavelet.data.sft import CatDataset, Example, SFTDataset
 from wavelet.trainer.debug import build_debug_tokenizer

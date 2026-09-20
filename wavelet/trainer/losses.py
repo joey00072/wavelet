@@ -10,7 +10,7 @@ from typing import Any, TypedDict
 import torch
 from torch import Tensor, nn
 
-from wavelet.configs.rl_config import RLLossConfig
+from wavelet.configs.config import RLLossConfig
 from wavelet.trainer.types import LossOutput
 
 logger = logging.getLogger(__name__)
@@ -189,6 +189,27 @@ def ipo_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
     )
 
 
+def icepop_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
+    """Importance-ratio policy gradient with an inclusive acceptance band."""
+    log_ratio = inputs.trainer_logprobs - inputs.inference_logprobs
+    low = torch.log(torch.as_tensor(getattr(loss_config, "ratio_low", 0.2), device=log_ratio.device))
+    high = torch.log(torch.as_tensor(getattr(loss_config, "ratio_high", 5.0), device=log_ratio.device))
+    rejected = (log_ratio.detach() < low) | (log_ratio.detach() > high)
+    keep = inputs.loss_mask & ~rejected
+    # Mask before exp: rejected very large ratios must not create inf*0 NaNs.
+    safe_ratio = torch.exp(torch.where(keep, log_ratio, torch.zeros_like(log_ratio)))
+    per_token = -keep.to(inputs.advantages.dtype) * getattr(loss_config, "adv_tau", 1.0) * inputs.advantages * safe_ratio
+    if inputs.loss_weights is not None:
+        per_token = per_token * inputs.loss_weights
+    mismatch = torch.exp(log_ratio) - log_ratio - 1
+    return LossOutput(
+        loss=per_token.sum(),
+        metrics={
+            "masked_mismatch_kl": _safe_mean(mismatch, inputs.loss_mask & rejected),
+            "unmasked_mismatch_kl": _safe_mean(mismatch, keep),
+            "is_masked": _safe_mean(rejected.float(), inputs.loss_mask),
+        },
+    )
 def ce_loss_fn(inputs: LossInputs) -> LossOutput:
     """Return weighted next-token cross entropy for one sequence."""
     per_token_loss = -inputs.trainer_logprobs
@@ -268,6 +289,11 @@ def setup_rl_loss_fn(loss_config: RLLossConfig) -> LossFn:
             return ipo_loss_fn(inputs, loss_config)
 
         return ipo_loss
+
+    if loss_config.type == "icepop":
+        def icepop_loss(inputs: LossInputs) -> LossOutput:
+            return icepop_loss_fn(inputs, loss_config)
+        return icepop_loss
 
     def dppo_loss(inputs: LossInputs) -> LossOutput:
         return dppo_loss_fn(inputs, loss_config)
@@ -774,9 +800,15 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                 )
 
                 in_chunk = (labels_chunk >= vocab_start) & (labels_chunk < vocab_end)
-                if torch.any(in_chunk):
-                    indexes = (labels_chunk[in_chunk] - vocab_start).to(torch.long)
-                    target_logits[in_chunk] = scaled_logits[in_chunk, indexes]
+                indexes = (
+                    (labels_chunk - vocab_start)
+                    .clamp(0, vocab_end - vocab_start - 1)
+                    .long()
+                )
+                chunk_targets = scaled_logits.gather(1, indexes.unsqueeze(-1)).squeeze(
+                    -1
+                )
+                target_logits = torch.where(in_chunk, chunk_targets, target_logits)
                 if mask_logits is not None:
                     in_chunk_mask, safe_ids = _chunk_mask_indices(
                         sampling_mask_ids[start:end],
@@ -879,9 +911,14 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                     probs = torch.exp(full_logits - full_log_z.unsqueeze(-1))
                     grad_logits = (-full_grad).unsqueeze(-1) * probs
                     in_chunk = (full_labels >= vocab_start) & (full_labels < vocab_end)
-                    if torch.any(in_chunk):
-                        indexes = (full_labels[in_chunk] - vocab_start).to(torch.long)
-                        grad_logits[in_chunk, indexes] += full_grad[in_chunk]
+                    indexes = (
+                        (full_labels - vocab_start)
+                        .clamp(0, vocab_end - vocab_start - 1)
+                        .long()
+                    )
+                    grad_logits.scatter_add_(
+                        1, indexes.unsqueeze(-1), (full_grad * in_chunk).unsqueeze(-1)
+                    )
                     grad_logits = grad_logits * full_inv_temperature
                     if grad_hidden is not None:
                         hidden_grad = grad_logits.to(hidden.dtype) @ weight_chunk

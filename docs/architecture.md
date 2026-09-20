@@ -10,7 +10,8 @@ filesystem artifacts carry state between independently restartable processes.
 | --- | --- |
 | `wavelet.configs` | Pydantic schemas, legacy input normalization, and cross-field validation |
 | `wavelet.data` | Canonical SFT and RL loading, normalization, tokenization, packing, and collation |
-| `wavelet.entrypoints` | Thin command adapters that load a subsystem's `main` function |
+| `wavelet.cli` | Lazy command dispatch directly to subsystem `main` functions |
+| `wavelet.entrypoints` | Commands with their own argument parsing or process setup |
 | `wavelet.orchestrator` | Example selection, rollout scheduling/sources, verifier environments, scoring, algorithms, metrics, and run state |
 | `wavelet.transport` | Filesystem rollout queues and filesystem/NCCL policy transfer |
 | `wavelet.inference` | Native and vLLM policy inference, HTTP clients, policy loading, and diagnostics |
@@ -20,9 +21,19 @@ filesystem artifacts carry state between independently restartable processes.
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
 | `wavelet.utils` | Configuration loading and path helpers |
 
-Entrypoints own argument parsing and process startup. A new command belongs in
-`wavelet.entrypoints`, while reusable configuration, lifecycle, and runtime
-behavior belong to the subsystem it invokes. Shared rollout scheduling lives in
+Register commands in `wavelet.cli` and point directly to a subsystem's existing
+`main` function. Add an entrypoint module only when it owns additional argument
+parsing or process setup. Use `uv run python -m wavelet <command>`; forwarding-only
+modules such as `wavelet.entrypoints.rl_trainer` have been removed.
+SLURM worker dispatch also calls `wavelet.deployment.slurm.main` directly.
+Reusable configuration, lifecycle, and runtime behavior belong to their subsystem.
+Import configuration classes directly from `wavelet.configs.config`; the
+forwarding modules `wavelet.configs.rl_config` and `wavelet.configs.sft` have
+been removed. Existing Python integrations using those paths must update their
+imports. YAML schemas and CLI commands are unchanged by this consolidation.
+YAML anchors and merge defaults (`<<: *defaults`) are supported; explicit
+values override merged defaults, while repeated explicit keys remain errors.
+Shared rollout scheduling lives in
 `wavelet.orchestrator.scheduler`, verifier clients and evaluation in
 `wavelet.orchestrator.envs`, inference serving in `wavelet.inference.server`,
 and trainer behavior in `wavelet.trainer.trainer` and `wavelet.trainer.rl`.
@@ -50,12 +61,15 @@ parallel dispatcher around SDPA. Set `fsdp.enabled: true`, `fsdp.impl: fsdp2`,
 `model.attn_implementation: sdpa`. The RL trainer pads packed rows to a common
 CP-compatible length, shards input/label and per-token RL streams on the
 sequence dimension, and reduces loss denominators over the combined `dp_cp`
-mesh. `fsdp.cp_style` is currently `ring`; Ulysses is not implemented. CP
-validation also requires a micro-batch size of one and a
-sequence length divisible by `2 * fsdp.cp`; SFT remains rejected until its
-token normalization is CP-aware. RL CP also requires
+mesh using PyTorch's ring context-parallel dispatcher. Ulysses is not
+implemented. CP validation requires a sequence length divisible by
+`2 * fsdp.cp`. Both SFT and RL normalize supervised tokens over the combined
+`dp_cp` mesh; RL CP also requires
 `loss.normalization: token`; sequence normalization would treat a sharded
 sequence fragment as an independent sequence.
+
+Existing configs should remove the obsolete `fsdp.cp_style` and
+`reward.reasoning_start` keys; unknown configuration keys are rejected.
 
 This path depends on `torch.distributed.tensor.experimental.context_parallel`
 and should be validated on the target multi-GPU topology; CPU tests cover only
@@ -227,16 +241,19 @@ adapter during later scheduler work. The HTTP server registers a refreshed
 adapter request only after vLLM accepted the load, so a failed load leaves the
 previous adapter serving.
 
-HTTP policy refreshes are transactions across all inference replicas. The
-rollout scheduler first blocks new submissions, cancels in-flight requests whose
-policy can no longer be admitted for the upcoming rollout step, and drains the
-requests that remain. LoRA adapters then use vLLM's in-place load directly; a second server
-pause would only repeat the scheduler drain. Full-model and collective updates
-pause generation without clearing the version-salted prefix cache, update every
-replica, and resume even when loading fails. The offline engine, whose adapter
-id is stable across snapshots, resets the prefix cache after each in-place
-adapter reload and forwards the client's `cache_salt`. Never replace adapter or
-model weights while a request is decoding.
+HTTP policy refreshes wait for acknowledgements from every inference replica
+before advancing the scheduler's policy version. The scheduler blocks new
+submissions and cancels requests outside the allowed policy window, but does
+not wait for whole agent episodes to finish on the HTTP path. OpenAI/vLLM LoRA
+updates hot-swap the adapter through vLLM's native in-place operation without
+calling `/pause` or `/resume`. Existing requests can continue across versions;
+the native adapter cache keeps the refreshed weights for their stable adapter
+ID rather than reloading an old request's artifact path. This avoids an explicit
+global generation pause; the engine still processes the adapter-load operation.
+Full-model and native-backend updates retain pause/load/resume, including resume
+on failure. Full-model updates preserve the version-salted prefix cache.
+The offline engine resets its prefix cache after each in-place adapter reload
+and forwards the client's `cache_salt`.
 Optional background interval evaluations share the loaded policy with rollout
 generation. A policy update first cancels or drains the older evaluation,
 according to `eval.cancel_on_new_policy`, so an evaluation never spans two

@@ -9,7 +9,7 @@ from typing import Any, Self
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.inference import engine as engine_module
 from wavelet.inference.engine import (
     ADMIN_CONTROL_TIMEOUT_SECONDS,
@@ -136,9 +136,12 @@ def test_nccl_ready_marker_is_written_with_custom_rollout_function(tmp_path) -> 
         orchestrator={"custom_rollout_function": "my_rollouts:generate"},
     )
     engine = HTTPPolicyInferenceEngine(config)
-    engine._load_policy_while_generation_paused = lambda payload: [  # type: ignore[method-assign]
-        {"policy_step": payload["step"]}
-    ]
+
+    def request_all(method, path, payload=None):
+        assert (tmp_path / NCCL_READY_MARKER).exists() == (path != "/pause")
+        return [{"policy_step": 1}]
+
+    engine._request_all = request_all
 
     engine.load_policy(tmp_path, step=1)
 
@@ -155,6 +158,8 @@ def test_admin_request_retries_transient_errors_then_succeeds(
     delays: list[float] = []
 
     def flaky_open(_request: object, *, timeout: float) -> _HTTPResponse:
+        if not _request.full_url.endswith("/load_policy"):
+            return _HTTPResponse({"status": "ok"})
         attempts.append(timeout)
         if len(attempts) < 3:
             if failure_kind == "transport":
@@ -184,6 +189,8 @@ def test_policy_step_mismatch_is_not_retried(monkeypatch, tmp_path: Path) -> Non
 
     def wrong_step(_request: object, *, timeout: float) -> _HTTPResponse:
         nonlocal attempts
+        if not _request.full_url.endswith("/load_policy"):
+            return _HTTPResponse({"status": "ok"})
         attempts += 1
         assert timeout == POLICY_LOAD_TIMEOUT_SECONDS
         return _HTTPResponse({"policy_step": 3})

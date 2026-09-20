@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import shutil
@@ -27,6 +28,7 @@ from wavelet.orchestrator.policy_metadata import (
     adapter_artifact_metadata,
     policy_metadata,
 )
+from wavelet.orchestrator.schedule import retained_policy_snapshots
 from wavelet.trainer.distributed import barrier
 from wavelet.transport.queue import (
     POLICY_META_FILENAME,
@@ -190,7 +192,10 @@ def _model_named_tensors(model: nn.Module) -> dict[str, Tensor]:
 
     unwrapped = unwrap_model(model)
     tensors = dict(unwrapped.named_parameters())
-    tensors.update(dict(unwrapped.named_buffers()))
+    for prefix, module in unwrapped.named_modules():
+        for name, buffer in module.named_buffers(recurse=False):
+            if name not in module._non_persistent_buffers_set:
+                tensors[f"{prefix}.{name}" if prefix else name] = buffer
     return tensors
 
 
@@ -198,11 +203,25 @@ def _materialize_wire_tensors(
     model: nn.Module,
     state_dict: dict[str, Tensor],
     layer_index: int,
+    dtype: torch.dtype | None = None,
 ) -> dict[str, Tensor]:
     """Gather only this layer's sharded tensors and retain their wire dtype."""
     from wavelet.trainer.model import unwrap_model
 
     conversion_model = unwrap_model(model)
+    parameter_names = dict(conversion_model.named_parameters())
+    keep_fp32 = getattr(conversion_model, "keep_in_fp32_for_weight_transfer", None)
+
+    def wire_tensor(name: str, tensor: Tensor) -> Tensor:
+        if (
+            dtype is None
+            or name not in parameter_names
+            or not tensor.is_floating_point()
+        ):
+            return tensor
+        target = torch.float32 if callable(keep_fp32) and keep_fp32(name) else dtype
+        return tensor.to(target)
+
     owner: nn.Module | None = None
     if layer_index < 0:
         owner = model
@@ -229,12 +248,13 @@ def _materialize_wire_tensors(
             offload_to_cpu=True,
         ):
             return {
-                name: tensor.detach().clone().contiguous()
+                name: wire_tensor(name, tensor).detach().clone().contiguous()
                 for name, tensor in state_dict.items()
             }
 
     materialized: dict[str, Tensor] = {}
     for name, tensor in state_dict.items():
+        tensor = wire_tensor(name, tensor)
         full_tensor = getattr(tensor, "full_tensor", None)
         if callable(full_tensor):
             tensor = full_tensor()
@@ -248,6 +268,12 @@ def _convert_layer_to_hf(
     layer_index: int,
 ) -> dict[str, Tensor]:
     """Convert one trainer layer to the checkpoint names vLLM consumes."""
+    from wavelet.trainer.model import _strip_training_wrapper_segments
+
+    state_dict = {
+        _strip_training_wrapper_segments(name): tensor
+        for name, tensor in state_dict.items()
+    }
     convert_layer = getattr(model, "convert_layer_to_hf", None)
     if callable(convert_layer):
         converted = convert_layer(state_dict, layer_index)
@@ -259,13 +285,15 @@ def _convert_layer_to_hf(
     return revert_weight_conversion(model, state_dict)
 
 
-def _iter_layer_state_dicts(model: nn.Module) -> Iterator[dict[str, Tensor]]:
+def _iter_layer_state_dicts(
+    model: nn.Module, dtype: torch.dtype | None = None
+) -> Iterator[dict[str, Tensor]]:
     from wavelet.trainer.model import unwrap_model
 
     conversion_model = unwrap_model(model)
     tensors = _model_named_tensors(model)
     for layer_index, layer in enumerate(_partition_state_dict(tensors)):
-        wire_layer = _materialize_wire_tensors(model, layer, layer_index - 1)
+        wire_layer = _materialize_wire_tensors(model, layer, layer_index - 1, dtype)
         yield _convert_layer_to_hf(conversion_model, wire_layer, layer_index - 1)
 
 
@@ -332,6 +360,7 @@ class NCCLWeightBroadcaster:
     device: torch.device | str | int = "cuda"
     timeout_seconds: int = 600
     source_rank: int = 0
+    dtype: torch.dtype | None = None
     _communicator: Any = field(init=False, repr=False)
     _device: torch.device = field(init=False, repr=False)
     _process_group: Any = field(init=False, repr=False)
@@ -388,7 +417,7 @@ class NCCLWeightBroadcaster:
     @torch.no_grad()
     def broadcast_model(self, model: nn.Module) -> None:
         self.broadcast_layers(
-            _iter_layer_state_dicts(model),
+            _iter_layer_state_dicts(model, self.dtype),
             layer_count=len(_partition_state_dict(_model_named_tensors(model))),
         )
 
@@ -625,6 +654,7 @@ class PolicyExportMixin:
             save_lora_adapter_snapshot,
             save_lora_adapter_snapshot_from_fsdp,
             save_model,
+            unwrap_model,
         )
 
         if (
@@ -638,11 +668,49 @@ class PolicyExportMixin:
                 is_main_process=self.world.is_main,
                 parallel_dims=self.parallel_dims,
             )
-        export_dtype = torch.bfloat16 if self.config.lora is None else None
+        native_deepseek = (
+            getattr(
+                getattr(unwrap_model(self.model), "config", None), "model_type", None
+            )
+            == "deepseek_v4"
+        )
+        if native_deepseek and self.config.lora is not None:
+            raise ValueError(
+                "Native DeepSeek-V4 policy export does not yet support LoRA."
+            )
+        export_dtype = (
+            torch.bfloat16 if self.config.lora is None and not native_deepseek else None
+        )
         export_model, state_dict = export_model_for_save(
             self.model,
             state_dict_dtype=export_dtype,
         )
+        if native_deepseek:
+            if self.world.is_main:
+                from safetensors.torch import save_file
+
+                from wavelet.trainer.models.deepseek_v4.conversion import wavelet_to_raw
+
+                target = tmp_dir / "model"
+                target.mkdir(parents=True, exist_ok=True)
+                native_state = (
+                    export_model.state_dict() if state_dict is None else state_dict
+                )
+                raw_state = wavelet_to_raw(native_state)
+                save_file(
+                    {
+                        key: value.detach().cpu().contiguous()
+                        for key, value in raw_state.items()
+                    },
+                    target / "model.safetensors",
+                )
+                export_config = copy.deepcopy(export_model.config)
+                if hasattr(export_config, "quantization_config"):
+                    del export_config.quantization_config
+                export_config.wavelet_checkpoint_format = None
+                export_config.save_pretrained(target)
+                self.tokenizer.save_pretrained(target)
+            return tmp_dir / "model"
         if self.config.policy_transfer.lightweight_lora and isinstance(
             export_model, PeftModel
         ):
@@ -704,14 +772,25 @@ class PolicyExportMixin:
         if self.world.is_main:
             prune_policy_snapshots(
                 step_dir.parent,
-                keep_last=self.config.policy_transfer.keep_last,
+                keep_last=retained_policy_snapshots(self.config),
             )
 
     def _export_nccl_policy(self, export_step: int) -> Path:
+        from wavelet.trainer.model import unwrap_model
+
         if self.model is None:
             raise RuntimeError("Trainer not set up. Call setup() first.")
         if self.world is None:
             raise RuntimeError("World not set up")
+        if (
+            getattr(
+                getattr(unwrap_model(self.model), "config", None), "model_type", None
+            )
+            == "deepseek_v4"
+        ):
+            raise NotImplementedError(
+                "Native DeepSeek-V4 requires filesystem policy transfer."
+            )
         if self.config.lora is not None:
             raise NotImplementedError(
                 "NCCL policy transfer is only implemented for full-model updates. "
@@ -756,8 +835,7 @@ class PolicyExportMixin:
         )
         (tmp_dir / STABLE_BATCH_MARKER).touch()
         tmp_dir.replace(step_dir)
-        if export_step > 0:
-            self._start_nccl_broadcaster()
+        self._start_nccl_broadcaster()
 
     def _broadcast_nccl_export(
         self,
@@ -765,16 +843,22 @@ class PolicyExportMixin:
         *,
         export_step: int,
     ) -> None:
-        if export_step == 0:
-            return
+        broadcaster = None
         if self.world.is_main:
             self._wait_for_nccl_ready(step_dir)
-            self._nccl_broadcaster().broadcast_model(self.model)
+            broadcaster = self._nccl_broadcaster()
+        self._barrier()
+        if broadcaster is not None:
+            broadcaster.broadcast_model(self.model)
         else:
             # Non-source ranks still drive every layer gather so the FSDP
             # collectives stay in lockstep with the broadcasting rank.
-            for _ in _iter_layer_state_dicts(self.model):
+            for _ in _iter_layer_state_dicts(self.model, self._nccl_wire_dtype()):
                 pass
+
+    def _nccl_wire_dtype(self) -> torch.dtype | None:
+        name = self.config.policy_transfer.nccl_dtype
+        return None if name == "model" else getattr(torch, name)
 
     def _wait_for_nccl_ready(self, step_dir: Path) -> None:
         ready_path = step_dir / NCCL_READY_MARKER
@@ -823,4 +907,5 @@ class PolicyExportMixin:
             ),
             device=device,
             timeout_seconds=self.config.policy_transfer.nccl_timeout_seconds,
+            dtype=self._nccl_wire_dtype(),
         )

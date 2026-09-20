@@ -87,11 +87,18 @@ class ActivationCheckpointingConfig(ConfigModel):
         return self
 
 
+class VLMConfig(ConfigModel):
+    vision_encoder_attr: str = "model.visual"
+    freeze_vision_encoder: bool = True
+
+
 class ModelConfig(ConfigModel):
     name: str = "Qwen/Qwen3-0.6B"
     adapter_path: Path | None = None
     chat_template: str | None = None
     trust_remote_code: bool = False
+    vlm: VLMConfig | None = None
+    experts_implementation: Literal["eager", "grouped_mm"] | None = None
     torch_dtype: Literal["auto", "float32", "float16", "bfloat16"] = "bfloat16"
     attn_implementation: Literal[
         "auto",
@@ -125,6 +132,10 @@ class ModelConfig(ConfigModel):
 
     @model_validator(mode="after")
     def validate_compile_fullgraph(self):
+        if self.load_in_4bit and self.experts_implementation == "grouped_mm":
+            raise ValueError(
+                "model.experts_implementation='grouped_mm' requires unquantized expert weights"
+            )
         if self.compile_fullgraph and not self.compile:
             raise ValueError("model.compile_fullgraph requires model.compile=true.")
         if self.smart_gc and self.activation_checkpointing is None:
@@ -212,6 +223,7 @@ class OptimizerConfig(ConfigModel):
         "adam_8bit",
         "sgd",
         "sign_sgd",
+        "muon",
     ] = "adamw"
     implementation: Literal["for-loop", "foreach", "fused"] = "fused"
     lr: float = Field(default=1e-3, gt=0.0)
@@ -221,6 +233,7 @@ class OptimizerConfig(ConfigModel):
     betas1: float = Field(default=0.9, ge=0.0)
     betas2: float = Field(default=0.999, ge=0.0)
     cpu_offload: bool = False
+    muon_momentum: float = Field(default=0.95, ge=0.0, lt=1.0)
 
     @model_validator(mode="before")
     @classmethod
@@ -317,7 +330,6 @@ class FSDPConfig(ConfigModel):
     dp_replicate: int = Field(default=1, ge=1)
     dp_shard: int = -1
     cp: int = Field(default=1, ge=1)
-    cp_style: Literal["ring"] = "ring"
     tp: int = Field(default=1, ge=1)
     ep: int = Field(default=1, ge=1)
     cpu_offload: bool = False
@@ -396,12 +408,15 @@ class DeploymentConfig(ConfigModel):
     type: Literal["single_node", "multi_node"] = "single_node"
     num_train_nodes: int = Field(default=1, ge=1)
     num_inference_nodes: int = Field(default=0, ge=0)
+    inference_replicas_per_node: int = Field(default=1, ge=1)
     gpus_per_node: int = Field(default=1, ge=1)
     trainer_master_port: int = Field(default=29500, ge=1, le=65535)
 
     @model_validator(mode="after")
     def validate_node_counts(self) -> "DeploymentConfig":
         total_nodes = self.num_train_nodes + self.num_inference_nodes
+        if self.inference_replicas_per_node != 1 and self.num_inference_nodes == 0:
+            raise ValueError("Inference replicas per node require inference nodes.")
         if self.type == "single_node" and total_nodes != 1:
             raise ValueError(
                 "deployment.type='single_node' requires exactly one train node "
@@ -429,6 +444,8 @@ class SlurmConfig(ConfigModel):
     exclude: str | None = None
     cpus_per_task: int | None = Field(default=None, ge=1)
     memory: str | None = None
+    inference_cpus_per_replica: int = Field(default=1, ge=1)
+    inference_memory_per_replica: str | None = Field(default=None, min_length=1)
     exclusive: bool = False
     shared_fs: bool = True
     setup_commands: list[str] = Field(default_factory=list)
@@ -448,6 +465,7 @@ class SlurmConfig(ConfigModel):
             "nodelist": self.nodelist,
             "exclude": self.exclude,
             "memory": self.memory,
+            "inference_memory_per_replica": self.inference_memory_per_replica,
             "python_command": self.python_command,
         }
         for name, value in scalar_values.items():
@@ -577,6 +595,11 @@ class TrainerConfig(ConfigModel):
     def validate_context_parallel(self):
         if self.fsdp.cp <= 1:
             return self
+        if getattr(self.model, "vlm", None) is not None:
+            raise ValueError(
+                "Context parallelism is not supported for VLM models yet; "
+                "disable fsdp.cp when model.vlm is configured."
+            )
         if self.model.attn_implementation != "sdpa":
             raise ValueError(
                 "Context parallelism requires model.attn_implementation='sdpa'."
@@ -589,8 +612,6 @@ class TrainerConfig(ConfigModel):
             )
         data = getattr(self, "data", None)
         if data is not None:
-            if data.micro_batch_size != 1:
-                raise ValueError("Micro batch size must be 1 when CP is enabled")
             divisor = 2 * self.fsdp.cp
             if data.seq_len % divisor != 0:
                 raise ValueError(
@@ -660,15 +681,6 @@ class SFTConfig(TrainerConfig):
         description="Directory for SFT checkpoints, metrics, logs, and run state.",
     )
     max_steps: int | None = Field(default=None, ge=1)
-
-    @model_validator(mode="after")
-    def validate_context_parallel_unsupported(self) -> "SFTConfig":
-        if self.fsdp.cp > 1:
-            raise ValueError(
-                "Context parallelism is currently supported for RLConfig only; "
-                "SFT token normalization is not CP-aware."
-            )
-        return self
 
     @model_validator(mode="after")
     def validate_sft_deployment(self) -> "SFTConfig":
@@ -751,7 +763,9 @@ class RLDataConfig(TrainingDataConfig):
 
 
 class RLLossConfig(ConfigModel):
-    type: Literal["dppo", "ipo", "custom"] = "dppo"
+    type: Literal["dppo", "ipo", "icepop", "custom"] = "dppo"
+    ratio_low: float = Field(default=0.2, gt=0.0, allow_inf_nan=False)
+    ratio_high: float = Field(default=5.0, gt=0.0, allow_inf_nan=False)
     import_path: str | None = None
     kwargs: dict[str, Any] = Field(default_factory=dict)
     dppo_mask_high: float = Field(default=0.20, ge=0.0)
@@ -778,6 +792,8 @@ class RLLossConfig(ConfigModel):
                 "kl_tau",
                 "adv_tau",
                 "teacher_tau",
+                "ratio_low",
+                "ratio_high",
             }
             conflicts = sorted(built_in_fields & normalized.keys())
             if conflicts:
@@ -789,6 +805,8 @@ class RLLossConfig(ConfigModel):
 
     @model_validator(mode="after")
     def validate_custom_loss(self) -> "RLLossConfig":
+        if self.ratio_low > self.ratio_high:
+            raise ValueError("loss.ratio_low must not exceed loss.ratio_high")
         if self.type == "custom":
             if self.import_path is None or not self.import_path.strip():
                 raise ValueError("Custom RL loss requires a non-empty import_path.")
@@ -820,9 +838,8 @@ class RLPolicyTransferConfig(ConfigModel):
     idle_timeout_seconds: float | None = Field(default=None, gt=0.0)
     export_initial: bool = True
     export_every_steps: int = Field(default=1, ge=1)
-    # Policy snapshots are transport artifacts, not checkpoints. Keep the
-    # active version and its predecessor so a lagging filesystem load cannot
-    # lose its source while the next version is published.
+    # Minimum retention. Filesystem publication also retains the allowed policy
+    # lag window so background loads cannot lose a selected snapshot.
     keep_last: int = Field(default=2, ge=2)
     lightweight_lora: bool = True
     nccl_host: str = "127.0.0.1"
@@ -830,6 +847,7 @@ class RLPolicyTransferConfig(ConfigModel):
     nccl_timeout_seconds: int = Field(default=600, ge=1)
     nccl_inference_world_size: int = Field(default=1, ge=1)
     nccl_rank_offset: int = Field(default=1, ge=1)
+    nccl_dtype: Literal["model", "bfloat16", "float32"] = "bfloat16"
 
 
 class RLSamplingConfig(_LegacySamplingConfig):
@@ -904,6 +922,9 @@ class RLEvalEnvConfig(_NamedEnvConfig):
 
 
 class RLEvalConfig(ConfigModel):
+    resume: bool = False
+    model_revision: str | None = None
+    live_traces: bool = True
     env: list[RLEvalEnvConfig] = Field(default_factory=list)
     sampling: RLEvalSamplingConfig = RLEvalSamplingConfig()
     num_examples: int = -1
@@ -1103,7 +1124,6 @@ class RLRewardConfig(ConfigModel):
     ] = "passthrough"
     normalize_whitespace: bool = True
     case_sensitive: bool = True
-    reasoning_start: str = "<start_working_out>"
     reasoning_end: str = "<end_working_out>"
     solution_start: str = "<SOLUTION>"
     solution_end: str = "</SOLUTION>"
@@ -1276,7 +1296,7 @@ class RLAdaptiveConcurrencyConfig(ConfigModel):
     min_inflight: int = Field(default=1, ge=1)
     max_inflight: int | None = Field(default=None, ge=1)
     initial_inflight: int | None = Field(default=None, ge=1)
-    growth_factor_per_turnover: float = Field(default=1.25, gt=1.0)
+    growth_factor_per_turnover: float = Field(default=1.2, gt=1.0)
     binding_fraction: float = Field(default=0.9, gt=0.0, le=1.0)
     growth_gate_polls: int = Field(default=3, ge=1)
     growth_kv_cache_usage: float = Field(default=0.6, ge=0.0, lt=1.0)
@@ -1411,6 +1431,7 @@ class RLTrainEnvConfig(_NamedEnvConfig):
 
 
 class RLOrchestratorConfig(ConfigModel):
+    live_traces: bool = True
     enabled: bool = True
     custom_rollout_function: str | None = None
     verifier_env_id: str | None = None
@@ -1441,6 +1462,10 @@ class RLOrchestratorConfig(ConfigModel):
     curriculum: RLCurriculumConfig | None = None
     rollout_chunk_examples: int | None = Field(default=None, ge=1)
     filter_zero_advantage: bool = True
+    refill_zero_advantage: bool = Field(
+        default=True,
+        description="Refill zero-advantage verifier groups before counting the batch target.",
+    )
     zero_advantage_max_retries: int = Field(default=8, ge=0)
     max_async_level: int = Field(default=0, ge=0)
     max_off_policy_steps: int = Field(default=0, ge=0)
@@ -1710,14 +1735,17 @@ class RLConfig(TrainerConfig):
                 )
             return self
         if self.inference.mode == "vllm_http":
+            if self.deployment.inference_replicas_per_node > 1 and (
+                self.slurm is None or not self.slurm.inference_memory_per_replica
+            ):
+                raise ValueError(
+                    "Multiple inference replicas per node require "
+                    "slurm.inference_memory_per_replica to avoid reserving "
+                    "the node's entire job memory for each server step."
+                )
             if self.deployment.num_inference_nodes < 1:
                 raise ValueError(
                     "Multi-node RL with vLLM requires at least one inference node."
-                )
-            if self.policy_transfer.type != "filesystem":
-                raise ValueError(
-                    "Multi-node RL currently requires policy_transfer.type="
-                    "'filesystem'."
                 )
             required_gpus = self.inference.vllm.tensor_parallel_size * (
                 self.inference.vllm.data_parallel_size_local
@@ -1729,8 +1757,20 @@ class RLConfig(TrainerConfig):
                     "deployment.gpus_per_node="
                     f"{self.deployment.gpus_per_node}."
                 )
+            if (
+                required_gpus * self.deployment.inference_replicas_per_node
+                > self.deployment.gpus_per_node
+            ):
+                raise ValueError(
+                    "Inference replicas per node exceed the available GPUs: "
+                    f"{self.deployment.inference_replicas_per_node} replicas * "
+                    f"{required_gpus} GPUs > {self.deployment.gpus_per_node}."
+                )
             last_port = (
-                self.inference.http.port + self.deployment.num_inference_nodes - 1
+                self.inference.http.port
+                + self.deployment.num_inference_nodes
+                * self.deployment.inference_replicas_per_node
+                - 1
             )
             if last_port > 65535:
                 raise ValueError(

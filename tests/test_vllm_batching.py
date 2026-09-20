@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.inference.engine import VLLMPolicyInferenceEngine, _OpenAIBatchRequest
 
 

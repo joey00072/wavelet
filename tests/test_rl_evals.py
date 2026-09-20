@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.entrypoints import rl_evals
 
 

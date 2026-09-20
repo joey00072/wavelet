@@ -7,10 +7,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 from safetensors.torch import load_file
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+)
 from transformers import GPT2Config, GPT2LMHeadModel
 
-from wavelet.configs.config import LoRAConfig, OptimizerConfig
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import LoRAConfig, OptimizerConfig, RLConfig
 from wavelet.trainer.model import apply_lora, save_lora_adapter_snapshot
 from wavelet.trainer.optim import setup_optimizer
 from wavelet.trainer.trainer import BaseTrainer, _lora_dtype
@@ -112,6 +114,32 @@ def test_policy_snapshot_preserves_fp32_adapter_tensors(tmp_path: Path) -> None:
 
     assert state
     assert all(tensor.dtype == torch.float32 for tensor in state.values())
+
+
+def test_checkpoint_wrapped_policy_snapshot_keeps_serving_parameter_names(
+    tmp_path: Path,
+) -> None:
+    model = _tiny_lora_model(lora_dtype=torch.float32)
+    with torch.no_grad():
+        for parameter in _trainable_parameters(model):
+            parameter.uniform_(-0.1, 0.1)
+    expected_dir = save_lora_adapter_snapshot(model, tmp_path / "expected")
+    expected = load_file(expected_dir / "adapter_model.safetensors")
+
+    blocks = model.base_model.model.transformer.h
+    blocks[0] = checkpoint_wrapper(blocks[0])
+    # Lightweight FSDP export gathers named parameters, bypassing the normal
+    # state_dict hooks that remove activation-checkpoint wrapper names.
+    gathered = dict(model.named_parameters())
+    assert any("_checkpoint_wrapped_module" in key for key in gathered)
+    adapter_dir = save_lora_adapter_snapshot(
+        model, tmp_path / "wrapped", state_dict=gathered
+    )
+    actual = load_file(adapter_dir / "adapter_model.safetensors")
+
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
 
 
 def test_fp32_lora_uses_base_dtype_cuda_autocast(

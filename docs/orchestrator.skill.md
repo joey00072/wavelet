@@ -97,7 +97,7 @@ uv run python -m wavelet debug orchestrator benchmark @ path/to/rl.yaml --no-inf
   collation, logprob alignment, KL, and optimizer behavior.
 - To read individual rollouts from a published batch rather than the sampled
   diagnostics above, start `uv run wavelet dashboard --runs-root outputs` and
-  use the Inspector view: sort by reward or advantage, filter to truncated or
-  zero-advantage rows, and open a group to compare its rollouts side by side.
-  The Generation view charts `reward/*`, `fate/*`, `generation/*`, and
-  `off_policy/*` from `orchestrator_metrics.jsonl` over every step.
+  use the Traces tab to select a step, filter retained episodes, and open the
+  three-pane transcript and metadata viewer. The Metrics
+  tab can search and chart every `reward/*`, `fate/*`, `generation/*`, and
+  `off_policy/*` signal from `orchestrator_metrics.jsonl`.

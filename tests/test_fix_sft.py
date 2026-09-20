@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from wavelet.configs.sft import SFTConfig
+from wavelet.configs.config import SFTConfig
 from wavelet.data.sft import _coerce_messages
 from wavelet.trainer.trainer import SFTTrainer
 

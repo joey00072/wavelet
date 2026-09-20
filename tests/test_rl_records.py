@@ -1,4 +1,4 @@
-from wavelet.configs.rl_config import RLDataConfig
+from wavelet.configs.config import RLDataConfig
 from wavelet.data.rl import RLExample, deserialize_rl_record, serialize_rl_record
 
 

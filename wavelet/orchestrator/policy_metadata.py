@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 
 
 def precision_metadata(config: RLConfig) -> dict[str, Any]:

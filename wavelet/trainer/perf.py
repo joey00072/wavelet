@@ -164,11 +164,22 @@ def estimate_attention_flops_per_token(
 
 def estimate_training_flops_per_token(model: nn.Module, *, seq_len: int) -> int | None:
     """Estimate model FLOPs per token for full fine-tuning or LoRA training."""
+    if seq_len < 1:
+        raise ValueError("seq_len must be positive.")
+    coefficients = estimate_training_flops_coefficients(model)
+    if coefficients is None:
+        return None
+    linear, quadratic = coefficients
+    return linear + quadratic * seq_len
+
+
+def estimate_training_flops_coefficients(model: nn.Module) -> tuple[int, int] | None:
+    """Estimate the linear and quadratic compute costs of one sequence."""
     config = _model_config(model)
     if config is None:
         return None
     active_parameters = estimate_active_matmul_parameters(config)
-    attention_flops = estimate_attention_flops_per_token(config, seq_len=seq_len)
+    attention_flops = estimate_attention_flops_per_token(config, seq_len=1)
     if active_parameters is None or attention_flops is None:
         return None
 
@@ -185,10 +196,10 @@ def estimate_training_flops_per_token(model: nn.Module, *, seq_len: int) -> int 
         return (
             4 * active_parameters
             + 2 * other_trainable_parameters
-            + 6 * lora_parameters
-            + attention_flops
+            + 6 * lora_parameters,
+            attention_flops,
         )
-    return 6 * active_parameters + attention_flops
+    return 6 * active_parameters, attention_flops
 
 
 def _model_config(model: nn.Module) -> PretrainedConfig | None:

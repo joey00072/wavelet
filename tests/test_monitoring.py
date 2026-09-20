@@ -7,7 +7,7 @@ import types
 from collections import namedtuple
 
 from wavelet import wandb_overview
-from wavelet.configs.sft import WandbConfig
+from wavelet.configs.config import WandbConfig
 from wavelet.monitor import RunMonitor, read_jsonl
 
 

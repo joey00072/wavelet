@@ -9,7 +9,7 @@ import torch
 import yaml
 
 from wavelet import debug as debug_module
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.inference import native_server
 from wavelet.orchestrator.placement import nccl_inference_ranks
 from wavelet.orchestrator.runtime import (

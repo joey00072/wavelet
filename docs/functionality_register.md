@@ -44,7 +44,7 @@ run in the ordinary test suite.
 | Native SLURM backend | Dry-run `examples/multinode/{sft,rl}.yaml`, inspect the generated sbatch scripts, then run the site-configured GPU smoke and verify `slurm_allocation.json` plus per-role logs |
 | Dashboard API and artifact readers | `uv run pytest tests/test_dashboard.py` |
 | Per-node trainer telemetry and heartbeat rank table | `uv run pytest tests/test_telemetry.py tests/test_monitoring.py` |
-| Web UI compatibility | `uv run wavelet synth-run --output outputs/demo_run`, `uv run wavelet dashboard --runs-root outputs`, then verify the current-run landing, older-runs list, overview, inspector, evals, pipeline, infra, config, and compare views; repeat against a live state server for a smoke run |
+| Web UI compatibility | `cd webui && bun run build && bun run test:e2e`; the suite verifies run selection, all-metric exploration, the three-pane trace viewer, evaluation reports, merged/split logs, config, empty/error states, and mobile layout against synthetic runs |
 
 For training parity, record baseline evaluation and final evaluation at fixed
 policy steps, failed-rollout counts, queue lifecycle counts, and policy lag.

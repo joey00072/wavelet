@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
 from wavelet.inference import server
 from wavelet.inference.server import _scored_prompt_logprobs

@@ -23,7 +23,7 @@ from peft import (
 )
 from safetensors import safe_open
 from safetensors.torch import save_file as save_safetensors
-from torch import nn
+from torch import Tensor, nn
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
@@ -56,6 +56,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
+    AutoProcessor,
     AutoTokenizer,
     BitsAndBytesConfig,
     PreTrainedModel,
@@ -63,13 +65,14 @@ from transformers import (
 )
 from transformers.utils import logging as transformers_logging
 
-from wavelet.configs.config import DEFAULT_LORA_TARGET_MODULES
-from wavelet.configs.sft import (
+from wavelet.configs.config import (
+    DEFAULT_LORA_TARGET_MODULES,
     ActivationCheckpointingConfig,
     FSDPConfig,
     LoRAConfig,
     ModelConfig,
 )
+from wavelet.data.multimodal import PROCESSOR_FIELDS
 from wavelet.trainer.debug import (
     DEBUG_LORA_TARGET_MODULES,
     DEBUG_MODEL_NAME,
@@ -82,10 +85,81 @@ from wavelet.trainer.moe import (
     configure_hf_moe_expert_parallel,
     hf_moe_experts,
     hf_moe_routers,
+    mark_moe_buffers_ddp_ignored,
 )
 from wavelet.trainer.types import LORA_STATE_ATTRS, lora_adapter_name_from_key
 
 logger = logging.getLogger(__name__)
+
+
+def setup_processor(config: ModelConfig) -> Any | None:
+    """Load the processor beside a VLM's adapter or base checkpoint."""
+    if config.vlm is None:
+        return None
+    source = config.adapter_path or config.name
+    try:
+        processor = AutoProcessor.from_pretrained(
+            source, trust_remote_code=config.trust_remote_code
+        )
+    except (AttributeError, KeyError, OSError, ValueError) as exc:
+        if config.adapter_path is None:
+            raise ValueError(
+                f"VLM model {config.name!r} requires a usable AutoProcessor"
+            ) from exc
+        logger.warning(
+            "Adapter has no usable processor; loading the base checkpoint processor."
+        )
+        processor = AutoProcessor.from_pretrained(
+            config.name, trust_remote_code=config.trust_remote_code
+        )
+    if not any(
+        getattr(processor, name, None) is not None
+        for name in ("image_processor", "video_processor")
+    ):
+        raise ValueError(
+            f"VLM model {config.name!r} processor has no image/video processor"
+        )
+    if config.chat_template is not None:
+        processor.chat_template = config.chat_template
+    return processor
+
+
+def resolve_module_attr(module: nn.Module, path: str) -> nn.Module | None:
+    """Resolve a dotted submodule path, returning ``None`` for missing paths."""
+    current: object = module
+    for part in path.split("."):
+        if not hasattr(current, part):
+            return None
+        current = getattr(current, part)
+    return current if isinstance(current, nn.Module) else None
+
+
+def freeze_vision_encoder(model: nn.Module, path: str | None = None) -> int:
+    """Freeze a model's vision tower and return the number of frozen params."""
+    if isinstance(model, PeftModel):
+        model = model.get_base_model()
+    candidates = (path,) if path else ("visual", "vision_tower", "vision_model")
+    encoder = next(
+        (
+            resolved
+            for candidate in candidates
+            if candidate
+            and (resolved := resolve_module_attr(model, candidate)) is not None
+        ),
+        None,
+    )
+    if encoder is None:
+        raise ValueError("Could not find a vision encoder to freeze")
+    count = 0
+    for parameter in encoder.parameters():
+        parameter.requires_grad_(False)
+        count += parameter.numel()
+    return count
+
+
+def multimodal_forward_kwargs(batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Extract validated processor tensors from a collated batch."""
+    return {key: value for key, value in batch.items() if key in PROCESSOR_FIELDS}
 
 
 def pre_download_model(model_name: str) -> Path | None:
@@ -150,6 +224,9 @@ def prepare_kbit_model(
 
 
 def setup_tokenizer(config: ModelConfig) -> PreTrainedTokenizerBase:
+    from wavelet.trainer.models.deepseek_v4 import register_model
+
+    register_model()
     if config.name == DEBUG_MODEL_NAME:
         return build_debug_tokenizer(model_max_length=4096)
     tokenizer_source = config.adapter_path or config.name
@@ -179,7 +256,9 @@ def setup_tokenizer(config: ModelConfig) -> PreTrainedTokenizerBase:
     return tokenizer
 
 
-def apply_liger_kernel(loss_impl: str, model_name: str) -> None:
+def apply_liger_kernel(
+    loss_impl: str, model_name: str, *, trust_remote_code: bool = False
+) -> None:
     """Patch the model class with Liger fused kernels before from_pretrained.
 
     Must be called before AutoModelForCausalLM.from_pretrained so the patched
@@ -192,28 +271,31 @@ def apply_liger_kernel(loss_impl: str, model_name: str) -> None:
     """
     if loss_impl not in ("liger", "liger_fused"):
         return
+    from wavelet.trainer.models.deepseek_v4 import register_model
+
+    register_model()
+    architecture = AutoConfig.from_pretrained(
+        model_name, trust_remote_code=trust_remote_code
+    )
+    if getattr(architecture, "model_type", None) == "deepseek_v4":
+        raise ValueError('Native eager DeepSeek-V4 requires loss_impl="torch".')
+    model_type = getattr(architecture, "model_type", None)
+    patch_name = _LIGER_MODEL_PATCHES.get(model_type)
+    if patch_name is None:
+        raise ValueError(
+            f"Liger kernels are unsupported for model_type={model_type!r}; "
+            "use loss_impl='torch'."
+        )
     try:
         from liger_kernel.transformers import monkey_patch
 
-        patches = {
-            name: getattr(monkey_patch, name) for _, name in _LIGER_MODEL_PATCHES
-        }
-        name_lower = model_name.lower()
-        for markers, patch_name in _LIGER_MODEL_PATCHES:
-            if any(marker in name_lower for marker in markers):
-                patches[patch_name](
-                    rope=True,
-                    rms_norm=True,
-                    swiglu=True,
-                    cross_entropy=False,
-                    fused_linear_cross_entropy=loss_impl == "liger_fused",
-                )
-                break
-        else:
-            raise ValueError(
-                f"Liger kernel not yet mapped for model '{model_name}'. "
-                "Add it to apply_liger_kernel() or use loss_impl='torch'."
-            )
+        getattr(monkey_patch, patch_name)(
+            rope=True,
+            rms_norm=True,
+            swiglu=True,
+            cross_entropy=False,
+            fused_linear_cross_entropy=loss_impl == "liger_fused",
+        )
     except (ImportError, AttributeError) as exc:
         raise ImportError(
             "Liger kernel support requires the installed 'liger-kernel' package, "
@@ -221,12 +303,12 @@ def apply_liger_kernel(loss_impl: str, model_name: str) -> None:
         ) from exc
 
 
-_LIGER_MODEL_PATCHES = (
-    (("qwen3", "qwen-3"), "apply_liger_kernel_to_qwen3"),
-    (("qwen2", "qwen-2"), "apply_liger_kernel_to_qwen2"),
-    (("llama",), "apply_liger_kernel_to_llama"),
-    (("mistral",), "apply_liger_kernel_to_mistral"),
-)
+_LIGER_MODEL_PATCHES = {
+    "qwen3": "apply_liger_kernel_to_qwen3",
+    "qwen2": "apply_liger_kernel_to_qwen2",
+    "llama": "apply_liger_kernel_to_llama",
+    "mistral": "apply_liger_kernel_to_mistral",
+}
 
 
 def _best_attn_implementation() -> str:
@@ -327,6 +409,8 @@ def _model_load_kwargs(
         "dtype": resolve_dtype(config.torch_dtype),
         "attn_implementation": attention,
     }
+    if config.experts_implementation is not None:
+        kwargs["experts_implementation"] = config.experts_implementation
     _add_tensor_parallel_load_kwargs(kwargs, config, parallel_dims)
     if config.meta_device_init:
         kwargs["low_cpu_mem_usage"] = True
@@ -397,7 +481,12 @@ def _load_pretrained_model(
     if suppress_warning:
         transformers_logging.set_verbosity_error()
     try:
-        return AutoModelForCausalLM.from_pretrained(config.name, **kwargs)
+        model_cls = (
+            AutoModelForImageTextToText
+            if getattr(config, "vlm", None) is not None
+            else AutoModelForCausalLM
+        )
+        return model_cls.from_pretrained(config.name, **kwargs)
     finally:
         if suppress_warning:
             transformers_logging.set_verbosity(previous_verbosity)
@@ -416,11 +505,21 @@ def _build_pretrained_model_on_meta(
     if dtype == "auto":
         dtype = getattr(model_config, "dtype", None) or torch.float32
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(
+        model_cls = (
+            AutoModelForImageTextToText
+            if getattr(config, "vlm", None) is not None
+            else AutoModelForCausalLM
+        )
+        model = model_cls.from_config(
             model_config,
             trust_remote_code=config.trust_remote_code,
             attn_implementation=attention,
             dtype=dtype,
+            **(
+                {"experts_implementation": config.experts_implementation}
+                if config.experts_implementation is not None
+                else {}
+            ),
         )
     return cast(PreTrainedModel, model)
 
@@ -452,12 +551,55 @@ def setup_model(
             parallel_dims=parallel_dims,
         )
 
+    from wavelet.trainer.models.deepseek_v4 import register_model
+
+    register_model()
     setup_runtime(config)
     model_kwargs, model_is_prequantized, attention = _model_load_kwargs(
         config,
         distributed=distributed,
         parallel_dims=parallel_dims,
     )
+    architecture = AutoConfig.from_pretrained(
+        config.name, trust_remote_code=config.trust_remote_code
+    )
+    if getattr(architecture, "model_type", None) == "deepseek_v4":
+        if (
+            getattr(architecture, "wavelet_checkpoint_format", None)
+            != "deepseek_v4_native_v1"
+        ):
+            raise ValueError(
+                "DeepSeek-V4 requires a converted native checkpoint; run "
+                "python -m wavelet.trainer.models.deepseek_v4.conversion RAW_DIR NATIVE_DIR first."
+            )
+        if config.experts_implementation not in {None, "eager"}:
+            raise ValueError(
+                "Native DeepSeek-V4 currently supports eager experts only."
+            )
+        model_kwargs.pop("experts_implementation", None)
+        if config.attn_implementation not in {"auto", "eager"}:
+            raise ValueError(
+                "Native DeepSeek-V4 currently supports eager attention only."
+            )
+        if (
+            config.load_in_4bit
+            or initialize_on_meta
+            or config.smart_gc
+            or config.fused_lm_head_token_chunk_size != "disabled"
+        ):
+            raise ValueError(
+                "Native DeepSeek-V4 does not support 4-bit, meta initialization, smart GC or fused LM-head injection."
+            )
+        if parallel_dims is not None and (
+            parallel_dims.cp_enabled
+            or parallel_dims.tp_enabled
+            or parallel_dims.ep_enabled
+        ):
+            raise ValueError(
+                "Native eager DeepSeek-V4 currently requires CP/TP/EP sizes of one."
+            )
+        attention = "eager"
+        model_kwargs["attn_implementation"] = attention
     if initialize_on_meta:
         if config.load_in_4bit:
             raise ValueError(
@@ -498,6 +640,12 @@ def setup_model(
             model,
             config.adapter_path,
             is_trainable=True,
+        )
+    vlm_config = getattr(config, "vlm", None)
+    if vlm_config is not None and getattr(vlm_config, "freeze_vision_encoder", True):
+        freeze_vision_encoder(
+            model,
+            getattr(vlm_config, "vision_encoder_attr", None),
         )
     return cast(PreTrainedModel, model)
 
@@ -755,6 +903,22 @@ def _is_lora_state_key(key: str) -> bool:
     return any(f".{attr}." in key for attr in LORA_STATE_ATTRS)
 
 
+def validate_lora_trainability(model: nn.Module) -> None:
+    """Reject base parameters accidentally unfrozen by distributed transforms."""
+    unexpected = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        and not _is_lora_state_key(f".{name}")
+        and "modules_to_save" not in name.split(".")
+    ]
+    if unexpected:
+        raise RuntimeError(
+            "LoRA has trainable base parameters after model setup: "
+            + ", ".join(unexpected[:8])
+        )
+
+
 def _tied_checkpoint_keys(model: nn.Module) -> set[str]:
     if not getattr(model.config, "tie_word_embeddings", False):
         return set()
@@ -871,6 +1035,9 @@ def maybe_wrap_fsdp(
     if not fsdp_config.enabled:
         return model
 
+    if getattr(model.config, "model_type", None) == "deepseek_v4":
+        raise ValueError("Native eager DeepSeek-V4 does not yet support FSDP wrapping.")
+
     if not torch.distributed.is_initialized():
         raise RuntimeError(
             "FSDP requires an initialized torch.distributed process group."
@@ -918,12 +1085,18 @@ def maybe_wrap_fsdp(
     )
     sharding_strategy = _fsdp_sharding_strategy(parallel_dims)
     device_mesh = None
+    process_group = None
     if (
         parallel_dims is not None
         and parallel_dims.dp_enabled
         and torch.distributed.get_world_size() > 1
     ):
         device_mesh = parallel_dims.get_mesh("hsdp")
+        if not parallel_dims.tp_enabled and not parallel_dims.dp_replicate_enabled:
+            # FSDP treats a child mesh as tensor-parallel state during checkpoint
+            # export. A flattened 1-D DP mesh has no TP parent dimension.
+            process_group = device_mesh.get_group()
+            device_mesh = None
 
     wrapped = FSDP(
         model,
@@ -934,6 +1107,7 @@ def maybe_wrap_fsdp(
         sharding_strategy=sharding_strategy,
         use_orig_params=True,
         device_mesh=device_mesh,
+        process_group=process_group,
     )
     return cast(PreTrainedModel, wrapped)
 
@@ -967,13 +1141,22 @@ def _wrap_fsdp2(
         if module is not model and type(module) in layer_classes
     ]
     if parallel_dims.ep_enabled:
-        configure_hf_moe_expert_parallel(model, parallel_dims)
+        configure_hf_moe_expert_parallel(
+            model,
+            parallel_dims,
+            grouped_mm=model_config.experts_implementation == "grouped_mm",
+        )
         expert_shard_kwargs = {
             **shard_kwargs,
             "mesh": parallel_dims.get_mesh("dp_mod_ep"),
         }
         for experts in hf_moe_experts(model):
             fully_shard(experts, **expert_shard_kwargs)
+            # Expert dispatch sums contributions from EP ranks; normalize over
+            # the same DP/CP world as the dense parameters, not only dp_mod_ep.
+            experts.set_gradient_divide_factor(
+                parallel_dims.dp_replicate * parallel_dims.dp_shard * parallel_dims.cp
+            )
     if model_config.moe_router_dtype == "float32":
         fp32_shard_kwargs = {
             **shard_kwargs,
@@ -1040,6 +1223,7 @@ def maybe_wrap_ddp(
         if world.device.type == "cuda"
         else {}
     )
+    mark_moe_buffers_ddp_ignored(model)
     return cast(PreTrainedModel, DDP(model, **ddp_kwargs))
 
 
@@ -1439,7 +1623,7 @@ def save_lora_adapter_snapshot(
         adapter_name=adapter_name,
     )
     cpu_state = {
-        _strip_fsdp_wrapped_module_segments(key): value.detach().cpu().contiguous()
+        _strip_training_wrapper_segments(key): value.detach().cpu().contiguous()
         for key, value in lora_state.items()
     }
     save_safetensors(cpu_state, target / "adapter_model.safetensors")
@@ -1639,9 +1823,12 @@ def _split_lora_state_key(key: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _strip_fsdp_wrapped_module_segments(key: str) -> str:
-    return key.replace("._fsdp_wrapped_module.", ".").removeprefix(
-        "_fsdp_wrapped_module."
+def _strip_training_wrapper_segments(key: str) -> str:
+    """Keep adapter keys compatible with the unwrapped inference model."""
+    return ".".join(
+        segment
+        for segment in key.split(".")
+        if segment not in {"_fsdp_wrapped_module", "_checkpoint_wrapped_module"}
     )
 
 

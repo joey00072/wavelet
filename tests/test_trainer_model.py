@@ -9,15 +9,16 @@ import pytest
 import torch
 from torch.utils.checkpoint import CheckpointPolicy
 
-from wavelet.configs.sft import (
+from wavelet.configs.config import (
     ActivationCheckpointingConfig,
+    FSDPConfig,
     LoRAConfig,
     ModelConfig,
     SFTConfig,
 )
 from wavelet.trainer import model as model_utils
 from wavelet.trainer.debug import DEBUG_MODEL_NAME
-from wavelet.trainer.distributed import ParallelDims
+from wavelet.trainer.distributed import ParallelDims, World
 from wavelet.trainer.model import setup_tokenizer
 from wavelet.trainer.trainer import BaseTrainer
 
@@ -27,6 +28,42 @@ class _Tokenizer:
     eos_token = "<eos>"
     chat_template = "original"
     padding_side = "right"
+
+
+@pytest.mark.parametrize("tp,replicate", [(1, 1), (2, 1), (1, 2)])
+def test_fsdp1_plain_dp_uses_process_group_for_checkpoint_compatibility(
+    monkeypatch, tp, replicate
+):
+    parallel_dims = ParallelDims(world_size=4, tp=tp, dp_replicate=replicate)
+    mesh = Mock()
+    monkeypatch.setattr(parallel_dims, "get_mesh", Mock(return_value=mesh))
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    wrapped = Mock()
+    monkeypatch.setattr(model_utils, "FSDP", wrapped)
+    model = torch.nn.Linear(2, 2)
+    model.config = Mock(model_type="test")
+    world = World(
+        rank=0,
+        local_rank=0,
+        world_size=4,
+        local_world_size=4,
+        device=torch.device("cpu"),
+    )
+    model_utils.maybe_wrap_fsdp(
+        model,
+        model_config=ModelConfig(),
+        fsdp_config=FSDPConfig(enabled=True, impl="fsdp1"),
+        world=world,
+        parallel_dims=parallel_dims,
+    )
+    kwargs = wrapped.call_args.kwargs
+    if tp == replicate == 1:
+        assert kwargs["device_mesh"] is None
+        assert kwargs["process_group"] is mesh.get_group.return_value
+    else:
+        assert kwargs["device_mesh"] is mesh
+        assert kwargs["process_group"] is None
 
 
 def test_pre_download_model_populates_hugging_face_cache(monkeypatch, tmp_path) -> None:

@@ -10,7 +10,7 @@ import pytest
 from test_verifiers_rollouts import _bare_scheduler
 
 import wavelet.orchestrator.envs as verifier_envs
-from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
+from wavelet.configs.config import RLConfig, RLEvalEnvConfig
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.runtime import (
     _load_policy_for_step,
@@ -375,6 +375,7 @@ def test_eval_requests_route_to_the_served_policy_model(
     assert captured["max_inflight_rollouts"] == 7
     assert metrics["progress/policy_step"] == 4.0
 
+    config.output_dir = tmp_path / "direct-eval"
     asyncio.run(
         verifier_envs.evaluate_env_async(
             orchestrator,  # type: ignore[arg-type]

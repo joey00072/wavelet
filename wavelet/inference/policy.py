@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import replace
 from pathlib import Path
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
 from wavelet.data.sft import apply_chat_template
 

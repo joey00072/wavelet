@@ -9,14 +9,15 @@ import torch
 from torch import nn
 
 from wavelet import debug as debug_module
-from wavelet.configs.config import DEFAULT_LORA_TARGET_MODULES
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
+    DEFAULT_LORA_TARGET_MODULES,
     GRPOAlgorithmConfig,
+    LoRAConfig,
     RLConfig,
     RLLossConfig,
+    SFTConfig,
     TokensLengthPenaltyConfig,
 )
-from wavelet.configs.sft import LoRAConfig, SFTConfig
 from wavelet.kernels import lora as lora_kernels
 from wavelet.kernels import patch as kernel_patch
 from wavelet.orchestrator import launcher as launcher_module
@@ -60,7 +61,7 @@ def test_ipo_loss_owns_symmetric_mask_threshold() -> None:
 
     with pytest.raises(ValueError, match="greater than or equal to 0"):
         RLLossConfig(type="ipo", ipo_epsilon=-0.1)
-    with pytest.raises(ValueError, match="Input should be 'dppo', 'ipo' or 'custom'"):
+    with pytest.raises(ValueError, match="literal_error"):
         RLLossConfig(type="unknown")  # type: ignore[arg-type]
 
     restored = RLLossConfig.model_validate(config.model_dump(mode="json"))

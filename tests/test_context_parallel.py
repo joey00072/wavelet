@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-
+import pytest
 import torch
 
 from wavelet.trainer.context_parallel import (
@@ -9,6 +8,7 @@ from wavelet.trainer.context_parallel import (
     prepare_context_parallel_batch,
 )
 from wavelet.trainer.distributed import ParallelDims
+from wavelet.trainer.trainer import SFTTrainer
 
 
 def test_context_parallel_batch_padding_preserves_packed_streams() -> None:
@@ -69,33 +69,52 @@ def test_context_parallel_batch_requires_sequence_fields() -> None:
         raise AssertionError("missing sequence fields should be rejected")
 
 
-def test_context_parallel_batch_passes_all_sequence_buffers(monkeypatch) -> None:
+def test_context_parallel_batch_rejects_explicit_attention_bias() -> None:
     dims = ParallelDims(cp=2, dp_shard=1, world_size=2)
     batch = {
         "input_ids": torch.ones(1, 4, dtype=torch.long),
         "labels": torch.ones(1, 4, dtype=torch.long),
     }
-    calls = {}
-
-    @contextmanager
-    def fake_context_parallel(mesh, *, buffers, buffer_seq_dims):
-        calls["mesh"] = mesh
-        calls["buffers"] = buffers
-        calls["seq_dims"] = buffer_seq_dims
-        yield
-
-    monkeypatch.setattr(
-        "torch.distributed.tensor.experimental.context_parallel",
-        fake_context_parallel,
-    )
-    monkeypatch.setattr(dims, "get_mesh", lambda name: "cp-mesh")
     attention_mask = torch.zeros(1, 1, 4, 4)
-    with context_parallel_batch(
-        batch,
-        dims,
-        extra_buffers=[(attention_mask, 2)],
+    with pytest.raises(ValueError, match="explicit 4D"), context_parallel_batch(
+        batch, dims, extra_buffers=[(attention_mask, 2)]
     ):
         pass
 
-    assert calls["seq_dims"] == [1, 1, 2]
-    assert calls["buffers"][-1] is attention_mask
+
+def test_context_parallel_batch_rejects_padding_attention_mask() -> None:
+    dims = ParallelDims(cp=2, dp_shard=1, world_size=2)
+    batch = {
+        "input_ids": torch.ones(1, 4, dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1, 0]]),
+    }
+    with pytest.raises(ValueError, match="all-ones 2D"), context_parallel_batch(
+        batch, dims
+    ):
+        pass
+
+
+def test_sft_loss_uses_global_supervised_token_count_under_cp(monkeypatch) -> None:
+    trainer = object.__new__(SFTTrainer)
+    trainer.parallel_dims = ParallelDims(cp=2, dp_shard=1, world_size=2)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(trainer.parallel_dims, "get_mesh", lambda name: _FakeMesh())
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+
+    def all_reduce(value, *, op, group):
+        del op, group
+        value.mul_(2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    logits = torch.tensor([[[2.0, 0.0], [0.0, 2.0]]], requires_grad=True)
+    labels = torch.tensor([[0, -100]])
+    output = trainer.compute_loss(logits, labels)
+    expected = torch.nn.functional.cross_entropy(
+        logits[:, :1].reshape(-1, 2), labels[:, :1].reshape(-1)
+    )
+    assert torch.allclose(output.loss, expected)
+
+
+class _FakeMesh:
+    def get_group(self):
+        return object()

@@ -5,7 +5,7 @@ from pathlib import Path
 
 from fastapi import HTTPException
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.inference import native_server
 
 

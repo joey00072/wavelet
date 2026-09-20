@@ -39,17 +39,17 @@ uv run torchrun --standalone --nproc-per-node=N \
 
 | Example | Status | Notes |
 | --- | --- | --- |
-| `alphabet_sort` | working | 4B LoRA RL plus a 2-GPU Qwen3-8B long-run recipe. |
+| `alphabet_sort` | working | 4B LoRA RL with a [20-step learning diagnostic](alphabet_sort/README.md), plus a 2-GPU Qwen3-8B long-run recipe. |
 | `equation_builder` | working | Local 3–5 number `+`/`-` environment; 0.6B LoRA plus 7B QLoRA smoke and BF16 LoRA long-run configs with rollout auditing. |
-| `reverse_text` | working | 0.6B LoRA RL plus SFT with periodic validation loss; includes two-GPU OPD and INT4 QLoRA smoke configs. |
+| `reverse_text` | working | 0.6B LoRA RL plus SFT; includes a [full-parameter learning diagnostic](reverse_text/README.md), two-GPU OPD, and INT4 QLoRA smoke configs. |
 | `moe_reverse_text` | working | Qwen3 MoE INT4 QLoRA SFT-to-RL smoke path on two GPUs. |
 | `qwen4b_math` | working | Single-node 4B math adaptation, plus a 2-GPU INT4 QLoRA smoke config. |
-| `qwen2_5_7b_polaris` | runnable | 7B LoRA GRPO on filtered Polaris with strict tags, diverse group sampling, a zero-step AIME 2024 baseline, and held-out 100-step evals. |
+| `qwen2_5_7b_polaris` | runnable | 7B LoRA GRPO on filtered Polaris with strict tags, AIME 2024 evaluation, and four-node SLURM recipes: 128 × 16 for larger runs or 16 fixed problems × 16 rollouts for a 20-step diagnostic. |
 | `hendrycks_sanity` | runnable | 1.5B math sanity config. |
 | `wiki_search` | runnable with env deps | Requires `wiki-search` environment setup. |
 | `wordle` | runnable after external env install | Requires the Wordle environment installed outside `uv sync`. |
 | `qwen30b_math` | adapted | Single-node prototype constrained to supported DP/TP dimensions. |
-| `qwen30b_swe` | adapted | Requires SWE environment; CP/EP remain disabled. |
+| `qwen30b_swe` | adapted | Native SWE bridge, two-node 30B LoRA smoke config, bounded 16 × 16 batching, and comparison guide. See its README for current validation status. |
 | `multinode` | runnable | Native multi-node SLURM SFT and split RL examples. |
 | `intellect_3_1` | config only | Large-model workload using AdamW; CP/EP remain disabled. |
 | `minimax_m2_5_swe` | config only | Large-model workload; CP/EP remain disabled. |

@@ -47,6 +47,7 @@ def _async_manager(
         "wavelet.trainer.distributed.distributed_uses_cuda", lambda: False
     )
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "new_group", lambda **kwargs: object())
     return manager
 
 

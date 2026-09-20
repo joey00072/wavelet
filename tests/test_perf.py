@@ -5,12 +5,13 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.monitor import emit_perf
 from wavelet.trainer.distributed import World
 from wavelet.trainer.perf import (
     estimate_active_matmul_parameters,
     estimate_attention_flops_per_token,
+    estimate_training_flops_coefficients,
     estimate_training_flops_per_token,
     peak_flops_per_second,
     training_flop_metrics,
@@ -57,6 +58,11 @@ def test_dense_training_flop_estimate_matches_component_formula() -> None:
     assert active_parameters == 1_408
     assert attention_flops == 1_920
     assert estimate_training_flops_per_token(model, seq_len=10) == 10_368
+    assert estimate_training_flops_per_token(model, seq_len=20) == 12_288
+    assert estimate_training_flops_coefficients(model) == (8_448, 192)
+    assert estimate_training_flops_coefficients(nn.Linear(2, 2)) is None
+    with pytest.raises(ValueError, match="seq_len must be positive"):
+        estimate_training_flops_per_token(model, seq_len=0)
 
 
 def test_moe_estimate_counts_only_active_experts() -> None:

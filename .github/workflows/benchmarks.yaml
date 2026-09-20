@@ -1,0 +1,58 @@
+name: GPU Benchmarks
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "47 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-benchmarks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sft:
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_SCHEDULED_GPU_BENCHMARKS == 'true'
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 45
+    env:
+      WANDB_MODE: disabled
+      UV_LINK_MODE: copy
+      BENCHMARK_ROOT: outputs/benchmarks/ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install locked dependencies
+        run: uv sync --extra dev --locked
+      - name: Check GPU availability
+        run: nvidia-smi
+      - name: Require CUDA in the benchmark environment
+        run: uv run python -c "import torch; assert torch.cuda.is_available(), 'GPU benchmark requires CUDA-enabled PyTorch and a visible device'"
+      - name: Benchmark SFT
+        run: >-
+          uv run wavelet benchmark run sft benchmarks/configs/sft.yaml
+          "$BENCHMARK_ROOT/run" "$BENCHMARK_ROOT/result.json"
+          --warmup-steps 5 --timeout-seconds 1800
+      - name: Compare reviewed baseline when available
+        run: |
+          if [ -f benchmarks/baselines/sft-ci.json ]; then
+            uv run wavelet benchmark compare "$BENCHMARK_ROOT/result.json" benchmarks/baselines/sft-ci.json
+          fi
+      - name: Upload benchmark results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.BENCHMARK_ROOT }}/result.json
+            ${{ env.BENCHMARK_ROOT }}/run/benchmark.log
+            ${{ env.BENCHMARK_ROOT }}/run/metrics.jsonl
+            ${{ env.BENCHMARK_ROOT }}/run/configs/
+          if-no-files-found: warn

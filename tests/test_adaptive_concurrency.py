@@ -84,7 +84,7 @@ def test_controller_grows_by_one_factor_per_pipeline_turnover() -> None:
         fallback_cost=128,
     )
 
-    observed = controller.observe([_sample(usage=0.2)], inflight=8)
+    observed = controller.observe([_sample(usage=0.0)], inflight=8)
     decisions = []
     while controller.turnover < 1.0:
         decisions.append(
@@ -125,6 +125,17 @@ def test_controller_growth_gate_lifetime_derives_from_poll_cadence(
 
     assert cap_before_expiry > 8.0
     assert controller.cap == cap_before_expiry
+
+
+def test_controller_tapers_growth_multiplier_with_kv_usage() -> None:
+    controller = AdaptiveConcurrencyController(
+        RLAdaptiveConcurrencyConfig(initial_inflight=8, growth_factor_per_turnover=1.2),
+        fallback_limit=16, minimum_burst=1, fallback_cost=128,
+    )
+    controller.observe([_sample(usage=0.0)], inflight=8)
+    assert controller.metrics()["generation/concurrency/growth_multiplier"] == 1.2
+    controller.observe([_sample(usage=0.8)], inflight=8)
+    assert controller.metrics()["generation/concurrency/growth_multiplier"] == 1.0
 
 
 def test_controller_requires_persistent_queue_before_cutting() -> None:

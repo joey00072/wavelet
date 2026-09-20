@@ -15,7 +15,11 @@ def _construct_unique_mapping(
 ) -> dict[Any, Any]:
     seen: set[Any] = set()
     for key_node, _value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
+        key = (
+            key_node.value
+            if key_node.tag == "tag:yaml.org,2002:merge"
+            else loader.construct_object(key_node, deep=deep)
+        )
         if key in seen:
             raise yaml.constructor.ConstructorError(
                 "while constructing a mapping",

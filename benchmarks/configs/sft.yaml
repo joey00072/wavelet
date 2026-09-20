@@ -1,0 +1,26 @@
+model:
+  name: Qwen/Qwen3-0.6B
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  activation_checkpointing: null
+data:
+  source: fake
+  max_examples: 128
+  batch_size: 4
+  micro_batch_size: 1
+  seq_len: 512
+  shuffle: false
+optim:
+  type: adamw
+  implementation: fused
+  lr: 0.00001
+lora: null
+gc: null
+max_steps: 20
+seed: 7
+monitor:
+  wandb:
+    enabled: false
+log:
+  log_every: 1
+output_dir: outputs/benchmarks/sft

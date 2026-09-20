@@ -12,7 +12,12 @@ from typing import Any
 import torch
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import FileSystemWriter
-from torch.distributed.checkpoint.staging import DefaultStager, StagingOptions
+from torch.distributed.checkpoint.staging import (
+    AsyncStager,
+    BlockingAsyncStager,
+    DefaultStager,
+    StagingOptions,
+)
 from torch.distributed.checkpoint.state_dict import (
     get_state_dict,
     set_model_state_dict,
@@ -23,11 +28,12 @@ from torch.distributed.checkpoint.state_dict_saver import (
     AsyncSaveResponse,
 )
 from torch.distributed.checkpoint.stateful import Stateful
+from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torchdata.stateful_dataloader import StatefulDataLoader
 
-from wavelet.configs.sft import CheckpointConfig
+from wavelet.configs.config import CheckpointConfig
 from wavelet.trainer.distributed import (
     World,
     all_ranks_true,
@@ -101,7 +107,7 @@ class PendingAsyncSave:
     checkpoint_dir: Path
     meta: dict[str, Any]
     response: AsyncSaveResponse | Future[Any]
-    stager: DefaultStager | None
+    stager: AsyncStager | None
 
 
 class CheckpointManager:
@@ -121,6 +127,16 @@ class CheckpointManager:
         self.output_dir = output_dir
         self.world = world
         self.pending_save: PendingAsyncSave | None = None
+        self._checkpoint_group: torch.distributed.ProcessGroup | None = None
+
+    def _process_group(self) -> torch.distributed.ProcessGroup | None:
+        if not torch.distributed.is_initialized():
+            return None
+        if self._checkpoint_group is None:
+            # Async DCP stages tensors on CPU. A separate Gloo group also keeps
+            # background checkpoint collectives off the training NCCL group.
+            self._checkpoint_group = torch.distributed.new_group(backend="gloo")
+        return self._checkpoint_group
 
     def save(
         self,
@@ -166,6 +182,7 @@ class CheckpointManager:
             async_checkpointer_type=AsyncCheckpointerType.THREAD,
             async_stager=stager,
             no_dist=no_dist,
+            process_group=self._process_group(),
         )
         self.pending_save = PendingAsyncSave(
             step=trainer_state.step,
@@ -228,6 +245,7 @@ class CheckpointManager:
             state_dict=state_dict,
             checkpoint_id=trainer_dir,
             no_dist=not torch.distributed.is_initialized(),
+            process_group=self._process_group(),
         )
 
         self._load_dataloader_state(checkpoint_dir, dataloader)
@@ -244,6 +262,10 @@ class CheckpointManager:
         self._maybe_finalize_pending(block=False)
 
     def wait_for_pending_save(self) -> None:
+        if self.pending_save is not None and self.world.is_main:
+            logger.info(
+                "Waiting for checkpoint upload: %s", self.pending_save.checkpoint_dir
+            )
         self._maybe_finalize_pending(block=True)
 
     def _maybe_finalize_pending(self, *, block: bool) -> None:
@@ -311,6 +333,7 @@ class CheckpointManager:
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
             (checkpoint_dir / "meta.json").write_text(json.dumps(meta))
             (checkpoint_dir / STABLE_CHECKPOINT_MARKER).touch()
+            logger.info("Checkpoint complete: %s", checkpoint_dir)
         barrier(self.world)
 
     def _reset_checkpoint_dir(self, checkpoint_dir: Path) -> None:
@@ -389,8 +412,18 @@ class CheckpointManager:
             return
         response.staging_completion.result()
 
-    def _build_async_stager(self, *, use_pinned_memory: bool) -> DefaultStager:
+    def _build_async_stager(self, *, use_pinned_memory: bool) -> AsyncStager:
         accelerator_available = bool(torch.accelerator.is_available())
+        if any(
+            isinstance(module, FullyShardedDataParallel)
+            for module in self.model.modules()
+        ):
+            # DefaultStager calls data_ptr() on FSDP1 ShardedTensor values,
+            # which do not implement it. The blocking copier understands shards;
+            # only staging blocks, while checkpoint upload remains asynchronous.
+            return BlockingAsyncStager(
+                cache_staged_state_dict=use_pinned_memory and accelerator_available
+            )
         return DefaultStager(
             StagingOptions(
                 use_pinned_memory=use_pinned_memory and accelerator_available,

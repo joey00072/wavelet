@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
-from wavelet.configs.rl_config import RLPolicyTransferConfig, RLTransportConfig
+from wavelet.configs.config import RLPolicyTransferConfig, RLTransportConfig
 from wavelet.monitor import tail_jsonl
 from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 

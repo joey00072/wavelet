@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from wavelet.dashboard.artifacts import RunArtifacts, discover_runs
+from wavelet.dashboard.live import list_episodes, read_episode
 from wavelet.dashboard.metrics import MAX_SERIES_POINTS
 from wavelet.dashboard.rows import RowFilters
 
@@ -148,8 +149,14 @@ def register_run_routes(
         return {"ok": True, "runs": len(registry.discover())}
 
     @app.get(f"{API_PREFIX}/runs")
-    async def api_runs() -> list[dict[str, Any]]:
-        return registry.summaries()
+    async def api_runs(
+        compact: bool = query(default=False),
+    ) -> list[dict[str, Any]]:
+        summaries = registry.summaries()
+        if not compact:
+            return summaries
+        fields = ("id", "status", "is_current", "model", "trainer_step", "target_step")
+        return [{key: row.get(key) for key in fields} for row in summaries]
 
     @app.get(f"{API_PREFIX}/current")
     async def api_current() -> dict[str, Any]:
@@ -163,6 +170,19 @@ def register_run_routes(
     @app.get(f"{API_PREFIX}/runs/{{run_id}}/summary")
     async def api_summary(run_id: str) -> dict[str, Any]:
         return reader_or_404(run_id).summary()
+
+    @app.get(f"{API_PREFIX}/runs/{{run_id}}/episodes")
+    async def api_episodes(
+        run_id: str, limit: int = query(default=100, ge=1, le=500)
+    ) -> dict[str, Any]:
+        return list_episodes(reader_or_404(run_id).output_dir, limit=limit)
+
+    @app.get(f"{API_PREFIX}/runs/{{run_id}}/episodes/{{episode_id}}")
+    async def api_episode(run_id: str, episode_id: str) -> dict[str, Any]:
+        payload = read_episode(reader_or_404(run_id).output_dir, episode_id)
+        if payload is None:
+            raise http_exception(status_code=404, detail="Episode snapshot unavailable")
+        return payload
 
     @app.get(f"{API_PREFIX}/runs/{{run_id}}/config")
     async def api_config(run_id: str) -> dict[str, Any]:
@@ -211,7 +231,7 @@ def register_run_routes(
         return reader_or_404(run_id).evals()
 
     @app.get(f"{API_PREFIX}/runs/{{run_id}}/evals/{{step}}/{{env}}/rows")
-    async def api_eval_rows(
+    def api_eval_rows(
         run_id: str,
         step: int,
         env: str,
@@ -244,7 +264,7 @@ def register_run_routes(
         )
 
     @app.get(f"{API_PREFIX}/runs/{{run_id}}/evals/{{step}}/{{env}}/rows/{{row_index}}")
-    async def api_eval_row(
+    def api_eval_row(
         run_id: str, step: int, env: str, row_index: int
     ) -> dict[str, Any]:
         row = reader_or_404(run_id).eval_row(step, env, row_index)
@@ -260,9 +280,10 @@ def register_run_routes(
         return reader_or_404(run_id).rollout_batches(limit=limit)
 
     @app.get(f"{API_PREFIX}/runs/{{run_id}}/rollouts/rows")
-    async def api_rollout_rows(
+    def api_rollout_rows(
         run_id: str,
         step: int | None = query(default=None, ge=0),
+        include_text: bool = query(default=True),
         sort: str = query(default="row_index"),
         order: str = query(default="asc"),
         offset: int = query(default=0, ge=0),
@@ -278,7 +299,7 @@ def register_run_routes(
         has_error: bool | None = query(default=None),
         search: str | None = query(default=None),
     ) -> dict[str, Any]:
-        return reader_or_404(run_id).rollout_rows(
+        payload = reader_or_404(run_id).rollout_rows(
             step,
             sort=sort,
             descending=order == "desc",
@@ -298,8 +319,16 @@ def register_run_routes(
             ),
         )
 
+        if not include_text:
+            for key in ("rows", "groups"):
+                payload[key] = [
+                    {k: v for k, v in row.items() if k not in {"prompt", "completion"}}
+                    for row in payload.get(key, [])
+                ]
+        return payload
+
     @app.get(f"{API_PREFIX}/runs/{{run_id}}/rollouts/{{step}}/rows/{{row_index}}")
-    async def api_rollout_row(run_id: str, step: int, row_index: int) -> dict[str, Any]:
+    def api_rollout_row(run_id: str, step: int, row_index: int) -> dict[str, Any]:
         row = reader_or_404(run_id).rollout_row(step, row_index)
         if row is None:
             raise http_exception(status_code=404, detail="Rollout row not found.")

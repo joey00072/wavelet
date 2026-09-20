@@ -6,8 +6,7 @@ from itertools import islice
 
 import pytest
 
-from wavelet.configs.rl_config import RLDataConfig
-from wavelet.configs.sft import LossMaskConfig
+from wavelet.configs.config import LossMaskConfig, RLDataConfig
 from wavelet.data.rl import RLDataset, RLExample
 from wavelet.data.sft import Example, SFTDataset
 

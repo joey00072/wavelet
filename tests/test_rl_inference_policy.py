@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
+import pytest
 import torch
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.orchestrator.schedule import (
     latest_exported_policy_step_at_or_before,
     next_exported_policy_step,
     policy_step_to_load,
     required_policy_step,
+    retained_policy_snapshots,
 )
 from wavelet.orchestrator.scheduler import (
     _load_policy_and_update_scheduler,
@@ -19,6 +21,7 @@ from wavelet.orchestrator.scheduler import (
 )
 from wavelet.trainer.distributed import World
 from wavelet.transport.policy import PolicyExportMixin
+from wavelet.transport.queue import STABLE_BATCH_MARKER, FileSystemPolicyReceiver
 
 
 class _PolicyReceiver:
@@ -31,6 +34,37 @@ class _PolicyReceiver:
 
 class _PolicyExporter(PolicyExportMixin):
     pass
+
+
+@pytest.mark.parametrize("interval", [1, 2, 4])
+def test_export_retains_policy_selected_before_request_drain(tmp_path, interval):
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={"max_async_level": 9, "max_off_policy_steps": 8},
+        policy_transfer={"keep_last": 2, "export_every_steps": interval},
+    )
+    exporter = _PolicyExporter()
+    exporter.config = config
+    exporter.world = Mock(is_main=True)
+    exporter._barrier = Mock()
+    receiver = FileSystemPolicyReceiver(tmp_path, config.policy_transfer)
+    receiver.policy_dir.mkdir(parents=True)
+    # Select the oldest allowed snapshot before draining. The trainer can finish
+    # the previous batch and publish another export while the loader is paused.
+    selected_step = 8
+    for step in range(0, selected_step + 8 + 2, interval):
+        temporary = receiver.policy_dir / f"pending-{step}"
+        temporary.mkdir()
+        destination = receiver.policy_dir / f"step-{step:06d}"
+        exporter._publish_export_directory(temporary, destination, export_step=step)
+    assert selected_step in receiver.available_steps()
+    assert (receiver.policy_dir / "step-000008" / STABLE_BATCH_MARKER).exists()
+    assert len(receiver.available_steps()) <= retained_policy_snapshots(config)
+
+
+def test_retention_preserves_larger_explicit_limit():
+    config = RLConfig(policy_transfer={"keep_last": 20})
+    assert retained_policy_snapshots(config) == 20
 
 
 def _config() -> RLConfig:
@@ -228,7 +262,6 @@ def test_async_policy_load_updates_scheduler_before_return(monkeypatch) -> None:
     assert loaded_step == 5
     assert calls == [
         ("begin", 0),
-        ("drain", 0),
         ("load", 4),
         ("set", 5),
         ("model", "policy"),
@@ -284,7 +317,6 @@ def test_foreground_policy_refresh_marks_pending_work_stale(monkeypatch) -> None
 
     assert calls == [
         ("begin", 0),
-        ("drain", 0),
         ("set", 5),
         ("model", "policy"),
         ("mark", 0),
@@ -327,3 +359,95 @@ def test_background_policy_refresh_closes_submission_gate_immediately(
     asyncio.run(run())
 
     assert calls == ["begin", "task"]
+
+
+@pytest.mark.parametrize("lora", [None, {"rank": 4}])
+def test_http_policy_update_does_not_wait_for_agent_episode(monkeypatch, lora):
+    config = RLConfig(lora=lora)
+    scheduler = Mock()
+    scheduler.drain_policy_update_requests = AsyncMock()
+    scheduler.mark_policy_update = AsyncMock()
+    monkeypatch.setattr(
+        "wavelet.orchestrator.scheduler._load_policy_async", AsyncMock(return_value=1)
+    )
+    asyncio.run(_load_policy_and_update_scheduler(config, Mock(), Mock(), 1, scheduler))
+    scheduler.drain_policy_update_requests.assert_not_awaited()
+    scheduler.set_policy_step.assert_called_once()
+    scheduler.finish_policy_update.assert_called_once()
+
+
+def test_policy_watch_runs_while_agent_is_waiting():
+    async def run():
+        policy_loaded = asyncio.Event()
+        config = RLConfig(transport={"poll_interval_seconds": 0.01})
+
+        async def generate(**kwargs):
+            await asyncio.wait_for(policy_loaded.wait(), timeout=1)
+            return ["completed"]
+
+        async def refresh(step):
+            assert step == 1
+            policy_loaded.set()
+
+        context = object.__new__(_VerifierChunkPublisher)
+        context.config = config
+        context.scheduler = Mock(generate_batch=generate)
+        context.prepare_policy = refresh
+        assert await context._generate_batch(rollout_step=1) == ["completed"]
+
+    asyncio.run(run())
+
+
+def test_policy_watch_failure_cancels_pending_generation():
+    async def run():
+        cancelled = asyncio.Event()
+
+        async def generate(**kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        context = object.__new__(_VerifierChunkPublisher)
+        context.config = RLConfig(transport={"poll_interval_seconds": 0.01})
+        context.scheduler = Mock(generate_batch=generate)
+        context.prepare_policy = AsyncMock(side_effect=RuntimeError("transfer failed"))
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            await context._generate_batch(rollout_step=1)
+        assert cancelled.is_set()
+
+    asyncio.run(run())
+
+
+def test_shutdown_finishes_in_progress_policy_transfer(monkeypatch):
+    async def run():
+        release = asyncio.Event()
+        context = object.__new__(_VerifierChunkPublisher)
+        context.pending_policy_update = asyncio.create_task(release.wait())
+        context.scheduler = Mock(aclose=AsyncMock())
+        monkeypatch.setattr(
+            "wavelet.orchestrator.scheduler._teardown_cached_verifier_envs", AsyncMock()
+        )
+        closing = asyncio.create_task(context.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+        assert not context.pending_policy_update.cancelled()
+        context.scheduler.aclose.assert_not_awaited()
+        release.set()
+        await closing
+        context.scheduler.aclose.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_nccl_initial_policy_rendezvous_precedes_rank_gathers(tmp_path):
+    exporter = _PolicyExporter()
+    exporter.world = Mock(is_main=True)
+    exporter.model = object()
+    calls = []
+    exporter._wait_for_nccl_ready = lambda path: calls.append("ready")
+    broadcaster = Mock(broadcast_model=lambda model: calls.append("broadcast"))
+    exporter._nccl_broadcaster = lambda: broadcaster
+    exporter._barrier = lambda: calls.append("barrier")
+    exporter._broadcast_nccl_export(tmp_path, export_step=0)
+    assert calls == ["ready", "barrier", "broadcast"]

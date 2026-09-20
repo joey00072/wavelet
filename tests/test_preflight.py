@@ -3,17 +3,84 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.debug import build_preflight_report
-from wavelet.entrypoints.rl_debug import main as debug_main
+from wavelet.debug import main as debug_main
 
 CUSTOM_ALGORITHM_FILE = Path(__file__).parent / "fixtures" / "custom_algorithm.py"
+
+
+def test_slurm_preflight_uses_allocated_trainer_world_size(tmp_path) -> None:
+    from wavelet.debug import _trainer_parallel_topology_check
+
+    config = RLConfig(
+        deployment={
+            "type": "multi_node",
+            "num_train_nodes": 2,
+            "num_inference_nodes": 1,
+            "gpus_per_node": 8,
+        },
+        slurm={"project_dir": tmp_path},
+        launcher={"mode": "process", "trainer_num_processes": 1},
+        fsdp={"enabled": True, "dp_shard": 16},
+    )
+    check = _trainer_parallel_topology_check(config, world_size=1)
+    assert check.status == "ok"
+    assert check.details["trainer_world_size"] == 16
+
+    config.fsdp.dp_shard = 8
+    assert _trainer_parallel_topology_check(config, world_size=1).status == "error"
+
+
+def test_slurm_preflight_counts_independent_replicas(tmp_path) -> None:
+    from wavelet.debug import _device_group_checks, _port_checks
+
+    config = RLConfig(
+        deployment={
+            "type": "multi_node",
+            "num_inference_nodes": 2,
+            "gpus_per_node": 8,
+            "inference_replicas_per_node": 2,
+        },
+        slurm={"project_dir": tmp_path, "inference_memory_per_replica": "64G"},
+        launcher={"mode": "process"},
+        inference={"vllm": {"tensor_parallel_size": 4}},
+    )
+    check = _device_group_checks(config)[0]
+    assert check.status == "ok"
+    assert check.details["replicas_per_node"] == 2
+    assert check.details["required_devices_per_replica"] == 4
+    assert _port_checks(config)[0].details == {
+        "replicas": 4,
+        "ports": [8000, 8001, 8002, 8003],
+    }
 
 
 def _write_local_data(tmp_path: Path) -> Path:
     data_path = tmp_path / "train.jsonl"
     data_path.write_text('{"prompt": "x", "completion": "y"}\n', encoding="utf-8")
     return data_path
+
+
+def test_preflight_reports_effective_policy_age_limit(tmp_path: Path) -> None:
+    config = RLConfig(
+        data={"source": "local", "path": _write_local_data(tmp_path)},
+        output_dir=tmp_path / "run",
+        orchestrator={"max_async_level": 2, "max_off_policy_steps": 8},
+    )
+    report = build_preflight_report(config)
+    assert report["summary"]["policy_freshness"] == {
+        "max_async_level": 2,
+        "max_off_policy_steps": 8,
+        "effective_max_policy_lag": 1,
+        "retained_policy_snapshots": 3,
+    }
+    config.orchestrator.max_async_level = 9
+    report = build_preflight_report(config)
+    assert report["summary"]["policy_freshness"]["effective_max_policy_lag"] == 8
+    config.orchestrator.max_off_policy_steps = 2
+    report = build_preflight_report(config)
+    assert report["summary"]["policy_freshness"]["effective_max_policy_lag"] == 2
 
 
 def test_preflight_reports_unavailable_cuda_device(tmp_path, monkeypatch) -> None:

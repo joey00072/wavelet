@@ -2,6 +2,8 @@ name: GPU Tests
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
 
 permissions:
   contents: read
@@ -12,6 +14,7 @@ concurrency:
 
 jobs:
   pytest:
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_SCHEDULED_GPU_CHECKS == 'true'
     name: GPU tests
     runs-on: [self-hosted, linux, gpu]
     timeout-minutes: 60
@@ -30,5 +33,14 @@ jobs:
         run: uv sync --extra dev --locked
       - name: Check GPU availability
         run: nvidia-smi
+      - name: Require CUDA in the test environment
+        run: uv run python -c "import torch; assert torch.cuda.is_available(), 'GPU CI requires CUDA-enabled PyTorch and a visible device'"
       - name: Run GPU tests
-        run: uv run pytest tests -m gpu
+        run: uv run pytest tests -m gpu --junitxml=outputs/ci/gpu-tests.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-tests-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/ci/gpu-tests.xml
+          if-no-files-found: warn

@@ -15,12 +15,14 @@ from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
-from wavelet.configs.rl_config import RLDataConfig
+from wavelet.configs.config import RLDataConfig
 from wavelet.data._stateful import StatefulDatasetMixin
+from wavelet.data.multimodal import collate_multimodal_fields
 from wavelet.data.sft import (
     IGNORE_INDEX,
     Example,
     Sample,
+    _ProcessorTokenizer,
     build_sample,
     load_data_payloads,
     normalize_record,
@@ -32,6 +34,15 @@ LOSS_COMPONENTS = ("rl", "ce", "ref_kl")
 # default to zero on rows that omit them.
 _SHARED_STREAMS = ("inference_logprobs", "teacher_logprobs", "sampling_masks")
 _WEIGHT_STREAMS = ("ce_weights", "ref_kl_weights")
+
+
+def _serialize_mm_kwargs(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return {
+        key: item.detach().cpu().tolist() if isinstance(item, Tensor) else item
+        for key, item in value.items()
+    }
 
 
 class RLSample(TypedDict):
@@ -51,6 +62,7 @@ class RLSample(TypedDict):
     temperatures: list[float]
     reward: float | None
     sample_count: NotRequired[int]
+    mm_kwargs: NotRequired[dict[str, Any]]
 
 
 class RLBatch(TypedDict):
@@ -75,6 +87,7 @@ class RLBatch(TypedDict):
     teacher_logprobs: Tensor
     temperatures: Tensor
     sample_counts: Tensor
+    mm_kwargs: NotRequired[dict[str, Tensor]]
 
 
 @dataclass
@@ -99,6 +112,7 @@ class RLExample:
     chat_template_kwargs: dict[str, Any] | None = None
     metadata: dict[str, Any] | None = None
     source: str = "dataset"
+    mm_kwargs: dict[str, Any] | None = None
 
 
 def rl_example_from_payload(payload: dict[str, Any]) -> RLExample:
@@ -122,6 +136,7 @@ def rl_example_from_payload(payload: dict[str, Any]) -> RLExample:
         chat_template_kwargs=payload.get("chat_template_kwargs"),
         metadata=payload.get("metadata"),
         source=payload.get("source") or "dataset",
+        mm_kwargs=payload.get("mm_kwargs"),
     )
 
 
@@ -167,6 +182,7 @@ def serialize_rl_record(
         config.tools_column: record.tools,
         config.chat_template_kwargs_column: record.chat_template_kwargs,
         config.metadata_column: record.metadata,
+        "mm_kwargs": _serialize_mm_kwargs(record.mm_kwargs),
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
     return payload
@@ -206,6 +222,7 @@ def deserialize_rl_record(payload: dict[str, Any], config: RLDataConfig) -> RLEx
         ce_weight=payload.get(config.ce_weight_column),
         ref_kl_weight=payload.get(config.ref_kl_weight_column),
         metadata=metadata,
+        mm_kwargs=base.mm_kwargs,
     )
 
 
@@ -279,13 +296,18 @@ def pack_samples(
     *,
     seq_len: int,
     pad_to_multiple_of: int,
+    bin_count_multiple: int = 1,
 ) -> list[RLSample]:
     """Pack samples with first-fit decreasing bin packing.
 
     Samples only share a bin when they carry the same optional streams;
     merging a row without ``inference_logprobs`` into a bin would otherwise
     drop the sampled logprobs of every other row in that bin.
+    Split bins at sample boundaries before adding distributed padding, so
+    available real samples fill otherwise idle data ranks.
     """
+    if bin_count_multiple < 1:
+        raise ValueError("bin_count_multiple must be positive.")
     sorted_samples = sorted(samples, key=lambda sample: -len(sample["input_ids"]))
     bins: list[list[RLSample]] = []
     bin_lengths: list[int] = []
@@ -302,6 +324,24 @@ def pack_samples(
             bins.append([sample])
             bin_lengths.append(sample_len)
             bin_streams.append(streams)
+    target_count = (
+        (len(bins) + bin_count_multiple - 1) // bin_count_multiple
+    ) * bin_count_multiple
+    while len(bins) < target_count:
+        candidates = [i for i, items in enumerate(bins) if len(items) > 1]
+        if not candidates:
+            break
+        index = max(candidates, key=lambda i: bin_lengths[i])
+        halves: list[list[RLSample]] = [[], []]
+        lengths = [0, 0]
+        for sample in bins[index]:
+            side = 0 if lengths[0] <= lengths[1] else 1
+            halves[side].append(sample)
+            lengths[side] += len(sample["input_ids"])
+        bins[index] = halves[0]
+        bin_lengths[index] = lengths[0]
+        bins.append(halves[1])
+        bin_lengths.append(lengths[1])
     return [
         _merge_samples(items, pad_to_multiple_of=pad_to_multiple_of) for items in bins
     ]
@@ -312,8 +352,9 @@ def pad_bins_for_distribution(
     *,
     data_world_size: int,
     micro_batch_size: int = 1,
+    packing_cost: tuple[int, int] = (1, 0),
 ) -> list[RLSample]:
-    """Add zero-loss bins so every data rank receives the same bin count.
+    """Balance estimated compute with equal bin counts on every data rank.
 
     Bins are padded to a multiple of ``data_world_size * micro_batch_size`` so
     each rank's epoch also splits into whole micro-batches; otherwise the final
@@ -323,9 +364,31 @@ def pad_bins_for_distribution(
     if multiple <= 1 or not bins:
         return bins
     pad_count = (-len(bins)) % multiple
-    if pad_count == 0:
+    shortest = min(bins, key=lambda sample: len(sample["input_ids"]))
+    bins = [*bins, *(_zero_loss_copy(shortest) for _ in range(pad_count))]
+    if data_world_size <= 1:
         return bins
-    return [*bins, *(_zero_loss_copy(bins[0]) for _ in range(pad_count))]
+    linear, quadratic = packing_cost
+
+    def cost(sample: RLSample) -> int:
+        tokens = len(sample["input_ids"])
+        # For reset positions 0..n-1, sum(2*p + 1) equals n*n per sequence.
+        return linear * tokens + (
+            quadratic * (2 * sum(sample["position_ids"]) + tokens) if quadratic else 0
+        )
+
+    ordered = sorted(((cost(sample), sample) for sample in bins), key=lambda x: -x[0])
+    loads = [0] * data_world_size
+    balanced = []
+    for start in range(0, len(ordered), data_world_size):
+        round_bins = ordered[start : start + data_world_size]
+        rank_order = sorted(range(data_world_size), key=loads.__getitem__)
+        assigned = dict(zip(rank_order, round_bins, strict=True))
+        for rank in range(data_world_size):
+            weight, sample = assigned[rank]
+            balanced.append(sample)
+            loads[rank] += weight
+    return balanced
 
 
 def _merge_samples(
@@ -341,8 +404,11 @@ def _merge_samples(
     rl_weights: list[float] = []
     temperatures: list[float] = []
     rewards = [
-        float(sample["reward"]) for sample in samples if sample["reward"] is not None
+        (float(sample["reward"]), int(sample.get("sample_count", 1)))
+        for sample in samples
+        if sample["reward"] is not None and sample.get("sample_count", 1) > 0
     ]
+    reward_count = sum(count for _, count in rewards)
     sample_count = sum(int(sample.get("sample_count", 1)) for sample in samples)
     streams: dict[str, list[Any]] = {
         **{k: [] for k in _SHARED_STREAMS if all(k in s for s in samples)},
@@ -376,9 +442,17 @@ def _merge_samples(
         "advantages": advantages,
         "rl_weights": rl_weights,
         "temperatures": temperatures,
-        "reward": sum(rewards) / len(rewards) if rewards else None,
+        "reward": (
+            sum(value * count for value, count in rewards) / reward_count
+            if reward_count
+            else None
+        ),
         "sample_count": sample_count,
     }
+    if any(sample.get("mm_kwargs") for sample in samples):
+        raise ValueError(
+            "Multimodal RL samples require padded batches; token packing is unsupported."
+        )
     packed.update(streams)  # type: ignore[typeddict-item]
     return packed
 
@@ -483,7 +557,9 @@ def collate_rl_batch(
         (len(mask) for item in batch for mask in item.get("sampling_masks", [])),
         default=0,
     )
-    output: dict[str, list[torch.Tensor]] = {key: [] for key in RLBatch.__annotations__}
+    output: dict[str, list[torch.Tensor]] = {
+        key: [] for key in RLBatch.__annotations__ if key != "mm_kwargs"
+    }
 
     for item in batch:
         _append_sample(
@@ -495,6 +571,7 @@ def collate_rl_batch(
         )
 
     stacked = {key: torch.stack(values) for key, values in output.items()}
+    stacked.update(collate_multimodal_fields(batch, max_len))
     return cast(RLBatch, stacked)
 
 
@@ -772,6 +849,17 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
         truncated=len(record.input_ids) > seq_len,
     )
 
+    if record.mm_kwargs and len(record.input_ids) > seq_len:
+        raise ValueError(
+            "Multimodal samples cannot be truncated; increase data.seq_len."
+        )
+    if (
+        record.mm_kwargs
+        and (record.metadata or {}).get("multimodal_input_ids") != record.input_ids
+    ):
+        raise ValueError(
+            "Processor tensors require matching metadata.multimodal_input_ids provenance."
+        )
     input_ids = [int(token_id) for token_id in record.input_ids[:seq_len]]
     target_ids = [int(token_id) for token_id in record.target_ids[:seq_len]]
     loss_mask = [bool(value) for value in record.loss_mask[:seq_len]]
@@ -799,6 +887,7 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
         "rl_weights": [],
         "temperatures": [],
         "reward": record.reward,
+        "mm_kwargs": record.mm_kwargs,
     }
 
 
@@ -843,11 +932,37 @@ def prepare_rl_sample(
     tokenizer: PreTrainedTokenizerBase,
     data_config: RLDataConfig,
     seq_len: int,
+    processor: Any | None = None,
 ) -> RLSample | None:
     has_rl_component, has_ce_component, has_ref_kl_component = (
         _validate_rl_record_streams(record)
     )
     base_sample: Sample | RLSample | None = _pretokenized_sample(record, seq_len)
+    if base_sample is not None and processor is not None and not record.mm_kwargs:
+        adapter = _ProcessorTokenizer(processor, tokenizer)
+        ids = adapter.apply_chat_template(
+            record.prompt + record.completion,
+            add_generation_prompt=False,
+            tools=record.tools,
+            **(record.chat_template_kwargs or {}),
+        )
+        sampled_ids = [*record.input_ids, record.target_ids[-1]]
+        if ids != sampled_ids:
+            raise ValueError(
+                "Multimodal processor tokens do not match sampled rollout tokens; refusing to pair images with a different token stream."
+            )
+        if len(record.input_ids) > seq_len:
+            raise ValueError(
+                "Multimodal samples cannot be truncated; increase data.seq_len."
+            )
+        mm = {
+            key: value
+            for key, value in adapter.encoded.items()
+            if key not in {"input_ids", "attention_mask"}
+        }
+        if "mm_token_type_ids" in mm:
+            mm["mm_token_type_ids"] = torch.as_tensor(mm["mm_token_type_ids"])[0, :-1]
+        base_sample["mm_kwargs"] = mm
     if base_sample is None:
         base_sample = build_sample(
             Example(
@@ -856,10 +971,12 @@ def prepare_rl_sample(
                 tools=record.tools,
                 chat_template_kwargs=record.chat_template_kwargs,
                 source=record.source,
+                mm_kwargs=record.mm_kwargs,
             ),
             tokenizer,
             seq_len=seq_len,
             loss_mask_config=data_config.loss_mask,
+            processor=processor,
         )
     if base_sample is None:
         return None
@@ -911,6 +1028,7 @@ def prepare_rl_sample(
         "rl_weights": [float(has_rl_component)] * num_trainable_tokens,
         "temperatures": temperatures,
         "reward": record.reward,
+        "mm_kwargs": base_sample.get("mm_kwargs"),
     }
     metadata = record.metadata or {}
     if metadata.get("_wavelet_dummy_rollout"):
@@ -922,6 +1040,17 @@ def prepare_rl_sample(
     )
     if sampling_masks is not None:
         sample["sampling_masks"] = sampling_masks
+    if (
+        metadata.get("_wavelet_filtered_rollout")
+        and num_trainable_tokens == 0
+        and sample["input_ids"]
+        and not sample.get("mm_kwargs")
+    ):
+        # Keep reward/count accounting without forwarding the discarded context.
+        sample["input_ids"] = sample["input_ids"][:1]
+        sample["target_ids"] = sample["target_ids"][:1]
+        sample["position_ids"] = [0]
+        sample["loss_mask"] = [False]
     return sample
 
 
@@ -947,12 +1076,16 @@ class _RecordDataset(StatefulDatasetMixin[RLExample], IterableDataset[RLSample])
     seed: int = 0
     data_rank: int = 0
     data_world_size: int = 1
+    processor: Any | None = None
+    packing_cost: tuple[int, int] = (1, 0)
 
     def __post_init__(self) -> None:
         self._initialize_iteration_state()
 
     def _prepare(self, record: RLExample) -> RLSample | None:
-        return prepare_rl_sample(record, self.tokenizer, self.data_config, self.seq_len)
+        return prepare_rl_sample(
+            record, self.tokenizer, self.data_config, self.seq_len, self.processor
+        )
 
 
 class RLDataset(_RecordDataset):
@@ -1133,16 +1266,18 @@ class PackedRLDataset(_RecordDataset):
             self._record_sample(record.source, len(sample["input_ids"]))
             samples.append(sample)
 
+        _, data_world_size = self._effective_data_partition()
         packed = pack_samples(
             samples,
             seq_len=self.seq_len,
             pad_to_multiple_of=self.data_config.pad_to_multiple_of,
+            bin_count_multiple=data_world_size * self.data_config.micro_batch_size,
         )
-        _, data_world_size = self._effective_data_partition()
         packed = pad_bins_for_distribution(
             packed,
             data_world_size=data_world_size,
             micro_batch_size=self.data_config.micro_batch_size,
+            packing_cost=self.packing_cost,
         )
         self._epoch_global_bins = {epoch: packed}
         return packed
@@ -1211,6 +1346,8 @@ def setup_rl_dataset(
     *,
     data_rank: int,
     data_world_size: int,
+    processor: Any | None = None,
+    packing_cost: tuple[int, int] = (1, 0),
 ) -> IterableDataset[RLSample]:
     if config.source == "fake":
         return FakeRLDataset(
@@ -1240,6 +1377,8 @@ def setup_rl_dataset(
         seed=config.seed,
         data_rank=data_rank,
         data_world_size=data_world_size,
+        processor=processor,
+        packing_cost=packing_cost,
     )
 
 

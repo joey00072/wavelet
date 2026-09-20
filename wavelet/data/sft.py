@@ -15,8 +15,9 @@ from torch.utils.data import IterableDataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
-from wavelet.configs.sft import DataConfig, LossMaskConfig
+from wavelet.configs.config import DataConfig, LossMaskConfig
 from wavelet.data._stateful import StatefulDatasetMixin
+from wavelet.data.multimodal import collate_multimodal_fields
 
 
 @dataclass
@@ -26,6 +27,9 @@ class Example:
     tools: list[dict[str, Any]] | None = None
     chat_template_kwargs: dict[str, Any] | None = None
     source: str = "dataset"
+    # Processor-produced tensors (pixel_values, image_grid_thw, ...). Kept
+    # opaque so each HF VLM can define its own forward schema.
+    mm_kwargs: dict[str, Any] | None = None
 
 
 def _coerce_messages(value: Any, role: str | None) -> list[dict[str, str]]:
@@ -46,7 +50,7 @@ def _coerce_messages(value: Any, role: str | None) -> list[dict[str, str]]:
                     **item,
                     "role": str(item.get("role", role)),
                     # Tool-call assistant messages commonly carry ``content: null``.
-                    "content": "" if content is None else str(content),
+                    "content": "" if content is None else content,
                 }
             )
         return messages
@@ -301,6 +305,11 @@ def normalize_record(payload: dict[str, Any], config: DataConfig) -> Example:
             or payload.get("__source")
             or config.source
         ),
+        mm_kwargs=(
+            payload.get("mm_kwargs")
+            if isinstance(payload.get("mm_kwargs"), dict)
+            else None
+        ),
     )
 
 
@@ -338,6 +347,7 @@ class Sample(TypedDict):
     position_ids: list[int]
     loss_mask: list[bool]
     target_ids: list[int]
+    mm_kwargs: dict[str, Any] | None
 
 
 def _token_ids(value: object) -> list[int]:
@@ -578,16 +588,83 @@ def _maybe_append_assistant_prefill_delta(
     return full_ids, len(full_ids)
 
 
+class _ProcessorTokenizer:
+    """Render every prefix through the processor so image expansion stays aligned."""
+
+    def __init__(self, processor: Any, tokenizer: PreTrainedTokenizerBase):
+        self.processor = processor
+        self.tokenizer = tokenizer
+        self.encoded: dict[str, Any] = {}
+
+    def apply_chat_template(
+        self, messages: list[dict[str, Any]], **kwargs: Any
+    ) -> list[int]:
+        kwargs.update(tokenize=True, return_dict=True, return_tensors="pt")
+        messages = [
+            {**message, "content": [{"type": "text", "text": message["content"]}]}
+            if isinstance(message.get("content"), str)
+            else message
+            for message in messages
+        ]
+        messages = [
+            {
+                **message,
+                "content": [
+                    {"type": "image", "image": part["image_url"]["url"]}
+                    if part.get("type") == "image_url"
+                    else part
+                    for part in message.get("content", [])
+                ],
+            }
+            for message in messages
+        ]
+        self.encoded = dict(self.processor.apply_chat_template(messages, **kwargs))
+        ids = self.encoded["input_ids"]
+        return ids[0].tolist() if isinstance(ids, Tensor) else list(ids[0])
+
+    def decode(self, ids: list[int]) -> str:
+        return self.tokenizer.decode(ids)
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        return self.tokenizer(text, **kwargs)
+
+
 def build_sample(
     record: Example,
     tokenizer: PreTrainedTokenizerBase,
     *,
     seq_len: int,
     loss_mask_config: LossMaskConfig,
+    processor: Any | None = None,
 ) -> Sample | None:
-    result = _build_loss_mask_fast(tokenizer, record, loss_mask_config)
-    if result is None:
-        result = _build_loss_mask(tokenizer, record, loss_mask_config)
+    mm_kwargs = record.mm_kwargs
+    if processor is not None:
+        if mm_kwargs:
+            raise ValueError(
+                "Use structured image/video messages with a processor; preprocessed mm_kwargs require pretokenized RL records."
+            )
+        adapter = _ProcessorTokenizer(processor, tokenizer)
+        result = _build_loss_mask(adapter, record, loss_mask_config)
+        final_ids = apply_chat_template(
+            adapter,
+            record.prompt + record.completion,
+            add_generation_prompt=False,
+            tools=record.tools,
+            chat_template_kwargs=record.chat_template_kwargs,
+        )
+        if final_ids != result[0]:
+            raise ValueError(
+                "Processor tokenization changed the final conversation prefix."
+            )
+        mm_kwargs = {
+            key: value
+            for key, value in adapter.encoded.items()
+            if key not in {"input_ids", "attention_mask"}
+        }
+    else:
+        result = _build_loss_mask_fast(tokenizer, record, loss_mask_config)
+        if result is None:
+            result = _build_loss_mask(tokenizer, record, loss_mask_config)
     full_ids, loss_mask = result
 
     if tokenizer.eos_token_id not in full_ids:
@@ -597,6 +674,24 @@ def build_sample(
         )
         full_ids.append(tokenizer.eos_token_id)
         loss_mask.append(True)
+        if mm_kwargs and "mm_token_type_ids" in mm_kwargs:
+            types = torch.as_tensor(mm_kwargs["mm_token_type_ids"])
+            mm_kwargs["mm_token_type_ids"] = torch.cat(
+                (types, types.new_zeros((1, 1))), dim=1
+            )
+
+    if mm_kwargs:
+        if len(full_ids) - 1 > seq_len:
+            raise ValueError(
+                "Multimodal samples cannot be truncated; increase data.seq_len."
+            )
+        if "mm_token_type_ids" in mm_kwargs:
+            mm_kwargs = {
+                **mm_kwargs,
+                "mm_token_type_ids": torch.as_tensor(mm_kwargs["mm_token_type_ids"])[
+                    0, :-1
+                ],
+            }
 
     input_ids = full_ids[:-1]
     target_ids = full_ids[1:]
@@ -621,6 +716,7 @@ def build_sample(
         "position_ids": list(range(len(input_ids))),
         "target_ids": target_ids,
         "loss_mask": loss_mask,
+        "mm_kwargs": mm_kwargs,
     }
 
 
@@ -706,6 +802,7 @@ def collate_batch(
     }
     if include_attention_mask:
         batch_out["attention_mask"] = torch.stack(attention_mask_out)
+    batch_out.update(collate_multimodal_fields(batch, max_len))
     return batch_out
 
 
@@ -723,9 +820,11 @@ class SFTDataset(StatefulDatasetMixin[Example], IterableDataset[Sample]):
         data_rank: int = 0,
         data_world_size: int = 1,
         max_epochs_per_iteration: int | None = None,
+        processor: Any | None = None,
     ) -> None:
         self.records = records
         self.tokenizer = tokenizer
+        self.processor = processor
         self.seq_len = seq_len
         self.loss_mask_config = loss_mask_config
         self.shuffle = shuffle
@@ -746,6 +845,7 @@ class SFTDataset(StatefulDatasetMixin[Example], IterableDataset[Sample]):
                 self.tokenizer,
                 seq_len=self.seq_len,
                 loss_mask_config=self.loss_mask_config,
+                processor=self.processor,
             )
 
             if sample is None:
@@ -812,6 +912,11 @@ class CatDataset(IterableDataset[Sample]):
 
     def __iter__(self) -> Iterator[Sample]:
         for sample in self.base:
+            if sample.get("mm_kwargs"):
+                raise ValueError(
+                    "Concatenative SFT packing does not support multimodal samples; "
+                    "use pack_function='pad'."
+                )
             self._pending_input_ids.extend(sample["input_ids"])
             self._pending_target_ids.extend(sample["target_ids"])
             self._pending_loss_mask.extend(sample["loss_mask"])
@@ -842,6 +947,7 @@ def setup_dataset(
     data_world_size: int,
     records: list[Example] | None = None,
     max_epochs_per_iteration: int | None = None,
+    processor: Any | None = None,
 ) -> SFTDataset | CatDataset:
     base = SFTDataset(
         load_records(config) if records is None else records,
@@ -853,6 +959,7 @@ def setup_dataset(
         data_rank=data_rank,
         data_world_size=data_world_size,
         max_epochs_per_iteration=max_epochs_per_iteration,
+        processor=processor,
     )
     if config.pack_function == "cat":
         return CatDataset(base, config.seq_len)

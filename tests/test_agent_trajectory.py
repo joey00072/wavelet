@@ -1,11 +1,63 @@
 from __future__ import annotations
 
+import itertools
+import random
+
 import pytest
 
 from wavelet.orchestrator.agent_trajectory import (
     TokenSegment,
+    _unique_ordered_output_matches,
     merge_token_segments,
 )
+
+
+def test_ordered_token_matches_agree_with_exhaustive_placements() -> None:
+    rng = random.Random(31)
+    cases = [
+        ([[1], [2]], [2, 1, 2, 1]),
+        ([[1, 1], [1, 1]], [1] * 4),
+        ([[1, 1], [1, 1]], [1] * 5),
+        ([[1, 2], [1]], [1, 2]),
+        ([[]], [1]),
+        ([], []),
+    ]
+    cases.extend(
+        (
+            [
+                [rng.randrange(2) for _ in range(rng.randrange(1, 5))]
+                for _ in range(rng.randrange(1, 4))
+            ],
+            [rng.randrange(2) for _ in range(rng.randrange(13))],
+        )
+        for _ in range(500)
+    )
+    for outputs, prompt in cases:
+        placements = itertools.product(
+            *[
+                [
+                    i
+                    for i in range(len(prompt) - len(output) + 1)
+                    if output and prompt[i : i + len(output)] == output
+                ]
+                for output in outputs
+            ]
+        )
+        valid = [
+            list(starts)
+            for starts in placements
+            if all(
+                starts[i] + len(outputs[i]) <= starts[i + 1]
+                for i in range(len(starts) - 1)
+            )
+        ]
+        expected = valid[0] if len(valid) == 1 else None
+        assert _unique_ordered_output_matches(outputs, prompt) == expected
+
+
+def test_ordered_token_matches_handle_long_unique_history() -> None:
+    prompt = list(range(1024))
+    assert _unique_ordered_output_matches([[token] for token in prompt], prompt) == prompt
 
 
 def test_merge_token_segments_preserves_exact_prefix_turn_boundary() -> None:
@@ -209,3 +261,22 @@ def test_merge_token_segments_preserves_sampling_masks_at_turn_boundaries() -> N
         [4, 9],
         [5, 7],
     ]
+
+
+def test_changed_media_splits_identical_token_prefixes():
+    first = TokenSegment(
+        prompt_ids=[1, 2],
+        output_ids=[3],
+        output_logprobs=[-1.0],
+        metadata={"media_fingerprint": "red"},
+    )
+    second = TokenSegment(
+        prompt_ids=[1, 2, 3, 4],
+        output_ids=[5],
+        output_logprobs=[-2.0],
+        metadata={"media_fingerprint": "blue"},
+    )
+    samples = merge_token_segments([first, second])
+    assert len(samples) == 2
+    assert [sample.terminal_segment_index for sample in samples] == [0, 1]
+    assert [sum(sample.loss_mask) for sample in samples] == [1, 1]

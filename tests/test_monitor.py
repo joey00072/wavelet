@@ -6,7 +6,7 @@ import pytest
 import wavelet.monitor as canonical_monitor
 import wavelet.monitor as legacy_metrics
 import wavelet.monitor as legacy_monitoring
-from wavelet.configs.sft import SFTConfig
+from wavelet.configs.config import SFTConfig
 from wavelet.monitor import (
     read_jsonl,
     redact,

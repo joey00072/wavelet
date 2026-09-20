@@ -16,7 +16,7 @@ from typing import Any
 
 import torch
 
-from wavelet.configs.rl_config import RLConfig, RLSamplingConfig
+from wavelet.configs.config import RLConfig, RLSamplingConfig
 from wavelet.data.rl import (
     RLExample,
     rl_examples_from_payload,
@@ -323,19 +323,14 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         ) from last_error
 
     def load_policy(self, policy_dir: Path, *, step: int) -> None:
-        if (
-            self.config.lora is None
-            and self.config.policy_transfer.type == "nccl"
-            and step > 0
-        ):
-            # The trainer blocks on this marker before broadcasting; a custom
-            # rollout function still needs the weights delivered.
-            (policy_dir / NCCL_READY_MARKER).touch()
         payload: dict[str, Any] = {"policy_dir": str(policy_dir), "step": step}
-        if self._uses_openai_rollouts() and self.config.lora is not None:
+        if self.config.lora is not None:
             payload["adapter_name"] = self.config.policy_transfer.adapter_name
             payload["load_inplace"] = True
-        if self.config.lora is not None:
+        if (
+            self.config.lora is not None
+            and self.config.inference.vllm.server_backend == "openai"
+        ):
             responses = self._request_all("POST", "/load_policy", payload)
         else:
             responses = self._load_policy_while_generation_paused(payload)
@@ -353,10 +348,12 @@ class HTTPPolicyInferenceEngine(PolicyInferenceEngine):
         self,
         payload: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Drain generation on every replica before replacing policy weights."""
+        """Pause decoding for full-model or native-backend policy updates."""
         primary_error: Exception | None = None
         try:
             self._request_all("POST", "/pause")
+            if self.config.policy_transfer.type == "nccl":
+                (Path(payload["policy_dir"]) / NCCL_READY_MARKER).touch()
             return self._request_all("POST", "/load_policy", payload)
         except Exception as exc:
             primary_error = exc

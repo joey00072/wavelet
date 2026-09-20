@@ -20,7 +20,7 @@ from vllm.lora.worker_manager import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.v1.engine.core import DPEngineCoreProc
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.inference import patches as inference_patches
 from wavelet.inference import server
 
@@ -149,7 +149,7 @@ def test_prompt_tokens_from_validation_error_parses_token_count(
     assert server._prompt_tokens_from_validation_error(error) == 5000
 
 
-def test_lru_patch_still_addresses_path_changes_without_load_inplace() -> None:
+def test_native_lru_loader_uses_inplace_flag_not_request_path() -> None:
     source = inspect.getsource(LRUCacheWorkerLoRAManager.add_adapter)
 
     assert "lora_request.load_inplace" in source
@@ -390,3 +390,63 @@ async def test_policy_update_resume_releases_generation() -> None:
     assert result == {"status": "resumed"}
     assert calls == ["resume"]
     assert state.generation_paused is False
+
+
+def test_server_hot_swap_keeps_new_weights_for_inflight_old_request(monkeypatch):
+    from contextlib import nullcontext
+    from unittest.mock import MagicMock
+
+    from vllm.lora import worker_manager
+
+    from wavelet import monitor
+
+    # Exercise the manager after actual server startup installs its patches.
+    for name in ("add_adapter", "_apply_adapters"):
+        monkeypatch.setattr(
+            LRUCacheWorkerLoRAManager, name, getattr(LRUCacheWorkerLoRAManager, name)
+        )
+    monkeypatch.setattr(worker_manager, "gpu_sync_allowed", nullcontext)
+    monkeypatch.setattr(server, "_CONFIG", None)
+    monkeypatch.setattr(server, "load_config", lambda *_: RLConfig())
+    monkeypatch.setattr(server, "_serve_args", lambda *_: SimpleNamespace())
+    monkeypatch.setattr(monitor, "setup_config_logger", lambda *_: None)
+    monkeypatch.setattr(inference_patches, "transformers_v5_compat", lambda: None)
+    for name in (
+        "_patch_load_lora_adapter",
+        "_patch_skip_lora_module_warnings",
+        "_patch_lora_cpu_pin_memory",
+        "_patch_noisy_tool_parser_errors",
+        "_patch_build_app",
+    ):
+        monkeypatch.setattr(server, name, lambda: None)
+
+    async def run_server(_args):
+        old = LoRARequest("policy", 1, "/old", load_inplace=False)
+        new = LoRARequest("policy", 1, "/new", load_inplace=True)
+        cache = {1: SimpleNamespace(id=1, path="/old")}
+        manager = MagicMock()
+        manager.capacity = 2
+        manager.lora_slots = 1
+        manager.__len__.side_effect = lambda: len(cache)
+        manager.remove_adapter.side_effect = lambda key: cache.pop(key, None)
+        manager.add_adapter.side_effect = lambda adapter: cache.setdefault(1, adapter)
+        manager.get_adapter.side_effect = cache.get
+        worker = LRUCacheWorkerLoRAManager.__new__(LRUCacheWorkerLoRAManager)
+        worker._adapter_manager = manager
+        worker.list_adapters = lambda: set(cache)
+        loads = []
+
+        def load(request):
+            loads.append(request.lora_path)
+            return SimpleNamespace(id=1, path=request.lora_path)
+
+        worker._load_adapter = load
+        worker.add_adapter(new)
+        new.load_inplace = False
+        for request in (old, new, old):
+            worker._apply_adapters({request})
+            assert cache[1].path == "/new"
+        assert loads == ["/new"]
+
+    monkeypatch.setattr(api_server, "run_server", run_server)
+    assert server.main([]) == 0

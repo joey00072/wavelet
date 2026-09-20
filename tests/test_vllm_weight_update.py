@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
@@ -11,6 +14,26 @@ from torch import nn
 
 import wavelet.transport.policy as weight_update
 from wavelet.transport.policy import NCCL_UPDATE_INFO_FILENAME
+
+
+def test_initial_nccl_policy_receives_weights(monkeypatch, tmp_path):
+    from wavelet.configs.config import RLConfig
+    from wavelet.inference import server
+
+    client = SimpleNamespace(collective_rpc=AsyncMock())
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    monkeypatch.setattr(server, "_engine_client", lambda request: client)
+    config = RLConfig(lora=None, policy_transfer={"type": "nccl"})
+    asyncio.run(
+        server._load_full_model_policy(
+            request, policy_dir=tmp_path, step=0, config=config
+        )
+    )
+    assert [call.args[0] for call in client.collective_rpc.await_args_list] == [
+        "init_broadcaster",
+        "update_weights_from_path",
+    ]
+    assert request.app.state.policy_step == 0
 
 
 class _DummyModel(nn.Module):
@@ -187,6 +210,46 @@ def test_materialize_wire_tensors_limits_root_fsdp_summon_scope(
     )
 
     assert [call["recurse"] for call in _FakeFSDP.summon_calls] == [False, True]
+
+
+def test_wire_precision_preserves_declared_parameters_and_buffers():
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.tensor([1.123456], dtype=torch.float32))
+    model.precise = nn.Parameter(torch.tensor([1.123456], dtype=torch.float32))
+    model.register_buffer("scale", torch.tensor([1.123456], dtype=torch.float32))
+    model.keep_in_fp32_for_weight_transfer = lambda name: name == "precise"
+    original = {**dict(model.named_parameters()), **dict(model.named_buffers())}
+    result = weight_update._materialize_wire_tensors(
+        model, original, -1, torch.bfloat16
+    )
+    assert result["weight"].dtype == torch.bfloat16
+    torch.testing.assert_close(result["weight"], original["weight"].bfloat16())
+    for name in ("precise", "scale"):
+        assert result[name].dtype == torch.float32
+        torch.testing.assert_close(result[name], original[name], rtol=0, atol=0)
+    assert model.weight.dtype == torch.float32
+
+
+def test_wire_tensors_exclude_reconstructed_nonpersistent_buffers():
+    model = nn.Module()
+    model.rotary_emb = nn.Module()
+    model.rotary_emb.register_buffer("inv_freq", torch.ones(4), persistent=False)
+    model.register_buffer("scale", torch.ones(1))
+    model.weight = nn.Parameter(torch.ones(2))
+    assert set(weight_update._model_named_tensors(model)) == {"weight", "scale"}
+
+
+def test_wire_conversion_removes_training_wrappers_before_hf_conversion():
+    model = nn.Module()
+    model.convert_layer_to_hf = lambda state, index: state
+    weight = torch.ones(2)
+    result = weight_update._convert_layer_to_hf(
+        model,
+        {"model.layers.0._checkpoint_wrapped_module._fsdp_wrapped_module.weight": weight},
+        0,
+    )
+    assert list(result) == ["model.layers.0.weight"]
+    assert result["model.layers.0.weight"] is weight
 
 
 def test_nccl_weight_update_worker_loads_each_layer_with_mixed_dtypes(

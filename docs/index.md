@@ -27,8 +27,8 @@ training or inference runs.
 - [Agent trajectory artifacts](agent_trajectory.md): token provenance contract
   for custom multi-turn and tool rollouts.
 - [Dashboard](../webui/README.md): browser dashboard over live or completed run
-  directories with training, generation, rollout inspection, evaluation,
-  pipeline, infrastructure, config, and multi-run comparison views.
+  directories with searchable metrics, rollout and evaluation samples, queue
+  and policy state, logs, and resolved config.
 - [Deployment](deployment.md): CUDA containers and local, Ray, or SLURM launchers
   contract.
 - [Functionality register](functionality_register.md): preservation checks per
@@ -152,9 +152,9 @@ uv run wavelet dashboard --runs-root outputs
 ```
 
 The page opens on the current run (fresh heartbeat first, then most recently
-updated); older runs are listed separately and can be compared. The dashboard
-reads the same artifacts the diagnostics commands read and works for completed
-runs. Without a GPU, `uv run wavelet synth-run --output
+updated); every discovered run remains available from the run picker. The
+dashboard reads the same artifacts the diagnostics commands read and works for
+completed runs. Without a GPU, `uv run wavelet synth-run --output
 outputs/demo_run` writes a synthetic run for exercising the UI. See the
 [dashboard guide](../webui/README.md).
 
@@ -230,9 +230,11 @@ uv run pytest tests/integration/test_reverse_text_sft.py -q
 ```
 
 Pull requests and pushes to `master` run the same Ruff checks plus separate CPU
-unit and integration jobs from the locked `uv` environment. The manual GPU
-workflow targets a self-hosted runner carrying the `linux` and `gpu` labels;
-GPU-only coverage remains an explicit release or hardware-runner check.
+unit and integration jobs from the locked `uv` environment. The nightly and
+manually dispatched GPU workflow targets a self-hosted runner carrying the
+`linux` and `gpu` labels. A weekly GPU benchmark retains throughput and memory
+measurements and compares a reviewed baseline when one is available; see the
+[benchmark guide](../benchmarks/README.md) for runner requirements.
 
 Track project size when a change adds or removes meaningful surface area:
 
@@ -252,3 +254,7 @@ a run directory discovers only its canonical `traces/` JSONL files.
 Run one evaluation epoch against an existing OpenAI-compatible server with
 `uv run wavelet evals @ run.yaml --orchestrator.verifier-base-url
 http://server:8000/v1`; the command starts neither training nor inference.
+
+- [Evaluation recovery and live episodes](evaluation_and_live_traces.md)
+- [Model and multimodal training](model_training.md)
+- [Runtime improvements](runtime_improvements.md)

@@ -11,7 +11,7 @@ from unittest.mock import Mock
 import pytest
 
 import wavelet.orchestrator.envs as verifier_envs
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
     GRPOAlgorithmConfig,
     RewardAlgorithmConfig,
     RLConfig,
@@ -959,13 +959,15 @@ def test_verifier_scheduler_drains_done_tasks_and_buffers_extra_groups() -> None
     assert records[0].metadata["policy_step"] == 3
 
 
-def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
+@pytest.mark.parametrize("refill", [True, False])
+def test_verifier_scheduler_resamples_zero_advantage_groups(refill: bool) -> None:
     config = RLConfig(
         orchestrator={
             "advantage_mode": "group_reward",
             "examples_per_step": 2,
             "rollouts_per_example": 2,
             "filter_zero_advantage": True,
+            "refill_zero_advantage": refill,
         }
     )
     scheduler = _bare_scheduler()
@@ -1009,13 +1011,13 @@ def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
         outputs: list[dict[str, Any]] = []
         accepted = scheduler._consume_completed_task(
             tasks[0],
-            target_groups=1,
+            target_groups=2,
             outputs=outputs,
             accepted_groups=0,
         )
         rejected = scheduler._consume_completed_task(
             tasks[1],
-            target_groups=1,
+            target_groups=2,
             outputs=outputs,
             accepted_groups=accepted[0],
         )
@@ -1029,10 +1031,14 @@ def test_verifier_scheduler_resamples_zero_advantage_groups() -> None:
     records, accepted, rejected = asyncio.run(run())
 
     assert accepted == (1, 1, 0)
-    assert rejected == (0, 1, 1)
-    assert len(records) == 2
-    assert [record.reward for record in records] == [0.0, 1.0]
+    assert rejected == ((0, 1, 1) if refill else (1, 1, 0))
+    assert len(records) == (2 if refill else 4)
+    assert [record.reward for record in records] == (
+        [0.0, 1.0] if refill else [0.0, 1.0, 1.0, 1.0]
+    )
     assert all(record.loss_mask == [True] for record in records)
+    finalized = scheduler._finalize_environment_records(records, distill=False)
+    assert sum(bool(any(record.loss_mask)) for record in finalized) == 2
 
 
 def test_verifier_batch_stats_report_unfiltered_generation_reward() -> None:
@@ -1318,7 +1324,7 @@ def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
     }
     assert record.metadata["rollout"] == {
         "group_key": '{"env_name":"repair","example_id":"case-7"}',
-        "rollout_key": '{"env_name":"repair","example_id":"case-7"}:0',
+        "rollout_key": '{"env_name":"repair","example_id":"case-7"}:traj-7:0',
         "sample_index": 0,
         "trajectory_id": "traj-7",
         "num_turns": 1,
@@ -1334,6 +1340,22 @@ def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
             "total": 1.1,
         },
     }
+
+
+def test_verifier_rollout_keys_distinguish_episodes_and_branches() -> None:
+    from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
+
+    keys = set()
+    for trajectory_id in ("episode-a", "episode-b"):
+        for sample_index in (0, 1):
+            metadata = rollout_task_harness_metadata(
+                {"trajectory_id": trajectory_id},
+                group_key="same-problem-group",
+                sample_index=sample_index,
+            )
+            assert metadata["rollout_key"] == metadata["rollout"]["rollout_key"]
+            keys.add(metadata["rollout_key"])
+    assert len(keys) == 4
 
 
 def test_verifier_tool_response_length_penalty_shapes_advantages() -> None:
@@ -1937,7 +1959,8 @@ def test_verifier_group_advantages_dispatch_external_algorithm() -> None:
     assert [output["advantage"] for output in outputs] == pytest.approx([2.0, 1.0])
 
 
-def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
+@pytest.mark.parametrize("refill", [True, False])
+def test_verifier_scheduler_bounds_zero_advantage_retries(refill: bool) -> None:
     config = RLConfig(
         orchestrator={
             "advantage_mode": "group_reward",
@@ -1945,6 +1968,7 @@ def test_verifier_scheduler_bounds_zero_advantage_retries() -> None:
             "rollouts_per_example": 1,
             "filter_zero_advantage": True,
             "zero_advantage_max_retries": 1,
+            "refill_zero_advantage": refill,
         }
     )
     scheduler = _bare_scheduler()
@@ -2233,7 +2257,7 @@ def test_verifier_scheduler_loads_each_environment_runtime(
     )
     loaded_envs: list[tuple[str, dict[str, Any]]] = []
 
-    def load_env(_vf, env_id, env_args, _extra):
+    def load_env(_vf, env_id, env_args, _extra, *, model_config=None):
         loaded_envs.append((env_id, env_args))
         env = type("Env", (), {"requires_group_scoring": env_id == "code"})()
         return env, False

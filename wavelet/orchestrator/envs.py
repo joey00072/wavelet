@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import shutil
 import urllib.error
@@ -13,12 +15,12 @@ import urllib.request
 from collections import Counter
 from collections.abc import Awaitable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from pathlib import Path
-from time import perf_counter
 from typing import Any
 
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
     OPDAlgorithmConfig,
     RLAlgorithmConfig,
     RLEvalEnvConfig,
@@ -39,7 +41,18 @@ from wavelet.orchestrator.algorithms import (
     score_algorithm_records,
     uses_group_advantages,
 )
-from wavelet.orchestrator.eval_utils import pass_at_k
+from wavelet.orchestrator.eval_utils import (
+    EvaluationJournal,
+    canonical_json,
+    evaluation_signature,
+    evaluation_task_keys,
+    pass_at_k,
+)
+from wavelet.orchestrator.live import (
+    LiveEpisode,
+    install_verifier_trace_hooks,
+    live_episode,
+)
 from wavelet.orchestrator.patches import apply_verifier_openai_patches
 from wavelet.orchestrator.rollout_metadata import (
     error_metric_name,
@@ -47,9 +60,18 @@ from wavelet.orchestrator.rollout_metadata import (
 )
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
-_ENV_CACHE: dict[tuple[str, str], Any] = {}
+_ENV_CACHE: dict[tuple[str, ...], Any] = {}
 _VERIFIER_EXECUTOR_CONCURRENCY = 0
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class LiveTraceContext:
+    output_dir: Path
+    env_name: str
+    step: int | None = None
+    policy_step: int | None = None
+    enabled: bool = True
 
 
 _OPENAI_PATCHES_APPLIED = False
@@ -238,6 +260,7 @@ async def evaluate_env_async(
         env_config.id,
         env_config.args,
         _verifier_extra_env_kwargs(config),
+        model_config=config.model if config.model.vlm is not None else None,
     )
     examples = [
         _normalize_verifier_example(example)
@@ -250,24 +273,57 @@ async def evaluate_env_async(
         client_label="verifier eval",
     )
 
-    started_at = perf_counter()
-    outputs = await _run_eval_examples(
-        vf,
-        env,
-        examples,
-        clients=clients,
-        model=_verifier_model(config, inference_engine),
-        sampling_args=_sampling_args_with_cache_salt(
-            env_config.sampling.to_sampling_args(),
-            cache_salt=str(policy_step),
-        ),
-        rollouts_per_example=env_config.rollouts_per_example,
-        max_retries=env_config.max_retries,
-        max_inflight_rollouts=config.eval.max_inflight_rollouts,
+    output_path = (
+        config.output_dir
+        / "evals"
+        / f"step-{step:06d}"
+        / f"{env_config.resolved_name}.jsonl"
     )
-    elapsed = perf_counter() - started_at
+    journal = EvaluationJournal(
+        output_path.parent / "journals" / env_config.resolved_name,
+        resume=config.eval.resume,
+        signature=evaluation_signature(
+            env_id=env_config.id,
+            env_args=env_config.args,
+            effective_env_kwargs=_verifier_extra_env_kwargs(config),
+            model=_verifier_model(config, inference_engine),
+            sampling_args=env_config.sampling.to_sampling_args(),
+            model_config=config.model.model_dump(mode="json"),
+            model_revision=config.eval.model_revision,
+            policy_step=policy_step,
+            endpoints=_verifier_base_urls(config),
+        ),
+    )
+
+    eval_sampling_args = env_config.sampling.to_sampling_args()
+    eval_sampling_args["extra_body"] = {
+        **(eval_sampling_args.get("extra_body") or {}),
+        "cache_salt": str(policy_step),
+    }
+    with journal:
+        outputs = await _run_eval_examples(
+            vf,
+            env,
+            examples,
+            clients=clients,
+            model=_verifier_model(config, inference_engine),
+            sampling_args=eval_sampling_args,
+            rollouts_per_example=env_config.rollouts_per_example,
+            max_retries=env_config.max_retries,
+            max_inflight_rollouts=config.eval.max_inflight_rollouts,
+            journal=journal,
+            trace_context={
+                "output_dir": config.output_dir,
+                "env_name": env_config.resolved_name,
+                "kind": "eval",
+                "step": step,
+                "policy_step": policy_step,
+            }
+            if config.eval.live_traces
+            else None,
+        )
+    elapsed = journal.elapsed_seconds
     env_name = env_config.resolved_name
-    output_path = config.output_dir / "evals" / f"step-{step:06d}" / f"{env_name}.jsonl"
     _write_eval_rollouts(output_path, outputs)
     _prune_eval_rollout_sets(
         config.output_dir / "evals",
@@ -297,15 +353,20 @@ async def _run_eval_examples(
     rollouts_per_example: int,
     max_retries: int,
     max_inflight_rollouts: int | None = None,
+    journal: EvaluationJournal | None = None,
+    trace_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    if not clients:
+        raise ValueError("Evaluation requires at least one client")
+    if rollouts_per_example < 1 or (
+        max_inflight_rollouts is not None and max_inflight_rollouts < 1
+    ):
+        raise ValueError("Evaluation rollout counts and concurrency must be positive")
     rollout_count = len(examples) * rollouts_per_example
-    executor_count = (
-        rollout_count
-        if max_inflight_rollouts is None
-        else min(rollout_count, max_inflight_rollouts)
-    )
+    executor_count = min(rollout_count, max_inflight_rollouts or rollout_count)
     _scale_verifier_executors(executor_count)
-    results: list[Any] = [None] * rollout_count
+    results: list[dict[str, Any] | None] = [None] * rollout_count
+    task_keys = evaluation_task_keys(examples)
     next_index = 0
 
     async def run_worker() -> None:
@@ -315,55 +376,87 @@ async def _run_eval_examples(
             next_index += 1
             example_index, rollout_index = divmod(result_index, rollouts_per_example)
             example = examples[example_index]
+            key = f"{task_keys[example_index]}:{rollout_index}"
+            completed = journal.completed(key) if journal is not None else None
+            if completed is not None:
+                results[result_index] = completed
+                continue
+            episode_context = (
+                live_episode(**trace_context, example_id=key)
+                if trace_context is not None
+                else nullcontext()
+            )
+            if trace_context is not None:
+                install_verifier_trace_hooks(env)
             try:
-                results[result_index] = await env.run_rollout(
-                    vf.RolloutInput(**example),
-                    client=clients[example_index % len(clients)],
-                    model=model,
-                    sampling_args=_eval_rollout_sampling_args(
-                        sampling_args, rollout_index=rollout_index
-                    ),
-                    max_retries=max_retries,
-                    state_columns=["trajectory", "sampling_args"],
-                )
-            except Exception as exc:  # noqa: BLE001
-                results[result_index] = exc
+                async with episode_context as episode:
+                    value = await env.run_rollout(
+                        vf.RolloutInput(**example),
+                        client=clients[example_index % len(clients)],
+                        model=model,
+                        sampling_args=_eval_rollout_sampling_args(
+                            sampling_args, rollout_index=rollout_index
+                        ),
+                        max_retries=max_retries,
+                        state_columns=["trajectory", "sampling_args"],
+                    )
+                    output = _normalize_eval_output(value, example, example_index)
+                    if episode is not None and output.get("error") is not None:
+                        await episode.afinish("error", error=output["error"])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - environment failures are failed eval samples.
+                output = _normalize_eval_output(exc, example, example_index)
+            if journal is not None:
+                output = journal.record(key, output)
+            results[result_index] = output
+            if output.get("error") is not None:
+                _raise_if_external_rate_limit(output["error"])
 
-    await asyncio.gather(*(run_worker() for _ in range(executor_count)))
-    outputs: list[dict[str, Any]] = []
-    for result_index, result in enumerate(results):
-        example_index = result_index // rollouts_per_example
-        example = examples[example_index]
-        example_id = str(example.get("example_id", example.get("id", example_index)))
-        if isinstance(result, Exception):
-            _raise_if_external_rate_limit(result)
-            outputs.append(
-                {
-                    "example_id": example_id,
-                    "error": _truncate_error(str(result)),
-                    "completion": [],
-                }
-            )
-            continue
-        try:
-            output = dict(result)
-        except (TypeError, ValueError) as exc:
-            outputs.append(
-                {
-                    "example_id": example_id,
-                    "error": f"Invalid verifier result: {exc}",
-                    "completion": [],
-                }
-            )
-            continue
+    tasks = [asyncio.create_task(run_worker()) for _ in range(executor_count)]
+    try:
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    return [output for output in results if output is not None]
+
+
+def _normalize_eval_output(
+    value: Any, example: dict[str, Any], index: int
+) -> dict[str, Any]:
+    example_id = str(example.get("example_id", example.get("id", index)))
+    if isinstance(value, Exception):
+        _raise_if_external_rate_limit(value)
+        return {
+            "example_id": example_id,
+            "error": _truncate_error(str(value)),
+            "completion": [],
+        }
+    try:
+        output = dict(value)
         output.setdefault("example_id", example_id)
-        error = output.get("error")
-        if error is not None:
-            _raise_if_external_rate_limit(error)
-            output["error"] = _truncate_error(str(error))
+        if output.get("error") is not None:
+            _raise_if_external_rate_limit(output["error"])
+            output["error"] = _truncate_error(str(output["error"]))
             output.pop("reward", None)
-        outputs.append(output)
-    return outputs
+        elif "reward" in output:
+            reward = output["reward"]
+            if (
+                isinstance(reward, bool)
+                or not isinstance(reward, (float, int))
+                or not math.isfinite(reward)
+            ):
+                raise ValueError("Evaluation reward must be a finite number")
+        return json.loads(canonical_json(output))
+    except (TypeError, ValueError) as exc:
+        return {
+            "example_id": example_id,
+            "error": f"Invalid verifier result: {exc}",
+            "completion": [],
+        }
 
 
 def _eval_rollout_sampling_args(
@@ -605,12 +698,15 @@ def _load_cached_env(
     env_id: str,
     env_args: dict[str, Any],
     extra_env_kwargs: dict[str, Any] | None = None,
+    *,
+    model_config: Any | None = None,
 ) -> tuple[Any, bool]:
     extra_env_kwargs = extra_env_kwargs or {}
     cache_key = (
         env_id,
         json.dumps(env_args, sort_keys=True, default=str),
         json.dumps(extra_env_kwargs, sort_keys=True, default=str),
+        model_config.model_dump_json() if model_config is not None else "",
     )
     cached = _ENV_CACHE.get(cache_key)
     if cached is not None:
@@ -624,6 +720,11 @@ def _load_cached_env(
             for key, value in extra_env_kwargs.items():
                 setattr(env, key, value)
     _patch_env_response_messages(vf, env)
+    if model_config is not None and model_config.vlm is not None:
+        from wavelet.orchestrator.multimodal import install_multimodal_rollout_hooks
+        from wavelet.trainer.model import setup_processor
+
+        install_multimodal_rollout_hooks(env, setup_processor(model_config))
     _ENV_CACHE[cache_key] = env
     return env, False
 
@@ -687,6 +788,7 @@ async def _run_all(
     env_name: str = "verifier",
     admission: RolloutAdmissionController | None = None,
     failure_stats: _VerifierFailureStats | None = None,
+    live_trace: LiveTraceContext | None = None,
 ) -> list[dict[str, Any]]:
     if not clients:
         raise ValueError("At least one verifier client is required.")
@@ -705,6 +807,7 @@ async def _run_all(
             env_name=env_name,
             admission=admission,
             failure_stats=failure_stats,
+            live_trace=live_trace,
         )
     return await _run_until_target_groups(
         vf,
@@ -722,6 +825,7 @@ async def _run_all(
         env_name=env_name,
         admission=admission,
         failure_stats=failure_stats,
+        live_trace=live_trace,
     )
 
 
@@ -739,6 +843,7 @@ async def _run_complete_record_set(
     env_name: str,
     admission: RolloutAdmissionController | None,
     failure_stats: _VerifierFailureStats | None,
+    live_trace: LiveTraceContext | None = None,
 ) -> list[dict[str, Any]]:
     tasks = [
         _run_admitted_group(
@@ -754,6 +859,7 @@ async def _run_complete_record_set(
             algorithm_config=algorithm_config,
             admission=admission,
             failure_stats=failure_stats,
+            live_trace=live_trace,
         )
         for index, record in enumerate(records)
     ]
@@ -786,6 +892,7 @@ async def _run_until_target_groups(
     env_name: str,
     admission: RolloutAdmissionController | None,
     failure_stats: _VerifierFailureStats | None,
+    live_trace: LiveTraceContext | None = None,
 ) -> list[dict[str, Any]]:
     group_tasks: list[asyncio.Task[list[dict[str, Any]]]] = []
     for record_index, record in enumerate(records):
@@ -805,6 +912,7 @@ async def _run_until_target_groups(
                 algorithm_config=algorithm_config,
                 admission=admission,
                 failure_stats=failure_stats,
+                live_trace=live_trace,
             )
         )
         group_tasks.append(task)
@@ -854,6 +962,7 @@ async def _run_admitted_group(
     algorithm_config: RLAlgorithmConfig,
     admission: RolloutAdmissionController | None,
     failure_stats: _VerifierFailureStats | None = None,
+    live_trace: LiveTraceContext | None = None,
 ) -> list[dict[str, Any]]:
     def operation() -> Awaitable[list[dict[str, Any]]]:
         return _run_group(
@@ -868,6 +977,7 @@ async def _run_admitted_group(
             max_retries=max_retries,
             algorithm_config=algorithm_config,
             failure_stats=failure_stats,
+            live_trace=live_trace,
         )
 
     if admission is None:
@@ -888,6 +998,7 @@ async def _run_group(
     max_retries: int,
     algorithm_config: RLAlgorithmConfig,
     failure_stats: _VerifierFailureStats | None = None,
+    live_trace: LiveTraceContext | None = None,
 ) -> list[dict[str, Any]]:
     try:
         if getattr(env, "requires_group_scoring", False):
@@ -898,32 +1009,72 @@ async def _run_group(
                     "run_group()."
                 )
             group_inputs = [vf.RolloutInput(**example) for _ in range(rollout_count)]
-            results = list(
-                await run_group(
-                    group_inputs,
-                    client=client,
-                    model=model,
-                    sampling_args=sampling_args,
-                    max_retries=max_retries,
-                    state_columns=["trajectory", "sampling_args"],
+            install_verifier_trace_hooks(env)
+            async with (
+                live_episode(
+                    live_trace.output_dir,
+                    live_trace.env_name,
+                    "group",
+                    step=live_trace.step,
+                    policy_step=live_trace.policy_step,
+                    example_id=str(example.get("example_id", "")),
                 )
-            )
+                if live_trace and live_trace.enabled
+                else nullcontext()
+            ) as episode:
+                results = list(
+                    await run_group(
+                        group_inputs,
+                        client=client,
+                        model=model,
+                        sampling_args=sampling_args,
+                        max_retries=max_retries,
+                        state_columns=["trajectory", "sampling_args"],
+                    )
+                )
+                if isinstance(episode, LiveEpisode) and any(
+                    isinstance(item, dict) and item.get("error") is not None
+                    for item in results
+                ):
+                    await episode.afinish("error", error="verifier returned an error")
             if failure_stats is not None:
                 for _ in range(max(0, rollout_count - len(results))):
                     failure_stats.record("MissingRollout")
         else:
-            tasks = [
-                env.run_rollout(
-                    vf.RolloutInput(**example),
-                    client=client,
-                    model=model,
-                    sampling_args=sampling_args,
-                    max_retries=max_retries,
-                    state_columns=["trajectory", "sampling_args"],
-                )
-                for _ in range(rollout_count)
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            install_verifier_trace_hooks(env)
+
+            async def run_one() -> Any:
+                async with (
+                    live_episode(
+                        live_trace.output_dir,
+                        live_trace.env_name,
+                        "rollout",
+                        step=live_trace.step,
+                        policy_step=live_trace.policy_step,
+                        example_id=str(example.get("example_id", "")),
+                    )
+                    if live_trace and live_trace.enabled
+                    else nullcontext()
+                ) as episode:
+                    result = await env.run_rollout(
+                        vf.RolloutInput(**example),
+                        client=client,
+                        model=model,
+                        sampling_args=sampling_args,
+                        max_retries=max_retries,
+                        state_columns=["trajectory", "sampling_args"],
+                    )
+                    if (
+                        isinstance(result, dict)
+                        and result.get("error") is not None
+                        and isinstance(episode, LiveEpisode)
+                    ):
+                        await episode.afinish("error", error=result["error"])
+                    return result
+
+            results = await asyncio.gather(
+                *(run_one() for _ in range(rollout_count)), return_exceptions=True
+            )
         outputs = _successful_rollout_outputs(
             results,
             failure_stats=failure_stats,
@@ -976,16 +1127,36 @@ async def _run_single_rollout(
     sampling_args: dict[str, Any],
     max_retries: int,
     failure_stats: _VerifierFailureStats | None = None,
+    live_trace: LiveTraceContext | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        result = await env.run_rollout(
-            vf.RolloutInput(**example),
-            client=client,
-            model=model,
-            sampling_args=sampling_args,
-            max_retries=max_retries,
-            state_columns=["trajectory", "sampling_args"],
-        )
+        install_verifier_trace_hooks(env)
+        async with (
+            live_episode(
+                live_trace.output_dir,
+                live_trace.env_name,
+                "rollout",
+                step=live_trace.step,
+                policy_step=live_trace.policy_step,
+                example_id=str(example.get("example_id", "")),
+            )
+            if live_trace and live_trace.enabled
+            else nullcontext()
+        ) as episode:
+            result = await env.run_rollout(
+                vf.RolloutInput(**example),
+                client=client,
+                model=model,
+                sampling_args=sampling_args,
+                max_retries=max_retries,
+                state_columns=["trajectory", "sampling_args"],
+            )
+            if (
+                isinstance(result, dict)
+                and result.get("error") is not None
+                and isinstance(episode, LiveEpisode)
+            ):
+                await episode.afinish("error", error=result["error"])
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1305,20 +1476,6 @@ def _sampling_args(
     return args
 
 
-def _sampling_args_with_cache_salt(
-    sampling_args: dict[str, Any],
-    *,
-    cache_salt: str | None,
-) -> dict[str, Any]:
-    if cache_salt is None:
-        return sampling_args
-    copied = dict(sampling_args)
-    extra_body = dict(copied.get("extra_body") or {})
-    extra_body["cache_salt"] = cache_salt
-    copied["extra_body"] = extra_body
-    return copied
-
-
 def _assign_rollout_advantages(outputs: list[dict[str, Any]], config) -> None:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for output in outputs:
@@ -1330,7 +1487,9 @@ def _assign_rollout_advantages(outputs: list[dict[str, Any]], config) -> None:
         )
 
 
-def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
+def _records_from_output(
+    output: dict[str, Any], *, require_multimodal_capture: bool = False
+) -> list[RLExample]:
     temperature = float((output.get("sampling_args") or {}).get("temperature", 1.0))
     group_key = _output_group_key(output)
     records: list[RLExample] = []
@@ -1342,8 +1501,18 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
         if not trainable_indexes:
             continue
         trajectory = output.get("trajectory") or []
-        first_step = trajectory[0] if trajectory else {}
-        last_step = trajectory[-1] if trajectory else {}
+        full_ids = [*sample["input_ids"], sample["target_ids"][-1]]
+        terminal_index = sample["terminal_segment_index"]
+        last_step = trajectory[terminal_index]
+        terminal_tokens = last_step.get("tokens") or {}
+        if (
+            terminal_tokens.get("prompt_ids", [])
+            + terminal_tokens.get("completion_ids", [])
+            != full_ids
+        ):
+            raise ValueError(
+                "Merged rollout tokens differ from its terminal trajectory step."
+            )
         inference_logprobs = [
             float(sample["inference_logprobs"][index]) for index in trainable_indexes
         ]
@@ -1363,7 +1532,6 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
             sampling_mask = [list(mask) for mask in selected_masks if mask is not None]
         metadata = {
             "group_key": group_key,
-            "rollout_key": f"{group_key}:{sample_index}",
             "stop_condition": output.get("stop_condition"),
             "is_truncated": output.get("is_truncated"),
             **_output_token_metadata(output),
@@ -1374,6 +1542,27 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 sample_index=sample_index,
             ),
         }
+        capture = (last_step.get("extras") or {}).get("wavelet_multimodal")
+        if require_multimodal_capture and capture is None:
+            raise ValueError(
+                "VLM rollout is missing generation-time multimodal capture."
+            )
+        mm_kwargs = None
+        prompt = last_step.get("prompt") or []
+        if capture is not None:
+            tokens = last_step["tokens"]
+            if capture["prompt_ids"] != tokens["prompt_ids"]:
+                raise ValueError(
+                    "Captured multimodal prompt IDs do not match trajectory tokens."
+                )
+            prompt = capture["prompt"]
+            mm_kwargs = dict(capture["mm_kwargs"])
+            if "mm_token_type_ids" in mm_kwargs:
+                types = list(mm_kwargs["mm_token_type_ids"][0])
+                mm_kwargs["mm_token_type_ids"] = (
+                    types + [0] * len(tokens["completion_ids"])
+                )[:-1]
+            metadata["multimodal_input_ids"] = list(sample["input_ids"])
         group_size = output.get("_wavelet_group_size")
         if _is_int(group_size):
             metadata["_wavelet_group_size"] = group_size
@@ -1389,7 +1578,7 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 metadata[metadata_key] = value
         records.append(
             RLExample(
-                prompt=_mask_prompt_history(first_step.get("prompt") or []),
+                prompt=_mask_prompt_history(prompt),
                 completion=[
                     dict(message) for message in last_step.get("completion") or []
                 ],
@@ -1407,6 +1596,7 @@ def _records_from_output(output: dict[str, Any]) -> list[RLExample]:
                 ce_weight=output.get("ce_weight"),
                 ref_kl_weight=output.get("ref_kl_weight"),
                 metadata=metadata,
+                mm_kwargs=mm_kwargs,
                 source=str(output.get("env_name") or output.get("task") or "verifier"),
             )
         )
@@ -1572,7 +1762,7 @@ def _output_group_key(output: dict[str, Any]) -> str:
 def _interleave_output(
     output: dict[str, Any],
     temperature: float,
-) -> list[dict[str, list[Any]]]:
+) -> list[dict[str, Any]]:
     trajectory = output.get("trajectory") or []
     if not trajectory:
         return []
@@ -1600,7 +1790,21 @@ def _step_token_segment(
             f"Verifier rollout for example {output.get('example_id')} step {index} "
             "is missing token data."
         )
+    capture = (step.get("extras") or {}).get("wavelet_multimodal")
+    metadata = None
+    if capture is not None:
+        media = {
+            key: value
+            for key, value in capture["mm_kwargs"].items()
+            if key != "mm_token_type_ids"
+        }
+        metadata = {
+            "media_fingerprint": hashlib.sha256(
+                canonical_json(media).encode()
+            ).hexdigest()
+        }
     return TokenSegment(
+        metadata=metadata,
         prompt_ids=[int(token_id) for token_id in tokens["prompt_ids"]],
         prompt_loss_mask=[bool(value) for value in tokens["prompt_mask"]],
         output_ids=[int(token_id) for token_id in tokens["completion_ids"]],

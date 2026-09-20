@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig, RLEvalConfig
+from wavelet.configs.config import RLConfig, RLEvalConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
 from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.scheduler import (
@@ -313,6 +313,56 @@ def test_async_final_eval_cancels_unused_scheduler_work(
     scheduler.aclose.assert_awaited_once_with()
     run_evals.assert_awaited_once()
     assert run_evals.await_args.kwargs["policy_step"] == 101
+
+
+@pytest.mark.parametrize("final_eval", [True, False])
+@pytest.mark.parametrize("transport, expected", [("nccl", [1, 2]), ("filesystem", [2])])
+def test_final_eval_receives_intermediate_nccl_exports(
+    monkeypatch, tmp_path, transport, expected, final_eval
+):
+    config = RLConfig.model_validate(
+        {
+            "max_steps": 2,
+            "output_dir": tmp_path,
+            "lora": None,
+            "policy_transfer": {"type": transport},
+            "eval": {"env": [{"id": "swe"}], "final_eval": final_eval},
+        }
+    )
+    loaded = []
+
+    async def load(config, engine, receiver, step):
+        # A rendezvous sender cannot publish version 2 before version 1 loads.
+        if transport == "nccl" and step == 2:
+            assert loaded == [1]
+        loaded.append(step)
+        return step
+
+    evaluate = AsyncMock()
+    monkeypatch.setattr("wavelet.orchestrator.scheduler._load_policy_async", load)
+    monkeypatch.setattr("wavelet.orchestrator.scheduler._run_evals_async", evaluate)
+    context = _VerifierChunkPublisher(
+        config=config,
+        orchestrator=Mock(),
+        inference_engine=Mock(),
+        policy_receiver=Mock(),
+        scheduler=Mock(aclose=AsyncMock()),
+        rollout_sender=Mock(),
+        state=None,
+        chunks_per_step=1,
+        last_eval_steps={"swe": 0},
+        loaded_policy_step=0,
+    )
+    async def run():
+        await context.finish_pending_policy(2)
+        await context.run_final_evals(2)
+
+    asyncio.run(run())
+    assert loaded == (expected if final_eval or transport == "nccl" else [])
+    if final_eval:
+        assert evaluate.await_args.kwargs["policy_step"] == 2
+    else:
+        evaluate.assert_not_awaited()
 
 
 def test_eval_only_base_model_does_not_wait_for_policy_snapshot(
@@ -781,3 +831,27 @@ def test_eval_rollouts_bound_inflight_requests() -> None:
 
     assert len(outputs) == 8
     assert peak == 3
+
+
+def test_evaluation_journal_resumes_completed_and_retries_errors(tmp_path) -> None:
+    from wavelet.orchestrator.eval_utils import EvaluationJournal
+
+    path = tmp_path / "journal"
+    with EvaluationJournal(path, signature="plan-a") as journal:
+        journal.record(0, {"example_id": "a", "reward": 1.0, "error": None})
+        journal.record(1, {"example_id": "a", "error": "timeout"})
+    with EvaluationJournal(path, signature="plan-a") as resumed:
+        assert resumed.completed(0)["reward"] == 1.0
+        assert resumed.completed(1) is None
+
+
+def test_evaluation_journal_rejects_changed_plan(tmp_path) -> None:
+    from wavelet.orchestrator.eval_utils import EvaluationJournal
+
+    path = tmp_path / "journal"
+    with EvaluationJournal(path, signature="plan-a") as journal:
+        journal.record(0, {"reward": 1.0})
+    with pytest.raises(ValueError, match="do not match"), EvaluationJournal(
+        path, signature="plan-b"
+    ):
+        pass

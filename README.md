@@ -61,9 +61,9 @@ Do not wrap the combined `wavelet rl` launcher in `torchrun`.
 
 ## Dashboard
 
-The dashboard reads live and completed run directories without modifying them.
-It includes training metrics, rollout groups, evaluations, queue state,
-infrastructure, resolved config, and run comparison.
+The compact dashboard reads live and completed run directories without
+modifying them. It exposes every recorded metric plus rollout and evaluation
+samples, queue and policy state, logs, and the redacted resolved config.
 
 Build the browser app once, then serve your runs:
 

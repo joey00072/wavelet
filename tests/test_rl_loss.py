@@ -7,7 +7,7 @@ import types
 import pytest
 import torch
 
-from wavelet.configs.rl_config import RLLossConfig
+from wavelet.configs.config import RLLossConfig
 from wavelet.trainer.losses import (
     LossInputs,
     component_normalization_unit_counts,
@@ -15,6 +15,19 @@ from wavelet.trainer.losses import (
     normalization_unit_count,
 )
 from wavelet.trainer.types import LossOutput
+
+
+def test_icepop_loss_masks_out_of_band_ratios_without_nan() -> None:
+    config = RLLossConfig(type="icepop", ratio_low=0.2, ratio_high=5.0)
+    ratios = torch.tensor([0.1, 0.2, 1.0, 5.0, 10.0])
+    trainer = ratios.log().unsqueeze(0).requires_grad_()
+    output = compute_loss(
+        trainer, torch.zeros_like(trainer), None, torch.ones_like(trainer),
+        torch.ones_like(trainer, dtype=torch.bool), config, loss_scale=1,
+    )
+    assert output.metrics["is_masked"] == pytest.approx(0.4)
+    output.loss.backward()
+    assert torch.isfinite(trainer.grad).all()
 
 
 def test_loss_scale_matches_token_normalization() -> None:

@@ -2,7 +2,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.orchestrator.scheduler import (
     IntegratedRolloutScheduler,
     PublishMode,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.monitor import setup_config_logger
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.utils.config import load_config

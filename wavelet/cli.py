@@ -4,9 +4,9 @@ import importlib
 import sys
 
 PUBLIC_COMMANDS = {
-    "rl": ("wavelet.entrypoints.rl_launcher", "Run reinforcement learning launcher"),
-    "sft": ("wavelet.entrypoints.sft", "Run supervised fine-tuning"),
-    "debug": ("wavelet.entrypoints.rl_debug", "Inspect and probe RL subsystems"),
+    "rl": ("wavelet.orchestrator.runtime", "Run reinforcement learning launcher"),
+    "sft": ("wavelet.trainer.trainer", "Run supervised fine-tuning"),
+    "debug": ("wavelet.debug", "Inspect and probe RL subsystems"),
     "evals": (
         "wavelet.entrypoints.rl_evals",
         "Evaluate a served policy without starting training",
@@ -27,21 +27,21 @@ PUBLIC_COMMANDS = {
         "wavelet.entrypoints.dashboard",
         "Serve the read-only run dashboard over run directories",
     ),
-    "rl-trainer": ("wavelet.entrypoints.rl_trainer", "Run RL trainer"),
+    "rl-trainer": ("wavelet.trainer.rl", "Run RL trainer"),
     "rl-orchestrator": ("wavelet.entrypoints.rl_orchestrator", "Run RL orchestrator"),
     "rl-inference": (
-        "wavelet.entrypoints.rl_inference",
+        "wavelet.orchestrator.scheduler",
         "Run RL inference annotation stage",
     ),
     "inference-server": (
-        "wavelet.entrypoints.inference_server",
+        "wavelet.inference.server",
         "Run OpenAI-compatible inference server",
     ),
 }
 
 INTERNAL_COMMANDS = {
     "slurm-worker": (
-        "wavelet.entrypoints.slurm_worker",
+        "wavelet.deployment.slurm",
         "Run roles inside a Wavelet SLURM allocation",
     ),
     "synth-run": (
@@ -49,7 +49,7 @@ INTERNAL_COMMANDS = {
         "Write a synthetic run directory for dashboard development",
     ),
     "native-inference-server": (
-        "wavelet.entrypoints.native_inference_server",
+        "wavelet.inference.native_server",
         "Run native vLLM inference server",
     ),
 }

@@ -7,7 +7,7 @@ import random
 from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
 
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
     RLAdvRangeGateConfig,
     RLCurriculumConfig,
     RLDifficultyPoolSamplerConfig,

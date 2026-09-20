@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
     RLAdvRangeGateConfig,
     RLCurriculumConfig,
     RLDifficultyPoolConfig,

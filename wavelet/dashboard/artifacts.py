@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.dashboard.external import EXTERNAL_SOURCES, ExternalSources
 from wavelet.dashboard.jsonl import JsonlCache, read_json
 from wavelet.dashboard.metrics import MetricStore, MetricTable
@@ -19,7 +19,6 @@ from wavelet.dashboard.rows import (
     ROLLOUT_SORT_KEYS,
     CompactRowCache,
     RowFilters,
-    full_row,
     group_eval_examples,
     group_rollouts,
     histogram,
@@ -109,10 +108,21 @@ class RunArtifacts:
 
     def _resolved_config_path(self) -> Path | None:
         config_dir = get_config_dir(self.output_dir)
-        for name in ("rl_orchestrator.yaml", "rl.yaml"):
-            candidate = config_dir / name
-            if candidate.is_file():
-                return candidate
+        attempts = sorted(
+            (
+                p
+                for p in (self.output_dir / "configs").glob("attempt_*")
+                if p.is_dir() and p.name.removeprefix("attempt_").isdigit()
+            ),
+            key=lambda p: int(p.name.removeprefix("attempt_")),
+            reverse=True,
+        )
+        directories = [config_dir, *(p / "resolved" for p in attempts)]
+        for directory in directories:
+            for name in ("rl_orchestrator.yaml", "rl.yaml"):
+                candidate = directory / name
+                if candidate.is_file():
+                    return candidate
         return None
 
     def config(self) -> RLConfig:
@@ -358,7 +368,7 @@ class RunArtifacts:
 
     def eval_row(self, step: int, env: str, row_index: int) -> dict[str, Any] | None:
         path = self.eval_set_path(step, env)
-        return None if path is None else full_row(path, row_index)
+        return None if path is None else self._rows.detail(path, row_index, kind="eval")
 
     # ---------------------------------------------------------------- rollouts
 
@@ -493,7 +503,11 @@ class RunArtifacts:
 
     def rollout_row(self, step: int, row_index: int) -> dict[str, Any] | None:
         path = self.rollout_path(step)
-        return None if not path.is_file() else full_row(path, row_index)
+        return (
+            None
+            if not path.is_file()
+            else self._rows.detail(path, row_index, kind="rollout")
+        )
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -721,17 +735,10 @@ def _grouped_metrics(
     return grouped
 
 
-def _finite(value: Any) -> int | float | None:
+def _int_or_none(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
-    if not math.isfinite(value):
-        return None
-    return value
-
-
-def _int_or_none(value: Any) -> int | None:
-    finite = _finite(value)
-    return None if finite is None else int(finite)
+    return int(value) if math.isfinite(value) else None
 
 
 def _count_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:

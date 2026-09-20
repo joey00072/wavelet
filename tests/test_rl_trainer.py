@@ -5,8 +5,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.sft import ModelConfig
+from wavelet.configs.config import ModelConfig, RLConfig
 from wavelet.data.rl import (
     PackedRLDataset,
     RLDataset,
@@ -238,6 +237,51 @@ def test_finalize_waits_for_pending_async_checkpoint(monkeypatch) -> None:
         force=True,
     )
     trainer.ckpt_manager.wait_for_pending_save.assert_called_once_with()
+
+
+def test_streaming_progress_counts_global_metrics_once_per_update(monkeypatch):
+    trainer = RLTrainer(RLConfig())
+    trainer.monitor = Mock()
+    trainer.model = Mock()
+    trainer.world = Mock(is_main=False)
+    trainer.dataloader = [{}, {}]
+    trainer._loaded_micro_batch_count = 2
+    trainer.total_tokens = 100
+    trainer.total_samples = 3
+    metrics = {"tokens/model": 27.0, "rollout/count": 5.0}
+    monkeypatch.setattr(trainer, "_prepare_batch", lambda batch: batch)
+    monkeypatch.setattr(
+        trainer,
+        "_train_step",
+        Mock(
+            side_effect=[
+                TrainOutput(loss=Mock(), stepped=False),
+                TrainOutput(loss=Mock(), stepped=True, metrics=metrics),
+            ]
+        ),
+    )
+    monkeypatch.setattr(trainer, "_log_train_output", Mock())
+    monkeypatch.setattr(trainer, "_maybe_checkpoint", Mock())
+    assert trainer.train_loaded_rollouts_once() == metrics
+    assert trainer._trainer_state().total_tokens == 127
+    assert trainer._trainer_state().total_samples == 8
+
+
+def test_rl_progress_uses_global_counts_when_local_rank_has_only_padding() -> None:
+    trainer = RLTrainer(RLConfig())
+    batch = {"input_ids": torch.zeros((1, 12)), "sample_counts": torch.zeros(1)}
+    trainer._record_progress(batch, TrainOutput(loss=Mock(), stepped=False))
+    assert trainer.total_tokens == trainer.total_samples == 0
+    trainer._record_progress(
+        batch,
+        TrainOutput(
+            loss=Mock(),
+            stepped=True,
+            metrics={"tokens/model": 37.0, "rollout/count": 3.0},
+        ),
+    )
+    assert trainer.total_tokens == 37
+    assert trainer.total_samples == 3
 
 
 def test_orchestrated_rl_resume_accepts_dynamic_micro_step_count() -> None:
@@ -802,7 +846,7 @@ def test_prepare_kbit_model_can_skip_float32_cast() -> None:
 
 
 def test_qlora_ddp_does_not_move_quantized_model(monkeypatch) -> None:
-    class FakeModel:
+    class FakeModel(torch.nn.Module):
         def to(self, device: torch.device):
             raise AssertionError(f"QLoRA model should not be moved with .to({device})")
 

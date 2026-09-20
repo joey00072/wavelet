@@ -6,7 +6,7 @@ import pytest
 import torch
 from torch import Tensor
 
-from wavelet.configs.rl_config import RLConfig, RLLossConfig
+from wavelet.configs.config import RLConfig, RLLossConfig
 from wavelet.orchestrator.advantage import group_reward_advantages
 from wavelet.orchestrator.schedule import chunks_per_step, rollout_groups_for_chunk
 from wavelet.trainer.losses import compute_loss

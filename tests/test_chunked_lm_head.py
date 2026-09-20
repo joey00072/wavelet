@@ -10,13 +10,16 @@ from wavelet.trainer.losses import (
 )
 
 
-def test_chunked_lm_head_matches_full_logits_logprobs() -> None:
+@pytest.mark.parametrize("vocab_size", [11, 8201])
+def test_chunked_lm_head_matches_full_logits_logprobs(vocab_size: int) -> None:
     torch.manual_seed(0)
     hidden = torch.randn(2, 5, 7, dtype=torch.float32, requires_grad=True)
-    full_head = torch.nn.Linear(7, 11, bias=False)
-    chunked_head = ChunkedLogprobLmHead(7, 11, chunk_size=3)
+    full_head = torch.nn.Linear(7, vocab_size, bias=False)
+    chunked_head = ChunkedLogprobLmHead(7, vocab_size, chunk_size=3)
     chunked_head.weight = full_head.weight
-    labels = torch.randint(0, 11, (2, 5))
+    labels = torch.randint(0, vocab_size, (2, 5))
+    if vocab_size > 8192:
+        labels[0, :4] = torch.tensor([0, 8191, 8192, vocab_size - 1])
     temperatures = torch.rand(2, 5) + 0.5
 
     full_logits = full_head(hidden) / temperatures.unsqueeze(-1)

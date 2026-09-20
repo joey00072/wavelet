@@ -3,15 +3,15 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
+from wavelet.debug import main as debug_main
 from wavelet.debug import (
     orchestrator_debug_state,
     probe_orchestrator,
     sample_orchestrator_records,
     with_orchestrator_limits,
 )
-from wavelet.entrypoints.rl_debug import main as debug_main
 
 
 def _example(index: int) -> RLExample:

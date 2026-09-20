@@ -1,6 +1,6 @@
 import torch
 
-from wavelet.configs.sft import SchedulerConfig
+from wavelet.configs.config import SchedulerConfig
 from wavelet.trainer.optim import setup_scheduler
 
 

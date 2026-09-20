@@ -14,7 +14,7 @@ from torch import Tensor
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import (
     PackedRLDataset,
     RLDataset,
@@ -53,11 +53,13 @@ from wavelet.trainer.losses import (
 from wavelet.trainer.model import (
     TORCH_DTYPES,
     is_fsdp_model,
+    multimodal_forward_kwargs,
     save_lora_adapter_snapshot_from_fsdp,
     sync_hf_tp_lora_replicated_grads,
     unwrap_model,
 )
 from wavelet.trainer.moe import moe_load_balance_metrics
+from wavelet.trainer.perf import estimate_training_flops_coefficients
 from wavelet.trainer.trainer import BaseTrainer, _mean, _reduce_by_key
 from wavelet.trainer.types import LossOutput, TrainOutput
 from wavelet.transport.policy import (
@@ -196,6 +198,8 @@ def _packed_training_attention_mask(
     mask is passed. Non-flash attention still needs an explicit block-causal
     mask to prevent packed samples from attending across boundaries.
     """
+    if getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4":
+        return None if attention_mask.bool().all() else attention_mask
     if not _has_packed_position_resets(attention_mask, position_ids):
         valid_tokens = attention_mask.bool()
         return None if valid_tokens.all() else attention_mask
@@ -230,7 +234,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
     def __init__(self, config: RLConfig) -> None:
         super().__init__(config)
         self._accumulated_micro_batches = 0
-        self._reward_accum: list[float] = []
         self._rollout_metric_accum: list[dict[str, float]] = []
         self._train_loss_accum: list[float] = []
         self._train_metric_accum: list[dict[str, float]] = []
@@ -259,6 +262,8 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             self.config.data,
             data_rank=data_rank,
             data_world_size=data_world_size,
+            processor=self.processor,
+            packing_cost=estimate_training_flops_coefficients(self.model) or (1, 0),
         )
         self.dataloader = setup_rl_dataloader(
             self.dataset,
@@ -462,6 +467,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             output = self._train_step(batch)
             if output.stepped:
                 metrics = output.metrics
+                self._record_progress(batch, output)
                 progress = tqdm(total=1, disable=not self.world.is_main)
                 self._log_train_output(output, progress)
                 self._maybe_checkpoint()
@@ -469,6 +475,11 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 progress.close()
                 return metrics
         return metrics
+
+    def _record_progress(self, batch: dict[str, Tensor], output: TrainOutput) -> None:
+        if output.stepped:
+            self.total_tokens += int(output.metrics["tokens/model"])
+            self.total_samples += int(output.metrics["rollout/count"])
 
     def _maybe_log_rollout_samples(self, rollout_path: Path) -> None:
         if self.monitor is None:
@@ -891,9 +902,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         loss_output: LossOutput,
     ) -> None:
         rollout_metrics = self._batch_rollout_metrics(batch)
-        reward_mean = rollout_metrics.get("reward/all/mean")
-        if reward_mean is not None:
-            self._reward_accum.append(reward_mean)
         self._rollout_metric_accum.append(rollout_metrics)
         self._train_loss_accum.append(float(loss_output.loss.detach().item()))
         self._train_metric_accum.append(
@@ -936,9 +944,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         metrics.update(self._aggregate_train_metrics(self._train_metric_accum))
         self._train_loss_accum.clear()
         self._train_metric_accum.clear()
-        if self._reward_accum:
-            metrics["reward_mean"] = _mean(self._reward_accum)
-            self._reward_accum.clear()
         if self._rollout_metric_accum:
             metrics.update(self._aggregate_rollout_metrics(self._rollout_metric_accum))
             self._rollout_metric_accum.clear()
@@ -1019,8 +1024,11 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         model_kwargs = {
             "input_ids": batch["input_ids"],
             "attention_mask": attention_mask,
-            "position_ids": batch["position_ids"],
+            "position_ids": None
+            if self.config.model.vlm is not None
+            else batch["position_ids"],
         }
+        model_kwargs.update(multimodal_forward_kwargs(batch))
         loss_mask = batch.get(
             "loss_mask",
             torch.ones_like(batch["target_ids"], dtype=torch.bool),
@@ -1249,8 +1257,6 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             for key in ("is_masked", "is_masked_low", "is_masked_high"):
                 if key in metrics:
                     aliases[f"{self.config.loss.type}/{key}"] = metrics[key]
-        if "reward_mean" in metrics:
-            aliases.setdefault("reward/all/mean", metrics["reward_mean"])
         return aliases
 
     def _maybe_no_sync(self) -> contextlib.AbstractContextManager[None]:
@@ -1473,12 +1479,17 @@ def _run_streaming_rollout_training(
     chunks_per_step = _chunks_per_step(config)
     min_loadable_rows = _min_loadable_rollout_rows(config, trainer)
     accumulator = RolloutChunkAccumulator()
+    step_started_at = perf_counter()
+    step_train_seconds = 0.0
+    step_wait_seconds = 0.0
+    step_load_seconds = 0.0
 
     while trainer.step < target_step:
         loop_started_at = perf_counter()
         wait_started_at = perf_counter()
         batch = receiver.wait()
         wait_seconds = perf_counter() - wait_started_at
+        step_wait_seconds += wait_seconds
         trainer_step_before = trainer.step
         row_count = count_nonempty_jsonl_rows(
             batch.path,
@@ -1532,11 +1543,13 @@ def _run_streaming_rollout_training(
             chunks_per_step=chunks_per_step,
         )
         load_seconds = perf_counter() - load_started_at
+        step_load_seconds += load_seconds
         train_started_at = perf_counter()
         trainer.prepare_for_training()
         metrics = trainer.train_loaded_rollouts_once()
         _validate_distributed_step_sync(trainer, metrics is not None)
         train_seconds = perf_counter() - train_started_at
+        step_train_seconds += train_seconds
         for loaded_batch in loaded_batches:
             trainer.record_rollout_consumed(
                 loaded_batch,
@@ -1547,17 +1560,24 @@ def _run_streaming_rollout_training(
 
         export_seconds = 0.0
         if metrics is not None:
-            _log_step_perf_metrics(
-                trainer,
-                metrics,
-                train_seconds=train_seconds,
-                loop_seconds=perf_counter() - loop_started_at,
-            )
-            accumulator.reset_after_optimizer_step()
             export_started_at = perf_counter()
             trainer.export_policy(step=trainer.step)
             trainer.offload_after_refit()
             export_seconds = perf_counter() - export_started_at
+            _log_step_perf_metrics(
+                trainer,
+                metrics,
+                train_seconds=step_train_seconds,
+                loop_seconds=perf_counter() - step_started_at,
+                wait_seconds=step_wait_seconds,
+                load_seconds=step_load_seconds,
+                export_seconds=export_seconds,
+            )
+            accumulator.reset_after_optimizer_step()
+            step_started_at = perf_counter()
+            step_train_seconds = 0.0
+            step_wait_seconds = 0.0
+            step_load_seconds = 0.0
         total_seconds = perf_counter() - loop_started_at
         emit_perf(
             "trainer_chunk",
@@ -1670,6 +1690,9 @@ def _log_step_perf_metrics(
     *,
     train_seconds: float,
     loop_seconds: float,
+    wait_seconds: float,
+    load_seconds: float,
+    export_seconds: float,
 ) -> None:
     if trainer.monitor is None:
         return
@@ -1685,6 +1708,9 @@ def _log_step_perf_metrics(
     perf_metrics = {
         "perf/train_seconds": train_seconds,
         "perf/step_seconds": loop_seconds,
+        "perf/rollout_wait_seconds": wait_seconds,
+        "perf/rollout_load_seconds": load_seconds,
+        "perf/policy_export_seconds": export_seconds,
         "perf/train_tokens_per_second": train_tokens_per_second,
         "perf/model_tokens_per_second": model_tokens_per_second,
         "perf/step_tokens_per_second": model_tokens / max(loop_seconds, 1e-9),

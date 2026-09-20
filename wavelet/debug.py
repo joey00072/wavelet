@@ -34,7 +34,9 @@ from wavelet.orchestrator.placement import (
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.schedule import (
     chunks_per_step,
+    max_policy_lag,
     required_policy_step,
+    retained_policy_snapshots,
     rollout_chunk_examples,
     target_steps,
 )
@@ -1585,6 +1587,12 @@ def _summary(config: RLConfig) -> dict[str, Any]:
         "inference_backend": config.inference.vllm.server_backend,
         "trainer_attention": config.model.attn_implementation,
         "policy_transfer": config.policy_transfer.type,
+        "policy_freshness": {
+            "max_async_level": config.orchestrator.max_async_level,
+            "max_off_policy_steps": config.orchestrator.max_off_policy_steps,
+            "effective_max_policy_lag": max_policy_lag(config),
+            "retained_policy_snapshots": retained_policy_snapshots(config),
+        },
         "algo": config.algo.model_dump(mode="json", exclude_none=True),
         "training_envs": [
             env.model_dump(mode="json", exclude_none=True)
@@ -1845,11 +1853,16 @@ def _trainer_parallel_topology_check(
     *,
     world_size: int,
 ) -> PreflightCheck:
-    trainer_world_size = (
-        world_size
-        if config.launcher.mode == "integrated"
-        else config.launcher.trainer_num_processes
-    )
+    if config.deployment.type == "multi_node":
+        trainer_world_size = (
+            config.deployment.num_train_nodes * config.deployment.gpus_per_node
+        )
+    else:
+        trainer_world_size = (
+            world_size
+            if config.launcher.mode == "integrated"
+            else config.launcher.trainer_num_processes
+        )
     fsdp = config.fsdp
     try:
         dims = (
@@ -1922,7 +1935,10 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
     if config.deployment.type == "multi_node":
         required = required_inference_devices(config)
         available = config.deployment.gpus_per_node
-        inference_status: CheckStatus = "ok" if required <= available else "error"
+        replicas = config.deployment.inference_replicas_per_node
+        inference_status: CheckStatus = (
+            "ok" if required * replicas <= available else "error"
+        )
         checks = [
             PreflightCheck(
                 name="slurm_trainer_world",
@@ -1945,12 +1961,13 @@ def _device_group_checks(config: RLConfig) -> list[PreflightCheck]:
                     status=inference_status,
                     message=(
                         f"Each SLURM inference node provides {available} GPU(s); "
-                        f"one vLLM replica requires {required}."
+                        f"{replicas} vLLM replica(s) require {required * replicas}."
                     ),
                     details={
                         "nodes": config.deployment.num_inference_nodes,
                         "gpus_per_node": available,
                         "required_devices_per_replica": required,
+                        "replicas_per_node": replicas,
                     },
                 ),
             )
@@ -2074,7 +2091,10 @@ def _port_checks(config: RLConfig) -> list[PreflightCheck]:
             )
         ]
     if config.deployment.type == "multi_node":
-        count = config.deployment.num_inference_nodes
+        count = (
+            config.deployment.num_inference_nodes
+            * config.deployment.inference_replicas_per_node
+        )
         ports = [config.inference.http.port + index for index in range(count)]
         return [
             PreflightCheck(
@@ -2340,6 +2360,9 @@ def _resolved_commands(config: RLConfig) -> list[dict[str, Any]]:
                 "command": "uv run python -m wavelet rl @ <provided config>",
                 "train_nodes": config.deployment.num_train_nodes,
                 "inference_nodes": config.deployment.num_inference_nodes,
+                "inference_replicas_per_node": (
+                    config.deployment.inference_replicas_per_node
+                ),
                 "gpus_per_node": config.deployment.gpus_per_node,
             }
         ]

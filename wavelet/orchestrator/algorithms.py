@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Protocol
 
-from wavelet.configs.rl_config import (
+from wavelet.configs.config import (
     AlgorithmScope,
     CustomAlgorithmConfig,
     GRPOAlgorithmConfig,

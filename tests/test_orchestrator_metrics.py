@@ -10,7 +10,7 @@ from unittest.mock import Mock
 import pytest
 
 import wavelet.monitor as monitor_module
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.monitor import (
     RolloutMetricInputs,
     log_eval_metrics,
@@ -18,6 +18,41 @@ from wavelet.monitor import (
     policy_staleness,
     rollout_metrics,
 )
+
+
+@pytest.mark.parametrize("exit_code", [0, 1])
+def test_launcher_finalizes_shared_wandb_status(monkeypatch, tmp_path, exit_code):
+    run = Mock()
+    sdk = types.SimpleNamespace(init=Mock(return_value=run), Settings=lambda **kw: kw)
+    monkeypatch.setitem(sys.modules, "wandb", sdk)
+    config = RLConfig(output_dir=tmp_path)
+    monitor_module.finish_shared_wandb_run(config, {}, exit_code=exit_code)
+    sdk.init.assert_not_called()
+    monitor_module.finish_shared_wandb_run(
+        config, {"WANDB_RUN_ID": "shared"}, exit_code=exit_code
+    )
+    assert sdk.init.call_args.kwargs["id"] == "shared"
+    settings = sdk.init.call_args.kwargs["settings"]
+    assert settings["x_label"] == "launcher"
+    assert settings["x_primary"] is False
+    assert settings["x_update_finish_state"] is True
+    run.finish.assert_called_once_with(exit_code=exit_code)
+
+
+def test_shared_wandb_finalization_failure_is_reported(monkeypatch, tmp_path):
+    warning = Mock()
+    monkeypatch.setattr(monitor_module.logger, "warning", warning)
+    monkeypatch.setitem(
+        sys.modules,
+        "wandb",
+        types.SimpleNamespace(
+            init=Mock(side_effect=RuntimeError("unavailable")), Settings=lambda **kw: kw
+        ),
+    )
+    monitor_module.finish_shared_wandb_run(
+        RLConfig(output_dir=tmp_path), {"WANDB_RUN_ID": "shared"}, exit_code=1
+    )
+    warning.assert_called_once_with("Failed to finalize shared W&B run.", exc_info=True)
 
 
 def test_rollout_metrics_match_reference_style_grouping() -> None:
@@ -82,7 +117,7 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
 
     serialized = json.dumps(metrics, sort_keys=True, separators=(",", ":"))
     assert hashlib.sha256(serialized.encode()).hexdigest() == (
-        "6348ffd3c76fb03f160bf5347d72f8887efbd6f88f87f152fb70d4f7dbb15173"
+        "ea7a40bac7c52430d38079831b66645c9c849adba10de75219dd92ee08da8613"
     )
 
     assert metrics["progress/samples"] == 4
@@ -503,3 +538,20 @@ def test_rollout_metrics_reject_extra_metric_overrides() -> None:
                 extra_metrics={"step": 99.0},
             )
         )
+
+
+def test_environment_advantages_preserve_centered_group_signal() -> None:
+    rows = [
+        {"env_name": "math", "example_id": "a", "reward": 0.0, "advantage": -0.5},
+        {"env_name": "math", "example_id": "a", "reward": 1.0, "advantage": 0.5},
+        {"env_name": "math", "example_id": "b", "reward": 0.0, "advantage": -0.5},
+        {"env_name": "math", "example_id": "b", "reward": 1.0, "advantage": 0.5},
+    ]
+    metrics = rollout_metrics(
+        RolloutMetricInputs(rows=rows, rollouts_per_example=2, step=1)
+    )
+    assert metrics["train/math/advantage/mean"] == 0.0
+    assert metrics["train/math/advantage/min"] == -0.5
+    assert metrics["train/math/advantage/max"] == 0.5
+    assert metrics["train/math/advantage/std"] == metrics["advantage/all/std"]
+    assert metrics["train/math/advantage/std"] > 0.0

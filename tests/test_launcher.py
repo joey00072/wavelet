@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.orchestrator.launcher import (
     LocalRoleHandle,
     LocalRoleLauncher,

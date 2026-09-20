@@ -6,6 +6,23 @@ import yaml
 from wavelet.utils.serialization import load_yaml
 
 
+def test_load_yaml_allows_merge_defaults_with_explicit_overrides(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "defaults: &defaults {lr: 0.1, steps: 2}\ntrain: {<<: *defaults, lr: 0.2}\n"
+    )
+    assert load_yaml(path)["train"] == {"lr": 0.2, "steps": 2}
+
+
+def test_load_yaml_rejects_duplicate_explicit_keys_after_merge(tmp_path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "defaults: &defaults {lr: 0.1}\ntrain: {<<: *defaults, lr: 0.2, lr: 0.3}\n"
+    )
+    with pytest.raises(yaml.constructor.ConstructorError, match="duplicate key 'lr'"):
+        load_yaml(path)
+
+
 def test_load_yaml_rejects_duplicate_mapping_keys(tmp_path) -> None:
     path = tmp_path / "duplicate.yaml"
     path.write_text("optim:\n  lr: 1e-5\n  lr: 2e-5\n", encoding="utf-8")

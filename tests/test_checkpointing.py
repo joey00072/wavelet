@@ -370,12 +370,15 @@ def test_trainer_progress_counts_global_tokens_and_logical_samples() -> None:
         device=torch.device("cpu"),
     )
 
-    trainer._record_progress({"input_ids": torch.ones((2, 3), dtype=torch.long)})
+    trainer._record_progress(
+        {"input_ids": torch.ones((2, 3), dtype=torch.long)}, Mock()
+    )
     trainer._record_progress(
         {
             "input_ids": torch.ones((2, 4), dtype=torch.long),
             "sample_counts": torch.tensor([1, 3]),
-        }
+        },
+        Mock(),
     )
 
     assert trainer.total_tokens == 28
@@ -473,3 +476,94 @@ def test_fixed_accumulation_trainer_still_rejects_misaligned_resume_state() -> N
 
     with pytest.raises(ValueError, match="micro_step does not match"):
         trainer._validate_resume_state(TrainerState(step=3, micro_step=7))
+
+
+def test_checkpoint_collectives_use_a_reused_cpu_group(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(2, 1)
+    manager = CheckpointManager(
+        model,
+        torch.optim.AdamW(model.parameters()),
+        None,
+        CheckpointConfig(mode="async", interval=1),
+        tmp_path,
+        World(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            device=torch.device("cpu"),
+        ),
+    )
+    cpu_group = object()
+    new_group = Mock(return_value=cpu_group)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    monkeypatch.setattr(
+        manager, "_reset_checkpoint_dir", lambda path: path.mkdir(parents=True)
+    )
+    monkeypatch.setattr(manager, "_save_dataloader_state", lambda *_: None)
+    response = Future()
+    response.set_result(None)
+    save = Mock(return_value=response)
+    monkeypatch.setattr("wavelet.trainer.ckpt.dcp.async_save", save)
+    assert manager.save(TrainerState(step=1, micro_step=1))
+    assert save.call_args.kwargs["process_group"] is cpu_group
+    assert save.call_args.kwargs["no_dist"] is False
+    assert manager._process_group() is cpu_group
+    new_group.assert_called_once_with(backend="gloo")
+
+
+def test_local_checkpoint_does_not_create_a_process_group(
+    monkeypatch, tmp_path
+) -> None:
+    model = torch.nn.Linear(2, 1)
+    manager = CheckpointManager(
+        model,
+        torch.optim.AdamW(model.parameters()),
+        None,
+        CheckpointConfig(mode="async", interval=1),
+        tmp_path,
+        World(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            device=torch.device("cpu"),
+        ),
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    new_group = Mock()
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    assert manager._process_group() is None
+    new_group.assert_not_called()
+
+
+def test_fsdp1_checkpoint_uses_sharded_tensor_compatible_staging(
+    monkeypatch, tmp_path
+) -> None:
+    from torch.distributed.checkpoint.staging import BlockingAsyncStager
+
+    model = torch.nn.Sequential(torch.nn.Linear(2, 1))
+    manager = CheckpointManager(
+        model,
+        torch.optim.AdamW(model.parameters()),
+        None,
+        CheckpointConfig(mode="async", interval=1),
+        tmp_path,
+        World(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            device=torch.device("cpu"),
+        ),
+    )
+    monkeypatch.setattr(
+        "wavelet.trainer.ckpt.FullyShardedDataParallel", torch.nn.Linear
+    )
+    stager = manager._build_async_stager(use_pinned_memory=False)
+    assert isinstance(stager, BlockingAsyncStager)
+    value = torch.tensor([1.0])
+    snapshot = stager.stage({"value": value})
+    value.fill_(2.0)
+    torch.testing.assert_close(snapshot["value"], torch.tensor([1.0]))

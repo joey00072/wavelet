@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from wavelet.dashboard.jsonl import file_signature
-from wavelet.monitor import _iter_jsonl_dicts, _message_text, _numeric
+from wavelet.monitor import _message_text, _numeric
 
 ROLLOUT_SORT_KEYS = frozenset(
     {
@@ -131,6 +131,14 @@ def compact_rollout_row(
     rollout = (
         metadata.get("rollout") if isinstance(metadata.get("rollout"), dict) else {}
     )
+    timing = (
+        rollout.get("timing_seconds")
+        if isinstance(rollout.get("timing_seconds"), dict)
+        else {}
+    )
+    duration_seconds = _numeric(rollout, "elapsed_sec")
+    if duration_seconds is None:
+        duration_seconds = _numeric(timing, "total")
     return {
         "row_index": row_index,
         "reward": _numeric(row, "reward"),
@@ -146,6 +154,7 @@ def compact_rollout_row(
         "input_token_count": metadata.get("input_token_count"),
         "turn_count": metadata.get("turn_count", rollout.get("num_turns")),
         "tool_calls": rollout.get("tool_calls"),
+        "duration_seconds": duration_seconds,
         "error": _optional_str(rollout.get("error")),
         "sequence_tokens": len(input_ids) if isinstance(input_ids, list) else None,
         "trainable_tokens": (
@@ -334,7 +343,8 @@ class CompactRowCache:
 
     def __init__(self, *, max_files: int = 16) -> None:
         self._entries: dict[
-            Path, tuple[tuple[int, int], list[dict[str, Any]], int, bool]
+            Path,
+            tuple[tuple[int, int], list[dict[str, Any]], int, bool, dict[int, int]],
         ] = {}
         self._order: list[Path] = []
         self._max_files = max_files
@@ -358,8 +368,12 @@ class CompactRowCache:
         rows: list[dict[str, Any]] = []
         scanned = 0
         scan_limited = False
-        with path.open("r", encoding="utf-8") as handle:
+        offsets: dict[int, int] = {}
+        byte_offset = 0
+        with path.open("rb") as handle:
             for row_index, line in enumerate(handle):
+                row_offset = byte_offset
+                byte_offset += len(line)
                 if row_index >= max_scan_rows:
                     scan_limited = True
                     break
@@ -371,9 +385,10 @@ class CompactRowCache:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(row, dict):
+                    offsets[row_index] = row_offset
                     rows.append(compact_fn(row, row_index=row_index))
         with self._lock:
-            self._entries[path] = (signature, rows, scanned, scan_limited)
+            self._entries[path] = (signature, rows, scanned, scan_limited, offsets)
             if path in self._order:
                 self._order.remove(path)
             self._order.append(path)
@@ -382,34 +397,47 @@ class CompactRowCache:
                 self._entries.pop(evicted, None)
         return rows, scanned, scan_limited
 
+    def detail(self, path: Path, row_index: int, *, kind: str) -> dict[str, Any] | None:
+        """Seek directly to a selected row using the compact list's byte index."""
+        if row_index < 0:
+            return None
+        self.rows(path, kind=kind)
+        with self._lock:
+            entry = self._entries.get(path)
+            offset = None if entry is None else entry[4].get(row_index)
+        if offset is None:
+            return None
+        try:
+            with path.open("rb") as handle:
+                handle.seek(offset)
+                row = json.loads(handle.readline())
+        except (OSError, ValueError):
+            return None
+        return _row_detail(row, row_index) if isinstance(row, dict) else None
 
-def full_row(path: Path, row_index: int) -> dict[str, Any] | None:
-    """Return one raw JSONL row with large token arrays summarized."""
-    for index, row in _iter_jsonl_dicts(path, limit=row_index + 1):
-        if index != row_index:
-            continue
-        detail = dict(row)
-        detail["row_index"] = row_index
-        for key in ("prompt", "completion", "target_completion"):
-            if key in detail:
-                detail[key] = normalize_messages(detail[key])
-        arrays = {}
-        for key in (
-            "input_ids",
-            "target_ids",
-            "loss_mask",
-            "inference_logprobs",
-            "teacher_logprobs",
-            "sampling_mask",
-        ):
-            value = detail.pop(key, None)
-            if isinstance(value, list):
-                arrays[key] = _array_summary(value)
-        if isinstance(detail.get("temperatures"), list):
-            detail["temperatures"] = _array_summary(detail["temperatures"])
-        detail["arrays"] = arrays
-        return detail
-    return None
+
+def _row_detail(row: dict[str, Any], row_index: int) -> dict[str, Any]:
+    detail = dict(row)
+    detail["row_index"] = row_index
+    for key in ("prompt", "completion", "target_completion"):
+        if key in detail:
+            detail[key] = normalize_messages(detail[key])
+    arrays = {}
+    for key in (
+        "input_ids",
+        "target_ids",
+        "loss_mask",
+        "inference_logprobs",
+        "teacher_logprobs",
+        "sampling_mask",
+    ):
+        value = detail.pop(key, None)
+        if isinstance(value, list):
+            arrays[key] = _array_summary(value)
+    if isinstance(detail.get("temperatures"), list):
+        detail["temperatures"] = _array_summary(detail["temperatures"])
+    detail["arrays"] = arrays
+    return detail
 
 
 def _array_summary(values: list[Any]) -> dict[str, Any]:

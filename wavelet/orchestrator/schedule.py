@@ -3,7 +3,7 @@ from __future__ import annotations
 from math import ceil
 from typing import Protocol
 
-from wavelet.configs.rl_config import RLConfig, RLEvalEnvConfig
+from wavelet.configs.config import RLConfig, RLEvalEnvConfig
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step
 
 
@@ -55,13 +55,27 @@ def rollout_groups_for_chunk(config: RLConfig, chunk_index: int) -> int:
     return min(chunk_examples, remaining)
 
 
-def required_policy_step(config: RLConfig, rollout_step: int) -> int:
-    """Oldest policy step allowed for a rollout under the async window."""
+def max_policy_lag(config: RLConfig) -> int:
+    """Maximum policy age allowed by both freshness constraints."""
     async_level = config.orchestrator.max_async_level
     async_lag = max(async_level - 1, 0)
     off_policy_steps = config.orchestrator.max_off_policy_steps
-    allowed_lag = min(async_lag, off_policy_steps)
-    return max(rollout_step - allowed_lag, 0)
+    return min(async_lag, off_policy_steps)
+
+
+def required_policy_step(config: RLConfig, rollout_step: int) -> int:
+    """Oldest policy step allowed for a rollout under the async window."""
+    return max(rollout_step - max_policy_lag(config), 0)
+
+
+def retained_policy_snapshots(config: RLConfig) -> int:
+    """Keep selected policies alive while admitted rollout requests drain."""
+    # The trainer can consume the previously published batch during a refresh.
+    # Retain the freshness window plus that export and the selected snapshot.
+    minimum = (
+        ceil(max_policy_lag(config) / config.policy_transfer.export_every_steps) + 2
+    )
+    return max(config.policy_transfer.keep_last, minimum)
 
 
 def next_exported_policy_step(config: RLConfig, required_step: int) -> int:

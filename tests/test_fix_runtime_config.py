@@ -8,8 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.sft import SFTConfig, WandbConfig
+from wavelet.configs.config import RLConfig, SFTConfig, WandbConfig
 from wavelet.monitor import RunMonitor
 from wavelet.orchestrator import launcher as launcher_module
 from wavelet.orchestrator.runtime import (
@@ -84,18 +83,12 @@ def test_legacy_betas_alias_rejects_conflicting_values() -> None:
         RLConfig(optim={"betas": [0.8, 0.9], "betas1": 0.5})
 
 
-@pytest.mark.parametrize(
-    "optim",
-    [
-        {"type": "muon"},
-        {"mu": 0.95},
-    ],
-)
-def test_unimplemented_muon_optimizer_config_is_rejected(
-    optim: dict[str, object],
-) -> None:
-    with pytest.raises(ValueError, match="muon|mu"):
-        RLConfig(optim=optim)
+def test_muon_config_accepts_explicit_momentum_and_rejects_unknown_alias() -> None:
+    config = RLConfig(optim={"type": "muon", "muon_momentum": 0.9})
+    assert config.optim.type == "muon"
+    assert config.optim.muon_momentum == 0.9
+    with pytest.raises(ValueError, match="mu"):
+        RLConfig(optim={"mu": 0.95})
 
 
 def test_unimplemented_fsdp_reshard_setting_is_rejected() -> None:
@@ -143,22 +136,40 @@ def test_fsdp2_ring_context_parallelism_is_accepted_for_rl() -> None:
     )
 
     assert config.fsdp.cp == 2
-    assert config.fsdp.cp_style == "ring"
 
 
-def test_context_parallelism_is_rejected_for_sft() -> None:
-    with pytest.raises(ValueError, match="supported for RLConfig only"):
-        SFTConfig(
-            model={"attn_implementation": "sdpa"},
-            fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
-            data={"pack_function": "cat", "seq_len": 128},
-        )
+def test_fsdp_rejects_unimplemented_context_parallel_style_option() -> None:
+    with pytest.raises(ValueError, match="cp_style"):
+        RLConfig(fsdp={"enabled": True, "impl": "fsdp2", "cp_style": "ring"})
+
+
+def test_context_parallelism_is_supported_for_sft() -> None:
+    config = SFTConfig(
+        model={"attn_implementation": "sdpa"},
+        fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
+        data={"pack_function": "cat", "seq_len": 128},
+    )
+    assert config.fsdp.cp == 2
 
 
 def test_context_parallelism_requires_sdpa() -> None:
     with pytest.raises(ValueError, match="attn_implementation='sdpa'"):
         RLConfig(
             model={"attn_implementation": "auto"},
+            fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
+            data={"seq_len": 128},
+        )
+
+
+def test_context_parallelism_rejects_vlm_until_multimodal_sharding_exists() -> None:
+    with pytest.raises(ValueError, match="not supported for VLM"):
+        SFTConfig(
+            model={
+                "attn_implementation": "sdpa",
+                "vlm": {
+                    "vision_encoder_attr": "visual",
+                },
+            },
             fsdp={"enabled": True, "impl": "fsdp2", "cp": 2},
             data={"seq_len": 128},
         )

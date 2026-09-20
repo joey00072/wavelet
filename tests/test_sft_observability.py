@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from wavelet.configs.sft import SFTConfig
+from wavelet.configs.config import SFTConfig
 from wavelet.trainer import trainer as trainer_module
 from wavelet.trainer.distributed import World
 from wavelet.trainer.trainer import SFTTrainer, _dataloader_progress

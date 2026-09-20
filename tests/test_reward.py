@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from wavelet.configs.rl_config import RLRewardConfig
+from wavelet.configs.config import RLRewardConfig
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.reward import RLRewardScorer
 
@@ -15,6 +15,11 @@ def _record(response: str, expected: str = "439") -> RLExample:
         advantage=None,
         reward=None,
     )
+
+
+def test_reward_rejects_unused_reasoning_start_option() -> None:
+    with pytest.raises(ValueError, match="reasoning_start"):
+        RLRewardConfig(reasoning_start="<start_working_out>")
 
 
 def test_math_reward_keeps_wrong_formatted_answer_near_zero() -> None:

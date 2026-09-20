@@ -1,0 +1,152 @@
+model:
+  name: PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT
+  torch_dtype: float32
+  attn_implementation: flash_attention_2
+  load_in_4bit: false
+  activation_checkpointing:
+    mode: full
+  matmul_precision: high
+  fused_lm_head_token_chunk_size: auto
+data:
+  source: local
+  path: outputs/reverse_text_diagnostic/rl_train.jsonl
+  batch_size: 128
+  micro_batch_size: 1
+  pack_sequences: true
+  pad_to_multiple_of: 1
+  seq_len: 2048
+  max_examples: null
+  shuffle: true
+  seed: 42
+loss:
+  type: ipo
+  ipo_epsilon: 0.1
+  kl_tau: 0.001
+algo:
+  type: grpo
+  normalize_advantages: false
+orchestrator:
+  enabled: true
+  custom_rollout_function: wavelet.orchestrator.verifiers:generate_rollouts
+  verifier_env_id: reverse-text-diagnostic
+  verifier_env_args: {}
+  verifier_model: PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT
+  verifier_client_type: openai_chat_completions_token
+  verifier_max_retries: 2
+  examples_per_step: 8
+  rollouts_per_example: 16
+  rollout_chunk_examples: 8
+  filter_zero_advantage: true
+  zero_advantage_max_retries: 8
+  max_async_level: 2
+  max_off_policy_steps: 8
+  max_pending_rollout_chunks: 16
+  overwrite: true
+  state_server:
+    enabled: true
+    host: 0.0.0.0
+    port: 8765
+  max_inflight_rollouts: 128
+  live_traces: false
+transport:
+  poll_interval_seconds: 0.05
+  cleanup_consumed: true
+  keep_last_consumed: 8
+eval:
+  interval: 10
+  num_examples: 256
+  rollouts_per_example: 1
+  eval_base_model: true
+  final_eval: true
+  keep_last_rollout_sets: 2
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 128
+  env:
+  - id: reverse-text-diagnostic
+    name: reverse-text-eval
+  live_traces: false
+inference:
+  enabled: true
+  mode: vllm_http
+  default_temperature: 1.0
+  sampling:
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    min_p: 0.0
+    repetition_penalty: 1.0
+    max_completion_tokens: 128
+  vllm:
+    server_backend: openai
+    dtype: bfloat16
+    gpu_memory_utilization: 0.65
+    max_model_len: 2048
+    enforce_eager: false
+    max_lora_rank: 16
+    tensor_parallel_size: 1
+    data_parallel_size: 1
+    data_parallel_size_local: 1
+    extra_args:
+      max_num_seqs: 128
+  http:
+    request_timeout_seconds: 900.0
+    startup_timeout_seconds: 1800
+reward:
+  mode: passthrough
+policy_transfer:
+  type: filesystem
+  export_initial: true
+  export_every_steps: 1
+  poll_interval_seconds: 0.05
+  keep_last: 2
+ckpt:
+  mode: async
+  interval: 100
+  keep_last: 2
+fsdp:
+  enabled: true
+  backend: nccl
+  dp_replicate: 1
+  dp_shard: 1
+  cp: 1
+  tp: 1
+  ep: 1
+  cpu_offload: false
+optim:
+  type: adamw
+  implementation: for-loop
+  lr: 3.0e-06
+  weight_decay: 0.01
+  betas:
+  - 0.9
+  - 0.999
+scheduler:
+  type: constant
+lora: null
+max_grad_norm: 1.0
+max_steps: 100
+seed: 42
+monitor:
+  enabled: true
+  samples:
+    enabled: true
+    interval: 10
+    sample_ratio: 0.25
+    max_samples: 8
+  wandb:
+    enabled: true
+    project: wavelet-reverse-text
+    name: reverse-text-0.6b-full-100steps
+    mode: online
+launcher:
+  mode: process
+  backend: local
+  inference_cuda_visible_devices: '0'
+  trainer_cuda_visible_devices: '1'
+output_dir: outputs/reverse_text_full_diagnostic
+clean_output_dir: false

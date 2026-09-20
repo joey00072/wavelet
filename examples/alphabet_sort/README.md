@@ -21,6 +21,35 @@ Install the verifier extras:
 uv sync --extra verifiers --extra envs
 ```
 
+For a short 4B learning check, `rl_diagnostic.yaml` uses 16 problem groups ×
+16 rollouts, IPO, FP32 optimization with BF16 compute, packed 2,048-token
+training sequences, and 768-token responses per turn. It runs 20 updates with
+128 fixed evaluation examples at baseline, every 10 updates, and completion.
+Evaluation uses the training task distribution; it is not a held-out test.
+
+```bash
+uv run python examples/alphabet_sort/prepare_rl_data.py \
+  --env-id alphabet-sort --preserve-order --similarity-power 4 \
+  --output outputs/alphabet_sort_data/rl_train_source_order.jsonl
+uv run python -m wavelet debug preflight @ examples/alphabet_sort/rl_diagnostic.yaml --json
+uv run python -m wavelet rl @ examples/alphabet_sort/rl_diagnostic.yaml
+```
+
+This config assigns inference to GPU 0 and training to GPU 1. It uses the
+model-native serving context; check available GPU memory before launching.
+Use `--max_steps 100` for a longer reward curve. Zero-advantage groups are
+replaced, so raw generation can exceed 256 episodes per update. The pinned
+legacy verifier provides a finite source pass; comparisons against an infinite
+native task stream must export that stream when advancing beyond the first pass.
+
+Wavelet's effective policy-age limit is
+`min(max_async_level - 1, max_off_policy_steps)`. This diagnostic's async level
+2 therefore permits one step of lag. Preflight reports this as
+`summary.policy_freshness.effective_max_policy_lag`. Increasing the candidate pool with
+`oversampling_factor` while keeping a tight freshness window can discard much
+of that extra work; inspect `generation/rollouts/cancelled_total` and
+`off_policy/max` along with throughput.
+
 Generate verifier examples:
 
 ```bash
@@ -113,3 +142,25 @@ alphabet-sort reward run.
 The reward recipe also runs verifier evals every 20 exported policy steps and at
 the end of training. Eval metrics are written to `eval_metrics.jsonl`, and raw
 eval rollouts are written under `evals/step-*`.
+
+## Policy retention during async refresh
+
+Filesystem `policy_transfer.keep_last` is a minimum. Wavelet also retains the
+effective lag window plus two snapshots, accounting for the export interval,
+so a selected adapter stays available while outstanding requests finish.
+Preflight reports this as `policy_freshness.retained_policy_snapshots`.
+
+For a wider-window throughput comparison, retain the same 16×16 admitted batch
+while allowing more candidate groups and up to eight steps of policy lag:
+
+```bash
+uv run python -m wavelet debug preflight @ examples/alphabet_sort/rl_diagnostic.yaml \
+  --orchestrator.max_async_level 9 --orchestrator.oversampling_factor 2 \
+  --output_dir outputs/alphabet_sort_async_diagnostic --json
+uv run python -m wavelet rl @ examples/alphabet_sort/rl_diagnostic.yaml \
+  --orchestrator.max_async_level 9 --orchestrator.oversampling_factor 2 \
+  --output_dir outputs/alphabet_sort_async_diagnostic
+```
+
+This changes sampling freshness and may change the learning trajectory; compare
+fixed-policy evaluations alongside timing and accepted output-token counts.

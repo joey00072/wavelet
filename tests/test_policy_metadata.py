@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.orchestrator.policy_metadata import (
     adapter_artifact_metadata,
     policy_metadata,

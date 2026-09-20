@@ -974,11 +974,7 @@ def rollout_metrics(inputs: RolloutMetricInputs) -> dict[str, float]:
         max(seq_len - decode_len, 0)
         for seq_len, decode_len in zip(seq_lens, decode_lens, strict=True)
     ]
-    advantage_values = [
-        value
-        for row in rows
-        if (value := _float_or_none(row.get("advantage"))) is not None
-    ]
+    advantage_values = _rollout_advantages(rows)
     metrics: dict[str, float] = {
         "progress/tokens": float(sum(seq_lens)),
         "progress/prefill_tokens": float(sum(prefill_lens)),
@@ -1130,6 +1126,14 @@ def _fate_error_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
+def _rollout_advantages(rows: list[dict[str, Any]]) -> list[float]:
+    return [
+        value
+        for row in rows
+        if (value := _float_or_none(row.get("advantage"))) is not None
+    ]
+
+
 def _add_environment_metrics(
     metrics: dict[str, float],
     rows: list[dict[str, Any]],
@@ -1162,10 +1166,7 @@ def _add_environment_metrics(
         metrics.update(
             series_stats(
                 f"{prefix}/advantage",
-                _grouped_rollout_means(
-                    grouped,
-                    lambda row: _float_or_none(row.get("advantage")),
-                ),
+                _rollout_advantages(env_rows),
             )
         )
         solve_none, solve_all, effective = _solve_rates(
@@ -1379,6 +1380,33 @@ def _maybe_create_wandb_overview(
             logger.info("Created W&B overview view: %s", url)
     except Exception:
         logger.warning("Failed to create W&B overview view.", exc_info=True)
+
+
+def finish_shared_wandb_run(
+    config: RLConfig, shared_env: dict[str, str], *, exit_code: int
+) -> None:
+    """Finalize a shared run only after the launcher has joined every role."""
+    if not shared_env:
+        return
+    try:
+        import wandb
+
+        run = wandb.init(
+            id=shared_env["WANDB_RUN_ID"],
+            project=config.monitor.wandb.project or "wavelet",
+            entity=config.monitor.wandb.entity,
+            dir=str(config.output_dir),
+            settings=wandb.Settings(
+                mode="shared",
+                x_label="launcher",
+                x_primary=False,
+                x_update_finish_state=True,
+                init_timeout=config.monitor.wandb.init_timeout_seconds,
+            ),
+        )
+        run.finish(exit_code=exit_code)
+    except Exception:
+        logger.warning("Failed to finalize shared W&B run.", exc_info=True)
 
 
 def finish_orchestrator_wandb() -> None:

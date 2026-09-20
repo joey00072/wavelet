@@ -42,6 +42,59 @@ canonical long run documented below. The long run evaluates AIME
 consumed training batches, evaluation sets, and sampled completions needed for
 reward-hacking inspection.
 
+## Four-node SLURM run
+
+`rl_slurm_4node_128x16.yaml` starts from the base instruct model, without a
+recovery SFT adapter. It assigns one eight-GPU node to FSDP training and three
+eight-GPU nodes to inference. Each inference node runs eight vLLM data-parallel
+workers. An optimizer step uses 128 distinct problems with 16 rollouts each
+(2,048 completions), in eight 16-problem chunks; the trainer microbatch is two
+completions per GPU. The existing policy freshness limit remains four steps.
+
+Stage the source, Python interpreter, virtual environment, data, model cache,
+and outputs on storage visible at the same paths on all nodes. A shared venv
+whose Python symlink points into one node's local home directory will not work.
+Prepare data with the commands above, adapt the SLURM partition and project
+directory to the cluster, and provide W&B credentials through the job environment
+or a private file sourced by `slurm.setup_commands`. W&B is enabled under project
+`wavelet-polaris`, with one shared run for training and rollout metrics.
+
+```bash
+uv run python -m wavelet debug preflight \
+  @ examples/qwen2_5_7b_polaris/rl_slurm_4node_128x16.yaml --json
+uv run python -m wavelet rl \
+  @ examples/qwen2_5_7b_polaris/rl_slurm_4node_128x16.yaml
+```
+
+The config retains the 100,000-step target and has a 24-hour allocation limit.
+AIME 2024 is evaluated before training and every 100 policy steps. Use a new
+output directory for retries unless explicitly resuming a stable checkpoint.
+
+### Short diagnostic run
+
+`rl_slurm_4node_16x16.yaml` retains the same placement and model but runs only
+20 optimizer steps. It takes the first 16 records in the prepared data file,
+keeps their order fixed, and samples 16 responses per problem (256 completions
+per update). Zero-advantage filtering is disabled so every update includes all
+16 problems and the reward denominator stays fixed. This is an overfitting and
+pipeline diagnostic; training reward on this subset is not a generalization
+measurement. AIME runs before training, every five steps, and at completion.
+The diagnostic disables per-phase live tracing to keep shared-filesystem I/O
+out of timing comparisons; metrics and sampled completed rollouts remain enabled.
+
+```bash
+uv run python -m wavelet debug preflight \
+  @ examples/qwen2_5_7b_polaris/rl_slurm_4node_16x16.yaml --json
+uv run python -m wavelet rl \
+  @ examples/qwen2_5_7b_polaris/rl_slurm_4node_16x16.yaml
+```
+
+Use the same prepared 16 records for comparisons with another implementation;
+matching only the seed is insufficient if the dataset ordering differs. Inspect
+correct and incorrect completions, failed rollout counts, policy lag, and
+baseline/final evaluation before interpreting the reward curve. Twenty steps
+can diagnose a broken pipeline but do not guarantee a reward increase.
+
 ## Incorrect synthetic solutions
 
 `generate_incorrect_synthetic.py` selects 100 deterministic, unique Polaris

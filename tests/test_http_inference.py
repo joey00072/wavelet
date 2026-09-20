@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
 from wavelet.inference.engine import HTTPPolicyInferenceEngine
 
@@ -64,8 +64,19 @@ def test_round_robin_annotation_restores_input_order() -> None:
     ]
 
 
-def test_policy_load_uses_all_server_request_path(tmp_path: Path, monkeypatch) -> None:
-    engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
+@pytest.mark.parametrize(
+    "custom_rollout_function",
+    [None, "wavelet.orchestrator.verifiers:generate_rollouts"],
+)
+def test_policy_load_uses_all_server_request_path(
+    tmp_path: Path, monkeypatch, custom_rollout_function
+) -> None:
+    engine = HTTPPolicyInferenceEngine(
+        RLConfig(
+            output_dir=tmp_path,
+            orchestrator={"custom_rollout_function": custom_rollout_function},
+        )
+    )
     calls: list[tuple[str, str, dict[str, object] | None]] = []
 
     def request_all(
@@ -121,3 +132,44 @@ def test_paused_policy_load_resumes_servers_after_failure(
         )
 
     assert paths == ["/pause", "/load_policy", "/resume"]
+
+
+@pytest.mark.parametrize("lora,backend", [(None, "openai"), ({"rank": 4}, "offline")])
+def test_full_model_and_native_updates_still_pause(
+    tmp_path, monkeypatch, lora, backend
+):
+    engine = HTTPPolicyInferenceEngine(
+        RLConfig(
+            output_dir=tmp_path,
+            lora=lora,
+            inference={"vllm": {"server_backend": backend}},
+        )
+    )
+    calls = []
+
+    def request_all(method, path, payload=None):
+        calls.append(path)
+        return [{"policy_step": 3}]
+
+    monkeypatch.setattr(engine, "_request_all", request_all)
+    engine.load_policy(tmp_path / "policy", step=3)
+    assert calls == ["/pause", "/load_policy", "/resume"]
+
+
+@pytest.mark.parametrize("failure", ["exception", "wrong_version"])
+def test_hot_swap_failure_does_not_advance_policy(tmp_path, monkeypatch, failure):
+    engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
+    engine.policy_step = 2
+    paths = []
+
+    def request_all(method, path, payload=None):
+        paths.append(path)
+        if failure == "exception":
+            raise RuntimeError("load failed")
+        return [{"policy_step": 3}, {"policy_step": 2}]
+
+    monkeypatch.setattr(engine, "_request_all", request_all)
+    with pytest.raises(RuntimeError):
+        engine.load_policy(tmp_path / "policy", step=3)
+    assert engine.policy_step == 2
+    assert paths == ["/load_policy"]

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from transformers import BatchEncoding
 
-from wavelet.configs.sft import LossMaskConfig
+from wavelet.configs.config import LossMaskConfig
 from wavelet.data.sft import (
     Example,
     _build_loss_mask_fast,

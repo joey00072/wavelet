@@ -9,8 +9,7 @@ from pathlib import Path
 from time import sleep
 from typing import Any, TextIO
 
-from wavelet.configs.config import validate_role_env_vars
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig, validate_role_env_vars
 
 _TERMINATE_TIMEOUT_SECONDS = 10.0
 

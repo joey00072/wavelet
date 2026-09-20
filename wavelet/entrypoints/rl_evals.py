@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.monitor import finish_orchestrator_wandb, setup_config_logger
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.scheduler import _run_evals_async

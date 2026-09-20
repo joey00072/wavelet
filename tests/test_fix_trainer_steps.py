@@ -7,9 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from wavelet.configs.config import SchedulerConfig
-from wavelet.configs.rl_config import RLConfig
-from wavelet.configs.sft import SFTConfig
+from wavelet.configs.config import RLConfig, SchedulerConfig, SFTConfig
 from wavelet.data.rl import FakeRLDataset, PackedRLDataset, RLDataset, RLExample
 from wavelet.trainer import distributed as distributed_module
 from wavelet.trainer.distributed import ParallelDims, World

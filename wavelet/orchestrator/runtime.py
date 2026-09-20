@@ -13,14 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
-from wavelet.configs.rl_config import RLConfig
+from wavelet.configs.config import RLConfig
 from wavelet.data.rl import count_nonempty_jsonl_rows
 from wavelet.inference.policy import (
     create_policy_inference_engine,
     expected_served_model_names,
     require_expected_served_model,
 )
-from wavelet.monitor import setup_config_logger
+from wavelet.monitor import finish_shared_wandb_run, setup_config_logger
 from wavelet.orchestrator.launcher import (
     RoleHandle,
     RoleSpec,
@@ -485,7 +485,7 @@ def _role_specs(
             **wandb_shared_env,
             "WANDB_SHARED_LABEL": label,
             "WANDB_SHARED_PRIMARY": primary_label,
-            "WANDB_SHARED_FINISHER": "orchestrator",
+            "WANDB_SHARED_FINISHER": "launcher",
         }
 
     roles: list[RoleSpec] = []
@@ -629,6 +629,7 @@ def _run_process_launcher(
     )
     handles = []
     previous_sigterm = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    exit_code = 1
     try:
         service_roles = [role for role in roles if role.service]
         job_roles = [role for role in roles if not role.service]
@@ -643,6 +644,7 @@ def _run_process_launcher(
             handles,
             poll_interval_seconds=config.launcher.poll_interval_seconds,
         )
+        exit_code = 0
     finally:
         try:
             terminate_remaining(handles)
@@ -650,6 +652,7 @@ def _run_process_launcher(
         finally:
             launcher.close()
             signal.signal(signal.SIGTERM, previous_sigterm)
+            finish_shared_wandb_run(config, wandb_shared_env, exit_code=exit_code)
     print(f"Published rollout batches under {config.output_dir / 'rollouts'}")
     return 0
 
