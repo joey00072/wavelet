@@ -496,25 +496,32 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
 
     def _sample_rollout_rows(self, rollout_path: Path) -> list[dict[str, object]]:
         sample_config = self.config.monitor.samples
-        payloads: list[dict[str, object]] = []
-        with rollout_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if stripped:
-                    payloads.append(json.loads(stripped))
-        if not payloads:
+        if sample_config.sample_ratio is not None and sample_config.sample_ratio <= 0:
             return []
-
-        max_samples = len(payloads)
-        if sample_config.sample_ratio is not None:
-            if sample_config.sample_ratio <= 0.0:
+        # Index byte offsets before sampling so unselected traces are never decoded.
+        offsets: list[int] = []
+        with rollout_path.open("rb") as handle:
+            while True:
+                offset = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if line.strip():
+                    offsets.append(offset)
+            if not offsets:
                 return []
-            max_samples = max(1, int(len(payloads) * sample_config.sample_ratio))
-        if sample_config.max_samples is not None:
-            max_samples = min(max_samples, sample_config.max_samples)
-        if len(payloads) > max_samples:
-            rng = random.Random(self.config.seed + self.step)
-            payloads = rng.sample(payloads, max_samples)
+            max_samples = len(offsets)
+            if sample_config.sample_ratio is not None:
+                max_samples = max(1, int(len(offsets) * sample_config.sample_ratio))
+            if sample_config.max_samples is not None:
+                max_samples = min(max_samples, sample_config.max_samples)
+            if len(offsets) > max_samples:
+                rng = random.Random(self.config.seed + self.step)
+                offsets = rng.sample(offsets, max_samples)
+            payloads = []
+            for offset in offsets:
+                handle.seek(offset)
+                payloads.append(json.loads(handle.readline()))
 
         rows = []
         for index, payload in enumerate(payloads):

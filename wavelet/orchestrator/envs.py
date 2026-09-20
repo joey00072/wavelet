@@ -1805,11 +1805,11 @@ def _step_token_segment(
         }
     return TokenSegment(
         metadata=metadata,
-        prompt_ids=[int(token_id) for token_id in tokens["prompt_ids"]],
+        prompt_ids=tokens["prompt_ids"],
         prompt_loss_mask=[bool(value) for value in tokens["prompt_mask"]],
-        output_ids=[int(token_id) for token_id in tokens["completion_ids"]],
+        output_ids=tokens["completion_ids"],
         output_loss_mask=[bool(value) for value in tokens["completion_mask"]],
-        output_logprobs=[float(value) for value in tokens["completion_logprobs"]],
+        output_logprobs=tokens["completion_logprobs"],
         output_sampling_mask=(
             [[int(token_id) for token_id in row] for row in tokens["sampling_mask"]]
             if tokens.get("sampling_mask") is not None

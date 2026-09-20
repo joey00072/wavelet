@@ -375,7 +375,10 @@ class RLOrchestrator:
             for record in records:
                 if record.temperatures is None:
                     raise ValueError("Rollout record is missing temperatures.")
-                handle.write(json.dumps(self._serialize_record(record)) + "\n")
+                handle.write(
+                    json.dumps(self._serialize_record(record), separators=(",", ":"))
+                    + "\n"
+                )
         return output_path
 
     def _serialize_record(self, record: RLExample) -> dict[str, object]:

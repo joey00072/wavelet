@@ -869,8 +869,10 @@ def log_rollout_metrics(
     chunk_index: int | None = None,
     timings: dict[str, float] | None = None,
     extra_metrics: dict[str, float] | None = None,
+    rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, float]:
-    rows = read_jsonl(path)
+    if rows is None:
+        rows = read_jsonl(path)
     metrics = rollout_metrics(
         RolloutMetricInputs(
             rows=rows,
@@ -1537,7 +1539,7 @@ def _seq_len(row: dict[str, Any]) -> int:
 def _decode_len(row: dict[str, Any]) -> int:
     loss_mask = row.get("loss_mask")
     if isinstance(loss_mask, list):
-        return sum(bool(item) for item in loss_mask)
+        return sum(map(bool, loss_mask))
     inference_logprobs = row.get("inference_logprobs")
     if isinstance(inference_logprobs, list):
         return len(inference_logprobs)

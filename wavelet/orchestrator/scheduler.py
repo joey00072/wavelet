@@ -455,6 +455,7 @@ class VerifierRolloutScheduler:
         self.vf = vf
         self.orchestrator = orchestrator
         self.config = config
+        self._batch_records: dict[int, tuple[dict[str, Any], list[RLExample]]] = {}
         env_specs = _training_env_specs(config)
         start_environment_record_cursors = start_environment_record_cursors or {}
         start_curriculum_states = start_curriculum_states or {}
@@ -695,6 +696,7 @@ class VerifierRolloutScheduler:
     ) -> list[RLExample]:
         """Build one batch for ``rollout_step`` from groups the trainer accepts."""
         started_at = perf_counter()
+        self._batch_records.clear()
         await self._ensure_inference_metrics_task()
         self.executor_concurrency = _scale_verifier_executors(
             self.max_inflight_rollouts
@@ -779,6 +781,7 @@ class VerifierRolloutScheduler:
                         rejected_groups=completed_groups,
                     )
                     outputs = []
+                    self._batch_records.clear()
 
                 await self._wait_for_policy_update()
                 self._set_group_admission_target(
@@ -866,22 +869,26 @@ class VerifierRolloutScheduler:
             and accepted_groups >= self._minimum_token_batch_groups
         )
 
-    @staticmethod
-    def _outputs_token_count(outputs: list[dict[str, Any]]) -> int:
+    def _records_for_outputs(self, outputs: list[dict[str, Any]]) -> list[RLExample]:
+        records = []
+        for output in outputs:
+            key = id(output)
+            if key not in self._batch_records:
+                converted = _records_from_output(
+                    output, require_multimodal_capture=self.config.model.vlm is not None
+                )
+                # Retain the output until batch completion to prevent id reuse.
+                self._batch_records[key] = (output, converted)
+            records.extend(self._batch_records[key][1])
+        return records
+
+    def _outputs_token_count(self, outputs: list[dict[str, Any]]) -> int:
         return sum(
-            len(record.input_ids or [])
-            for output in outputs
-            for record in _records_from_output(output)
+            len(record.input_ids or []) for record in self._records_for_outputs(outputs)
         )
 
     def _has_trainable_batch(self, outputs: list[dict[str, Any]]) -> bool:
-        records = [
-            record
-            for output in outputs
-            for record in _records_from_output(
-                output, require_multimodal_capture=self.config.model.vlm is not None
-            )
-        ]
+        records = self._records_for_outputs(outputs)
         records = self._finalize_environment_records(records, distill=False)
         return _has_trainable_rollout_record(records)
 
@@ -981,13 +988,7 @@ class VerifierRolloutScheduler:
         batch_stats: _VerifierBatchStats,
     ) -> list[RLExample]:
         convert_started_at = perf_counter()
-        records = [
-            record
-            for output in outputs
-            for record in _records_from_output(
-                output, require_multimodal_capture=self.config.model.vlm is not None
-            )
-        ]
+        records = self._records_for_outputs(outputs)
         records = self._finalize_environment_records(records, distill=True)
         self.last_batch_metrics = batch_stats.metrics()
         self.last_batch_metrics["generation/executor_concurrency"] = float(
@@ -1052,6 +1053,7 @@ class VerifierRolloutScheduler:
             convert=perf_counter() - convert_started_at,
             total=perf_counter() - started_at,
         )
+        self._batch_records.clear()
         return records
 
     def _drain_completed_groups_to_ready(
@@ -1353,6 +1355,7 @@ class VerifierRolloutScheduler:
             await asyncio.gather(*self.pending, return_exceptions=True)
         self.pending.clear()
         self.groups.clear()
+        self._batch_records.clear()
         self.ready_groups.clear()
         self.ready_group_off_policy_steps.clear()
 
@@ -1566,14 +1569,18 @@ class VerifierRolloutScheduler:
         if not self._can_admit_new_group():
             return False
 
-        if remaining_capacity < self._minimum_rollout_count:
-            return False
-
         runtimes = self.env_runtimes
-        if runtimes:
-            runtime = self._select_environment_runtime()
-            if remaining_capacity < runtime.rollout_count:
-                return False
+        runtime = self._select_environment_runtime() if runtimes else None
+        requires_group_scoring = (
+            runtime.requires_group_scoring if runtime else self.requires_group_scoring
+        )
+        admission_cost = (
+            (runtime.rollout_count if runtime else self.rollout_count)
+            if requires_group_scoring
+            else 1
+        )
+        if remaining_capacity < admission_cost:
+            return False
         runtime, record, record_cursor, curriculum_task_key = (
             self._next_environment_record()
         )
@@ -2715,19 +2722,22 @@ class _VerifierChunkPublisher:
         )
 
         materialize_started_at = perf_counter()
-        materialized_path = self.orchestrator._write_records(records, step=queue_step)
+        materialized_path = await asyncio.to_thread(
+            self.orchestrator._write_records, records, step=queue_step
+        )
         materialize_seconds = perf_counter() - materialize_started_at
         publish_started_at = perf_counter()
         environment_cursors, environment_selection_cursor = (
             self.scheduler.environment_cursor_snapshot()
         )
-        batch = self.rollout_sender.publish(
+        batch = await asyncio.to_thread(
+            self.rollout_sender.publish,
             materialized_path,
             step=queue_step,
             optimizer_step=optimizer_step,
             chunk_index=queue_step % self.chunks_per_step,
             policy_step=rollout_policy_step,
-            rows=_count_nonempty_lines(materialized_path),
+            rows=len(records),
             tokens=_rollout_record_tokens(records),
             environment_record_cursors=_rollout_environment_record_cursors(records),
             environment_next_record_cursors=environment_cursors,
@@ -2755,6 +2765,7 @@ class _VerifierChunkPublisher:
                 "step": perf_counter() - step_started_at,
             },
             extra_metrics=getattr(self.scheduler, "last_batch_metrics", None),
+            rows=[self.orchestrator._serialize_record(record) for record in records],
         )
         emit_perf(
             "inference_chunk",

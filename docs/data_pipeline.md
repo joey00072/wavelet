@@ -125,3 +125,18 @@ and branch index, so separate episodes in one group remain distinguishable.
 `group_key` still identifies the reward/advantage group. Environments without a
 trajectory ID retain the group-and-branch fallback; that fallback is not a unique
 episode identifier.
+
+## Rollout logging cost
+
+Rollout JSONL is written with compact separators, preserving all values and trace
+metadata. Async publication uses the already available record count instead of
+rescanning the materialized file. Trainer sample logging indexes byte offsets
+and decodes only the selected rows; its seeded selection, order, ratio and limit
+remain unchanged. This avoids decoding entire batches merely to log a few samples.
+These changes do not alter token packing, policy freshness, or group completion.
+
+Pretokenized rows retain full length, stream-alignment, numeric, and multimodal
+provenance validation. Token and mask coercion uses bulk builtin iterators to
+reduce Python loop overhead without changing conversion or truncation semantics.
+Trajectory segment construction performs token coercion once at the validated
+`TokenSegment` boundary.

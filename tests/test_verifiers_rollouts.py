@@ -79,6 +79,7 @@ def _bare_scheduler(**overrides: Any) -> VerifierRolloutScheduler:
         "cancelled_rollouts_count": 0,
         "rejected_groups_count": 0,
         "last_batch_metrics": {},
+        "_batch_records": {},
         "failure_stats": _VerifierFailureStats(),
         "_policy_update_ready": policy_update_ready,
         "policy_update_wait_seconds": 0.0,
@@ -2598,3 +2599,151 @@ def test_rollout_environment_record_cursors_deduplicate_trajectory_rows() -> Non
         "code": [9],
         "math": [4],
     }
+
+
+@pytest.mark.parametrize("group_scoring", [False, True])
+@pytest.mark.parametrize("capacity", [1, 15, 17, 127])
+def test_new_group_admission_uses_dispatch_cost(group_scoring, capacity):
+    scheduler = _bounded_group_scheduler(max_inflight_rollouts=128)
+    occupied = 128 - capacity
+    scheduler.pending[object()] = _PendingVerifierRequest(
+        group_id=-1, client_index=0, rollout_count=occupied, policy_step=0
+    )
+    scheduler.env_runtimes[0].requires_group_scoring = group_scoring
+    scheduler.requires_group_scoring = group_scoring
+
+    def dispatch(self, group_id, group):
+        count = group.rollouts_to_schedule if group.requires_group_scoring else 1
+        group.rollouts_to_schedule -= count
+        self.pending[object()] = _PendingVerifierRequest(
+            group_id=group_id, client_index=0, rollout_count=count, policy_step=0
+        )
+
+    scheduler._schedule_group_rollout = MethodType(dispatch, scheduler)
+    scheduler._fill_inflight()
+
+    expected = capacity - capacity % 16 if group_scoring else capacity
+    assert scheduler.inflight_rollout_count == occupied + expected
+    assert scheduler.inflight_rollout_count <= 128
+    assert len(scheduler.groups) == (expected + 15) // 16
+    assert sum(g.rollouts_to_schedule for g in scheduler.groups.values()) == (
+        len(scheduler.groups) * 16 - expected
+    )
+    scheduler._fill_inflight()
+    assert scheduler.inflight_rollout_count == occupied + expected
+
+
+def test_single_free_slot_starts_next_group_without_exceeding_candidate_budget():
+    scheduler = _bounded_group_scheduler(max_inflight_rollouts=128)
+    scheduler._set_group_admission_target(8, accepted_groups=7)
+    scheduler.pending[object()] = _PendingVerifierRequest(
+        group_id=-1, client_index=0, rollout_count=127, policy_step=0
+    )
+
+    def dispatch(self, group_id, group):
+        group.rollouts_to_schedule -= 1
+        self.pending[object()] = _PendingVerifierRequest(
+            group_id=group_id, client_index=0, rollout_count=1, policy_step=0
+        )
+
+    scheduler._schedule_group_rollout = MethodType(dispatch, scheduler)
+    scheduler._fill_inflight()
+    assert scheduler.inflight_rollout_count == 128
+    assert len(scheduler.groups) == 1
+    assert scheduler.groups[0].rollouts_to_schedule == 15
+    # Completed requests free capacity but cannot admit a second candidate.
+    scheduler.pending.clear()
+    scheduler._fill_inflight()
+    assert len(scheduler.groups) == 1
+    assert scheduler.inflight_rollout_count == 15
+
+
+def test_batch_conversion_reuses_pristine_records_and_releases_on_finalize(monkeypatch):
+    import wavelet.orchestrator.scheduler as scheduler_module
+
+    scheduler = _bare_scheduler(
+        executor_concurrency=1,
+        config=RLConfig(
+            algo=GRPOAlgorithmConfig(), orchestrator={"filter_zero_advantage": True}
+        ),
+    )
+    original = scheduler_module._records_from_output
+    convert = Mock(wraps=original)
+    monkeypatch.setattr(scheduler_module, "_records_from_output", convert)
+    output = {"trajectory": _trainable_trajectory(), "reward": 0.0, "advantage": 0.0}
+    assert scheduler._outputs_token_count([output]) == 1
+    pristine = scheduler._records_for_outputs([output])[0]
+    assert pristine.loss_mask == [True]
+    # Filtering must operate on copies; distillation still needs the original mask.
+    assert scheduler._has_trainable_batch([output]) is False
+    assert pristine.loss_mask == [True]
+    finalized = scheduler._finalize_batch(
+        [output],
+        started_at=0.0,
+        attempts=1,
+        accepted_groups=1,
+        rejected_groups=0,
+        completed_groups=1,
+        accepted_tokens=1,
+        batch_stats=_VerifierBatchStats(),
+    )
+    assert finalized[0].loss_mask == [False]
+    assert pristine.loss_mask == [True]
+    assert convert.call_count == 1
+    assert scheduler._batch_records == {}
+    # A later batch must not reuse old policy metadata or advantages.
+    output["advantage"] = 1.0
+    assert scheduler._records_for_outputs([output])[0].advantage == 1.0
+    assert convert.call_count == 2
+    asyncio.run(scheduler.aclose())
+    assert scheduler._batch_records == {}
+
+
+def test_partial_group_admission_completes_exact_groups_under_real_async_dispatch(
+    tmp_path, monkeypatch
+):
+    scheduler = _bounded_group_scheduler(max_inflight_rollouts=17)
+    scheduler.config.output_dir = tmp_path
+    scheduler._schedule_group_rollout = MethodType(
+        VerifierRolloutScheduler._schedule_group_rollout, scheduler
+    )
+    active = 0
+    peak = 0
+    emitted = 0
+
+    class Admission:
+        async def run(self, *, cost, operation):
+            return await operation()
+
+    scheduler.admission = Admission()
+
+    async def generate(*args, **kwargs):
+        nonlocal active, peak, emitted
+        index = emitted
+        emitted += 1
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return [{"reward": float(index % 2), "trajectory": _trainable_trajectory()}]
+
+    monkeypatch.setattr("wavelet.orchestrator.scheduler._run_single_rollout", generate)
+
+    async def run():
+        try:
+            return await scheduler.generate_batch(
+                target_groups=2, rollout_step=0, prewarm_rollout_step=1
+            )
+        finally:
+            await scheduler.aclose()
+
+    records = asyncio.run(run())
+    assert peak == 17
+    assert emitted == len(records) == 32
+    groups = {}
+    for record in records:
+        assert record.metadata["policy_step"] == 0
+        groups.setdefault(record.metadata["group_key"], []).append(record)
+    assert sorted(map(len, groups.values())) == [16, 16]
+    assert not scheduler.pending
+    assert not scheduler._batch_records

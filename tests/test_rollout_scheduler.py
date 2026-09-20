@@ -267,3 +267,96 @@ def test_resume_rejects_stale_stable_rollout_batch(tmp_path) -> None:
             optimizer_step=3,
             chunk_index=None,
         )
+
+
+@pytest.mark.parametrize("failure", [None, "write", "publish"])
+def test_verifier_publication_keeps_rollout_event_loop_responsive(
+    tmp_path, monkeypatch, failure
+):
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from wavelet.data.rl import RLExample
+    from wavelet.orchestrator.rollouts import RLOrchestrator
+    from wavelet.orchestrator.scheduler import _VerifierChunkPublisher
+
+    config = RLConfig(
+        output_dir=tmp_path,
+        orchestrator={"examples_per_step": 1, "rollouts_per_example": 1},
+    )
+    orchestrator = RLOrchestrator(config)
+    sender = FileSystemRolloutSender(tmp_path, config.transport)
+    context = _VerifierChunkPublisher(
+        config=config,
+        orchestrator=orchestrator,
+        inference_engine=None,
+        policy_receiver=None,
+        rollout_sender=sender,
+        state=None,
+        chunks_per_step=1,
+        last_eval_steps={},
+        loaded_policy_step=0,
+        scheduler=SimpleNamespace(
+            environment_cursor_snapshot=lambda: ({}, 0),
+            curriculum_state_snapshot=lambda: None,
+            last_batch_metrics=None,
+        ),
+    )
+    record = RLExample(
+        prompt=[],
+        completion=[],
+        advantage=1.0,
+        reward=1.0,
+        temperatures=1.0,
+        input_ids=[1],
+        target_ids=[2],
+        loss_mask=[True],
+    )
+    context._generate_batch = AsyncMock(return_value=[record])
+    entered = threading.Event()
+    release = threading.Event()
+    main_thread = threading.get_ident()
+    write = orchestrator._write_records
+    publish = sender.publish
+
+    def blocking_write(*args, **kwargs):
+        assert threading.get_ident() != main_thread
+        entered.set()
+        assert release.wait(2), "Rollout event loop was blocked by materialization"
+        if failure == "write":
+            raise OSError("write failed")
+        return write(*args, **kwargs)
+
+    def checked_publish(*args, **kwargs):
+        assert threading.get_ident() != main_thread
+        if failure == "publish":
+            raise OSError("publish failed")
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_write_records", blocking_write)
+    monkeypatch.setattr(sender, "publish", checked_publish)
+
+    async def run():
+        async def heartbeat():
+            while not entered.is_set():
+                await asyncio.sleep(0)
+            release.set()
+
+        ticker = asyncio.create_task(heartbeat())
+        try:
+            await context.publish_chunk(
+                0, wait_policy_seconds=0.0, load_policy_seconds=0.0
+            )
+        finally:
+            ticker.cancel()
+            await asyncio.gather(ticker, return_exceptions=True)
+
+    if failure:
+        with pytest.raises(OSError, match=failure):
+            asyncio.run(run())
+        assert sender.stable_batch(0) is None
+    else:
+        asyncio.run(run())
+        assert sender.stable_batch(0) is not None

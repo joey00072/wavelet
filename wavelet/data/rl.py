@@ -829,7 +829,7 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
             "Pretokenized RL row has mismatched source input_ids, target_ids, "
             f"and loss_mask lengths {source_lengths}."
         )
-    source_trainable_tokens = sum(bool(value) for value in record.loss_mask)
+    source_trainable_tokens = sum(map(bool, record.loss_mask))
     for field_name, values in (
         ("advantage", record.advantage),
         ("inference_logprobs", record.inference_logprobs),
@@ -860,9 +860,9 @@ def _pretokenized_sample(record: RLExample, seq_len: int) -> RLSample | None:
         raise ValueError(
             "Processor tensors require matching metadata.multimodal_input_ids provenance."
         )
-    input_ids = [int(token_id) for token_id in record.input_ids[:seq_len]]
-    target_ids = [int(token_id) for token_id in record.target_ids[:seq_len]]
-    loss_mask = [bool(value) for value in record.loss_mask[:seq_len]]
+    input_ids = list(map(int, record.input_ids[:seq_len]))
+    target_ids = list(map(int, record.target_ids[:seq_len]))
+    loss_mask = list(map(bool, record.loss_mask[:seq_len]))
     if sum(loss_mask) == 0:
         metadata = record.metadata or {}
         if not (

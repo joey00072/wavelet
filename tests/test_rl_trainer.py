@@ -995,3 +995,53 @@ def test_ipo_mask_metrics_use_ipo_namespace() -> None:
     dppo_aliases = RLTrainer(RLConfig())._standard_metric_aliases({"is_masked": 0.20})
     assert dppo_aliases["dppo/is_masked"] == pytest.approx(0.20)
     assert "ipo/is_masked" not in dppo_aliases
+
+
+@pytest.mark.parametrize("ratio,limit", [(None, 3), (0.5, 2), (None, None), (0.0, 3)])
+def test_rollout_sample_logging_decodes_only_selected_rows(
+    tmp_path, monkeypatch, ratio, limit
+):
+    import json
+    import random
+    from types import SimpleNamespace
+
+    records = [{"id": i, "text": "λ" * 10} for i in range(9)]
+    path = tmp_path / "rollouts.jsonl"
+    path.write_text(
+        "\n" + "\n\n".join(json.dumps(r, ensure_ascii=False) for r in records)
+    )
+    config = RLConfig(
+        seed=17, monitor={"samples": {"sample_ratio": ratio, "max_samples": limit}}
+    )
+    trainer = SimpleNamespace(
+        config=config,
+        step=3,
+        _sample_log_row=lambda payload, **kwargs: payload,
+    )
+    expected_count = (
+        len(records) if ratio is None else max(1, int(len(records) * ratio))
+    )
+    if ratio == 0:
+        expected_count = 0
+    if limit is not None:
+        expected_count = min(expected_count, limit)
+    expected = (
+        random.Random(20).sample(records, expected_count)
+        if expected_count < len(records)
+        else records
+    )
+    decode = Mock(wraps=json.loads)
+    monkeypatch.setattr(json, "loads", decode)
+    assert RLTrainer._sample_rollout_rows(trainer, path) == expected
+    assert decode.call_count == expected_count
+
+
+def test_rollout_sample_logging_empty_file(tmp_path):
+    from types import SimpleNamespace
+
+    path = tmp_path / "empty.jsonl"
+    path.write_text("\n \n")
+    assert (
+        RLTrainer._sample_rollout_rows(SimpleNamespace(config=RLConfig(), step=0), path)
+        == []
+    )

@@ -555,3 +555,27 @@ def test_environment_advantages_preserve_centered_group_signal() -> None:
     assert metrics["train/math/advantage/max"] == 0.5
     assert metrics["train/math/advantage/std"] == metrics["advantage/all/std"]
     assert metrics["train/math/advantage/std"] > 0.0
+
+
+def test_in_memory_rollout_metrics_match_file_and_skip_read(tmp_path, monkeypatch):
+    rows = [
+        {
+            "example_id": "a",
+            "reward": 1.0,
+            "advantage": 0.5,
+            "input_ids": [1, 2],
+            "loss_mask": [False, True],
+            "metadata": {"policy_step": 2, "_wavelet_rollout_count": 1},
+        }
+    ]
+    path = tmp_path / "rollouts.jsonl"
+    path.write_text(json.dumps(rows[0]) + "\n")
+    config = RLConfig(output_dir=tmp_path)
+    expected = log_rollout_metrics(config, path, step=3)
+
+    def no_read(*args):
+        raise AssertionError("Already materialized rollout rows must not be reread")
+
+    monkeypatch.setattr("wavelet.monitor.read_jsonl", no_read)
+    assert log_rollout_metrics(config, path, step=3, rows=rows) == expected
+    assert rows[0]["metadata"] == {"policy_step": 2, "_wavelet_rollout_count": 1}

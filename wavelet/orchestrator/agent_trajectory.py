@@ -17,9 +17,9 @@ class TokenSegment:
     output_sampling_mask: list[list[int]] | None = None
 
     def __post_init__(self) -> None:
-        prompt_ids = [int(token_id) for token_id in self.prompt_ids]
-        output_ids = [int(token_id) for token_id in self.output_ids]
-        output_logprobs = [float(value) for value in self.output_logprobs]
+        prompt_ids = list(map(int, self.prompt_ids))
+        output_ids = list(map(int, self.output_ids))
+        output_logprobs = list(map(float, self.output_logprobs))
         output_sampling_mask = _coerce_sampling_masks(
             self.output_sampling_mask,
             length=len(output_ids),
@@ -382,7 +382,7 @@ def _coerce_mask(
         return [default] * length
     if len(values) != length:
         raise ValueError(f"{field_name} length must be {length}, got {len(values)}.")
-    return [bool(value) for value in values]
+    return list(map(bool, values))
 
 
 def _coerce_sampling_masks(

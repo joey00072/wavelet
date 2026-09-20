@@ -17,6 +17,26 @@ Related docs: [documentation index](index.md).
 - Use small `--examples` and `--rollouts` limits first, then scale up.
 - Prefer JSON output so another agent can compare runs across configs.
 
+## Async throughput invariants
+
+Independently scored rollouts consume one inference slot when dispatched, even
+when their advantage group contains multiple rollouts. A new group can begin as
+soon as one slot is free. Environments that score a whole group together still
+require enough slots for the entire group. Candidate budgets, policy freshness,
+and group completion requirements apply in both cases.
+
+Within one generated batch, token counting, trainability checks, and finalization
+reuse converted trajectory records. The cache retains pristine records so
+filtering cannot erase tokens needed by later distillation; it is cleared on
+batch completion, retry, and shutdown. Do not reuse it across policy batches.
+
+Async publication runs JSONL writing and queue copying in worker threads so
+in-flight tool and model requests can progress. Publication remains ordered and
+awaited: failures propagate and no partial file becomes a stable queue batch.
+Metrics use the in-memory serialized rows instead of rereading the artifact.
+Measure generation, materialization, publication, and training separately;
+improvements in one stage do not establish end-to-end throughput parity.
+
 ## Commands
 
 Inspect schedule and rollout settings:
