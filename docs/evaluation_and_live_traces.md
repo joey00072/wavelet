@@ -47,9 +47,9 @@ performance control; completed rollout artifacts and metrics remain available.
 
 The dashboard distinguishes episode-weighted rewards from filtered training
 rewards. New orchestrator logs publish `reward/episodes/all/{mean,count}` and
-`reward/episodes/trainable/{mean,count}`. Counts are the denominators of those
+`reward/episodes/effective/{mean,count}`. Counts are the denominators of those
 means, using rollout ownership metadata so continuation branches do not count
-again. The trainable subset requires training tokens and excludes filtered,
+again. The effective subset requires training tokens and excludes filtered,
 dummy, and errored rows. Missing rewards do not enter either denominator; an
 empty subset has count zero and no mean. These describe the published batch,
 not every attempted or rejected candidate in the generation pipeline.

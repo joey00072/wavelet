@@ -141,3 +141,12 @@ native environment arguments. For the larger comparison, increase the batch to
 16 × 16 as described above and use the independent frozen baseline instead of
 mixing evaluation policies. The smoke checks integration; it does not establish
 SWE learning or speed parity.
+
+The smoke config uses `orchestrator.batch_selection: rollouts` with
+`refill_zero_advantage: false`. Its target is `examples_per_step ×
+rollouts_per_example` clean completed rollouts before zero-advantage pruning.
+Failed independent members finish their group slots without replacement; GRPO
+scores only clean survivors. A batch can therefore span more distinct problems
+when members fail. Completed groups are scored before splitting across batches,
+and the remaining scored members retain their original policy provenance.
+This selection path needs a fresh run; active runs retain the code they loaded.

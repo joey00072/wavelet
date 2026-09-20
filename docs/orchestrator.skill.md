@@ -121,3 +121,21 @@ uv run python -m wavelet debug orchestrator benchmark @ path/to/rl.yaml --no-inf
   three-pane transcript and metadata viewer. The Metrics
   tab can search and chart every `reward/*`, `fate/*`, `generation/*`, and
   `off_policy/*` signal from `orchestrator_metrics.jsonl`.
+
+### Survivor-based rollout batches
+
+For a fixed count of clean episodes, set `batch_selection: rollouts`,
+`examples_per_step`, `rollouts_per_example`, and `refill_zero_advantage: false`.
+The target is the product of the two counts before zero-advantage pruning.
+Independent request failures finish group slots and are never converted into
+reward-zero examples or retried to bias the group. Advantages use the surviving
+clean outputs. The scheduler scores complete terminal groups, cuts exactly at
+the rollout target, and buffers the scored tail without recomputing advantages.
+Policy freshness still applies to the buffered tail. An all-zero training batch
+is discarded with bounded retries and no optimizer update. Exact zero RL credit
+is filtered in this mode; auxiliary CE/reference-KL components remain trainable.
+
+The default `groups` selection retains complete-group/retry behavior. Environments
+requiring joint verifier group scoring still need complete scoring calls, even
+with rollout-count batching. Survivor selection currently requires a fixed
+`examples_per_step` target and does not combine with effective-group refilling.

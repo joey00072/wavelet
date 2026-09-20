@@ -1461,6 +1461,10 @@ class RLOrchestratorConfig(ConfigModel):
     concurrency: RLAdaptiveConcurrencyConfig | None = None
     curriculum: RLCurriculumConfig | None = None
     rollout_chunk_examples: int | None = Field(default=None, ge=1)
+    batch_selection: Literal["groups", "rollouts"] = Field(
+        default="groups",
+        description="Count complete groups or clean surviving rollouts toward the batch.",
+    )
     filter_zero_advantage: bool = True
     refill_zero_advantage: bool = Field(
         default=True,
@@ -1480,6 +1484,13 @@ class RLOrchestratorConfig(ConfigModel):
 
     @model_validator(mode="after")
     def validate_batch_target(self) -> "RLOrchestratorConfig":
+        if self.batch_selection == "rollouts" and self.examples_per_step is None:
+            raise ValueError("batch_selection='rollouts' requires examples_per_step.")
+        if self.batch_selection == "rollouts" and self.refill_zero_advantage:
+            raise ValueError(
+                "batch_selection='rollouts' requires refill_zero_advantage=false: "
+                "count clean survivors before zero-advantage pruning."
+            )
         if self.examples_per_step is not None and self.token_batch_size is not None:
             raise ValueError(
                 "Set only one of orchestrator.examples_per_step and "

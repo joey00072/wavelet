@@ -2699,11 +2699,15 @@ def test_batch_conversion_reuses_pristine_records_and_releases_on_finalize(monke
     assert scheduler._batch_records == {}
 
 
+@pytest.mark.parametrize("survivor_selection", [False, True])
 def test_partial_group_admission_completes_exact_groups_under_real_async_dispatch(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, survivor_selection
 ):
     scheduler = _bounded_group_scheduler(max_inflight_rollouts=17)
     scheduler.config.output_dir = tmp_path
+    if survivor_selection:
+        scheduler.config.orchestrator.refill_zero_advantage = False
+        scheduler.config.orchestrator.batch_selection = "rollouts"
     scheduler._schedule_group_rollout = MethodType(
         VerifierRolloutScheduler._schedule_group_rollout, scheduler
     )
@@ -2725,6 +2729,8 @@ def test_partial_group_admission_completes_exact_groups_under_real_async_dispatc
         peak = max(peak, active)
         await asyncio.sleep(0)
         active -= 1
+        if survivor_selection and index == 0:
+            return []
         return [{"reward": float(index % 2), "trajectory": _trainable_trajectory()}]
 
     monkeypatch.setattr("wavelet.orchestrator.scheduler._run_single_rollout", generate)
@@ -2739,11 +2745,169 @@ def test_partial_group_admission_completes_exact_groups_under_real_async_dispatc
 
     records = asyncio.run(run())
     assert peak == 17
-    assert emitted == len(records) == 32
+    assert len(records) == 32
+    assert emitted == (48 if survivor_selection else 32)
     groups = {}
     for record in records:
         assert record.metadata["policy_step"] == 0
         groups.setdefault(record.metadata["group_key"], []).append(record)
-    assert sorted(map(len, groups.values())) == [16, 16]
+    assert sorted(map(len, groups.values())) == (
+        [1, 15, 16] if survivor_selection else [16, 16]
+    )
     assert not scheduler.pending
     assert not scheduler._batch_records
+
+
+def test_survivor_selection_scores_clean_members_without_rescheduling_failures():
+    config = RLConfig(
+        algo={"type": "grpo"},
+        orchestrator={
+            "examples_per_step": 1,
+            "rollouts_per_example": 3,
+            "batch_selection": "rollouts",
+            "refill_zero_advantage": False,
+            "max_off_policy_steps": 2,
+            "max_async_level": 3,
+        },
+    )
+    scheduler = _bare_scheduler(
+        config=config,
+        rollout_count=3,
+        policy_step=1,
+        _batch_rollout_count=0,
+        _rollout_batch_target=3,
+    )
+    scheduler.groups[0] = _VerifierGroupState(
+        example={"example_id": 0},
+        rollouts_to_schedule=0,
+        policy_step=0,
+    )
+    outputs = []
+
+    async def run():
+        results = []
+        # A failed request does not become reward zero or get retried, even if
+        # the policy has advanced while the remaining requests finish.
+        for reward in (None, 1.0, 0.0):
+            task = asyncio.get_running_loop().create_future()
+            task.set_result(
+                []
+                if reward is None
+                else [
+                    {
+                        "reward": reward,
+                        "trajectory": _trainable_trajectory(),
+                    }
+                ]
+            )
+            scheduler.pending[task] = _PendingVerifierRequest(
+                group_id=0,
+                client_index=0,
+                rollout_count=1,
+                policy_step=0,
+            )
+            results.append(
+                scheduler._consume_completed_task(
+                    task,
+                    target_groups=1,
+                    outputs=outputs,
+                    accepted_groups=0,
+                )
+            )
+        return results
+
+    assert asyncio.run(run()) == [(0, 0, 0), (0, 0, 0), (1, 1, 0)]
+    assert [row["advantage"] for row in outputs] == [0.5, -0.5]
+    assert scheduler._batch_rollout_count == 2
+    assert not scheduler._batch_target_reached(
+        accepted_groups=1,
+        accepted_tokens=0,
+        target_groups=1,
+        target_tokens=None,
+    )
+    assert scheduler.groups == {}
+    assert not scheduler.pending
+
+
+def test_survivor_batch_cuts_after_scoring_and_preserves_tail_age():
+    scheduler = _bare_scheduler(
+        rollout_count=3, _batch_rollout_count=2, _rollout_batch_target=3
+    )
+    group = [{"advantage": value} for value in (0.5, -0.25, -0.25)]
+    outputs = []
+    scheduler._append_batch_outputs(group, outputs, age=2)
+    assert outputs == group[:1]
+    assert outputs[0] is group[0]
+    assert scheduler.ready_groups == [group[1:]]
+    assert scheduler.ready_group_off_policy_steps == [2]
+    assert scheduler._batch_rollout_count == 3
+    assert scheduler._batch_target_reached(
+        accepted_groups=2,
+        accepted_tokens=0,
+        target_groups=1,
+        target_tokens=None,
+    )
+    scheduler._batch_rollout_count = 0
+    tail = scheduler.ready_groups.pop(0)
+    age = scheduler.ready_group_off_policy_steps.pop(0)
+    next_outputs = []
+    scheduler._append_batch_outputs(tail, next_outputs, age=age)
+    assert next_outputs == group[1:]
+    assert not scheduler.ready_groups
+    assert [row["advantage"] for row in next_outputs] == [-0.25, -0.25]
+
+
+@pytest.mark.parametrize("component", ["ce_weight", "ref_kl_weight"])
+def test_zero_advantage_pruning_preserves_auxiliary_training(component):
+    from wavelet.orchestrator.envs import _mark_zero_advantage_records_metric_only
+
+    record = RLExample(
+        prompt=[],
+        completion=[],
+        advantage=0.0,
+        reward=1.0,
+        input_ids=[1, 2],
+        target_ids=[2, 3],
+        loss_mask=[False, True],
+        inference_logprobs=[-0.5],
+        teacher_logprobs=[-0.6],
+        **{component: 1.0},
+    )
+    result = _mark_zero_advantage_records_metric_only(
+        [record], RLConfig(algo={"type": "grpo"})
+    )[0]
+    assert result.advantage is None
+    assert result.loss_mask == record.loss_mask
+    assert result.teacher_logprobs == record.teacher_logprobs
+    assert not (result.metadata or {}).get("_wavelet_filtered_rollout")
+    assert record.advantage == 0.0
+
+
+def test_survivor_selection_prunes_exact_zero_credit_only():
+    from dataclasses import replace
+
+    from wavelet.orchestrator.envs import _mark_zero_advantage_records_metric_only
+
+    config = RLConfig(
+        algo={"type": "grpo"},
+        orchestrator={
+            "examples_per_step": 1,
+            "rollouts_per_example": 2,
+            "batch_selection": "rollouts",
+            "refill_zero_advantage": False,
+        },
+    )
+    record = RLExample(
+        prompt=[],
+        completion=[],
+        advantage=1e-9,
+        reward=1.0,
+        loss_mask=[True],
+        inference_logprobs=[-0.5],
+    )
+    tiny, zero = _mark_zero_advantage_records_metric_only(
+        [record, replace(record, advantage=0.0)], config
+    )
+    assert tiny is record
+    assert zero.loss_mask == [False]
+    assert zero.metadata["_wavelet_filtered_rollout"] is True

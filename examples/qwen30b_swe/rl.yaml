@@ -48,6 +48,7 @@ orchestrator:
   rollout_chunk_examples: 4
   filter_zero_advantage: true
   refill_zero_advantage: false
+  batch_selection: rollouts
   max_inflight_rollouts: 8
   max_async_level: 3
   max_off_policy_steps: 2

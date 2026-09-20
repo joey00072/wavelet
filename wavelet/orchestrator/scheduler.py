@@ -456,6 +456,8 @@ class VerifierRolloutScheduler:
         self.orchestrator = orchestrator
         self.config = config
         self._batch_records: dict[int, tuple[dict[str, Any], list[RLExample]]] = {}
+        self._batch_rollout_count = 0
+        self._rollout_batch_target: int | None = None
         env_specs = _training_env_specs(config)
         start_environment_record_cursors = start_environment_record_cursors or {}
         start_curriculum_states = start_curriculum_states or {}
@@ -703,6 +705,13 @@ class VerifierRolloutScheduler:
         )
         target_groups = self.target_groups if target_groups is None else target_groups
         target_tokens = self.target_tokens if target_groups is None else None
+        self._batch_rollout_count = 0
+        self._rollout_batch_target = (
+            target_groups * self.rollout_count
+            if target_groups is not None
+            and self.config.orchestrator.batch_selection == "rollouts"
+            else None
+        )
         self._set_group_admission_target(target_groups, accepted_groups=0)
         outputs: list[dict[str, Any]] = []
         accepted_groups = 0
@@ -719,7 +728,7 @@ class VerifierRolloutScheduler:
                 self._minimum_token_batch_groups,
             )
         )
-        max_completed_groups = retry_target * (
+        max_completed_groups = (self._rollout_batch_target or retry_target) * (
             self.config.orchestrator.zero_advantage_max_retries + 1
         )
         self.policy_update_wait_seconds = 0.0
@@ -738,10 +747,14 @@ class VerifierRolloutScheduler:
                 target_tokens=target_tokens,
             ):
                 ready_group = self.ready_groups.pop(0)
-                outputs.extend(ready_group)
-                accepted_tokens += self._outputs_token_count(ready_group)
-                if self.ready_group_off_policy_steps:
+                age = (
                     self.ready_group_off_policy_steps.pop(0)
+                    if self.ready_group_off_policy_steps
+                    else 0
+                )
+                start = len(outputs)
+                self._append_batch_outputs(ready_group, outputs, age=age)
+                accepted_tokens += self._outputs_token_count(outputs[start:])
                 accepted_groups += 1
             (
                 drained_completed,
@@ -771,6 +784,7 @@ class VerifierRolloutScheduler:
                     attempt += 1
                     accepted_groups = 0
                     accepted_tokens = 0
+                    self._batch_rollout_count = 0
                     self._raise_if_retries_exhausted(
                         completed_groups=completed_groups,
                         max_completed_groups=max_completed_groups,
@@ -861,6 +875,9 @@ class VerifierRolloutScheduler:
         target_tokens: int | None,
     ) -> bool:
         if target_groups is not None:
+            rollout_target = getattr(self, "_rollout_batch_target", None)
+            if rollout_target is not None:
+                return self._batch_rollout_count >= rollout_target
             return accepted_groups >= target_groups
         if target_tokens is None:
             raise RuntimeError("Verifier scheduler has no batch target.")
@@ -1153,7 +1170,15 @@ class VerifierRolloutScheduler:
             if group.record_cursor is not None:
                 output["_wavelet_record_cursor"] = group.record_cursor
         missing_rollouts = request.rollout_count - len(group_outputs)
-        if missing_rollouts > 0 and request.policy_step != self.policy_step:
+        use_survivors = (
+            self.config.orchestrator.batch_selection == "rollouts"
+            and not requires_group_scoring
+        )
+        if (
+            missing_rollouts > 0
+            and not use_survivors
+            and request.policy_step != self.policy_step
+        ):
             # The group cannot be completed under one policy any more; it is
             # cancelled work, so it must not consume the zero-advantage retry
             # budget or count as a reward-filter rejection.
@@ -1173,6 +1198,7 @@ class VerifierRolloutScheduler:
             return 0, 0, 0
         if missing_rollouts > 0:
             group.failed_rollouts += missing_rollouts
+        if missing_rollouts > 0 and not use_survivors:
             if group.failed_rollouts > _MAX_GROUP_RETRIES * rollout_count:
                 self.groups.pop(request.group_id, None)
                 logger.warning(
@@ -1191,7 +1217,10 @@ class VerifierRolloutScheduler:
                 return 0, 0, 0
             group.rollouts_to_schedule += missing_rollouts
         group.completed_outputs.extend(group_outputs)
-        if len(group.completed_outputs) < rollout_count:
+        finished = len(group.completed_outputs) + (
+            group.failed_rollouts if use_survivors else 0
+        )
+        if finished < rollout_count:
             return 0, 0, 0
 
         completed_outputs = group.completed_outputs
@@ -1203,22 +1232,28 @@ class VerifierRolloutScheduler:
         )
         curriculum = group.curriculum
         curriculum_admitted = True
-        if curriculum is not None:
+        if curriculum is not None and completed_outputs:
             task_key = group.curriculum_task_key
             if task_key is None:
                 raise RuntimeError("Curriculum rollout group is missing its task key.")
             curriculum_admitted = curriculum.on_result(task_key, completed_outputs)
-        is_usable = curriculum_admitted and _is_usable_training_group(
-            completed_outputs,
-            expected_rollouts=rollout_count,
-            filter_zero_advantage=(
-                self.config.orchestrator.filter_zero_advantage
-                and self.config.orchestrator.refill_zero_advantage
-            ),
-            advantage_epsilon=algorithm_epsilon(algorithm_config),
-            loss_component=algorithm_loss_component(algorithm_config),
+        is_usable = (
+            bool(completed_outputs)
+            and curriculum_admitted
+            and _is_usable_training_group(
+                completed_outputs,
+                expected_rollouts=len(completed_outputs)
+                if use_survivors
+                else rollout_count,
+                filter_zero_advantage=(
+                    self.config.orchestrator.filter_zero_advantage
+                    and self.config.orchestrator.refill_zero_advantage
+                ),
+                advantage_epsilon=algorithm_epsilon(algorithm_config),
+                loss_component=algorithm_loss_component(algorithm_config),
+            )
         )
-        if batch_stats is not None:
+        if batch_stats is not None and completed_outputs:
             batch_stats.observe(
                 completed_outputs,
                 admitted=is_usable,
@@ -1232,12 +1267,32 @@ class VerifierRolloutScheduler:
             target_groups=target_groups,
             target_tokens=target_tokens,
         ):
-            outputs.extend(completed_outputs)
+            self._append_batch_outputs(completed_outputs, outputs)
             return 1, 1, 0
 
         self.ready_groups.append(completed_outputs)
         self.ready_group_off_policy_steps.append(0)
         return 0, 1, 0
+
+    def _append_batch_outputs(
+        self,
+        group: list[dict[str, Any]],
+        outputs: list[dict[str, Any]],
+        *,
+        age: int = 0,
+    ) -> None:
+        target = getattr(self, "_rollout_batch_target", None)
+        take = (
+            len(group) if target is None else max(target - self._batch_rollout_count, 0)
+        )
+        selected = group[:take]
+        outputs.extend(selected)
+        self._batch_rollout_count = getattr(self, "_batch_rollout_count", 0) + len(
+            selected
+        )
+        if len(selected) < len(group):
+            self.ready_groups.insert(0, group[len(selected) :])
+            self.ready_group_off_policy_steps.insert(0, age)
 
     async def discard_stale_requests(self, rollout_step: int) -> int:
         """Cancel work the trainer would reject for ``rollout_step``.
@@ -1373,6 +1428,8 @@ class VerifierRolloutScheduler:
         accepted_groups: int,
     ) -> None:
         self._admission_target_groups = target_groups
+        if getattr(self, "_rollout_batch_target", None) is not None and accepted_groups:
+            accepted_groups = self._batch_rollout_count // self.rollout_count
         self._admission_accepted_groups = accepted_groups
 
     def _can_admit_new_group(self) -> bool:

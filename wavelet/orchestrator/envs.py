@@ -1343,11 +1343,24 @@ def _mark_zero_advantage_records_metric_only(
     algorithm_config = algorithm_config or config.algo
     if not uses_group_advantages(algorithm_config):
         return records
-    epsilon = algorithm_epsilon(algorithm_config)
+    epsilon = (
+        0.0
+        if config.orchestrator.batch_selection == "rollouts"
+        else algorithm_epsilon(algorithm_config)
+    )
     marked: list[RLExample] = []
     for record in records:
         if record.advantage is not None and abs(float(record.advantage)) > epsilon:
             marked.append(record)
+            continue
+        auxiliary_weights = (record.ce_weight, record.ref_kl_weight)
+        if any(
+            any(value != 0.0 for value in weight)
+            if isinstance(weight, list)
+            else weight is not None and weight != 0.0
+            for weight in auxiliary_weights
+        ):
+            marked.append(replace(record, advantage=None))
             continue
         metadata = dict(record.metadata or {})
         metadata["_wavelet_filtered_rollout"] = True

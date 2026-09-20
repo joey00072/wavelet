@@ -49,7 +49,7 @@ uv run torchrun --standalone --nproc-per-node=N \
 | `wiki_search` | runnable with env deps | Requires `wiki-search` environment setup. |
 | `wordle` | runnable after external env install | Requires the Wordle environment installed outside `uv sync`. |
 | `qwen30b_math` | adapted | Single-node prototype constrained to supported DP/TP dimensions. |
-| `qwen30b_swe` | adapted | Native SWE bridge, two-node 30B LoRA smoke config, bounded 16 × 16 batching, and comparison guide. See its README for current validation status. |
+| `qwen30b_swe` | adapted | Native SWE bridge, two-node 30B LoRA smoke config, survivor-based rollout batches, and comparison guide. See its README for current validation status. |
 | `multinode` | runnable | Native multi-node SLURM SFT and split RL examples. |
 | `intellect_3_1` | config only | Large-model workload using AdamW; CP/EP remain disabled. |
 | `minimax_m2_5_swe` | config only | Large-model workload; CP/EP remain disabled. |

@@ -162,8 +162,8 @@ def test_episode_reward_cohorts_expose_denominators_without_branch_double_counti
     )
     assert metrics["reward/episodes/all/count"] == 5
     assert metrics["reward/episodes/all/mean"] == 0.2
-    assert metrics["reward/episodes/trainable/count"] == 2
-    assert metrics["reward/episodes/trainable/mean"] == 0.5
+    assert metrics["reward/episodes/effective/count"] == 2
+    assert metrics["reward/episodes/effective/mean"] == 0.5
     # Existing problem-weighted series keeps its historical definition.
     assert metrics["reward/all/mean"] == pytest.approx(1 / 6)
 
@@ -175,6 +175,6 @@ def test_empty_reward_cohort_does_not_report_fake_zero_mean():
         RolloutMetricInputs(rows=[], rollouts_per_example=16, step=0)
     )
     assert metrics["reward/episodes/all/count"] == 0
-    assert metrics["reward/episodes/trainable/count"] == 0
+    assert metrics["reward/episodes/effective/count"] == 0
     assert "reward/episodes/all/mean" not in metrics
-    assert "reward/episodes/trainable/mean" not in metrics
+    assert "reward/episodes/effective/mean" not in metrics

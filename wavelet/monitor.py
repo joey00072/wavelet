@@ -1064,8 +1064,8 @@ def _episode_reward_metrics(
     rows: list[dict[str, Any]], decode_lens: list[int]
 ) -> dict[str, float]:
     """Expose episode-weighted rewards and their explicit cohort denominators."""
-    counts = {"all": 0, "trainable": 0}
-    totals = {"all": 0.0, "trainable": 0.0}
+    counts = {"all": 0, "effective": 0}
+    totals = {"all": 0.0, "effective": 0.0}
     for row, tokens in zip(rows, decode_lens, strict=True):
         count = max(_sample_count(row), 0)
         reward = _float_or_none(row.get("reward"))
@@ -1080,8 +1080,8 @@ def _episode_reward_metrics(
             and not metadata.get("_wavelet_dummy_rollout")
             and _row_error(row) is None
         ):
-            counts["trainable"] += count
-            totals["trainable"] += reward * count
+            counts["effective"] += count
+            totals["effective"] += reward * count
     metrics = {}
     for cohort, count in counts.items():
         prefix = f"reward/episodes/{cohort}"

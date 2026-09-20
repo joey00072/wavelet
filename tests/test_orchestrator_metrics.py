@@ -123,8 +123,8 @@ def test_rollout_metrics_match_reference_style_grouping() -> None:
     serialized = json.dumps(legacy_metrics, sort_keys=True, separators=(",", ":"))
     assert metrics["reward/episodes/all/count"] == 4.0
     assert metrics["reward/episodes/all/mean"] == 0.5
-    assert metrics["reward/episodes/trainable/count"] == 3.0
-    assert metrics["reward/episodes/trainable/mean"] == pytest.approx(2 / 3)
+    assert metrics["reward/episodes/effective/count"] == 3.0
+    assert metrics["reward/episodes/effective/mean"] == pytest.approx(2 / 3)
     assert hashlib.sha256(serialized.encode()).hexdigest() == (
         "ea7a40bac7c52430d38079831b66645c9c849adba10de75219dd92ee08da8613"
     )
