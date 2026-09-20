@@ -182,8 +182,8 @@ test("reward cohorts show denominators and queue-step semantics", async ({ page 
   const values: Record<string, number> = {
     "reward/episodes/all/mean": 0.15234375,
     "reward/episodes/all/count": 256,
-    "reward/episodes/trainable/mean": 0.3482142857,
-    "reward/episodes/trainable/count": 112,
+    "reward/episodes/effective/mean": 0.3482142857,
+    "reward/episodes/effective/count": 112,
     "reward/all/mean": 0.15234375,
   };
   await page.route("**/metrics/keys", route => route.fulfill({
@@ -197,11 +197,12 @@ test("reward cohorts show denominators and queue-step semantics", async ({ page 
   const all = page.locator('[data-metric="reward/episodes/all/mean"]');
   await expect(all).toContainText("Reward · all episodes");
   await expect(all).toContainText("including filtered episodes");
+  await all.scrollIntoViewIfNeeded();
   await expect(all).toContainText("Rollout queue step");
-  const trainable = page.locator('[data-metric="reward/episodes/trainable/mean"]');
+  const trainable = page.locator('[data-metric="reward/episodes/effective/mean"]');
   await trainable.scrollIntoViewIfNeeded();
   await expect(trainable).toContainText("not an overall solve rate");
   await expect(page.locator('[data-metric="reward/episodes/all/count"] .chart-latest')).toHaveText("256");
-  await expect(page.locator('[data-metric="reward/episodes/trainable/count"] .chart-latest')).toHaveText("112");
+  await expect(page.locator('[data-metric="reward/episodes/effective/count"] .chart-latest')).toHaveText("112");
   await expect(page.locator('[data-metric="reward/all/mean"]')).toHaveCount(0);
 });

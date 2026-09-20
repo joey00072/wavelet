@@ -129,7 +129,7 @@ of one episode; do not infer distinct episode counts from the table. The dashboa
 does not synthesize token overlays, physical branch graphs, or timed replay from
 rows without the required recorded annotations.
 
-Reward overview charts distinguish all episodes from the trainable subset and
+Reward overview charts distinguish all episodes from the effective training subset and
 show each recorded denominator. Chart descriptions identify the population and
 source; step axes distinguish optimizer updates from rollout queue indices.
 Older runs retain their original problem-average reward series. Missing cohort

@@ -77,8 +77,8 @@ const OVERVIEW_KEYS: Record<MetricSource, string[]> = {
   orchestrator: [
     "reward/episodes/all/mean",
     "reward/episodes/all/count",
-    "reward/episodes/trainable/mean",
-    "reward/episodes/trainable/count",
+    "reward/episodes/effective/mean",
+    "reward/episodes/effective/count",
     "reward/all/mean",
     "generation/reward/mean",
     "generation/tokens_per_second",
@@ -463,7 +463,10 @@ function MetricSections({ selected, series, comparison, compareRun, search, smoo
     selected[source]
       .filter((key) => !terms || Boolean(filter?.test(key)))
       .map((key) => ({ source, key })),
-  ).sort((a, b) => Number(b.key === "reward/all/mean") - Number(a.key === "reward/all/mean"));
+  ).sort((a, b) => {
+    const priority = (key: string) => key === "reward/episodes/effective/mean" ? 3 : key === "reward/episodes/all/mean" ? 2 : key === "reward/all/mean" ? 1 : 0;
+    return priority(b.key) - priority(a.key);
+  });
   const groups = new Map<string, typeof charts>();
   for (const chart of charts) {
     const section = metricSection(chart.source, chart.key);
@@ -979,8 +982,8 @@ function metricLabel(name: string, source: MetricSource): string {
   const labels: Record<string, string> = {
     "reward/episodes/all/mean": "Reward · all episodes",
     "reward/episodes/all/count": "Reward denominator · all episodes",
-    "reward/episodes/trainable/mean": "Reward · trainable episodes",
-    "reward/episodes/trainable/count": "Reward denominator · trainable episodes",
+    "reward/episodes/effective/mean": "Reward · effective episodes",
+    "reward/episodes/effective/count": "Reward denominator · effective episodes",
     "reward/all/mean": source === "trainer" ? "Reward · all episodes" : "Reward · problem average",
     "generation/reward/mean": "Reward · all scored candidates",
     "rollout/count": "Episodes in optimizer batch",
@@ -993,7 +996,7 @@ function metricLabel(name: string, source: MetricSource): string {
 
 function metricDescription(name: string, source: MetricSource): string {
   const origin = source === "trainer" ? "Trainer" : source === "eval" ? "Evaluation" : "Orchestrator";
-  if (name.startsWith("reward/episodes/trainable/")) return `${origin} · Episodes with training tokens, excluding filtered, dummy and errored rows. Continuation branches do not count twice. This selected subset is not an overall solve rate.`;
+  if (name.startsWith("reward/episodes/effective/")) return `${origin} · Episodes with training tokens, excluding filtered, dummy and errored rows. Continuation branches do not count twice. This selected subset is not an overall solve rate.`;
   if (name.startsWith("reward/episodes/all/")) return `${origin} · Episode-weighted reward over the published batch, including filtered episodes. The count is the reward denominator, not the number of token rows.`;
   if (name === "reward/all/mean") return source === "trainer"
     ? "Trainer · Episode-weighted reward including filtered episodes. Optimizer step 1 consumes the first published batch."
