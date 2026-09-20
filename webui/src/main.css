@@ -203,7 +203,7 @@ main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 
 /* Charts */
 .metric-sections { display: flex; flex-direction: column; gap: 18px; }
-.metric-section > summary { height: 28px; display: flex; align-items: center; gap: 12px; padding: 0; color: var(--muted); font-size: 12px; font-family: var(--mono); }
+.metric-section > summary { min-height: 32px; display: flex; align-items: center; gap: 12px; padding: 6px 12px; color: var(--text); background: var(--panel); border: 1px solid var(--line-strong); font-size: 11px; font-family: var(--mono); text-transform: uppercase; letter-spacing: .04em; }
 .metric-section > summary::before { content: ""; flex: 1; order: 2; height: 1px; background: var(--line); }
 .metric-section > summary:hover { color: var(--bright); }
 .metric-section > summary::after { content: ""; order: 3; margin-left: 0; width: 6px; height: 6px; border-right: 1.5px solid var(--muted); border-bottom: 1.5px solid var(--muted); transform: rotate(45deg) translateY(-2px); transition: transform 160ms var(--ease); }
@@ -409,3 +409,9 @@ tbody tr:focus-visible { box-shadow: inset 2px 0 0 var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+.section-env { min-width: 0; max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); text-transform: none; letter-spacing: normal; }
+.section-empty { min-height: 110px; display: grid; place-items: center; color: var(--muted); font: 11px var(--mono); }
+.missing-metric { padding: 24px; text-align: center; align-content: center; gap: 8px; }
+.missing-metric span { max-width: 220px; font-size: 11px; }
+.missing-metric + .chart-footer { color: var(--muted); font: 10px var(--mono); padding-left: 12px; }

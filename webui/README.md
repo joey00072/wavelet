@@ -142,3 +142,12 @@ Use the ⓘ button for the metric's source, reward population, and denominator
 semantics; explanations do not displace the plot. Hover or focus a card to
 show CSV export and expand controls. Rollout queue and policy freshness metrics
 have their own section. Charts and trace details continue to load lazily.
+
+The default overview groups charts into Training, Evaluation, Stability,
+Inference, Performance, and Queue blocks. Training shows `effective/agent/reward`
+and `all/agent/reward` separately. The latter uses episode-weighted rewards;
+historical trainer rewards supply it when the newer explicit all-episode metric
+is absent. Missing effective rewards are marked **Not recorded**, never inferred
+from the all-episode mean. Metric identifiers and population definitions remain
+available through ⓘ. Empty evaluation/inference blocks indicate missing telemetry;
+available per-replica inference signals appear automatically.

@@ -348,13 +348,14 @@ function MetricsView({ apiBase, runId, interval, summary, runs }: ViewProps & { 
       const names = new Set((available[source] ?? []).map(({ key }) => key));
       next[source] = OVERVIEW_KEYS[source].filter((key) => names.has(key));
     }
-    if (next.orchestrator.includes("reward/all/mean")) {
-      next.trainer = next.trainer.filter((key) => key !== "reward/all/mean");
-      next.orchestrator = next.orchestrator.filter((key) => key !== "generation/reward/mean");
-    }
     if (next.orchestrator.includes("reward/episodes/all/mean")) {
-      next.orchestrator = next.orchestrator.filter((key) => key !== "reward/all/mean");
+      next.trainer = next.trainer.filter((key) => key !== "reward/all/mean");
+      next.orchestrator = next.orchestrator.filter((key) => !["reward/all/mean", "generation/reward/mean"].includes(key));
+    } else if (next.trainer.includes("reward/all/mean")) {
+      // Historical trainer reward is episode weighted; the orchestrator key is problem weighted.
+      next.orchestrator = next.orchestrator.filter((key) => !["reward/all/mean", "generation/reward/mean"].includes(key));
     }
+    next.orchestrator.push(...(available.orchestrator ?? []).map(({ key }) => key).filter(key => /^inference\/replica_\d+\/(kv_cache_usage|requests_running|requests_waiting|preemptions_delta|generation_tokens_per_second|prompt_tokens_per_second)$/.test(key)));
     next.eval = (available.eval ?? []).map(({ key }) => key).filter((key) => /avg@|pass@|reward/.test(key)).slice(0, 2);
     setSelected(next);
   }, [keysState.data, customized]);
@@ -416,6 +417,7 @@ function MetricsView({ apiBase, runId, interval, summary, runs }: ViewProps & { 
       {search && !compileRegex(search) && <InlineError>Invalid regular expression.</InlineError>}
       {errors.length > 0 && <InlineError>{errors.join(" · ")}</InlineError>}
       <MetricSections
+        showBlocks={mode === "overview" && !customized && !search}
         selected={selected}
         series={series}
         comparison={comparison}
@@ -438,14 +440,15 @@ const SECTION_ORDER = ["train", "eval", "stability", "inference", "performance",
 function metricSection(source: MetricSource, key: string): string {
   if (source === "eval" || key.startsWith("eval/")) return "eval";
   if (key.startsWith("inference/")) return "inference";
-  if (/^(optim|entropy|mismatch|kl|ipo|dppo|grad)/.test(key)) return "stability";
+  if (/^(optim|entropy|mismatch|kl|ipo|dppo|grad|train\/(loss|policy_loss))/.test(key)) return "stability";
   if (/^(perf|time|memory|system|node)/.test(key) || key.includes("tokens_per_second")) return "performance";
   if (/^(off_policy|policy\/lag|generation\/(rollouts|groups|effective_groups))/.test(key)) return "queue";
   if (source === "orchestrator" || /^(train|reward|loss|generation|advantage|fate|off_policy|policy)/.test(key)) return "train";
   return "other";
 }
 
-function MetricSections({ selected, series, comparison, compareRun, search, smoothing, axis, open, trainEnvs, evalEnvs, onRemove }: {
+function MetricSections({ showBlocks, selected, series, comparison, compareRun, search, smoothing, axis, open, trainEnvs, evalEnvs, onRemove }: {
+  showBlocks: boolean;
   selected: Record<MetricSource, string[]>;
   series: Record<MetricSource, Series | null>;
   comparison: Record<MetricSource, Series | null>;
@@ -475,10 +478,15 @@ function MetricSections({ selected, series, comparison, compareRun, search, smoo
   }
   return (
     <div className="metric-sections">
-      {SECTION_ORDER.filter((section) => groups.has(section)).map((section) => (
+      {SECTION_ORDER.filter((section) => groups.has(section) || (showBlocks && ["train", "eval", "inference"].includes(section))).map((section) => (
         <details className="metric-section" key={`${section}:${open}`} open={open}>
-          <summary title={[...trainEnvs, ...evalEnvs].join(", ")}>{sectionTitle(section)}</summary>
+          <summary>{sectionTitle(section)}{["train", "eval"].includes(section) && <span className="section-env" title={(section === "train" ? trainEnvs : evalEnvs).join(", ")}>{(section === "train" ? trainEnvs : evalEnvs).join(", ") || "No environment configured"}</span>}</summary>
           <div className="chart-grid">
+            {showBlocks && section === "train" && !charts.some(({ key }) => key === "reward/episodes/effective/mean") && <article className="chart-card" data-metric="reward/episodes/effective/mean">
+              <header><span className="chart-title">effective/agent/reward</span><span className="chart-latest">–</span></header>
+              <div className="chart-empty missing-metric">Not recorded for this run<span>Requires rewards for episodes selected for training.</span></div>
+              <div className="chart-footer">Unavailable · not zero</div>
+            </article>}
             {groups.get(section)?.map(({ source, key }) => (
               <MetricChart
                 key={`${source}:${key}`}
@@ -496,6 +504,7 @@ function MetricSections({ selected, series, comparison, compareRun, search, smoo
               />
             ))}
           </div>
+          {!groups.has(section) && section !== "train" && <div className="section-empty">{section === "eval" ? "No evaluation metrics recorded" : "No inference telemetry recorded"}</div>}
         </details>
       ))}
       {charts.length === 0 && search && <Empty title="No metrics match" detail={search} />}
@@ -981,11 +990,11 @@ function InlineError({ children }: { children: ReactNode }) {
 
 function metricLabel(name: string, source: MetricSource): string {
   const labels: Record<string, string> = {
-    "reward/episodes/all/mean": "Reward · all episodes",
-    "reward/episodes/all/count": "Reward denominator · all episodes",
-    "reward/episodes/effective/mean": "Reward · effective episodes",
-    "reward/episodes/effective/count": "Reward denominator · effective episodes",
-    "reward/all/mean": source === "trainer" ? "Reward · all episodes" : "Reward · problem average",
+    "reward/episodes/all/mean": "all/agent/reward",
+    "reward/episodes/all/count": "all/agent/count",
+    "reward/episodes/effective/mean": "effective/agent/reward",
+    "reward/episodes/effective/count": "effective/agent/count",
+    "reward/all/mean": source === "trainer" ? "all/agent/reward" : "Reward · problem average",
     "generation/reward/mean": "Reward · all scored candidates",
     "rollout/count": "Episodes in optimizer batch",
   };

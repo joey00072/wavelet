@@ -146,6 +146,7 @@ test("trace pages are bounded, details are on demand, and tool calls survive", a
 test("comparison overlays use a second run without replacing the selected run", async ({ page }) => {
   await page.goto("/?run=synthetic-a");
   await page.getByRole("combobox", { name: "Compare run" }).selectOption("synthetic-b");
+  await page.locator('[data-metric="reward/all/mean"]').first().scrollIntoViewIfNeeded();
   await expect(page.locator(".comparison-line").first()).toBeVisible();
   await expect(page.getByRole("combobox", { name: "Run", exact: true })).toHaveValue("synthetic-a");
   await expect(page.locator(".chart-legend").first()).toContainText("synthetic-b");
@@ -195,7 +196,7 @@ test("reward cohorts show denominators and queue-step semantics", async ({ page 
   });
   await page.goto("/");
   const all = page.locator('[data-metric="reward/episodes/all/mean"]');
-  await expect(all).toContainText("Reward · all episodes");
+  await expect(all).toContainText("all/agent/reward");
   await expect(all.getByRole("note")).toHaveCount(0);
   await all.getByRole("button", { name: "About reward/episodes/all/mean", exact: true }).click();
   await expect(all.getByRole("note")).toContainText("including filtered episodes");
@@ -214,7 +215,7 @@ test("reward cohorts show denominators and queue-step semantics", async ({ page 
 test("chart descriptions do not shift neighboring plots", async ({ page }) => {
   await page.goto("/");
   const cards = page.locator(".chart-card");
-  const first = cards.first();
+  const first = cards.filter({ has: page.getByRole("button", { name: /^About / }) }).first();
   await first.scrollIntoViewIfNeeded();
   const plot = first.locator("svg");
   await expect(plot).toBeVisible();
@@ -231,4 +232,19 @@ test("chart descriptions do not shift neighboring plots", async ({ page }) => {
   await first.getByRole("button", { name: "Close", exact: true }).click();
   const headers = await cards.locator("header").evaluateAll(nodes => nodes.map(n => n.getBoundingClientRect().height));
   expect(new Set(headers).size).toBe(1);
+});
+
+test("historical overview separates missing effective reward from all episode reward", async ({ page }) => {
+  await page.route("**/metrics/keys", route => route.fulfill({json:{trainer:[{key:"reward/all/mean"}],orchestrator:[{key:"reward/all/mean"}],eval:[]}}));
+  await page.route("**/series?*", route => route.fulfill({json:{steps:[1],timestamps:[null],series:{"reward/all/mean":[0.15234375]}}}));
+  await page.goto("/");
+  const missing = page.locator('[data-metric="reward/episodes/effective/mean"]');
+  await expect(missing).toContainText("effective/agent/reward");
+  await expect(missing).toContainText("Not recorded");
+  const all = page.locator('[data-metric="reward/all/mean"]');
+  await expect(all).toHaveCount(1);
+  await expect(all).toContainText("all/agent/reward");
+  await expect(all.locator('.chart-latest')).toHaveText('0.1523');
+  await expect(all).toContainText('Optimizer step');
+  await expect(page.getByText('No evaluation metrics recorded')).toBeVisible();
 });
