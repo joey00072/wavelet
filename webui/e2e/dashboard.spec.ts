@@ -1,18 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
 
-const RUN_VIEWS = [
-  ["overview", "Overview"],
-  ["training", "Trainer"],
-  ["rollouts", "Generation"],
-  ["inspector", "Inspector"],
-  ["evals", "Evaluation"],
-  ["pipeline", "Step lifecycle"],
-  ["infra", "Trainer heartbeat"],
-  ["config", "Resolved config"],
-] as const;
-const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
-
 function collectBrowserErrors(page: Page): string[] {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));
@@ -22,187 +9,171 @@ function collectBrowserErrors(page: Page): string[] {
   return errors;
 }
 
-test("every run view renders without browser errors", async ({ page }) => {
+test("the compact dashboard exposes every primary surface", async ({ page }, testInfo) => {
   const errors = collectBrowserErrors(page);
-  for (const [view] of RUN_VIEWS) {
-    await page.goto(`/#/run/current/${view}`);
-    await expect(page.locator(`[data-view="${view}"]`)).toBeVisible();
+  await page.goto("/");
+  await expect(page.getByRole("navigation", { name: "Dashboard sections" })).toBeVisible();
+  await expect(page.locator('[data-view="metrics"]')).toBeVisible();
+  await expect(page.locator(".chart-card").first()).toBeVisible();
+
+  await page.getByRole("button", { name: /^all$/i }).click();
+  await page.getByRole("searchbox", { name: "Filter metrics" }).fill("reward");
+  await expect(page.locator(".metric-keys button").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Traces", exact: true }).click();
+  await expect(page.locator('[data-view="traces"] tbody tr').first()).toBeVisible();
+  await page.locator('[data-view="traces"] tbody tr').first().click();
+  const rollout = page.getByRole("dialog", { name: /Trace Viewer · sequence/ });
+  await expect(rollout.getByText("Trace Viewer", { exact: true })).toBeVisible();
+  if (testInfo.project.name === "desktop") {
+    await expect(rollout.locator(".trace-list-item").first()).toBeVisible();
+    await expect(rollout.locator(".trace-overview-pane")).toBeVisible();
   }
-  await page.goto("/#/run/synthetic-a/config");
-  const filter = page.getByRole("textbox", { name: "Filter configuration" });
-  await filter.fill("seq_len");
-  await expect(page.getByText("seq_len", { exact: true }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Close detail" }).click();
+
+  await page.getByRole("button", { name: "Report", exact: true }).click();
+  await expect(page.locator('[data-view="report"]')).toBeVisible();
+  await expect(page.getByText("Evaluation history", { exact: false })).toBeVisible();
+
+  await page.getByRole("button", { name: "Logs", exact: true }).click();
+  await expect(page.locator(".log-output")).not.toBeEmpty();
+  await page.getByRole("button", { name: "split", exact: true }).click();
+  await expect(page.locator(".log-pane").first()).toBeVisible();
+
+  await page.getByRole("button", { name: "Config", exact: true }).click();
+  await page.getByRole("searchbox", { name: "Filter configuration" }).fill("seq_len");
+  await expect(page.locator(".config-output")).toContainText("seq_len");
   expect(errors).toEqual([]);
 });
 
-test("run selection opens comparison", async ({ page }) => {
-  await page.goto("/#/runs");
-  const selectors = page.getByRole("checkbox", { name: /^Select / });
-  await expect(selectors.nth(1)).toBeVisible();
-  await selectors.nth(0).check();
-  await selectors.nth(1).check();
-  await page.getByRole("button", { name: /^Compare \(2\)$/ }).click();
-  await expect(page).toHaveURL(/#\/compare\?runs=/);
-  await expect(
-    page.getByRole("heading", { name: /Compare \d+ runs/ }),
-  ).toBeVisible();
+test("run selection is reflected in the URL and header", async ({ page }) => {
+  await page.goto("/");
+  const picker = page.getByRole("combobox", { name: "Run", exact: true });
+  await picker.selectOption("synthetic-a");
+  await expect.poll(() => new URL(page.url()).searchParams.get("run")).toBe("synthetic-a");
+  await expect(page.getByRole("region", { name: "Run overview" })).toContainText("Qwen/Qwen3-0.6B");
 });
 
-test("theme and chart controls are usable", async ({ page }, testInfo) => {
-  await page.goto("/#/run/current/overview");
-  const themeButton = testInfo.project.name === "mobile"
-    ? page.getByRole("button", { name: /Use (light|dark) theme/ })
-    : page.getByRole("button", { name: "Toggle theme" });
-  await themeButton.click();
-  await expect(page.locator("html")).toHaveClass(/dark/);
-  await page.getByRole("button", { name: "Chart settings" }).first().click();
-  await expect(page.getByText("Smoothing", { exact: true })).toBeVisible();
-});
-
-test("charts and rollout rows open accessible detail views", async ({ page }) => {
-  await page.goto("/#/run/current/overview");
-  await page.getByRole("button", { name: "Expand Reward chart" }).click();
-  const chartDialog = page.getByRole("dialog", { name: "Reward" });
-  await expect(chartDialog).toBeVisible();
-  await chartDialog.locator(FOCUSABLE).last().focus();
-  await page.keyboard.press("Tab");
-  expect(await chartDialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
-  await page.keyboard.press("Escape");
-  await expect(chartDialog).toBeHidden();
-
-  await page.goto("/#/run/current/inspector");
-  const composition = page.getByRole("status", { name: /Batch composition:/ });
-  await expect(composition).toContainText(/\d+ prompt groups.*\d+ samples per group.*\d+ total rollouts/);
-  const grouped = page.getByRole("region", { name: /Rollout groups in batch/ });
-  await expect(grouped).toBeVisible();
-  await expect(page.getByRole("region", { name: /Rollouts in group/ }).first()).toBeVisible();
-  await page.getByRole("button", { name: /^Samples \(/ }).click();
-  const table = page.getByRole("region", { name: /Rollouts in batch/ });
-  await expect(table).toBeVisible();
-  let delaySort = false;
-  await page.route("**/rollouts/rows?**", async (route) => {
-    if (delaySort) await new Promise((resolve) => setTimeout(resolve, 800));
-    await route.continue();
+test("the first reward observation has a visible chart marker", async ({ page }) => {
+  await page.route("**/series?*", (route) => {
+    const keys = new URL(route.request().url()).searchParams.get("keys")?.split(",") ?? [];
+    return route.fulfill({
+      json: {
+        steps: [1],
+        timestamps: ["2026-09-19T00:00:00Z"],
+        series: Object.fromEntries(keys.map((key) => [key, [0.3125]])),
+      },
+    });
   });
-  delaySort = true;
-  const sortedResponse = page.waitForResponse((response) =>
-    response.url().includes("/rollouts/rows?") && response.url().includes("order=asc"),
-  );
-  await table.getByRole("button", { name: "Reward" }).click();
-  await expect(table).toBeVisible({ timeout: 200 });
-  await sortedResponse;
-  delaySort = false;
-  const firstRow = table.locator("tbody tr").first();
-  await firstRow.focus();
-  await page.keyboard.press("Enter");
-  const rolloutDialog = page.getByRole("dialog", { name: /Rollout \d+ · batch/ });
-  await expect(rolloutDialog).toBeVisible();
-  await expect(rolloutDialog.getByText("Prompt", { exact: true })).toBeVisible();
-  await page.route("**/rollouts/*/rows/*", async (route) => {
-    await new Promise((resolve) => setTimeout(resolve, 800));
-    await route.continue();
-  });
-  const sibling = rolloutDialog.locator('button[aria-pressed="false"]').first();
-  const siblingIndex = (await sibling.textContent())?.replace("#", "") ?? "";
-  const siblingResponse = page.waitForResponse((response) =>
-    response.url().endsWith(`/rows/${siblingIndex}`),
-  );
-  await sibling.click();
-  await expect(rolloutDialog.getByText("Prompt", { exact: true })).toBeVisible({ timeout: 200 });
-  await expect(rolloutDialog.getByText(`loading #${siblingIndex}`)).toBeVisible();
-  await siblingResponse;
-  await expect(rolloutDialog).toHaveAccessibleName(new RegExp(`Rollout ${siblingIndex} · batch`));
-  await rolloutDialog.locator(FOCUSABLE).last().focus();
-  await page.keyboard.press("Tab");
-  expect(await rolloutDialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
-  await page.getByRole("button", { name: "Close drawer" }).click();
-  await expect(firstRow).toBeFocused();
+  await page.goto("/");
+  await page.locator('[data-metric="reward/all/mean"]').first().scrollIntoViewIfNeeded();
+  const reward = page.getByRole("img", { name: "reward/all/mean chart", exact: true }).first();
+  await expect(reward.locator("circle")).toBeVisible();
+  await expect(reward.locator("circle title")).toHaveText("step 1: 0.3125");
 });
 
-test("desktop navigation and run rows work from the keyboard", async ({
-  page,
-}, testInfo) => {
-  test.skip(testInfo.project.name === "mobile");
-  await page.goto("/#/runs");
-  await page.keyboard.press("Tab");
-  await expect(page.getByRole("link", { name: "Skip to dashboard content" })).toBeFocused();
-
-  const firstRow = page.getByRole("region", { name: "Runs table" }).locator("tbody tr").first();
-  await firstRow.focus();
-  await page.keyboard.press("Enter");
-  await expect(page.locator('[data-page="run"][data-view="overview"]')).toBeVisible();
-});
-
-test("batch timeline switches steps without a picker", async ({ page }) => {
-  await page.goto("/#/run/current/inspector");
-  const keepLatest = page.getByRole("button", { name: "Keep viewing latest" });
-  await expect(keepLatest).toHaveAttribute("aria-pressed", "true");
-  const rail = page.getByRole("navigation", { name: "Rollout batches" });
-  await expect(rail).toBeVisible();
-  const steps = rail.getByRole("button", { name: /^Batch step / });
-  const count = await steps.count();
-  expect(count).toBeGreaterThan(1);
-
-  const previous = steps.nth(count - 2);
-  await previous.click();
-  await expect(previous).toHaveAttribute("aria-current", "step");
-  await expect(keepLatest).toHaveAttribute("aria-pressed", "false");
-  await expect.poll(() => new URL(page.url()).hash).toContain("step=");
-
-  await keepLatest.click();
-  await expect(steps.last()).toHaveAttribute("aria-current", "step");
-  await expect(keepLatest).toHaveAttribute("aria-pressed", "true");
-  await expect.poll(() => new URL(page.url()).hash).not.toContain("step=");
-});
-
-test("empty and failed API states explain how to recover", async ({ page }) => {
-  await page.route("**/api/runs", (route) =>
-    route.fulfill({ status: 200, contentType: "application/json", body: "[]" }),
-  );
-  await page.goto("/#/runs");
+test("empty and failed API states are explicit", async ({ page }) => {
+  await page.route("**/api/runs?compact=true", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.goto("/");
   await expect(page.getByText("No runs found", { exact: true })).toBeVisible();
 
-  await page.unroute("**/api/runs");
-  await page.route("**/api/runs", (route) =>
-    route.fulfill({
-      status: 503,
-      contentType: "application/json",
-      body: JSON.stringify({ detail: "dashboard unavailable" }),
-    }),
-  );
+  await page.unroute("**/api/runs?compact=true");
+  await page.route("**/api/runs?compact=true", (route) => route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ detail: "dashboard unavailable" }) }));
   await page.reload();
-  await expect(page.getByText("Cannot reach the API", { exact: false })).toBeVisible();
-  await expect(page.getByText("dashboard unavailable", { exact: false }).first()).toBeVisible();
+  await expect(page.getByText("Cannot reach the API", { exact: true })).toBeVisible();
+  await expect(page.getByText("dashboard unavailable", { exact: false })).toBeVisible();
 });
 
-test("mobile navigation reaches all run views without page overflow", async ({
-  page,
-}, testInfo) => {
+test("mobile layout does not overflow", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile");
-  await page.goto("/#/run/current/overview");
-  const nav = page.getByLabel("Run view", { exact: true });
-  await expect(nav).toBeVisible();
-  for (const [view] of RUN_VIEWS) {
-    await nav.selectOption(view);
-    await expect(page).toHaveURL(new RegExp(`#\\/run\\/current\\/${view}`));
-  }
-  const overflow = await page.evaluate(
-    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
-  );
+  await page.goto("/");
+  await expect(page.getByRole("navigation", { name: "Dashboard sections" })).toBeVisible();
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
+});
 
-  await page.setViewportSize({ width: 320, height: 720 });
-  await expect(page.getByRole("link", { name: /(Current|Recent) run/ })).toBeVisible();
-  await expect(page.getByRole("link", { name: "All runs" })).toBeVisible();
-  const narrowOverflow = await page.evaluate(
-    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
-  );
-  expect(narrowOverflow).toBeLessThanOrEqual(1);
+test("charts support regex selection, inspection, and zoom", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.getByRole("searchbox", { name: "Filter metrics" }).fill("^reward/|^train/loss$");
+  const chart = page.getByRole("img", { name: "reward/all/mean chart", exact: true }).first();
+  await expect(chart).toBeVisible();
+  await chart.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(chart.locator("..").locator(".chart-readout")).toContainText("raw");
+  if (testInfo.project.name === "desktop") {
+    const bounds = (await chart.boundingBox())!;
+    await page.mouse.move(bounds.x + bounds.width * .3, bounds.y + bounds.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(bounds.x + bounds.width * .8, bounds.y + bounds.height / 2);
+    await page.mouse.up();
+    await expect(page.getByRole("button", { name: "Reset zoom" })).toBeVisible();
+    await page.getByRole("button", { name: "Reset zoom" }).click();
+  }
+  await page.getByRole("searchbox", { name: "Filter metrics" }).fill("[");
+  await expect(page.getByText("Invalid regular expression.")).toBeVisible();
+});
 
-  await page.goto("/#/run/current/overview");
-  await page.getByRole("button", { name: "Expand Reward chart" }).click();
-  const modalOverflow = await page.evaluate(
-    () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
-  );
-  expect(modalOverflow).toBeLessThanOrEqual(1);
+test("trace pages are bounded, details are on demand, and tool calls survive", async ({ page }) => {
+  let detailsRequested = 0;
+  const offsets: number[] = [];
+  await page.route("**/rollouts/rows?*", async route => {
+    const params = new URL(route.request().url()).searchParams;
+    expect(params.get("limit")).toBe("50");
+    const offset = Number(params.get("offset")); offsets.push(offset);
+    await route.fulfill({ json: { available: true, total: 120, filtered: 120, groups: [], rows: Array.from({length: Math.min(50, 120-offset)}, (_,i)=>({row_index:offset+i,reward:1,env:"test",input_token_count:1,completion_token_count:1})) }});
+  });
+  await page.route(/\/rollouts\/\d+\/rows\/\d+$/, async route => {
+    detailsRequested++;
+    await route.fulfill({json:{prompt:[], completion:Array.from({length:100},(_,i)=>({role:"assistant",content:null,tool_calls:[{function:{name:"bash",arguments:`echo lazy-message-${i}`}}]}))}});
+  });
+  await page.goto("/?run=synthetic-a&tab=traces");
+  await expect(page.locator('[data-view="traces"] tbody tr')).toHaveCount(50);
+  expect(detailsRequested).toBe(0);
+  await page.getByRole("button", {name:"Next page"}).click();
+  await expect.poll(()=>offsets.includes(50)).toBe(true);
+  await page.locator('[data-view="traces"] tbody tr').first().click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByRole("dialog")).toContainText("echo lazy-message-0");
+  await expect(page.getByRole("dialog").locator(".trace-entry")).toHaveCount(12);
+  expect(detailsRequested).toBe(1);
+  expect(new URL(page.url()).searchParams.get("row")).toBe("50");
+  await page.getByRole("button", {name:"Close detail"}).click();
+  await page.getByRole("combobox", {name:"Run",exact:true}).selectOption("synthetic-b");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+
+test("comparison overlays use a second run without replacing the selected run", async ({ page }) => {
+  await page.goto("/?run=synthetic-a");
+  await page.getByRole("combobox", { name: "Compare run" }).selectOption("synthetic-b");
+  await expect(page.locator(".comparison-line").first()).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Run", exact: true })).toHaveValue("synthetic-a");
+  await expect(page.locator(".chart-legend").first()).toContainText("synthetic-b");
+});
+
+test("downsampled graphs retain spike envelopes and label bucket means", async ({ page }) => {
+  await page.route("**/series?*", route => {
+    const keys = new URL(route.request().url()).searchParams.get("keys")!.split(",");
+    return route.fulfill({json:{steps:[1,10],timestamps:[null,null],downsampled:true,series:Object.fromEntries(keys.map(k=>[k,[2,3]])),envelope:Object.fromEntries(keys.map(k=>[k,{min:[0,1],max:[90,100]}]))}});
+  });
+  await page.goto("/");
+  await page.locator('[data-metric="reward/all/mean"]').first().scrollIntoViewIfNeeded();
+  const chart = page.getByRole("img", {name:"reward/all/mean chart",exact:true}).first();
+  await expect(chart.locator(".metric-envelope")).toBeVisible();
+  await chart.focus();await page.keyboard.press("ArrowRight");
+  await expect(chart.locator("..").locator(".chart-readout")).toContainText("bucket mean");
+  await expect(chart.locator("..").locator(".chart-readout")).toContainText("max 90");
+});
+
+test("hidden browser tabs stop polling and refresh when visible", async ({ page }) => {
+  let summaries = 0;
+  page.on("request", request => { if (new URL(request.url()).pathname.endsWith("/summary")) summaries++; });
+  await page.goto("/");
+  await expect(page.locator(".chart-card").first()).toBeVisible();
+  await page.evaluate(() => { Object.defineProperty(document, "hidden", {configurable:true,get:()=>true}); document.dispatchEvent(new Event("visibilitychange")); });
+  const before = summaries;
+  await page.waitForTimeout(3500);
+  expect(summaries).toBe(before);
+  await page.evaluate(() => { Object.defineProperty(document, "hidden", {configurable:true,get:()=>false}); document.dispatchEvent(new Event("visibilitychange")); });
+  await expect.poll(()=>summaries).toBeGreaterThan(before);
 });

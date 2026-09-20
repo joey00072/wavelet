@@ -123,6 +123,8 @@ export function usePoll<T>(url: string | null, intervalMs: number, options: Poll
     }
     let cancelled = false;
     let timer: number | undefined;
+    let pending = false;
+    let hasLoaded = false;
     const controller = new AbortController();
     const changedUrl = lastUrl.current !== url;
     const changedResource = lastResourceKey.current !== resourceKey;
@@ -137,10 +139,17 @@ export function usePoll<T>(url: string | null, intervalMs: number, options: Poll
       setLoading(true);
     }
     const run = async () => {
+      if (cancelled || pending) return;
+      if (document.hidden) {
+        if (intervalMs > 0) timer = window.setTimeout(run, intervalMs);
+        return;
+      }
+      pending = true;
       setRefetching(true);
       try {
         const next = await fetchJson<T>(url, controller.signal);
         if (!cancelled) {
+          hasLoaded = true;
           setData(next);
           setError(null);
           setUpdatedAt(new Date().toISOString());
@@ -150,6 +159,7 @@ export function usePoll<T>(url: string | null, intervalMs: number, options: Poll
           setError(caught instanceof Error ? caught.message : String(caught));
         }
       } finally {
+        pending = false;
         if (!cancelled) {
           setLoading(false);
           setRefetching(false);
@@ -157,8 +167,11 @@ export function usePoll<T>(url: string | null, intervalMs: number, options: Poll
         }
       }
     };
+    const onVisible = () => { if (!document.hidden && (intervalMs > 0 || !hasLoaded)) { window.clearTimeout(timer); void run(); } };
+    document.addEventListener("visibilitychange", onVisible);
     run();
     return () => {
+      document.removeEventListener("visibilitychange", onVisible);
       cancelled = true;
       controller.abort();
       if (timer !== undefined) window.clearTimeout(timer);

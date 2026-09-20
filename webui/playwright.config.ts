@@ -18,7 +18,7 @@ export default defineConfig({
     url: `http://127.0.0.1:${port}/api/health`,
     env: { WAVELET_E2E_PORT: String(port) },
     reuseExistingServer: true,
-    timeout: 30_000,
+    timeout: 90_000,
   },
   projects: [
     { name: "desktop", use: { ...devices["Desktop Chrome"] } },

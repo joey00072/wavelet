@@ -16,11 +16,6 @@ export function fmtInt(value: number | null | undefined): string {
   return Math.round(value).toLocaleString();
 }
 
-export function fmtPct(value: number | null | undefined, digits = 1): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "–";
-  return `${(value * 100).toFixed(digits)}%`;
-}
-
 export function fmtBytes(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "–";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -39,13 +34,6 @@ export function fmtSeconds(value: number | null | undefined): string {
   if (value < 90) return `${value.toFixed(1)} s`;
   if (value < 5400) return `${(value / 60).toFixed(1)} min`;
   return `${(value / 3600).toFixed(2)} h`;
-}
-
-export function fmtTime(value: string | null | undefined): string {
-  if (!value) return "–";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 export function fmtDateTime(value: string | null | undefined): string {
@@ -69,22 +57,6 @@ export function fmtAge(value: string | null | undefined, now = Date.now()): stri
   if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
   if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h ago`;
   return `${(seconds / 86400).toFixed(1)}d ago`;
-}
-
-export function shortId(value: string | null | undefined, max = 28): string {
-  if (!value) return "–";
-  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-}
-
-/** Compact tick labels: at most three significant digits. */
-export function fmtAxis(value: number): string {
-  if (!Number.isFinite(value)) return "–";
-  if (value === 0) return "0";
-  const abs = Math.abs(value);
-  if (abs >= 1e4) return fmt(value, 3);
-  if (abs >= 100) return value.toFixed(0);
-  if (abs >= 1) return Number(value.toPrecision(3)).toString();
-  return Number(value.toPrecision(2)).toString();
 }
 
 /** Human model label from a name or a Hugging Face cache snapshot path. */
