@@ -11,7 +11,6 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard, distribute_tensor
-from torch.utils.hooks import RemovableHandle
 
 from wavelet.configs.config import ModelConfig
 
@@ -298,66 +297,6 @@ def configure_hf_moe_routers(model: nn.Module, config: ModelConfig) -> int:
         if config.moe_router_dtype == "float32":
             _configure_fp32_router(router)
     return len(routers)
-
-
-@torch.no_grad()
-def update_moe_selection_bias(
-    model: nn.Module,
-    *,
-    process_group: Any | None = None,
-) -> int:
-    """Apply the reference auxiliary-loss-free routing update.
-
-    For each native DeepSeek MoE layer, the update is
-    ``coeff * sign(mean(counts) - counts)``, centered to zero, then the
-    nonpersistent usage counter is cleared.  Counts are reduced before the
-    update when a process group is supplied (or when the default group is
-    initialized), so every rank applies the same bias.
-    """
-    layers = [
-        module for module in model.modules() if hasattr(module, "tokens_per_expert")
-    ]
-    if not layers:
-        return 0
-    for layer in layers:
-        counts = layer.tokens_per_expert
-        can_update_bias = (
-            hasattr(layer, "router")
-            and getattr(layer.router, "selection_bias", None) is not None
-            and getattr(layer, "load_balance_coeff", None) is not None
-        )
-        if can_update_bias and (process_group is not None or dist.is_initialized()):
-            dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=process_group)
-        if can_update_bias and counts.numel() and bool(counts.sum() > 0):
-            delta = float(layer.load_balance_coeff) * torch.sign(counts.mean() - counts)
-            delta.sub_(delta.mean())
-            layer.router.selection_bias.add_(delta.to(layer.router.selection_bias))
-        counts.zero_()
-    return len(layers)
-
-
-def install_moe_load_balance_hook(
-    optimizer: torch.optim.Optimizer,
-    model: nn.Module,
-    *,
-    process_group: Any | None = None,
-) -> RemovableHandle:
-    """Install selection-bias updates immediately before optimizer steps."""
-    mark_moe_buffers_ddp_ignored(model)
-
-    def _hook(*_args: Any, **_kwargs: Any) -> None:
-        update_moe_selection_bias(model, process_group=process_group)
-
-    return optimizer.register_step_pre_hook(_hook)
-
-
-def mark_moe_buffers_ddp_ignored(model: nn.Module) -> None:
-    """Mark usage counters so DDP does not broadcast rank-local accumulation."""
-    ignored = set(getattr(model, "_ddp_params_and_buffers_to_ignore", set()))
-    for name, _buffer in model.named_buffers():
-        if name.endswith("tokens_per_expert"):
-            ignored.add(name)
-    model._ddp_params_and_buffers_to_ignore = ignored
 
 
 def _configure_fp32_router(router: nn.Module) -> None:

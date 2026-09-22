@@ -76,8 +76,9 @@ def test_context_parallel_batch_rejects_explicit_attention_bias() -> None:
         "labels": torch.ones(1, 4, dtype=torch.long),
     }
     attention_mask = torch.zeros(1, 1, 4, 4)
-    with pytest.raises(ValueError, match="explicit 4D"), context_parallel_batch(
-        batch, dims, extra_buffers=[(attention_mask, 2)]
+    with (
+        pytest.raises(ValueError, match="explicit 4D"),
+        context_parallel_batch(batch, dims, extra_buffers=[(attention_mask, 2)]),
     ):
         pass
 
@@ -88,8 +89,9 @@ def test_context_parallel_batch_rejects_padding_attention_mask() -> None:
         "input_ids": torch.ones(1, 4, dtype=torch.long),
         "attention_mask": torch.tensor([[1, 1, 1, 0]]),
     }
-    with pytest.raises(ValueError, match="all-ones 2D"), context_parallel_batch(
-        batch, dims
+    with (
+        pytest.raises(ValueError, match="all-ones 2D"),
+        context_parallel_batch(batch, dims),
     ):
         pass
 

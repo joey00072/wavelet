@@ -152,9 +152,7 @@ def test_journal_ignores_uncommitted_files_but_rejects_committed_corruption(tmp_
     with EvaluationJournal(path, signature="plan") as journal:
         assert journal.completed(0)["reward"] == 1.0
     next(path.glob("episode-*.json")).write_text('{"partial":')
-    with pytest.raises(json.JSONDecodeError), EvaluationJournal(
-        path, signature="plan"
-    ):
+    with pytest.raises(json.JSONDecodeError), EvaluationJournal(path, signature="plan"):
         pass
 
 
@@ -166,8 +164,9 @@ def test_journal_requires_explicit_resume_and_excludes_concurrent_writer(tmp_pat
         EvaluationJournal(path, signature="plan"),
     ):
         pass
-    with pytest.raises(FileExistsError, match="eval.resume"), EvaluationJournal(
-        path, signature="plan", resume=False
+    with (
+        pytest.raises(FileExistsError, match="eval.resume"),
+        EvaluationJournal(path, signature="plan", resume=False),
     ):
         pass
 
@@ -188,7 +187,9 @@ def test_invalid_reward_is_failed_and_retried(tmp_path, reward):
         return {"reward": reward}
 
     with EvaluationJournal(tmp_path / "journal", signature="plan") as journal:
-        output = asyncio.run(_run(SimpleNamespace(run_rollout=rollout), [{"id": "a"}], journal))[0]
+        output = asyncio.run(
+            _run(SimpleNamespace(run_rollout=rollout), [{"id": "a"}], journal)
+        )[0]
         assert "reward" not in output
         assert "finite number" in output["error"]
         assert all(journal.completed(key) is None for key in journal.rows)
@@ -198,7 +199,8 @@ def test_provider_limit_is_classified_before_error_truncation(tmp_path):
     async def rollout(*_args, **_kwargs):
         return {"error": "x" * 600 + " rate limit 429"}
 
-    with EvaluationJournal(
-        tmp_path / "journal", signature="plan"
-    ) as journal, pytest.raises(RuntimeError, match="rate limit"):
+    with (
+        EvaluationJournal(tmp_path / "journal", signature="plan") as journal,
+        pytest.raises(RuntimeError, match="rate limit"),
+    ):
         asyncio.run(_run(SimpleNamespace(run_rollout=rollout), [{"id": "a"}], journal))

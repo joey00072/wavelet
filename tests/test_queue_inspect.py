@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from wavelet.transport.queue import (
+from wavelet.transport.rollouts.filesystem import (
     ClaimRecord,
     ConsumedRecord,
     RolloutManifest,

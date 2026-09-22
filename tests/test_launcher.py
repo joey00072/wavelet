@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from wavelet.configs.config import RLConfig
-from wavelet.orchestrator.launcher import (
+from wavelet.launch.roles import (
     LocalRoleHandle,
     LocalRoleLauncher,
     RayRoleLauncher,
@@ -43,9 +43,9 @@ class _FakeProcess:
 def test_local_role_handle_terminates_process_group(tmp_path, monkeypatch) -> None:
     process = _FakeProcess(timeout_once=True)
     killpg_calls: list[tuple[int, int]] = []
-    monkeypatch.setattr("wavelet.orchestrator.launcher.os.getpgid", lambda pid: 4321)
+    monkeypatch.setattr("wavelet.launch.roles.os.getpgid", lambda pid: 4321)
     monkeypatch.setattr(
-        "wavelet.orchestrator.launcher.os.killpg",
+        "wavelet.launch.roles.os.killpg",
         lambda pgid, signal_number: killpg_calls.append((pgid, signal_number)),
     )
 
@@ -64,13 +64,13 @@ def test_local_role_handle_terminates_process_group(tmp_path, monkeypatch) -> No
 
 def test_local_role_handle_falls_back_to_child_signal(tmp_path, monkeypatch) -> None:
     process = _FakeProcess()
-    monkeypatch.setattr("wavelet.orchestrator.launcher.os.getpgid", lambda pid: 4321)
+    monkeypatch.setattr("wavelet.launch.roles.os.getpgid", lambda pid: 4321)
 
     def raise_os_error(pgid: int, signal_number: int) -> None:
         del pgid, signal_number
         raise OSError("no process group")
 
-    monkeypatch.setattr("wavelet.orchestrator.launcher.os.killpg", raise_os_error)
+    monkeypatch.setattr("wavelet.launch.roles.os.killpg", raise_os_error)
 
     with (tmp_path / "role.log").open("w", encoding="utf-8") as log_file:
         handle = LocalRoleHandle(
@@ -92,7 +92,7 @@ def test_local_role_launcher_starts_roles_in_new_session(tmp_path, monkeypatch) 
         captured["kwargs"] = kwargs
         return _FakeProcess()
 
-    monkeypatch.setattr("wavelet.orchestrator.launcher.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("wavelet.launch.roles.subprocess.Popen", fake_popen)
 
     launcher = LocalRoleLauncher(tmp_path)
     handle = launcher.start(
@@ -118,7 +118,7 @@ def test_local_role_launcher_applies_role_environment(tmp_path, monkeypatch) -> 
         return _FakeProcess()
 
     monkeypatch.setenv("WAVELET_PARENT_VALUE", "parent")
-    monkeypatch.setattr("wavelet.orchestrator.launcher.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("wavelet.launch.roles.subprocess.Popen", fake_popen)
 
     handle = LocalRoleLauncher(tmp_path).start(
         RoleSpec(
@@ -148,7 +148,7 @@ def test_local_role_launcher_preserves_existing_log(tmp_path, monkeypatch) -> No
     log_path = log_dir / "rl_inference.log"
     log_path.write_text("previous run\n", encoding="utf-8")
     monkeypatch.setattr(
-        "wavelet.orchestrator.launcher.subprocess.Popen",
+        "wavelet.launch.roles.subprocess.Popen",
         lambda *args, **kwargs: _FakeProcess(),
     )
 
@@ -171,7 +171,7 @@ def test_local_role_launcher_writes_to_explicit_attempt_log_dir(
 ) -> None:
     attempt_log_dir = tmp_path / "logs" / "attempt_2"
     monkeypatch.setattr(
-        "wavelet.orchestrator.launcher.subprocess.Popen",
+        "wavelet.launch.roles.subprocess.Popen",
         lambda *args, **kwargs: _FakeProcess(),
     )
 

@@ -9,13 +9,15 @@ filesystem artifacts carry state between independently restartable processes.
 | Area | Responsibility |
 | --- | --- |
 | `wavelet.configs` | Pydantic schemas, legacy input normalization, and cross-field validation |
+| `wavelet.contracts` | Shared rollout, policy, schedule, queue, and trace records |
 | `wavelet.data` | Canonical SFT and RL loading, normalization, tokenization, packing, and collation |
 | `wavelet.cli` | Lazy command dispatch directly to subsystem `main` functions |
 | `wavelet.entrypoints` | Commands with their own argument parsing or process setup |
 | `wavelet.orchestrator` | Example selection, rollout scheduling/sources, verifier environments, scoring, algorithms, metrics, and run state |
-| `wavelet.transport` | Filesystem rollout queues and filesystem/NCCL policy transfer |
-| `wavelet.inference` | Native and vLLM policy inference, HTTP clients, policy loading, and diagnostics |
-| `wavelet.trainer` | Model/LoRA and distributed setup, RL/SFT training, losses, optimization, and checkpointing |
+| `wavelet.transport` | Rollout protocols/queues and filesystem/NCCL weight transfer |
+| `wavelet.inference` | Backend-neutral engine/client protocols plus the vLLM engine and server |
+| `wavelet.trainer` | Model, loss, distributed-training, policy-export, and trainer entrypoint code |
+| `wavelet.launch` | Role specifications, placement, local/Ray launch glue, and `wavelet rl` |
 | `wavelet.dashboard` | Read-only run artifact readers, the `/api/runs` router for the dashboard and live state server, W&B/Trackio history providers, and synthetic runs |
 | `wavelet.deployment` | SLURM script generation, allocation discovery, and multi-node role lifecycle |
 | `wavelet.kernels` | Optional performance kernels and narrowly scoped runtime patches |
@@ -33,12 +35,13 @@ been removed. Existing Python integrations using those paths must update their
 imports. YAML schemas and CLI commands are unchanged by this consolidation.
 YAML anchors and merge defaults (`<<: *defaults`) are supported; explicit
 values override merged defaults, while repeated explicit keys remain errors.
-Shared rollout scheduling lives in
-`wavelet.orchestrator.scheduler`, verifier clients and evaluation in
-`wavelet.orchestrator.envs`, inference serving in `wavelet.inference.server`,
+Shared rollout scheduling contracts live in `wavelet.contracts.schedule`; the
+runtime scheduler lives in `wavelet.orchestrator.scheduler`. Verifier clients and evaluation in
+`wavelet.orchestrator.envs`, inference serving in `wavelet.inference.vllm.server`,
 and trainer behavior in `wavelet.trainer.trainer` and `wavelet.trainer.rl`.
-The only retained alias is `wavelet.orchestrator.verifiers`, which backs the
-public `wavelet.orchestrator.verifiers:generate_rollouts` config value.
+The public `wavelet.orchestrator.verifiers` module re-exports the verifier
+scheduler API used by the `wavelet.orchestrator.verifiers:generate_rollouts`
+config value.
 Trainer process-group initialization uses `dist_timeout_seconds` from the SFT
 or RL config. It defaults to 1800 seconds and can be increased for slow or
 multi-node rendezvous without changing code.
@@ -210,8 +213,8 @@ already-derived component mask and optional token weights, and return
 
 ## Policy Artifacts
 
-`wavelet.transport.policy` owns filesystem and NCCL policy transfer, while
-`wavelet.transport.queue` owns queue artifacts and lifecycle events.
+`wavelet.transport.weights` owns filesystem and NCCL policy transfer, while
+`wavelet.transport.rollouts.filesystem` owns queue artifacts and lifecycle events.
 Filesystem policy exports use a temporary directory followed by an atomic
 rename and stable marker. Metadata is written beside the model or adapter. NCCL
 transfer uses the same readiness concept, but sends a layer count followed by

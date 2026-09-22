@@ -1,7 +1,52 @@
-"""Compatibility alias for verifier APIs consolidated into the scheduler."""
+"""Public verifier-rollout API backed by the orchestrator scheduler."""
 
-import sys
+from wavelet.orchestrator.envs import _eval_metrics, _run_eval_examples
+from wavelet.orchestrator.scheduler import (
+    VerifierRolloutScheduler,
+    _assign_rollout_advantages,
+    _completed_group_outputs,
+    _is_usable_training_group,
+    _load_cached_env,
+    _PendingVerifierRequest,
+    _records_from_output,
+    _resume_curriculum_state,
+    _resume_environment_cursor_state,
+    _rollout_environment_record_cursors,
+    _rollout_records_policy_step,
+    _run_all,
+    _run_group,
+    _sampling_args,
+    _successful_rollout_outputs,
+    _verifier_extra_env_kwargs,
+    _VerifierBatchStats,
+    _VerifierEnvRuntime,
+    _VerifierFailureStats,
+    _VerifierGroupState,
+    generate_rollouts,
+)
 
-from wavelet.orchestrator import scheduler as _scheduler
-
-sys.modules[__name__] = _scheduler
+__all__ = [
+    "VerifierRolloutScheduler",
+    "_PendingVerifierRequest",
+    "_VerifierBatchStats",
+    "_VerifierEnvRuntime",
+    "_VerifierFailureStats",
+    "_VerifierGroupState",
+    "_assign_rollout_advantages",
+    "_completed_group_outputs",
+    "_eval_metrics",
+    "_is_usable_training_group",
+    "_load_cached_env",
+    "_records_from_output",
+    "_resume_curriculum_state",
+    "_resume_environment_cursor_state",
+    "_rollout_environment_record_cursors",
+    "_rollout_records_policy_step",
+    "_run_all",
+    "_run_eval_examples",
+    "_run_group",
+    "_sampling_args",
+    "_successful_rollout_outputs",
+    "_verifier_extra_env_kwargs",
+    "generate_rollouts",
+]

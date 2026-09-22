@@ -22,17 +22,19 @@ Guidance for coding agents working in this repository.
 - `pyproject.toml`: project metadata and Python requirement.
 - `wavelet/`: package directory for app code, CLI, trainer, inference, and orchestration.
 - `wavelet/cli.py`: lazy CLI dispatch directly to subsystem `main` functions.
+- `wavelet/contracts/`: shared records, schedules, policy metadata, and trace contracts.
 - `wavelet/entrypoints/`: commands requiring additional parsing or process setup;
   do not add forwarding-only modules.
 - `wavelet/configs/`: Pydantic config models and legacy normalization.
 - `wavelet/orchestrator/`: rollout scheduling and sources, verifier environments,
-  rewards, algorithms, metrics, state inspection, and launcher utilities.
-- `wavelet/transport/`: filesystem queue and filesystem/NCCL policy transport
-  implementations.
-- `wavelet/trainer/`: model and LoRA/QLoRA setup, distributed world/mesh state,
-  SFT/RL trainers, losses, optimization, and checkpointing.
-- `wavelet/inference/`: vLLM integration, policy adapter loading, and inference
-  serialization.
+  rewards, algorithms, metrics, and state inspection.
+- `wavelet/transport/`: rollout queue and filesystem/NCCL weight transport.
+- `wavelet/trainer/`: training utilities, model/loss code, policy export, and
+  trainer entrypoints.
+- `wavelet/inference/`: backend-neutral engine/client protocols and the vLLM
+  engine/server implementation.
+- `wavelet/launch/`: role specifications, placement, local/Ray launchers, and the
+  `wavelet rl` runtime.
 - `wavelet/data/`: `sft.py` and `rl.py` data pipelines.
 - `wavelet/dashboard/`: read-only run artifact readers, the `/api/runs` HTTP
   router shared by `wavelet dashboard` and the live state server, and the

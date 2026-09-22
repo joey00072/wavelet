@@ -9,7 +9,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from wavelet.configs.config import RLConfig
-from wavelet.inference.engine import VLLMPolicyInferenceEngine, _OpenAIBatchRequest
+from wavelet.inference.vllm.engine import VLLMPolicyInferenceEngine, _OpenAIBatchRequest
 
 
 def _request(index: int) -> _OpenAIBatchRequest:
@@ -113,7 +113,9 @@ def test_vllm_setup_passes_fully_sharded_loras(monkeypatch) -> None:
 
     vllm_module.LLM = FakeLLM
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setattr("wavelet.inference.engine.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(
+        "wavelet.inference.vllm.engine.setup_tokenizer", lambda _: object()
+    )
     monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
 
     config = RLConfig(
@@ -142,7 +144,9 @@ def test_vllm_setup_rounds_lora_rank_to_supported_capacity(monkeypatch) -> None:
 
     vllm_module.LLM = FakeLLM
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setattr("wavelet.inference.engine.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(
+        "wavelet.inference.vllm.engine.setup_tokenizer", lambda _: object()
+    )
     monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
 
     engine = VLLMPolicyInferenceEngine(
@@ -177,7 +181,9 @@ def test_vllm_setup_passes_sampling_mask_flag(
 
     vllm_module.LLM = FakeLLM
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setattr("wavelet.inference.engine.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(
+        "wavelet.inference.vllm.engine.setup_tokenizer", lambda _: object()
+    )
     monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
 
     config = RLConfig(inference={"sampling": sampling, "vllm": vllm})
@@ -204,7 +210,9 @@ def test_vllm_setup_only_passes_explicit_model_context(
 
     vllm_module.LLM = FakeLLM
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setattr("wavelet.inference.engine.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(
+        "wavelet.inference.vllm.engine.setup_tokenizer", lambda _: object()
+    )
     monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
     vllm = {} if configured is None else {"max_model_len": configured}
 
@@ -223,7 +231,9 @@ def test_vllm_setup_passes_quantized_load_args(monkeypatch) -> None:
 
     vllm_module.LLM = FakeLLM
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setattr("wavelet.inference.engine.setup_tokenizer", lambda _: object())
+    monkeypatch.setattr(
+        "wavelet.inference.vllm.engine.setup_tokenizer", lambda _: object()
+    )
     monkeypatch.setattr(VLLMPolicyInferenceEngine, "_openai_batch_loop", lambda _: None)
 
     config = RLConfig(

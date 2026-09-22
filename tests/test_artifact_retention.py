@@ -6,16 +6,16 @@ import pytest
 
 from wavelet.configs.config import RLConfig, RLTransportConfig
 from wavelet.orchestrator.envs import _prune_eval_rollout_sets
+from wavelet.trainer.policy_export import (
+    PolicyExporter,
+    prune_policy_snapshots,
+    prune_policy_snapshots_beyond,
+)
 from wavelet.trainer.rl import (
     _combined_rollout_path,
     _remove_combined_rollout_path,
 )
-from wavelet.transport.policy import (
-    PolicyExportMixin,
-    prune_policy_snapshots,
-    prune_policy_snapshots_beyond,
-)
-from wavelet.transport.queue import (
+from wavelet.transport.rollouts.filesystem import (
     CONSUMED_FILENAME,
     STABLE_BATCH_MARKER,
     get_policy_step_dir,
@@ -73,13 +73,15 @@ def test_forced_resume_reuses_complete_policy_snapshot(tmp_path) -> None:
     )
     future = _stable_policy_dir(policy_root, 6)
 
-    exporter = PolicyExportMixin()
-    exporter.config = config
-    exporter.output_dir = tmp_path
-    exporter.model = object()
-    exporter.tokenizer = object()
-    exporter.world = SimpleNamespace(is_main=True, world_size=1)
-    exporter.offload_after_refit = Mock()
+    trainer = SimpleNamespace(
+        config=config,
+        output_dir=tmp_path,
+        model=object(),
+        tokenizer=object(),
+        world=SimpleNamespace(is_main=True, world_size=1),
+        offload_after_refit=Mock(),
+    )
+    exporter = PolicyExporter(trainer)
 
     assert exporter.export_policy(step=5, force=True) == step_dir
     assert (adapter_dir / "adapter_model.safetensors").read_bytes() == b"weights"
@@ -89,12 +91,14 @@ def test_forced_resume_reuses_complete_policy_snapshot(tmp_path) -> None:
 def test_ordinary_export_does_not_overwrite_stable_policy(tmp_path) -> None:
     config = RLConfig(output_dir=tmp_path)
     _stable_policy_dir(tmp_path / "policies", 1)
-    exporter = PolicyExportMixin()
-    exporter.config = config
-    exporter.output_dir = tmp_path
-    exporter.model = object()
-    exporter.tokenizer = object()
-    exporter.world = SimpleNamespace(is_main=True, world_size=1)
+    trainer = SimpleNamespace(
+        config=config,
+        output_dir=tmp_path,
+        model=object(),
+        tokenizer=object(),
+        world=SimpleNamespace(is_main=True, world_size=1),
+    )
+    exporter = PolicyExporter(trainer)
 
     with pytest.raises(FileExistsError, match="Stable policy step 1"):
         exporter.export_policy(step=1)

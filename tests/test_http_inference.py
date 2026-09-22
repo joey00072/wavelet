@@ -5,7 +5,8 @@ import pytest
 
 from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
-from wavelet.inference.engine import HTTPPolicyInferenceEngine
+from wavelet.inference.client import HTTPEngineAdmin
+from wavelet.inference.vllm.engine import HTTPPolicyInferenceEngine
 
 
 def _record(index: int) -> RLExample:
@@ -36,7 +37,7 @@ def test_openai_rollout_rejects_missing_sampled_token_logprobs() -> None:
 
 def test_round_robin_annotation_restores_input_order() -> None:
     engine = HTTPPolicyInferenceEngine.__new__(HTTPPolicyInferenceEngine)
-    engine.base_urls = ["server-0", "server-1", "server-2"]
+    engine._base_urls = ["server-0", "server-1", "server-2"]
     records = [_record(index) for index in range(7)]
     chunks: dict[str, list[str]] = {}
 
@@ -86,10 +87,10 @@ def test_policy_load_uses_all_server_request_path(
     ) -> list[dict[str, object]]:
         calls.append((method, path, payload))
         if payload is None:
-            return [{"status": path.removeprefix("/")}]
-        return [{"policy_step": payload["step"]}]
+            return {"status": path.removeprefix("/")}
+        return {"policy_step": payload["step"]}
 
-    monkeypatch.setattr(engine, "_request_all", request_all)
+    monkeypatch.setattr(engine.admin[0], "_request", request_all)
 
     engine.load_policy(tmp_path / "policy", step=3)
 
@@ -118,13 +119,13 @@ def test_paused_policy_load_resumes_servers_after_failure(
         _method: str,
         path: str,
         _payload: dict[str, object] | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> dict[str, object]:
         paths.append(path)
         if path == "/load_policy":
             raise RuntimeError("load failed")
-        return [{"status": "ok"}]
+        return {"status": "ok"}
 
-    monkeypatch.setattr(engine, "_request_all", request_all)
+    monkeypatch.setattr(engine.admin[0], "_request", request_all)
 
     with pytest.raises(RuntimeError, match="load failed"):
         engine._load_policy_while_generation_paused(
@@ -149,9 +150,9 @@ def test_full_model_and_native_updates_still_pause(
 
     def request_all(method, path, payload=None):
         calls.append(path)
-        return [{"policy_step": 3}]
+        return {"policy_step": 3}
 
-    monkeypatch.setattr(engine, "_request_all", request_all)
+    monkeypatch.setattr(engine.admin[0], "_request", request_all)
     engine.load_policy(tmp_path / "policy", step=3)
     assert calls == ["/pause", "/load_policy", "/resume"]
 
@@ -166,10 +167,31 @@ def test_hot_swap_failure_does_not_advance_policy(tmp_path, monkeypatch, failure
         paths.append(path)
         if failure == "exception":
             raise RuntimeError("load failed")
-        return [{"policy_step": 3}, {"policy_step": 2}]
+        return {"policy_step": 2}
 
-    monkeypatch.setattr(engine, "_request_all", request_all)
+    monkeypatch.setattr(engine.admin[0], "_request", request_all)
     with pytest.raises(RuntimeError):
         engine.load_policy(tmp_path / "policy", step=3)
     assert engine.policy_step == 2
     assert paths == ["/load_policy"]
+
+
+def test_hot_swap_replica_mismatch_does_not_advance_policy(tmp_path, monkeypatch):
+    engine = HTTPPolicyInferenceEngine(RLConfig(output_dir=tmp_path))
+    engine.policy_step = 2
+    engine._base_urls = ["http://a", "http://b"]
+
+    def _admin(step: int) -> HTTPEngineAdmin:
+        admin = HTTPEngineAdmin("http://replica")
+        monkeypatch.setattr(
+            admin,
+            "_request",
+            lambda method, path, payload=None, step=step: {"policy_step": step},
+        )
+        return admin
+
+    engine.admin = [_admin(3), _admin(2)]
+
+    with pytest.raises(RuntimeError):
+        engine.load_policy(tmp_path / "policy", step=3)
+    assert engine.policy_step == 2

@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import HTTPException
 
 from wavelet.configs.config import RLConfig
-from wavelet.inference import native_server
+from wavelet.inference.vllm import native_server
 
 
 class _FakeEngine:

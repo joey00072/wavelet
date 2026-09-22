@@ -98,9 +98,10 @@ def test_live_trace_cancellation_and_disk_failure_are_safe(tmp_path):
         if not path.name.endswith(".meta.json")
     ]
     assert data[0]["status"] == "cancelled"
-    with patch(
-        "wavelet.orchestrator.live.atomic_json", side_effect=OSError("full")
-    ), live_episode(tmp_path, "fake", "rollout") as episode:
+    with (
+        patch("wavelet.orchestrator.live.atomic_json", side_effect=OSError("full")),
+        live_episode(tmp_path, "fake", "rollout") as episode,
+    ):
         episode.event("prompt", prompt="exact hello")
     assert episode.data["status"] == "completed"
 

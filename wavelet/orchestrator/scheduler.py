@@ -8,7 +8,6 @@ import sys
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from enum import StrEnum
 from pathlib import Path
 from time import perf_counter, sleep
 from typing import Any, ClassVar
@@ -19,6 +18,23 @@ from wavelet.configs.config import (
     RLEvalEnvConfig,
     RLSamplingConfig,
     RLTrainEnvConfig,
+)
+from wavelet.contracts.policy_metadata import policy_metadata
+from wavelet.contracts.schedule import (
+    PublishMode,
+    chunks_per_step,
+    latest_exported_policy_step_at_or_before,
+    policy_step_to_load,
+    required_policy_step,
+    resolve_rollout_schedule,
+    rollout_chunk_examples,
+    rollout_groups_for_chunk,
+    select_due_eval_envs,
+    target_steps,
+)
+from wavelet.contracts.source import (
+    VERIFIER_ROLLOUT_FUNCTION,
+    RolloutSourceKind,
 )
 from wavelet.data.rl import RLExample, load_rl_records
 from wavelet.inference.policy import create_policy_inference_engine
@@ -39,8 +55,8 @@ from wavelet.orchestrator.concurrency import (
 )
 from wavelet.orchestrator.curriculum import Curriculum
 
-# ``wavelet.orchestrator.verifiers`` aliases this module, so a few env helpers
-# are re-exported here for that public path even when unused below.
+# A few environment helpers are re-exported here for the public verifier
+# module even though they are not used directly by this scheduler.
 from wavelet.orchestrator.envs import (
     LiveTraceContext,
     _assign_group_advantages,
@@ -76,29 +92,13 @@ from wavelet.orchestrator.envs import (
 )
 from wavelet.orchestrator.inference_metrics import InferenceMetricsScraper
 from wavelet.orchestrator.periodic_logger import PeriodicLogger, pipeline_status
-from wavelet.orchestrator.policy_metadata import policy_metadata
 from wavelet.orchestrator.rollouts import (
     RLOrchestrator,
     _count_nonempty_lines,
     _reusable_rollout_batch,
 )
-from wavelet.orchestrator.schedule import (
-    chunks_per_step,
-    latest_exported_policy_step_at_or_before,
-    policy_step_to_load,
-    required_policy_step,
-    rollout_chunk_examples,
-    rollout_groups_for_chunk,
-    select_due_eval_envs,
-    target_steps,
-)
-from wavelet.orchestrator.sources import (
-    VERIFIER_ROLLOUT_FUNCTION,
-    RolloutSourceKind,
-    source_kind,
-)
 from wavelet.orchestrator.state_server import OrchestratorRunState, maybe_state_server
-from wavelet.transport.queue import (
+from wavelet.transport.rollouts.filesystem import (
     FileSystemPolicyReceiver,
     FileSystemRolloutSender,
     QueueEvent,
@@ -113,26 +113,6 @@ from wavelet.utils.config import load_config
 from wavelet.utils.pathing import resolve_resume_checkpoint_source
 
 logger = logging.getLogger(__name__)
-
-
-class PublishMode(StrEnum):
-    BATCH = "batch"
-    STREAMING = "streaming"
-
-
-@dataclass(frozen=True)
-class RolloutSchedule:
-    """Explicit scheduler parameters derived from legacy-compatible config."""
-
-    source: RolloutSourceKind
-    max_async_level: int
-    chunk_examples: int
-    publish_mode: PublishMode
-    max_pending_chunks: int | None
-
-    @property
-    def is_sync(self) -> bool:
-        return self.max_async_level == 0
 
 
 @dataclass(slots=True)
@@ -153,27 +133,6 @@ class IntegratedRolloutScheduler:
             self.publish(step)
             self.consume_and_train()
             self.after_step()
-
-
-def resolve_rollout_schedule(config: RLConfig) -> RolloutSchedule:
-    source = source_kind(config.orchestrator.custom_rollout_function)
-    streaming = (
-        config.launcher.mode == "process"
-        and config.orchestrator.max_async_level > 0
-        and source in {RolloutSourceKind.NATIVE, RolloutSourceKind.VERIFIER}
-        and (
-            source is RolloutSourceKind.VERIFIER
-            or config.orchestrator.examples_per_step is not None
-            or config.orchestrator.token_batch_size is not None
-        )
-    )
-    return RolloutSchedule(
-        source=source,
-        max_async_level=config.orchestrator.max_async_level,
-        chunk_examples=rollout_chunk_examples(config),
-        publish_mode=PublishMode.STREAMING if streaming else PublishMode.BATCH,
-        max_pending_chunks=config.orchestrator.max_pending_rollout_chunks,
-    )
 
 
 def _resume_optimizer_step(config: RLConfig) -> int:

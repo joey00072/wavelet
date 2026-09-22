@@ -1,0 +1,1270 @@
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import os
+import re
+import sys
+import uuid
+from argparse import Namespace
+from http import HTTPStatus
+from logging import CRITICAL
+from pathlib import Path
+from typing import Any
+
+import uvloop
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import Field
+from starlette.datastructures import State
+
+from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.generate.base.serving import (
+    GenerateBaseServing as OpenAIServing,
+)
+from vllm.entrypoints.openai.api_server import init_app_state
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+)
+from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+from vllm.entrypoints.openai.cli_args import (
+    make_arg_parser,
+    validate_parsed_serve_args,
+)
+from vllm.entrypoints.openai.engine.protocol import (
+    ErrorResponse,
+    GenerationError,
+    RequestResponseMetadata,
+)
+from vllm.entrypoints.openai.models.serving import (
+    OpenAIServingModels,
+    create_error_response,
+)
+from vllm.entrypoints.serve.lora.protocol import LoadLoRAAdapterRequest
+from vllm.entrypoints.serve.utils.api_utils import (
+    get_max_tokens,
+    load_aware_call,
+    validate_json_request,
+    with_cancellation,
+)
+from vllm.exceptions import VLLMValidationError
+from vllm.sampling_params import BeamSearchParams, SamplingParams
+from vllm.utils.argparse_utils import FlexibleArgumentParser
+from wavelet.configs.config import RLConfig
+from wavelet.debug import inference_debug_state
+from wavelet.monitor import emit_perf
+from wavelet.utils.config import load_config
+
+_CONFIG: RLConfig | None = None
+router = APIRouter()
+CONTEXT_FIT_SAFETY_TOKENS = 16
+
+MODEL_TOOL_CALL_PARSER: dict[str, str] = {
+    "zai-org/GLM-4.5": "glm45",
+    "zai-org/GLM-4.5-FP8": "glm45",
+    "zai-org/GLM-4.5-Base": "glm45",
+    "zai-org/GLM-4.5-Air": "glm45",
+    "zai-org/GLM-4.5-Air-FP8": "glm45",
+    "zai-org/GLM-4.5-Air-Base": "glm45",
+    "zai-org/GLM-4.5V": "glm45",
+    "zai-org/GLM-4.5V-FP8": "glm45",
+    "zai-org/GLM-4.7": "glm47",
+    "zai-org/GLM-4.7-FP8": "glm47",
+    "zai-org/GLM-4.7-Flash": "glm47",
+    "zai-org/GLM-5": "glm47",
+    "zai-org/GLM-5-FP8": "glm47",
+    "zai-org/GLM-5.1": "glm47",
+    "zai-org/GLM-5.1-FP8": "glm47",
+    "MiniMaxAI/MiniMax-M2": "minimax_m2",
+    "MiniMaxAI/MiniMax-M2.1": "minimax_m2",
+    "MiniMaxAI/MiniMax-M2.5": "minimax_m2",
+    "PrimeIntellect/INTELLECT-3": "hermes",
+    "PrimeIntellect/INTELLECT-3-FP8": "hermes",
+    "PrimeIntellect/INTELLECT-3.1": "hermes",
+    "Qwen/Qwen3-0.6B": "hermes",
+    "Qwen/Qwen3-0.6B-Base": "hermes",
+    "Qwen/Qwen3-0.6B-FP8": "hermes",
+    "Qwen/Qwen3-1.7B": "hermes",
+    "Qwen/Qwen3-1.7B-Base": "hermes",
+    "Qwen/Qwen3-1.7B-FP8": "hermes",
+    "Qwen/Qwen3-4B": "hermes",
+    "Qwen/Qwen3-4B-Base": "hermes",
+    "Qwen/Qwen3-4B-FP8": "hermes",
+    "Qwen/Qwen3-8B": "hermes",
+    "Qwen/Qwen3-8B-Base": "hermes",
+    "Qwen/Qwen3-8B-FP8": "hermes",
+    "Qwen/Qwen3-14B": "hermes",
+    "Qwen/Qwen3-14B-Base": "hermes",
+    "Qwen/Qwen3-14B-FP8": "hermes",
+    "Qwen/Qwen3-32B": "hermes",
+    "Qwen/Qwen3-32B-FP8": "hermes",
+    "Qwen/Qwen3-30B-A3B": "hermes",
+    "Qwen/Qwen3-30B-A3B-Base": "hermes",
+    "Qwen/Qwen3-30B-A3B-FP8": "hermes",
+    "Qwen/Qwen3-235B-A22B": "hermes",
+    "Qwen/Qwen3-235B-A22B-FP8": "hermes",
+    "Qwen/Qwen3-4B-Instruct-2507": "hermes",
+    "Qwen/Qwen3-4B-Thinking-2507": "hermes",
+    "Qwen/Qwen3-4B-Instruct-2507-FP8": "hermes",
+    "Qwen/Qwen3-4B-Thinking-2507-FP8": "hermes",
+    "Qwen/Qwen3-30B-A3B-Instruct-2507": "hermes",
+    "Qwen/Qwen3-30B-A3B-Thinking-2507": "hermes",
+    "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8": "hermes",
+    "Qwen/Qwen3-30B-A3B-Thinking-2507-FP8": "hermes",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507": "hermes",
+    "Qwen/Qwen3-235B-A22B-Thinking-2507": "hermes",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8": "hermes",
+    "Qwen/Qwen3-235B-A22B-Thinking-2507-FP8": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Instruct": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Thinking": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8": "hermes",
+    "Qwen/Qwen3-Next-80B-A3B-Thinking-FP8": "hermes",
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct": "hermes",
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8": "hermes",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct": "hermes",
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8": "hermes",
+    "Qwen/Qwen3-Coder-Next": "hermes",
+    "Qwen/Qwen3-Coder-Next-Base": "hermes",
+    "Qwen/Qwen3-Coder-Next-FP8": "hermes",
+    "Qwen/Qwen3.5-0.8B": "qwen3_coder",
+    "Qwen/Qwen3.5-0.8B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-2B": "qwen3_coder",
+    "Qwen/Qwen3.5-2B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-4B": "qwen3_coder",
+    "Qwen/Qwen3.5-4B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-9B": "qwen3_coder",
+    "Qwen/Qwen3.5-9B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-27B": "qwen3_coder",
+    "Qwen/Qwen3.5-27B-FP8": "qwen3_coder",
+    "Qwen/Qwen3.5-35B-A3B": "qwen3_coder",
+    "Qwen/Qwen3.5-35B-A3B-Base": "qwen3_coder",
+    "Qwen/Qwen3.5-35B-A3B-FP8": "qwen3_coder",
+    "Qwen/Qwen3.5-122B-A10B": "qwen3_coder",
+    "Qwen/Qwen3.5-122B-A10B-FP8": "qwen3_coder",
+    "Qwen/Qwen3.5-397B-A17B": "qwen3_coder",
+    "Qwen/Qwen3.5-397B-A17B-FP8": "qwen3_coder",
+    "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16": "qwen3_coder",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": "qwen3_coder",
+}
+
+MODEL_REASONING_PARSER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^zai-org/GLM-"), "glm45"),
+    (re.compile(r"^MiniMaxAI/MiniMax-M2"), "minimax_m2_append_think"),
+    (re.compile(r"^PrimeIntellect/INTELLECT-3"), "deepseek_r1"),
+    (re.compile(r"^nvidia/NVIDIA-Nemotron-3-Super"), "nemotron_v3"),
+    (re.compile(r"^Qwen/Qwen3-.*Thinking"), "deepseek_r1"),
+    (re.compile(r"^Qwen/Qwen3\.(5|6|8)-"), "qwen3"),
+)
+
+
+def _resolve_tool_call_parser(
+    model_name: str, tool_call_parser: str | None
+) -> str | None:
+    if tool_call_parser == "auto":
+        return MODEL_TOOL_CALL_PARSER.get(model_name)
+    return tool_call_parser
+
+
+def _resolve_reasoning_parser(
+    model_name: str,
+    reasoning_parser: str | None,
+) -> str | None:
+    if reasoning_parser != "auto":
+        return reasoning_parser
+    for pattern, parser_name in MODEL_REASONING_PARSER_PATTERNS:
+        if pattern.search(model_name):
+            return parser_name
+    return None
+
+
+class ChatCompletionRequestWithTokens(ChatCompletionRequest):
+    tokens: list[int] = Field(description="Prompt tokens to use for the request.")
+
+
+class OpenAIServingChatWithTokens(OpenAIServingChat):
+    async def _with_context_fit(self, request, attempt):
+        """Retry ``attempt`` with a context-fitted request when vLLM rejects it."""
+        for _ in range(4):
+            try:
+                return await attempt(request)
+            except VLLMValidationError as exc:
+                fitted_request = _fit_chat_request_to_context(
+                    request,
+                    max_model_len=self.model_config.max_model_len,
+                    error=exc,
+                )
+                if fitted_request is request:
+                    raise
+                request = fitted_request
+        return await attempt(request)
+
+    async def create_chat_completion(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None = None,
+    ):
+        create = super().create_chat_completion
+        return await self._with_context_fit(
+            request, lambda fitted: create(fitted, raw_request)
+        )
+
+    async def _render_with_context_fit(
+        self,
+        request: ChatCompletionRequestWithTokens,
+    ):
+        async def render(fitted: ChatCompletionRequestWithTokens):
+            return fitted, await self.render_chat_request(fitted)
+
+        return await self._with_context_fit(request, render)
+
+    def _output_parser(self, request, tokenizer) -> tuple[Any | None, dict]:
+        chat_template_kwargs = self._effective_chat_template_kwargs(request)
+        parser = (
+            None
+            if self.parser_cls is None
+            else self.parser_cls(
+                tokenizer,
+                request.tools,
+                chat_template_kwargs=chat_template_kwargs,
+                model_config=self.model_config,
+            )
+        )
+        return parser, chat_template_kwargs
+
+    def _reasoning_ended(
+        self,
+        request,
+        parser,
+        prompt_token_ids: list[int],
+    ) -> bool | None:
+        if not request.include_reasoning or request._grammar_from_parser:
+            return True
+        if parser is None or parser.reasoning_parser is None:
+            return None
+        return parser.is_reasoning_end(prompt_token_ids)
+
+    async def _token_generators(
+        self,
+        request: ChatCompletionRequestWithTokens,
+        engine_prompts,
+        *,
+        request_id: str,
+        raw_request: Request | None,
+        lora_request,
+        output_parser,
+        chat_template_kwargs: dict,
+    ) -> list[Any]:
+        data_parallel_rank = self._get_data_parallel_rank(raw_request)
+        generators = []
+        for index, engine_prompt in enumerate(engine_prompts):
+            prompt_token_ids = self._extract_prompt_components(engine_prompt).token_ids
+            sub_request_id = (
+                request_id if len(engine_prompts) == 1 else f"{request_id}_{index}"
+            )
+            prompt_len = self._extract_prompt_len(engine_prompt)
+            max_model_len = self.model_config.max_model_len
+            if prompt_len >= max_model_len:
+                raise VLLMValidationError(
+                    f"This model's maximum context length is {max_model_len} tokens. "
+                    f"However, your request has {prompt_len} input tokens.",
+                    parameter="input_tokens",
+                    value=prompt_len,
+                )
+            max_tokens = get_max_tokens(
+                max_model_len,
+                request.max_completion_tokens
+                if request.max_completion_tokens is not None
+                else request.max_tokens,
+                prompt_len,
+                self.default_sampling_params,
+                self.override_max_tokens,
+                truncate_prompt_tokens=request.truncate_prompt_tokens,
+            )
+            if request.use_beam_search:
+                sampling_params: SamplingParams | BeamSearchParams = (
+                    request.to_beam_search_params(
+                        max_tokens,
+                        self.default_sampling_params,
+                    )
+                )
+            else:
+                sampling_params = request.to_sampling_params(
+                    max_tokens,
+                    self.default_sampling_params,
+                )
+            self._log_inputs(
+                sub_request_id,
+                engine_prompt,
+                params=sampling_params,
+                lora_request=lora_request,
+            )
+            trace_headers = (
+                None
+                if raw_request is None
+                else await self._get_trace_headers(raw_request.headers)
+            )
+            if isinstance(sampling_params, BeamSearchParams):
+                generator = self.beam_search(
+                    prompt=engine_prompt,
+                    request_id=sub_request_id,
+                    params=sampling_params,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    session_id=self._get_session_id(request, raw_request),
+                )
+            else:
+                reasoning_ended = self._reasoning_ended(
+                    request,
+                    output_parser,
+                    prompt_token_ids or [],
+                )
+                generator = self.engine_client.generate(
+                    engine_prompt,
+                    sampling_params,
+                    sub_request_id,
+                    lora_request=lora_request,
+                    trace_headers=trace_headers,
+                    priority=self._get_priority(request, raw_request),
+                    data_parallel_rank=data_parallel_rank,
+                    session_id=self._get_session_id(request, raw_request),
+                    reasoning_ended=reasoning_ended,
+                    reasoning_parser_kwargs={
+                        "chat_template_kwargs": chat_template_kwargs,
+                    }
+                    if output_parser is not None
+                    and output_parser.reasoning_parser is not None
+                    else None,
+                )
+            generators.append(generator)
+        return generators
+
+    async def _finish_token_completion(
+        self,
+        request,
+        result_generator,
+        request_id,
+        model_name,
+        conversation,
+        tokenizer,
+        request_metadata,
+        output_parser,
+        chat_template_kwargs,
+        mm_token_counts,
+    ):
+        if request.stream:
+            return self.chat_completion_stream_generator(
+                request,
+                result_generator,
+                request_id,
+                model_name,
+                conversation,
+                tokenizer,
+                request_metadata,
+                chat_template_kwargs=chat_template_kwargs,
+                mm_token_counts=mm_token_counts,
+            )
+        try:
+            final_output = None
+
+            async def capture_output():
+                nonlocal final_output
+                async for output in result_generator:
+                    final_output = output
+                    yield output
+
+            response = await self.chat_completion_full_generator(
+                request,
+                capture_output(),
+                request_id,
+                model_name,
+                conversation,
+                tokenizer,
+                request_metadata,
+                parser=output_parser,
+                mm_token_counts=mm_token_counts,
+            )
+            if isinstance(response, ErrorResponse) or final_output is None:
+                return response
+            choices = response.model_dump(mode="json").get("choices", [])
+            for choice, output in zip(choices, final_output.outputs, strict=False):
+                sampling_mask = getattr(output, "sampling_mask", None)
+                sampling_mask = getattr(sampling_mask, "token_ids", sampling_mask)
+                if sampling_mask is not None:
+                    choice["sampling_mask"] = [list(row) for row in sampling_mask]
+            if not any("sampling_mask" in choice for choice in choices):
+                return response
+            payload = response.model_dump(mode="json")
+            payload["choices"] = choices
+            return JSONResponse(content=payload)
+        except GenerationError:
+            raise
+        except ValueError as exc:
+            return self.create_error_response(exc)
+
+    async def create_chat_completion_with_tokens(
+        self,
+        request: ChatCompletionRequestWithTokens,
+        raw_request: Request | None = None,
+    ):
+        request = _fit_chat_request_to_prompt_tokens(
+            request,
+            max_model_len=self.model_config.max_model_len,
+            prompt_tokens=len(request.tokens),
+        )
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+        try:
+            output_parser, chat_template_kwargs = self._output_parser(
+                request,
+                tokenizer,
+            )
+        except RuntimeError as exc:
+            return self.create_error_response(str(exc))
+
+        request, rendered = await self._render_with_context_fit(request)
+        if isinstance(rendered, ErrorResponse):
+            return rendered
+        conversation, engine_prompts = rendered
+        engine_prompts[0]["prompt_token_ids"] = request.tokens
+        mm_token_counts = {
+            modality: sum(placeholder.length for placeholder in placeholders)
+            for modality, placeholders in engine_prompts[0]
+            .get("mm_placeholders", {})
+            .items()
+        }
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        request_metadata = RequestResponseMetadata(request_id=request_id)
+        if raw_request:
+            raw_request.state.request_metadata = request_metadata
+
+        try:
+            lora_request = self._maybe_get_adapters(
+                request,
+                supports_default_mm_loras=True,
+            )
+            model_name = self.models.model_name(lora_request)
+        except (ValueError, TypeError, RuntimeError) as exc:
+            return self.create_error_response(exc)
+
+        try:
+            generators = await self._token_generators(
+                request,
+                engine_prompts,
+                request_id=request_id,
+                raw_request=raw_request,
+                lora_request=lora_request,
+                output_parser=output_parser,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        except ValueError as exc:
+            return self.create_error_response(exc)
+
+        assert len(generators) == 1
+        (result_generator,) = generators
+        return await self._finish_token_completion(
+            request,
+            result_generator,
+            request_id,
+            model_name,
+            conversation,
+            tokenizer,
+            request_metadata,
+            output_parser,
+            chat_template_kwargs,
+            mm_token_counts,
+        )
+
+
+def _fit_chat_request_to_context(
+    request: ChatCompletionRequest,
+    *,
+    max_model_len: int,
+    error: VLLMValidationError,
+) -> ChatCompletionRequest:
+    prompt_tokens = _prompt_tokens_from_validation_error(error)
+    if prompt_tokens is None or prompt_tokens >= max_model_len:
+        return request
+    return _fit_chat_request_to_prompt_tokens(
+        request,
+        max_model_len=max_model_len,
+        prompt_tokens=prompt_tokens,
+    )
+
+
+def _fit_chat_request_to_prompt_tokens(
+    request: ChatCompletionRequest,
+    *,
+    max_model_len: int,
+    prompt_tokens: int,
+) -> ChatCompletionRequest:
+    remaining_tokens = max(
+        max_model_len - prompt_tokens - CONTEXT_FIT_SAFETY_TOKENS,
+        1,
+    )
+    requested_tokens = (
+        request.max_completion_tokens
+        if request.max_completion_tokens is not None
+        else request.max_tokens
+    )
+    if requested_tokens is None or requested_tokens <= remaining_tokens:
+        return request
+
+    updates: dict[str, Any] = {}
+    if request.max_completion_tokens is not None:
+        updates["max_completion_tokens"] = remaining_tokens
+    elif request.max_tokens is not None:
+        updates["max_tokens"] = remaining_tokens
+    emit_perf(
+        "fit_chat_context",
+        prompt_tokens=prompt_tokens,
+        requested_tokens=requested_tokens,
+        max_model_len=max_model_len,
+        fitted_tokens=remaining_tokens,
+    )
+    return request.model_copy(update=updates)
+
+
+def _prompt_tokens_from_validation_error(error: VLLMValidationError) -> int | None:
+    value = getattr(error, "value", None)
+    if isinstance(value, int):
+        return value
+    match = re.search(r"prompt contains at least (\d+) input tokens", str(error))
+    if match is None:
+        match = re.search(r"request has (\d+) input tokens", str(error))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _require_config() -> RLConfig:
+    if _CONFIG is None:
+        raise RuntimeError("Wavelet vLLM OpenAI server config was not initialized.")
+    return _CONFIG
+
+
+def _tokenization_serving(request: Request) -> OpenAIServing:
+    return request.app.state.openai_serving_tokenization
+
+
+def _models(request: Request) -> OpenAIServingModels:
+    return request.app.state.openai_serving_models
+
+
+def _engine_client(request: Request) -> EngineClient:
+    return request.app.state.engine_client
+
+
+def _chat_with_tokens(request: Request) -> OpenAIServingChatWithTokens | None:
+    return request.app.state.openai_serving_chat_with_tokens
+
+
+def _patch_load_lora_adapter() -> None:
+    async def patched_load_lora_adapter(
+        self: OpenAIServingModels,
+        request: LoadLoRAAdapterRequest,
+        base_model_name: str | None = None,
+    ) -> ErrorResponse | str:
+        lora_name = request.lora_name
+        async with self.lora_resolver_lock[lora_name]:
+            from vllm.lora.request import LoRARequest
+
+            # Keep the adapter id stable across snapshots so the worker cache
+            # swaps weights in place, but only publish the new request after
+            # the engine accepted it; a failed load must not poison generation.
+            existing = self.lora_requests.get(lora_name)
+            lora_request = LoRARequest(
+                lora_name=lora_name,
+                lora_int_id=(
+                    existing.lora_int_id
+                    if existing is not None
+                    else self.lora_id_counter.inc(1)
+                ),
+                lora_path=request.lora_path,
+                load_inplace=request.load_inplace,
+            )
+            if base_model_name is not None and self.is_base_model(base_model_name):
+                lora_request.base_model_name = base_model_name
+            try:
+                await self.engine_client.add_lora(lora_request)
+            except Exception as exc:  # noqa: BLE001 - translate vLLM failures to HTTP
+                error_type = "BadRequestError"
+                status_code = HTTPStatus.BAD_REQUEST
+                if "No adapter found" in str(exc):
+                    error_type = "NotFoundError"
+                    status_code = HTTPStatus.NOT_FOUND
+                return create_error_response(
+                    message=str(exc),
+                    err_type=error_type,
+                    status_code=status_code,
+                )
+            self.lora_requests[lora_name] = lora_request
+            return f"Success: LoRA adapter '{lora_name}' added successfully."
+
+    OpenAIServingModels.load_lora_adapter = patched_load_lora_adapter
+
+
+def _patch_lora_cpu_pin_memory() -> None:
+    from vllm.lora import lora_model, lora_weights, model_manager
+
+    def pin_memory_unavailable() -> bool:
+        return False
+
+    for module in (lora_model, lora_weights, model_manager):
+        if hasattr(module, "is_pin_memory_available"):
+            module.is_pin_memory_available = pin_memory_unavailable
+        if hasattr(module, "PIN_MEMORY"):
+            module.PIN_MEMORY = False
+
+
+def _patch_noisy_tool_parser_errors() -> None:
+    try:
+        from vllm.tool_parsers import hermes_tool_parser
+    except ImportError:
+        return
+
+    hermes_tool_parser.logger.setLevel(CRITICAL)
+
+
+def _patch_skip_lora_module_warnings() -> None:
+    from vllm.exceptions import LoRAAdapterNotFoundError
+    from vllm.lora.lora_model import LoRAModel
+    from vllm.lora.peft_helper import PEFTHelper
+    from vllm.lora.request import LoRARequest
+    from vllm.lora.utils import get_adapter_absolute_path
+    from vllm.lora.worker_manager import WorkerLoRAManager
+
+    if "moe_ep_spec" in inspect.signature(LoRAModel.from_local_checkpoint).parameters:
+        return
+
+    def patched_load_adapter(
+        self: WorkerLoRAManager,
+        lora_request: LoRARequest,
+    ) -> LoRAModel:
+        try:
+            supported_lora_modules = self._adapter_manager.supported_lora_modules
+            packed_modules_mapping = self._adapter_manager.packed_modules_mapping
+            expected_lora_list: list[str] = []
+            for module in supported_lora_modules:
+                if module in packed_modules_mapping:
+                    expected_lora_list.extend(packed_modules_mapping[module])
+                else:
+                    expected_lora_list.append(module)
+                if module == "experts":
+                    expected_lora_list.append(module)
+            expected_lora_modules = set(expected_lora_list)
+            lora_path = get_adapter_absolute_path(lora_request.lora_path)
+
+            peft_helper = PEFTHelper.from_local_dir(
+                lora_path,
+                self.max_position_embeddings,
+                lora_request.tensorizer_config_dict,
+            )
+            peft_helper.validate_legal(self.lora_config)
+
+            model = self._adapter_manager.model
+            weights_mapper = getattr(model, "hf_to_vllm_mapper", None)
+            skip_prefixes = getattr(model, "lora_skip_prefixes", None)
+
+            return self._lora_model_cls.from_local_checkpoint(
+                lora_path,
+                expected_lora_modules,
+                peft_helper=peft_helper,
+                lora_model_id=lora_request.lora_int_id,
+                device="cpu",
+                dtype=self.lora_config.lora_dtype,
+                model_vocab_size=self.vocab_size,
+                tensorizer_config_dict=lora_request.tensorizer_config_dict,
+                weights_mapper=weights_mapper,
+                skip_prefixes=skip_prefixes,
+            )
+        except FileNotFoundError as exc:
+            raise LoRAAdapterNotFoundError(
+                lora_request.lora_name,
+                lora_request.lora_path,
+            ) from exc
+
+    WorkerLoRAManager._load_adapter = patched_load_adapter
+
+
+@router.get("/health")
+async def health(request: Request) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "policy_step": getattr(request.app.state, "policy_step", None),
+        "asleep": getattr(request.app.state, "asleep", False),
+    }
+
+
+@router.get("/liveness", response_model=None)
+async def liveness(request: Request) -> dict[str, str] | JSONResponse:
+    """Check that every vLLM worker can service a no-op RPC."""
+    config = _require_config()
+    try:
+        await asyncio.wait_for(
+            _engine_client(request).collective_rpc("liveness_probe"),
+            timeout=config.inference.http.liveness_timeout_seconds,
+        )
+    except TimeoutError:
+        return JSONResponse(
+            {"status": "engine_unresponsive"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    return {"status": "ok"}
+
+
+@router.get("/debug/state")
+async def debug_state(request: Request) -> dict[str, Any]:
+    state = inference_debug_state(_require_config())
+    state["runtime"] = {
+        "policy_step": getattr(request.app.state, "policy_step", None),
+        "policy_adapter_name": getattr(request.app.state, "policy_adapter_name", None),
+        "policy_adapter_path": getattr(request.app.state, "policy_adapter_path", None),
+        "policy_weight_path": getattr(request.app.state, "policy_weight_path", None),
+        "generation_paused": getattr(request.app.state, "generation_paused", False),
+        "asleep": getattr(request.app.state, "asleep", False),
+    }
+    return state
+
+
+async def _set_generation_paused(
+    raw_request: Request, *, paused: bool
+) -> dict[str, str]:
+    client = _engine_client(raw_request)
+    method = "pause_generation" if paused else "resume_generation"
+    if not hasattr(client, method):
+        raise RuntimeError(
+            "This vLLM engine does not support safe policy updates because "
+            f"{method} is unavailable."
+        )
+    if paused:
+        await client.pause_generation(mode="keep", clear_cache=False)
+    else:
+        await client.resume_generation()
+    raw_request.app.state.generation_paused = paused
+    return {"status": "paused" if paused else "resumed"}
+
+
+@router.post("/pause")
+async def pause(raw_request: Request) -> dict[str, str]:
+    """Drain active requests and hold new generation during a policy update."""
+    return await _set_generation_paused(raw_request, paused=True)
+
+
+@router.post("/resume")
+async def resume(raw_request: Request) -> dict[str, str]:
+    """Allow generation after a policy update transaction."""
+    return await _set_generation_paused(raw_request, paused=False)
+
+
+@router.post("/sleep")
+async def sleep(payload: dict[str, Any], raw_request: Request) -> dict[str, Any]:
+    level = int(payload.get("level", 1))
+    client = _engine_client(raw_request)
+    if hasattr(client, "reset_prefix_cache"):
+        await client.reset_prefix_cache()
+    if hasattr(client, "reset_mm_cache"):
+        await client.reset_mm_cache()
+    if hasattr(client, "sleep"):
+        await client.sleep(level=level)
+        status = "slept"
+    elif hasattr(client, "pause_generation"):
+        await client.pause_generation(mode="keep", clear_cache=True)
+        status = "paused"
+    else:
+        try:
+            await client.collective_rpc("sleep", kwargs={"level": level})
+        except TypeError:
+            await client.collective_rpc("sleep", args=())
+        status = "slept"
+    raw_request.app.state.asleep = True
+    return {"status": status}
+
+
+@router.post("/wake")
+async def wake(payload: dict[str, Any], raw_request: Request) -> dict[str, Any]:
+    tags = payload.get("tags")
+    kwargs = {"tags": tags} if tags is not None else {}
+    client = _engine_client(raw_request)
+    if hasattr(client, "wake_up"):
+        await client.wake_up(**kwargs)
+        status = "woke"
+    elif hasattr(client, "resume_generation"):
+        await client.resume_generation()
+        status = "resumed"
+    else:
+        try:
+            await client.collective_rpc("wake_up", kwargs=kwargs)
+        except TypeError:
+            await client.collective_rpc("wake_up", args=())
+        status = "woke"
+    raw_request.app.state.asleep = False
+    return {"status": status}
+
+
+@router.post("/load_policy")
+async def load_policy(payload: dict[str, Any], raw_request: Request):
+    config = _require_config()
+    policy_dir = Path(payload["policy_dir"])
+    step = int(payload["step"])
+    if config.lora is None:
+        return await _load_full_model_policy(
+            raw_request,
+            policy_dir=policy_dir,
+            step=step,
+            config=config,
+        )
+    return await _load_adapter_policy(
+        raw_request,
+        policy_dir=policy_dir,
+        step=step,
+        load_inplace=bool(payload.get("load_inplace", False)),
+        config=config,
+    )
+
+
+async def _load_full_model_policy(
+    raw_request: Request,
+    *,
+    policy_dir: Path,
+    step: int,
+    config: RLConfig,
+) -> dict[str, Any]:
+    weight_dir = policy_dir
+    if config.policy_transfer.type != "nccl" and (policy_dir / "model").exists():
+        weight_dir = policy_dir / "model"
+    weight_path = str(weight_dir.resolve())
+    response = {"status": "ok", "policy_step": step, "weight_path": weight_path}
+    unchanged = (
+        getattr(raw_request.app.state, "policy_step", None) == step
+        and getattr(raw_request.app.state, "policy_weight_path", None) == weight_path
+    )
+    if (step != 0 or config.policy_transfer.type == "nccl") and not unchanged:
+        client = _engine_client(raw_request)
+        if config.policy_transfer.type == "nccl":
+            await client.collective_rpc(
+                "init_broadcaster",
+                args=(
+                    config.policy_transfer.nccl_host,
+                    config.policy_transfer.nccl_port,
+                    config.policy_transfer.nccl_rank_offset,
+                    config.policy_transfer.nccl_inference_world_size,
+                    config.policy_transfer.nccl_timeout_seconds,
+                ),
+            )
+        await client.collective_rpc("update_weights_from_path", args=(weight_path,))
+    raw_request.app.state.policy_step = step
+    raw_request.app.state.policy_weight_path = weight_path
+    return response
+
+
+async def _load_adapter_policy(
+    raw_request: Request,
+    *,
+    policy_dir: Path,
+    step: int,
+    load_inplace: bool,
+    config: RLConfig,
+):
+    adapter_name = config.policy_transfer.adapter_name
+    adapter_dir = policy_dir / "adapter"
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"Policy adapter not found at {adapter_dir}.")
+
+    models = _models(raw_request)
+    adapter_path = str(adapter_dir.resolve())
+    response = {"status": "ok", "policy_step": step, "adapter_name": adapter_name}
+    if (
+        getattr(raw_request.app.state, "policy_step", None) == step
+        and getattr(raw_request.app.state, "policy_adapter_name", None) == adapter_name
+        and getattr(raw_request.app.state, "policy_adapter_path", None) == adapter_path
+    ):
+        _reset_load_inplace(models, adapter_name)
+        return response
+    try:
+        result = await models.load_lora_adapter(
+            LoadLoRAAdapterRequest(
+                lora_name=adapter_name,
+                lora_path=adapter_path,
+                load_inplace=load_inplace,
+            )
+        )
+    finally:
+        _reset_load_inplace(models, adapter_name)
+    if isinstance(result, ErrorResponse):
+        return JSONResponse(
+            content=result.model_dump(),
+            status_code=result.error.code,
+        )
+    raw_request.app.state.policy_step = step
+    raw_request.app.state.policy_adapter_name = adapter_name
+    raw_request.app.state.policy_adapter_path = adapter_path
+    return response
+
+
+def _reset_load_inplace(models: OpenAIServingModels, adapter_name: str) -> None:
+    """Stop a sticky load_inplace flag from forcing reloads on later requests."""
+    stored = models.lora_requests.get(adapter_name)
+    if stored is not None:
+        stored.load_inplace = False
+
+
+@router.post("/init_broadcaster")
+async def init_broadcaster(payload: dict[str, Any], raw_request: Request):
+    transfer = _require_config().policy_transfer
+    init_info = payload.get("init_info", payload)
+    await _engine_client(raw_request).collective_rpc(
+        "init_broadcaster",
+        args=(
+            init_info.get("host", transfer.nccl_host),
+            *(
+                int(init_info.get(key, default))
+                for key, default in (
+                    ("port", transfer.nccl_port),
+                    ("rank_offset", transfer.nccl_rank_offset),
+                    ("inference_world_size", transfer.nccl_inference_world_size),
+                    ("timeout", transfer.nccl_timeout_seconds),
+                )
+            ),
+        ),
+    )
+    return {"status": "ok"}
+
+
+def _scored_prompt_logprobs(
+    rows: object,
+    token_ids: list[int],
+) -> list[float]:
+    if rows is None:
+        raise ValueError("vLLM scoring output omitted prompt_logprobs.")
+    entries = list(rows)
+    if len(entries) != len(token_ids):
+        raise ValueError(
+            "vLLM prompt logprobs do not align with scored token ids "
+            f"({len(entries)} != {len(token_ids)})."
+        )
+    values = [0.0]
+    for token_id, entry in zip(token_ids[1:], entries[1:], strict=True):
+        if not isinstance(entry, dict):
+            raise TypeError(f"Missing prompt logprob for token id {token_id}.")
+        candidate = entry.get(token_id, entry.get(str(token_id)))
+        if candidate is None:
+            raise ValueError(f"Missing prompt logprob for token id {token_id}.")
+        if hasattr(candidate, "logprob"):
+            candidate = candidate.logprob
+        elif isinstance(candidate, dict):
+            candidate = candidate.get("logprob")
+        if candidate is None:
+            raise ValueError(f"Missing prompt logprob value for token id {token_id}.")
+        values.append(float(candidate))
+    return values
+
+
+@router.post("/score")
+async def score_prompt(payload: dict[str, Any], raw_request: Request):
+    """Return temperature-one prefill logprobs for a fixed token sequence."""
+    token_ids = payload.get("token_ids")
+    if (
+        not isinstance(token_ids, list)
+        or len(token_ids) < 2
+        or any(not isinstance(token_id, int) for token_id in token_ids)
+    ):
+        raise HTTPException(status_code=400, detail="token_ids must contain integers.")
+    model = str(payload.get("model") or "")
+    allowed_models = {_CONFIG.model.name} if _CONFIG is not None else set()
+    adapter_name = getattr(raw_request.app.state, "policy_adapter_name", None)
+    if isinstance(adapter_name, str):
+        allowed_models.add(adapter_name)
+    if model not in allowed_models:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {model!r} is not served by this process.",
+        )
+
+    lora_request = None
+    adapter_path = getattr(raw_request.app.state, "policy_adapter_path", None)
+    if model == adapter_name and isinstance(adapter_path, str):
+        if _CONFIG is None:
+            raise RuntimeError("Wavelet vLLM server config was not initialized.")
+        from vllm.lora.request import LoRARequest
+
+        lora_request = LoRARequest(
+            adapter_name,
+            _CONFIG.policy_transfer.adapter_id,
+            adapter_path,
+        )
+    params = SamplingParams(
+        max_tokens=1,
+        temperature=1.0,
+        top_p=1.0,
+        prompt_logprobs=1,
+    )
+    output = None
+    generator = _engine_client(raw_request).generate(
+        {"prompt_token_ids": token_ids},
+        params,
+        f"score-{uuid.uuid4().hex}",
+        lora_request=lora_request,
+    )
+    async for item in generator:
+        output = item
+    if output is None:
+        raise RuntimeError("vLLM scoring request returned no output.")
+    return {
+        "model": model,
+        "token_ids": token_ids,
+        "prompt_logprobs": _scored_prompt_logprobs(
+            output.prompt_logprobs,
+            token_ids,
+        ),
+    }
+
+
+@router.post(
+    "/v1/chat/completions/tokens",
+    dependencies=[Depends(validate_json_request)],
+)
+@router.post(
+    "/chat/completions/tokens",
+    dependencies=[Depends(validate_json_request)],
+)
+@with_cancellation
+@load_aware_call
+async def chat_completions_tokens(
+    request: ChatCompletionRequestWithTokens,
+    raw_request: Request,
+):
+    handler = _chat_with_tokens(raw_request)
+    if handler is None:
+        return _tokenization_serving(raw_request).create_error_response(
+            message="The model does not support Chat Completions API"
+        )
+    generator = await handler.create_chat_completion_with_tokens(request, raw_request)
+    if isinstance(generator, JSONResponse):
+        return generator
+    if isinstance(generator, ErrorResponse):
+        return JSONResponse(
+            content=generator.model_dump(),
+            status_code=generator.error.code,
+        )
+    if isinstance(generator, ChatCompletionResponse):
+        return JSONResponse(content=generator.model_dump())
+    return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+async def custom_init_app_state(
+    engine_client: EngineClient,
+    state: State,
+    args: Namespace,
+    supported_tasks: tuple,
+) -> None:
+    await init_app_state(engine_client, state, args, supported_tasks)
+    state.policy_step = None
+    state.policy_adapter_name = None
+    state.policy_adapter_path = None
+    state.policy_weight_path = None
+    state.generation_paused = False
+    if "generate" in supported_tasks and state.openai_serving_chat is not None:
+        serving_chat = object.__new__(OpenAIServingChatWithTokens)
+        serving_chat.__dict__.update(state.openai_serving_chat.__dict__)
+        state.openai_serving_chat = serving_chat
+        state.openai_serving_chat_with_tokens = serving_chat
+    else:
+        state.openai_serving_chat_with_tokens = None
+
+
+def _patch_build_app() -> None:
+    from vllm.entrypoints.openai import api_server
+
+    original_build_app = api_server.build_app
+
+    def custom_build_app(args: Namespace, supported_tasks: tuple, model_config=None):
+        app = original_build_app(args, supported_tasks, model_config)
+        app.include_router(router)
+        return app
+
+    api_server.init_app_state = custom_init_app_state
+    api_server.build_app = custom_build_app
+
+
+def _base_serve_argv(config: RLConfig) -> list[str]:
+    vllm_config = config.inference.vllm
+    return [
+        "--host",
+        config.inference.http.host,
+        "--port",
+        str(config.inference.http.port),
+        "--model",
+        config.model.name,
+        "--dtype",
+        vllm_config.dtype or config.model.torch_dtype,
+        "--tensor-parallel-size",
+        str(vllm_config.tensor_parallel_size),
+        "--data-parallel-size",
+        str(vllm_config.data_parallel_size),
+        "--gpu-memory-utilization",
+        str(vllm_config.gpu_memory_utilization),
+        "--logprobs-mode",
+        "processed_logprobs",
+        "--generation-config",
+        "vllm",
+        "--no-enable-log-requests",
+    ]
+
+
+def _append_optional_serve_args(argv: list[str], config: RLConfig) -> None:
+    vllm_config = config.inference.vllm
+    if vllm_config.max_model_len is not None:
+        argv.extend(["--max-model-len", str(vllm_config.max_model_len)])
+    if vllm_config.quantization is not None:
+        argv.extend(["--quantization", vllm_config.quantization])
+    if vllm_config.load_format is not None:
+        argv.extend(["--load-format", vllm_config.load_format])
+    if vllm_config.data_parallel_size_local is not None:
+        argv.extend(
+            [
+                "--data-parallel-size-local",
+                str(vllm_config.data_parallel_size_local),
+            ]
+        )
+    if vllm_config.data_parallel_rpc_port is not None:
+        argv.extend(
+            [
+                "--data-parallel-rpc-port",
+                str(vllm_config.data_parallel_rpc_port),
+            ]
+        )
+    if config.model.trust_remote_code or vllm_config.trust_remote_code:
+        argv.append("--trust-remote-code")
+    if config.model.chat_template is not None:
+        argv.extend(["--chat-template", config.model.chat_template])
+    if config.sampling_mask_required():
+        argv.append("--return-sampling-mask")
+    hf_overrides = {}
+    if vllm_config.enable_fp32_lm_head:
+        hf_overrides["head_dtype"] = "float32"
+    if vllm_config.enable_fp32_router_logits:
+        hf_overrides["moe_router_dtype"] = "float32"
+    if hf_overrides:
+        argv.extend(
+            [
+                "--hf-overrides",
+                json.dumps(hf_overrides, separators=(",", ":")),
+            ]
+        )
+
+
+def _append_parser_serve_args(argv: list[str], config: RLConfig) -> None:
+    vllm_config = config.inference.vllm
+    tool_call_parser = _resolve_tool_call_parser(
+        config.model.name,
+        vllm_config.tool_call_parser,
+    )
+    if tool_call_parser is not None:
+        argv.extend(["--tool-call-parser", tool_call_parser])
+        argv.append("--enable-auto-tool-choice")
+    reasoning_parser = _resolve_reasoning_parser(
+        config.model.name,
+        vllm_config.reasoning_parser,
+    )
+    if reasoning_parser is not None:
+        argv.extend(["--reasoning-parser", reasoning_parser])
+    if vllm_config.enforce_eager:
+        argv.append("--enforce-eager")
+    if config.launcher.mode == "colocate_sleep":
+        argv.append("--enable-sleep-mode")
+
+
+def _append_lora_serve_args(argv: list[str], config: RLConfig) -> None:
+    if config.lora is None:
+        return
+    vllm_config = config.inference.vllm
+    max_lora_rank = vllm_config.max_lora_rank or config.lora.rank
+    argv.extend(
+        [
+            "--enable-lora",
+            "--max-loras",
+            "1",
+            "--max-cpu-loras",
+            "1",
+            "--max-lora-rank",
+            str(max_lora_rank),
+        ]
+    )
+    if vllm_config.fully_sharded_loras:
+        argv.append("--fully-sharded-loras")
+
+
+def _append_extra_serve_args(argv: list[str], config: RLConfig) -> None:
+    for key, value in sorted(config.inference.vllm.extra_args.items()):
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            argv.append(flag if value else f"--no-{flag.removeprefix('--')}")
+            continue
+        rendered = (
+            json.dumps(value, separators=(",", ":"))
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        argv.extend([flag, rendered])
+
+
+def _serve_argv(config: RLConfig) -> list[str]:
+    """Build vLLM server arguments without initializing the GPU platform."""
+    argv = _base_serve_argv(config)
+    _append_optional_serve_args(argv, config)
+    _append_parser_serve_args(argv, config)
+    _append_lora_serve_args(argv, config)
+    _append_extra_serve_args(argv, config)
+    worker_extension_cls = (
+        "wavelet.inference.vllm.weight_update_worker.NCCLWeightUpdateWorker"
+        if config.policy_transfer.type == "nccl"
+        else "wavelet.inference.vllm.weight_update_worker.FileSystemWeightUpdateWorker"
+    )
+    argv.extend(["--worker-extension-cls", worker_extension_cls])
+    return argv
+
+
+def _serve_args(config: RLConfig) -> Namespace:
+    argv = _serve_argv(config)
+
+    parser = FlexibleArgumentParser(
+        description="Wavelet vLLM OpenAI-compatible RL server."
+    )
+    parser = make_arg_parser(parser)
+    args = parser.parse_args(argv)
+    assert args is not None
+    validate_parsed_serve_args(args)
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    global _CONFIG
+    if argv is None:
+        argv = sys.argv[1:]
+    config = load_config(RLConfig, argv)
+    _CONFIG = config
+    from wavelet.monitor import setup_config_logger
+
+    setup_config_logger(f"inference_server_{config.inference.http.port}", config)
+    from wavelet.inference.vllm.patches import transformers_v5_compat
+
+    transformers_v5_compat()
+    os.environ.setdefault("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "True")
+    _patch_load_lora_adapter()
+    _patch_skip_lora_module_warnings()
+    _patch_lora_cpu_pin_memory()
+    _patch_noisy_tool_parser_errors()
+    _patch_build_app()
+
+    from vllm.entrypoints.openai.api_server import run_server
+
+    uvloop.run(run_server(_serve_args(config)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

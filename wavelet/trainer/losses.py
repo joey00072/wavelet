@@ -192,13 +192,24 @@ def ipo_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
 def icepop_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
     """Importance-ratio policy gradient with an inclusive acceptance band."""
     log_ratio = inputs.trainer_logprobs - inputs.inference_logprobs
-    low = torch.log(torch.as_tensor(getattr(loss_config, "ratio_low", 0.2), device=log_ratio.device))
-    high = torch.log(torch.as_tensor(getattr(loss_config, "ratio_high", 5.0), device=log_ratio.device))
+    low = torch.log(
+        torch.as_tensor(getattr(loss_config, "ratio_low", 0.2), device=log_ratio.device)
+    )
+    high = torch.log(
+        torch.as_tensor(
+            getattr(loss_config, "ratio_high", 5.0), device=log_ratio.device
+        )
+    )
     rejected = (log_ratio.detach() < low) | (log_ratio.detach() > high)
     keep = inputs.loss_mask & ~rejected
     # Mask before exp: rejected very large ratios must not create inf*0 NaNs.
     safe_ratio = torch.exp(torch.where(keep, log_ratio, torch.zeros_like(log_ratio)))
-    per_token = -keep.to(inputs.advantages.dtype) * getattr(loss_config, "adv_tau", 1.0) * inputs.advantages * safe_ratio
+    per_token = (
+        -keep.to(inputs.advantages.dtype)
+        * getattr(loss_config, "adv_tau", 1.0)
+        * inputs.advantages
+        * safe_ratio
+    )
     if inputs.loss_weights is not None:
         per_token = per_token * inputs.loss_weights
     mismatch = torch.exp(log_ratio) - log_ratio - 1
@@ -210,6 +221,8 @@ def icepop_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
             "is_masked": _safe_mean(rejected.float(), inputs.loss_mask),
         },
     )
+
+
 def ce_loss_fn(inputs: LossInputs) -> LossOutput:
     """Return weighted next-token cross entropy for one sequence."""
     per_token_loss = -inputs.trainer_logprobs
@@ -291,8 +304,10 @@ def setup_rl_loss_fn(loss_config: RLLossConfig) -> LossFn:
         return ipo_loss
 
     if loss_config.type == "icepop":
+
         def icepop_loss(inputs: LossInputs) -> LossOutput:
             return icepop_loss_fn(inputs, loss_config)
+
         return icepop_loss
 
     def dppo_loss(inputs: LossInputs) -> LossOutput:

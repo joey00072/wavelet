@@ -9,12 +9,12 @@ from types import SimpleNamespace
 import pytest
 
 from wavelet.configs.config import RLConfig, SFTConfig, WandbConfig
-from wavelet.monitor import RunMonitor
-from wavelet.orchestrator import launcher as launcher_module
-from wavelet.orchestrator.runtime import (
+from wavelet.launch import roles as launcher_module
+from wavelet.launch.runtime import (
     _raise_keyboard_interrupt,
     _role_config_payload,
 )
+from wavelet.monitor import RunMonitor
 from wavelet.utils.pathing import validate_output_dir
 from wavelet.utils.serialization import load_yaml
 
@@ -420,7 +420,7 @@ def test_unknown_config_keys_are_rejected_everywhere() -> None:
 
 
 def test_process_mode_rejects_overlapping_device_groups() -> None:
-    from wavelet.orchestrator.placement import device_group_conflict_error
+    from wavelet.launch.placement import device_group_conflict_error
 
     overlapping = RLConfig(
         launcher={

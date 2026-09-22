@@ -15,6 +15,13 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from wavelet.configs.config import RLConfig
+from wavelet.contracts.schedule import (
+    chunks_per_step as _chunks_per_step,
+)
+from wavelet.contracts.schedule import required_policy_step
+from wavelet.contracts.schedule import (
+    target_steps as _target_steps,
+)
 from wavelet.data.rl import (
     PackedRLDataset,
     RLDataset,
@@ -26,13 +33,6 @@ from wavelet.data.rl import (
 )
 from wavelet.data.sft import Example, build_sample
 from wavelet.monitor import emit_perf, setup_config_logger
-from wavelet.orchestrator.schedule import (
-    chunks_per_step as _chunks_per_step,
-)
-from wavelet.orchestrator.schedule import required_policy_step
-from wavelet.orchestrator.schedule import (
-    target_steps as _target_steps,
-)
 from wavelet.trainer.ckpt import TrainerState
 from wavelet.trainer.distributed import (
     all_ranks_true,
@@ -40,6 +40,7 @@ from wavelet.trainer.distributed import (
     barrier,
     world_is_distributed,
 )
+from wavelet.trainer.loop import run_rl_training
 from wavelet.trainer.losses import (
     TRUST_REGION_METRIC_KEYS,
     component_normalization_unit_counts,
@@ -60,12 +61,10 @@ from wavelet.trainer.model import (
 )
 from wavelet.trainer.moe import moe_load_balance_metrics
 from wavelet.trainer.perf import estimate_training_flops_coefficients
+from wavelet.trainer.policy_export import PolicyExporter
 from wavelet.trainer.trainer import BaseTrainer, _mean, _reduce_by_key
 from wavelet.trainer.types import LossOutput, TrainOutput
-from wavelet.transport.policy import (
-    PolicyExportMixin,
-)
-from wavelet.transport.queue import (
+from wavelet.transport.rollouts.filesystem import (
     FileSystemRolloutReceiver,
     RolloutBatch,
     RolloutChunkAccumulator,
@@ -199,8 +198,6 @@ def _packed_training_attention_mask(
     mask is passed. Non-flash attention still needs an explicit block-causal
     mask to prevent packed samples from attending across boundaries.
     """
-    if getattr(getattr(model, "config", None), "model_type", None) == "deepseek_v4":
-        return None if attention_mask.bool().all() else attention_mask
     if not _has_packed_position_resets(attention_mask, position_ids):
         valid_tokens = attention_mask.bool()
         return None if valid_tokens.all() else attention_mask
@@ -229,11 +226,12 @@ def _packed_training_attention_mask(
     return _packed_causal_attention_mask(attention_mask, position_ids)
 
 
-class RLTrainer(PolicyExportMixin, BaseTrainer):
+class RLTrainer(BaseTrainer):
     config: RLConfig
 
     def __init__(self, config: RLConfig) -> None:
         super().__init__(config)
+        self.policy_exporter = PolicyExporter(self)
         self._accumulated_micro_batches = 0
         self._rollout_metric_accum: list[dict[str, float]] = []
         self._train_loss_accum: list[Tensor] = []
@@ -246,7 +244,21 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         self._rollout_batch_loaded = False
         self._step_compute_seconds = 0.0
         self._rl_loss_fn = setup_rl_loss_fn(config.loss)
-        self._init_policy_transport()
+        self.policy_exporter._init_policy_transport()
+
+    def should_export_policy(self, step: int) -> bool:
+        return self.policy_exporter.should_export_policy(step)
+
+    def export_policy(
+        self,
+        *,
+        step: int | None = None,
+        force: bool = False,
+    ) -> Path | None:
+        return self.policy_exporter.export_policy(step=step, force=force)
+
+    def _close_policy_transport(self) -> None:
+        self.policy_exporter._close_policy_transport()
 
     def _setup_data(self) -> None:
         if self.tokenizer is None:
@@ -1423,50 +1435,11 @@ def main(argv: list[str] | None = None) -> int:
                     start_step=trainer.step,
                     events_dir=trainer.rollout_events_dir(),
                 )
-                while trainer.step < target_step:
-                    loop_started_at = perf_counter()
-                    wait_started_at = perf_counter()
-                    batch = receiver.wait()
-                    wait_seconds = perf_counter() - wait_started_at
-                    trainer_step_before = trainer.step
-                    row_count = count_rollout_rows(
-                        batch.training_path,
-                        description="Rollout batch",
-                    )
-                    trainer.validate_rollout_batch(
-                        batch,
-                        row_count=row_count,
-                    )
-                    trainer.record_rollout_claim(
-                        batch,
-                        trainer_step_before=trainer_step_before,
-                    )
-                    load_started_at = perf_counter()
-                    trainer.load_rollout_path(batch.path)
-                    load_seconds = perf_counter() - load_started_at
-                    train_started_at = perf_counter()
-                    trainer.prepare_for_training()
-                    trainer.train_until(trainer.step + 1)
-                    train_seconds = perf_counter() - train_started_at
-                    trainer.record_rollout_consumed(
-                        batch,
-                        trainer_step_before=trainer_step_before,
-                        optimizer_step_completed=True,
-                    )
-                    export_started_at = perf_counter()
-                    trainer.export_policy(step=trainer.step)
-                    trainer.offload_after_refit()
-                    export_seconds = perf_counter() - export_started_at
-                    total_seconds = perf_counter() - loop_started_at
-                    emit_perf(
-                        "trainer_step",
-                        step=trainer.step,
-                        wait_batch=wait_seconds,
-                        load_rollout=load_seconds,
-                        train=train_seconds,
-                        export_policy=export_seconds,
-                        total=total_seconds,
-                    )
+                run_rl_training(
+                    trainer,
+                    receiver,
+                    target_step=target_step,
+                )
             except Exception:
                 trainer.finalize(status="failed")
                 raise
@@ -1480,7 +1453,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _use_streaming_rollout_chunks(config: RLConfig) -> bool:
-    from wavelet.orchestrator.scheduler import PublishMode, resolve_rollout_schedule
+    from wavelet.contracts.schedule import PublishMode, resolve_rollout_schedule
 
     return resolve_rollout_schedule(config).publish_mode is PublishMode.STREAMING and (
         config.orchestrator.examples_per_step is not None

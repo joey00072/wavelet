@@ -57,7 +57,9 @@ def test_ordered_token_matches_agree_with_exhaustive_placements() -> None:
 
 def test_ordered_token_matches_handle_long_unique_history() -> None:
     prompt = list(range(1024))
-    assert _unique_ordered_output_matches([[token] for token in prompt], prompt) == prompt
+    assert (
+        _unique_ordered_output_matches([[token] for token in prompt], prompt) == prompt
+    )
 
 
 def test_merge_token_segments_preserves_exact_prefix_turn_boundary() -> None:

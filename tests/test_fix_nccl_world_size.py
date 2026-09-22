@@ -10,15 +10,16 @@ import yaml
 
 from wavelet import debug as debug_module
 from wavelet.configs.config import RLConfig
-from wavelet.inference import native_server
-from wavelet.orchestrator.placement import nccl_inference_ranks
-from wavelet.orchestrator.runtime import (
+from wavelet.inference.vllm import native_server
+from wavelet.inference.vllm import weight_update_worker as policy_module
+from wavelet.inference.vllm.weight_update_worker import NCCLWeightUpdateWorker
+from wavelet.launch.placement import nccl_inference_ranks
+from wavelet.launch.runtime import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
     _role_specs,
 )
-from wavelet.transport import policy as policy_module
-from wavelet.transport.policy import NCCLWeightUpdateWorker, nccl_world_size
+from wavelet.transport.weights.nccl import nccl_world_size
 
 
 def _nccl_http_config(
@@ -88,7 +89,7 @@ def _init_worker(
         "_require_vllm_nccl",
         lambda message: (_FakeCommunicator, _FakeProcessGroup),
     )
-    worker = NCCLWeightUpdateWorker()
+    worker = object.__new__(NCCLWeightUpdateWorker)
     worker.device = torch.device("cuda", local_rank)
     worker.init_broadcaster("127.0.0.1", 29501, rank_offset, inference_world_size, 30)
     return _FakeProcessGroup.created[-1]

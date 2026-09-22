@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
 
+import wavelet.trainer.policy_export as policy_export_module
 from wavelet.configs.config import RLConfig
-from wavelet.orchestrator.schedule import (
+from wavelet.contracts.schedule import (
     latest_exported_policy_step_at_or_before,
     next_exported_policy_step,
     policy_step_to_load,
@@ -20,8 +22,11 @@ from wavelet.orchestrator.scheduler import (
     _VerifierChunkPublisher,
 )
 from wavelet.trainer.distributed import World
-from wavelet.transport.policy import PolicyExportMixin
-from wavelet.transport.queue import STABLE_BATCH_MARKER, FileSystemPolicyReceiver
+from wavelet.trainer.policy_export import PolicyExporter
+from wavelet.transport.rollouts.filesystem import (
+    STABLE_BATCH_MARKER,
+    FileSystemPolicyReceiver,
+)
 
 
 class _PolicyReceiver:
@@ -32,7 +37,7 @@ class _PolicyReceiver:
         return self.steps
 
 
-class _PolicyExporter(PolicyExportMixin):
+class _PolicyExporter(PolicyExporter):
     pass
 
 
@@ -43,9 +48,8 @@ def test_export_retains_policy_selected_before_request_drain(tmp_path, interval)
         orchestrator={"max_async_level": 9, "max_off_policy_steps": 8},
         policy_transfer={"keep_last": 2, "export_every_steps": interval},
     )
-    exporter = _PolicyExporter()
-    exporter.config = config
-    exporter.world = Mock(is_main=True)
+    trainer = SimpleNamespace(config=config, world=Mock(is_main=True))
+    exporter = _PolicyExporter(trainer)
     exporter._barrier = Mock()
     receiver = FileSystemPolicyReceiver(tmp_path, config.policy_transfer)
     receiver.policy_dir.mkdir(parents=True)
@@ -188,18 +192,20 @@ def test_checkpoint_resume_can_force_export_between_intervals() -> None:
             )
         }
     )
-    exporter = _PolicyExporter()
-    exporter.config = config
-    exporter.model = object()
-    exporter.tokenizer = object()
-    exporter.world = World(
-        rank=0,
-        local_rank=0,
-        world_size=1,
-        local_world_size=1,
-        device=torch.device("cpu"),
+    trainer = SimpleNamespace(
+        config=config,
+        model=object(),
+        tokenizer=object(),
+        world=World(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            local_world_size=1,
+            device=torch.device("cpu"),
+        ),
+        output_dir=Path("outputs/run"),
     )
-    exporter.output_dir = Path("outputs/run")
+    exporter = _PolicyExporter(trainer)
     exporter._export_nccl_policy = Mock(return_value=Path("policy"))
 
     assert exporter.export_policy(step=7) is None
@@ -440,14 +446,18 @@ def test_shutdown_finishes_in_progress_policy_transfer(monkeypatch):
     asyncio.run(run())
 
 
-def test_nccl_initial_policy_rendezvous_precedes_rank_gathers(tmp_path):
-    exporter = _PolicyExporter()
-    exporter.world = Mock(is_main=True)
-    exporter.model = object()
+def test_nccl_initial_policy_rendezvous_precedes_rank_gathers(tmp_path, monkeypatch):
+    trainer = SimpleNamespace(world=Mock(is_main=True), model=object())
+    exporter = _PolicyExporter(trainer)
     calls = []
     exporter._wait_for_nccl_ready = lambda path: calls.append("ready")
-    broadcaster = Mock(broadcast_model=lambda model: calls.append("broadcast"))
+    broadcaster = Mock()
     exporter._nccl_broadcaster = lambda: broadcaster
     exporter._barrier = lambda: calls.append("barrier")
+    monkeypatch.setattr(
+        policy_export_module,
+        "broadcast_model",
+        lambda broadcaster, model: calls.append("broadcast"),
+    )
     exporter._broadcast_nccl_export(tmp_path, export_step=0)
     assert calls == ["ready", "barrier", "broadcast"]

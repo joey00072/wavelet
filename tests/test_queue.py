@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from wavelet.configs.config import RLPolicyTransferConfig, RLTransportConfig
-from wavelet.transport.queue import (
+from wavelet.transport.rollouts.filesystem import (
     FileSystemPolicyReceiver,
     FileSystemRolloutReceiver,
     FileSystemRolloutSender,
@@ -52,7 +52,9 @@ def test_publish_does_not_mark_batch_stable_when_manifest_write_fails(
     def fail_manifest(*_args, **_kwargs) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr("wavelet.transport.queue.write_manifest", fail_manifest)
+    monkeypatch.setattr(
+        "wavelet.transport.rollouts.filesystem.write_manifest", fail_manifest
+    )
 
     with pytest.raises(OSError, match="disk full"):
         sender.publish(source, step=0, optimizer_step=0)
@@ -244,7 +246,7 @@ def test_binary_training_payload_retains_trace_and_accounts_transfer(tmp_path):
 def test_failed_binary_publication_is_invisible_and_retry_clears_sidecar(
     tmp_path, monkeypatch
 ):
-    from wavelet.transport import queue
+    from wavelet.transport.rollouts import filesystem as queue
 
     config = RLTransportConfig()
     source = _write_source(tmp_path / "source.jsonl", "{}\n")

@@ -40,7 +40,6 @@ shards reuse Transformers' eager or grouped implementation; Wavelet owns token
 dispatch and collective communication. The installed Transformers implementation and device must
 support the requested model and backend. Wavelet recognizes Qwen3.5 packed
 experts and Nemotron-H ungated expert projections for expert parallel dispatch.
-Native DeepSeek-V4 uses a separate eager implementation; see its limits below.
 
 Expert-parallel sharding preserves each parameter's `requires_grad` flag.
 LoRA runs keep base experts frozen while propagating gradients through them to
@@ -128,45 +127,9 @@ generation captures fail explicitly. A change in captured media splits a
 trajectory into separate training samples instead of reusing earlier
 logprobs under different pixels.
 
-Native DeepSeek-V4 implements sliding, compressed sparse and heavily compressed
-attention, packed-document isolation, mHC, hash/top-k experts, dual RoPE and
-FP8/MXFP4 checkpoint dequantization. The eager implementation is intended for
-correctness and CPU validation; it does not provide the reference optimized
-CUDA kernels. Use `loss_impl: torch`, `model.attn_implementation: eager` (or
-`auto`), and eager experts. FSDP, CP/TP/EP, QLoRA, meta initialization,
-smart checkpointing, chunked fused LM heads and cached decoding are unsupported.
-
-Published checkpoints use different tensor names. Convert a local safetensors
-checkpoint before passing it as `model.name`:
-
-```sh
-uv run python -m wavelet.trainer.models.deepseek_v4.conversion RAW_DIR NATIVE_DIR
-```
-
-The destination must not exist. Conversion currently holds the entire checkpoint
-in CPU RAM, dequantizes weights and omits inference-only MTP weights. Copy the
-matching tokenizer assets into the native directory separately. `--to-raw`
-performs the reverse tensor-name conversion; it does not requantize weights.
-Native model saves carry an explicit format marker and remain reloadable by Wavelet.
-The loader rejects unconverted published checkpoints; conversion checks tensor
-names and shapes before creating an output directory. Full-model filesystem policy
-exports use published tensor names and preserve FP32-sensitive state. Native
-LoRA policy export and NCCL policy transfer are unsupported. The vLLM plugin
-accepts compressed layer types, resolves per-layer RoPE, and supplies the
-unquantized grouped output projection that published-name policy exports need.
-These adapters have CPU contract tests; real GPU model loading is unvalidated.
-Top-k router selection bias updates once per optimizer step using accumulated
-expert counts reduced across data-parallel ranks; hash routing is excluded.
-
-CPU fixtures cover actual model forward/backward, packed attention isolation,
-checkpoint reloads and conversion. GPU training, vLLM loading and two-GPU ring
-attention have not been run: GPU validation was explicitly skipped to conserve
-resources. Scheduled GPU workflows are disabled unless their repository opt-in
-variables are enabled; CPU results do not establish GPU compatibility or speed.
-
 Liger dispatch uses the checkpoint's actual `model_type`, rather than its path
 or name. The supported Liger families are Qwen3, Qwen2, Llama and Mistral;
-other architectures, including Qwen3.5, VLMs and native DeepSeek-V4, require
+other architectures, including Qwen3.5 and VLMs, require
 `loss_impl: torch` and fail early if a Liger mode is requested.
 
 RL loss diagnostics accumulate as detached device scalars during gradient

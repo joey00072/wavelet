@@ -12,13 +12,16 @@ import pytest
 import torch
 from torch import nn
 
-import wavelet.transport.policy as weight_update
-from wavelet.transport.policy import NCCL_UPDATE_INFO_FILENAME
+pytest.importorskip("vllm")
+
+import wavelet.inference.vllm.weight_update_worker as weight_update
+from wavelet.trainer import export_tensors
+from wavelet.transport.weights.handshake import NCCL_UPDATE_INFO_FILENAME
 
 
 def test_initial_nccl_policy_receives_weights(monkeypatch, tmp_path):
     from wavelet.configs.config import RLConfig
-    from wavelet.inference import server
+    from wavelet.inference.vllm import server
 
     client = SimpleNamespace(collective_rpc=AsyncMock())
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
@@ -76,7 +79,9 @@ def test_filesystem_weight_update_worker_uses_layerwise_reload(
     policy_dir = tmp_path / "model"
     policy_dir.mkdir()
     runner = _DummyRunner()
-    worker = weight_update.FileSystemWeightUpdateWorker()
+    # Real Worker.__init__ needs vLLM engine args we don't have here; bypass
+    # it to unit-test update_weights_from_path in isolation.
+    worker = object.__new__(weight_update.FileSystemWeightUpdateWorker)
     worker.model_runner = runner
     worker.load_config = object()
     worker.vllm_config = object()
@@ -168,7 +173,7 @@ def test_iter_layer_state_dicts_converts_each_partition() -> None:
             calls.append(layer_index)
             return state
 
-    groups = list(weight_update._iter_layer_state_dicts(_Model()))
+    groups = list(export_tensors._iter_layer_state_dicts(_Model()))
 
     assert len(groups) == 3
     assert calls == [-1, 0, 1]
@@ -198,12 +203,12 @@ def test_materialize_wire_tensors_limits_root_fsdp_summon_scope(
     )
     model = _Model()
 
-    weight_update._materialize_wire_tensors(
+    export_tensors._materialize_wire_tensors(
         model,
         {"embed.weight": torch.ones(1)},
         -1,
     )
-    weight_update._materialize_wire_tensors(
+    export_tensors._materialize_wire_tensors(
         model,
         {"layers.0.weight": torch.ones(1)},
         0,
@@ -219,7 +224,7 @@ def test_wire_precision_preserves_declared_parameters_and_buffers():
     model.register_buffer("scale", torch.tensor([1.123456], dtype=torch.float32))
     model.keep_in_fp32_for_weight_transfer = lambda name: name == "precise"
     original = {**dict(model.named_parameters()), **dict(model.named_buffers())}
-    result = weight_update._materialize_wire_tensors(
+    result = export_tensors._materialize_wire_tensors(
         model, original, -1, torch.bfloat16
     )
     assert result["weight"].dtype == torch.bfloat16
@@ -236,7 +241,7 @@ def test_wire_tensors_exclude_reconstructed_nonpersistent_buffers():
     model.rotary_emb.register_buffer("inv_freq", torch.ones(4), persistent=False)
     model.register_buffer("scale", torch.ones(1))
     model.weight = nn.Parameter(torch.ones(2))
-    assert set(weight_update._model_named_tensors(model)) == {"weight", "scale"}
+    assert set(export_tensors._model_named_tensors(model)) == {"weight", "scale"}
 
 
 def test_wire_conversion_removes_training_wrappers_before_hf_conversion():
@@ -245,7 +250,9 @@ def test_wire_conversion_removes_training_wrappers_before_hf_conversion():
     weight = torch.ones(2)
     result = weight_update._convert_layer_to_hf(
         model,
-        {"model.layers.0._checkpoint_wrapped_module._fsdp_wrapped_module.weight": weight},
+        {
+            "model.layers.0._checkpoint_wrapped_module._fsdp_wrapped_module.weight": weight
+        },
         0,
     )
     assert list(result) == ["model.layers.0.weight"]
@@ -280,7 +287,9 @@ def test_nccl_weight_update_worker_loads_each_layer_with_mixed_dtypes(
                     dtype=dtype,
                 )
             )
-    worker = weight_update.NCCLWeightUpdateWorker()
+    # Real Worker.__init__ needs vLLM engine args we don't have here; bypass
+    # it to unit-test update_weights_from_path in isolation.
+    worker = object.__new__(weight_update.NCCLWeightUpdateWorker)
     runner = _DummyRunner()
     worker.model_runner = runner
     worker.vllm_config = object()
@@ -316,6 +325,8 @@ def test_nccl_weight_update_worker_loads_each_layer_with_mixed_dtypes(
 
 def test_nccl_broadcaster_groups_each_layer_by_dtype() -> None:
     communicator = _QueuedCommunicator([])
+    # __post_init__ requires CUDA and a real NCCL process group; bypass the
+    # dataclass constructor to unit-test broadcast_layers in isolation.
     broadcaster = object.__new__(weight_update.NCCLWeightBroadcaster)
     broadcaster.rank = 0
     broadcaster.source_rank = 0

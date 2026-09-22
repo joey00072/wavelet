@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -28,17 +27,13 @@ from wavelet.trainer.distributed import (
 )
 from wavelet.trainer.model import (
     load_fsdp2_model_from_hf,
-    maybe_wrap_ddp,
     maybe_wrap_fsdp,
     setup_model,
 )
-from wavelet.trainer.models.deepseek_v4 import DeepseekV4Config
-from wavelet.trainer.models.deepseek_v4.modeling import DeepseekV4ForCausalLM
 from wavelet.trainer.moe import (
     configure_hf_moe_expert_parallel,
     configure_hf_moe_routers,
     hf_moe_experts,
-    install_moe_load_balance_hook,
 )
 
 
@@ -325,88 +320,6 @@ def _expert_parallel_worker(
         assert torch.isfinite(loaded_loss)
     finally:
         dist.destroy_process_group()
-
-
-def _deepseek_csa_ddp_worker(rank: int, init_file: str) -> None:
-    """Run real CSA backward twice, including the rank-local bias counters."""
-    torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{init_file}",
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=60),
-    )
-    try:
-        config = DeepseekV4Config(
-            vocab_size=16,
-            hidden_size=8,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            head_dim=4,
-            q_lora_rank=4,
-            partial_rotary_factor=1.0,
-            layer_types=["compressed_sparse_attention"],
-            compress_rates={"compressed_sparse_attention": 2},
-            sliding_window=4,
-            o_groups=2,
-            o_lora_rank=2,
-            index_n_heads=2,
-            index_head_dim=4,
-            index_topk=2,
-            moe_intermediate_size=8,
-            n_routed_experts=2,
-            num_experts_per_tok=1,
-            num_hash_layers=0,
-            hc_mult=2,
-            max_position_embeddings=16,
-        )
-        model = DeepseekV4ForCausalLM(config)
-        ddp = maybe_wrap_ddp(
-            model,
-            model_config=ModelConfig(torch_dtype="float32"),
-            world=World(
-                rank=rank,
-                local_rank=rank,
-                world_size=2,
-                local_world_size=2,
-                device=torch.device("cpu"),
-            ),
-        )
-        optimizer = torch.optim.SGD(ddp.parameters(), lr=1e-3)
-        handle = install_moe_load_balance_hook(optimizer, ddp)
-        ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-        try:
-            for _ in range(2):
-                optimizer.zero_grad(set_to_none=True)
-                loss = ddp(ids, labels=ids).loss
-                assert loss is not None and torch.isfinite(loss)
-                loss.backward()
-                # Deliberately make local observations unequal; the hook must
-                # reduce them before applying the same centered update.
-                with torch.no_grad():
-                    model.model.layers[0].mlp.tokens_per_expert.add_(
-                        torch.tensor([rank + 1.0, 0.0])
-                    )
-                optimizer.step()
-            bias = model.model.layers[0].mlp.router.selection_bias
-            gathered = [torch.empty_like(bias) for _ in range(2)]
-            dist.all_gather(gathered, bias)
-            torch.testing.assert_close(gathered[0], gathered[1])
-        finally:
-            handle.remove()
-    finally:
-        dist.destroy_process_group()
-
-
-def test_deepseek_csa_ddp_two_steps_and_balancing(tmp_path):
-    init_file = tmp_path / "csa-ddp-init"
-    mp.spawn(
-        _deepseek_csa_ddp_worker,
-        args=(str(init_file),),
-        nprocs=2,
-        join=True,
-    )
 
 
 def _new_expert_parallel_worker(rank: int, init_file: str, kind: str) -> None:

@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from wavelet.configs.config import RLConfig, RLEvalConfig
+from wavelet.contracts.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.eval_utils import compute_eval_policy_step, pass_at_k
-from wavelet.orchestrator.schedule import select_due_eval_envs, target_steps
 from wavelet.orchestrator.scheduler import (
     _final_eval_policy_step,
     _initial_eval_steps,
@@ -353,6 +353,7 @@ def test_final_eval_receives_intermediate_nccl_exports(
         last_eval_steps={"swe": 0},
         loaded_policy_step=0,
     )
+
     async def run():
         await context.finish_pending_policy(2)
         await context.run_final_evals(2)
@@ -851,7 +852,8 @@ def test_evaluation_journal_rejects_changed_plan(tmp_path) -> None:
     path = tmp_path / "journal"
     with EvaluationJournal(path, signature="plan-a") as journal:
         journal.record(0, {"reward": 1.0})
-    with pytest.raises(ValueError, match="do not match"), EvaluationJournal(
-        path, signature="plan-b"
+    with (
+        pytest.raises(ValueError, match="do not match"),
+        EvaluationJournal(path, signature="plan-b"),
     ):
         pass
