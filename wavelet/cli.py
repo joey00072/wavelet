@@ -4,7 +4,7 @@ import importlib
 import sys
 
 PUBLIC_COMMANDS = {
-    "rl": ("wavelet.launch.runtime", "Run reinforcement learning launcher"),
+    "rl": ("wavelet.orchestrator.runtime", "Run reinforcement learning launcher"),
     "sft": ("wavelet.trainer.trainer", "Run supervised fine-tuning"),
     "debug": ("wavelet.debug", "Inspect and probe RL subsystems"),
     "evals": (
@@ -34,7 +34,7 @@ PUBLIC_COMMANDS = {
         "Run RL inference annotation stage",
     ),
     "inference-server": (
-        "wavelet.inference.vllm.server",
+        "wavelet.inference.server",
         "Run OpenAI-compatible inference server",
     ),
 }
@@ -49,7 +49,7 @@ INTERNAL_COMMANDS = {
         "Write a synthetic run directory for dashboard development",
     ),
     "native-inference-server": (
-        "wavelet.inference.vllm.native_server",
+        "wavelet.inference.native_server",
         "Run native vLLM inference server",
     ),
 }

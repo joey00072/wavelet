@@ -9,7 +9,7 @@ import pytest
 
 from wavelet.configs.config import RLConfig, SFTConfig
 from wavelet.deployment import slurm
-from wavelet.launch.placement import http_base_urls
+from wavelet.orchestrator.placement import http_base_urls
 from wavelet.utils.serialization import dump_yaml, load_yaml
 
 

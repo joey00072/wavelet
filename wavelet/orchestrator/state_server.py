@@ -21,7 +21,7 @@ from wavelet.monitor import (
     unavailable_rollout_inspection,
 )
 from wavelet.monitor import redact as _redact
-from wavelet.transport.rollouts.filesystem import (
+from wavelet.transport.queue import (
     MANIFEST_FILENAME,
     STABLE_BATCH_MARKER,
     STEP_DIR_PREFIX,

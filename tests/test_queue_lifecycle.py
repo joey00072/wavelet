@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from wavelet.transport.rollouts.filesystem import (
+from wavelet.transport.queue import (
     ClaimRecord,
     ConsumedRecord,
     QueueEvent,
@@ -88,15 +88,11 @@ def test_required_lifecycle_write_failures_propagate(
         raise OSError("disk full")
 
     if operation == "claim":
-        monkeypatch.setattr(
-            "wavelet.transport.rollouts.filesystem.write_claim", fail_write
-        )
+        monkeypatch.setattr("wavelet.transport.queue.write_claim", fail_write)
         with pytest.raises(OSError, match="disk full"):
             record_rollout_claim(batch, trainer_step_before=0)
     else:
-        monkeypatch.setattr(
-            "wavelet.transport.rollouts.filesystem.write_consumed", fail_write
-        )
+        monkeypatch.setattr("wavelet.transport.queue.write_consumed", fail_write)
         with pytest.raises(OSError, match="disk full"):
             record_rollout_consumed(
                 batch,

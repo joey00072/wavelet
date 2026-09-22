@@ -7,10 +7,10 @@ import torch
 from torch import Tensor
 
 from wavelet.configs.config import RLConfig, RLLossConfig
-from wavelet.contracts.schedule import chunks_per_step, rollout_groups_for_chunk
 from wavelet.orchestrator.advantage import group_reward_advantages
+from wavelet.orchestrator.schedule import chunks_per_step, rollout_groups_for_chunk
 from wavelet.trainer.losses import compute_loss
-from wavelet.transport.rollouts.filesystem import RolloutChunkAccumulator
+from wavelet.transport.queue import RolloutChunkAccumulator
 
 UPSTREAM_AUDITED_COMMIT = "ef9dea17815756f21bd20028fd8a8dcf29319763"
 

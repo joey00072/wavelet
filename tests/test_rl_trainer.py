@@ -1052,7 +1052,7 @@ def test_trainer_uses_binary_payload_and_logs_original_trace(tmp_path):
     from types import SimpleNamespace
 
     from wavelet.data.rl import load_rl_records
-    from wavelet.transport.rollouts.filesystem import FileSystemRolloutSender
+    from wavelet.transport.queue import FileSystemRolloutSender
 
     row = {
         "prompt": [],

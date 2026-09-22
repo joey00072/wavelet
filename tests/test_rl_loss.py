@@ -22,13 +22,8 @@ def test_icepop_loss_masks_out_of_band_ratios_without_nan() -> None:
     ratios = torch.tensor([0.1, 0.2, 1.0, 5.0, 10.0])
     trainer = ratios.log().unsqueeze(0).requires_grad_()
     output = compute_loss(
-        trainer,
-        torch.zeros_like(trainer),
-        None,
-        torch.ones_like(trainer),
-        torch.ones_like(trainer, dtype=torch.bool),
-        config,
-        loss_scale=1,
+        trainer, torch.zeros_like(trainer), None, torch.ones_like(trainer),
+        torch.ones_like(trainer, dtype=torch.bool), config, loss_scale=1,
     )
     assert output.metrics["is_masked"] == pytest.approx(0.4)
     output.loss.backward()

@@ -9,8 +9,8 @@ import pytest
 
 from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
-from wavelet.inference.vllm import server
-from wavelet.inference.vllm.server import _scored_prompt_logprobs
+from wavelet.inference import server
+from wavelet.inference.server import _scored_prompt_logprobs
 from wavelet.orchestrator import envs
 
 

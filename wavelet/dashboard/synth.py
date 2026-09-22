@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from wavelet.transport.rollouts.filesystem import (
+from wavelet.transport.queue import (
     MANIFEST_FILENAME,
     POLICY_META_FILENAME,
     QUEUE_EVENT_FILENAME,

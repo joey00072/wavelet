@@ -62,7 +62,7 @@ flash-attn = [
 ]
 
 [project.entry-points."vllm.general_plugins"]
-wavelet = "wavelet.inference.vllm.patches:transformers_v5_compat"
+wavelet = "wavelet.inference.patches:transformers_v5_compat"
 
 [tool.uv]
 no-build-isolation-package = ["flash-attn"]

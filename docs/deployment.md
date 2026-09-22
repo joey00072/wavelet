@@ -93,9 +93,6 @@ uv run wavelet debug preflight @ run.yaml \
   --json
 ```
 
-Role GPU requirements come from the configured trainer and inference device
-groups. The launcher does not provision a cluster or create scheduler jobs.
-
 ## Native multi-node SLURM
 
 The normal `sft` and `rl` commands submit a job when a config contains both a

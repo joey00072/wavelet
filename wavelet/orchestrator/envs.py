@@ -25,10 +25,6 @@ from wavelet.configs.config import (
     RLAlgorithmConfig,
     RLEvalEnvConfig,
 )
-from wavelet.contracts.rollout_metadata import (
-    error_metric_name,
-    rollout_task_harness_metadata,
-)
 from wavelet.data.rl import RLExample
 from wavelet.orchestrator.admission import RolloutAdmissionController
 from wavelet.orchestrator.advantage import (
@@ -58,6 +54,10 @@ from wavelet.orchestrator.live import (
     live_episode,
 )
 from wavelet.orchestrator.patches import apply_verifier_openai_patches
+from wavelet.orchestrator.rollout_metadata import (
+    error_metric_name,
+    rollout_task_harness_metadata,
+)
 from wavelet.orchestrator.rollouts import RLOrchestrator
 
 _ENV_CACHE: dict[tuple[str, ...], Any] = {}
@@ -721,8 +721,8 @@ def _load_cached_env(
                 setattr(env, key, value)
     _patch_env_response_messages(vf, env)
     if model_config is not None and model_config.vlm is not None:
-        from wavelet.data.tokenizer import setup_processor
         from wavelet.orchestrator.multimodal import install_multimodal_rollout_hooks
+        from wavelet.trainer.model import setup_processor
 
         install_multimodal_rollout_hooks(env, setup_processor(model_config))
     _ENV_CACHE[cache_key] = env
@@ -1662,7 +1662,7 @@ def _opsd_prefix_token_ids(
             f"OPSD requires '{algorithm_config.demo_key}' in verifier example metadata."
         )
     if tokenizer is None:
-        from wavelet.data.tokenizer import setup_tokenizer
+        from wavelet.trainer.model import setup_tokenizer
 
         tokenizer = setup_tokenizer(config.model)
     rendered = tokenizer.apply_chat_template(
@@ -1720,7 +1720,7 @@ def annotate_distillation_records(
     ]
     opsd_tokenizer = None
     if is_opsd:
-        from wavelet.data.tokenizer import setup_tokenizer
+        from wavelet.trainer.model import setup_tokenizer
 
         opsd_tokenizer = setup_tokenizer(config.model)
     prefixes = [

@@ -26,7 +26,7 @@ from wavelet.dashboard.rows import (
     sort_rows,
 )
 from wavelet.monitor import redact
-from wavelet.transport.rollouts.filesystem import (
+from wavelet.transport.queue import (
     MANIFEST_FILENAME,
     QUEUE_EVENT_FILENAME,
     STABLE_BATCH_MARKER,

@@ -93,7 +93,9 @@ class AdaptiveConcurrencyController:
             and time.monotonic() < self.can_grow_until
             and active >= self.config.binding_fraction * self.limit
         ):
-            self.cap = self._clamp(self.cap * self.growth_multiplier**fraction)
+            self.cap = self._clamp(
+                self.cap * self.growth_multiplier**fraction
+            )
             return self._apply_limit(int(self.cap))
         return ConcurrencyDecision(limit=self.limit)
 

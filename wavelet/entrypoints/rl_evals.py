@@ -4,10 +4,10 @@ import asyncio
 import sys
 
 from wavelet.configs.config import RLConfig
-from wavelet.contracts.source import VERIFIER_ROLLOUT_FUNCTION
 from wavelet.monitor import finish_orchestrator_wandb, setup_config_logger
 from wavelet.orchestrator.rollouts import RLOrchestrator
 from wavelet.orchestrator.scheduler import _run_evals_async
+from wavelet.orchestrator.sources import VERIFIER_ROLLOUT_FUNCTION
 from wavelet.utils.config import load_config
 
 

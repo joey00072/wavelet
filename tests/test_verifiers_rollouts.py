@@ -41,7 +41,7 @@ from wavelet.orchestrator.verifiers import (
     _VerifierFailureStats,
     _VerifierGroupState,
 )
-from wavelet.transport.rollouts.filesystem import FileSystemRolloutSender
+from wavelet.transport.queue import FileSystemRolloutSender
 
 
 def _bare_scheduler(**overrides: Any) -> VerifierRolloutScheduler:
@@ -1344,7 +1344,7 @@ def test_verifier_records_keep_task_and_harness_metadata_separate() -> None:
 
 
 def test_verifier_rollout_keys_distinguish_episodes_and_branches() -> None:
-    from wavelet.contracts.rollout_metadata import rollout_task_harness_metadata
+    from wavelet.orchestrator.rollout_metadata import rollout_task_harness_metadata
 
     keys = set()
     for trajectory_id in ("episode-a", "episode-b"):

@@ -10,8 +10,8 @@ from typing import Any, Self
 import pytest
 
 from wavelet.configs.config import RLConfig
-from wavelet.inference.vllm import engine as engine_module
-from wavelet.inference.vllm.engine import (
+from wavelet.inference import engine as engine_module
+from wavelet.inference.engine import (
     ADMIN_CONTROL_TIMEOUT_SECONDS,
     NCCL_READY_MARKER,
     POLICY_LOAD_TIMEOUT_SECONDS,
@@ -139,9 +139,9 @@ def test_nccl_ready_marker_is_written_with_custom_rollout_function(tmp_path) -> 
 
     def request_all(method, path, payload=None):
         assert (tmp_path / NCCL_READY_MARKER).exists() == (path != "/pause")
-        return {"policy_step": 1}
+        return [{"policy_step": 1}]
 
-    engine.admin[0]._request = request_all
+    engine._request_all = request_all
 
     engine.load_policy(tmp_path, step=1)
 

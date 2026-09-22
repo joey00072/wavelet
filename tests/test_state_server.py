@@ -4,7 +4,7 @@ import pytest
 
 from wavelet.configs.config import RLConfig
 from wavelet.orchestrator.state_server import OrchestratorRunState
-from wavelet.transport.rollouts.filesystem import FileSystemRolloutSender
+from wavelet.transport.queue import FileSystemRolloutSender
 
 
 def test_orchestrator_state_tracks_rollout_and_policy_updates(tmp_path) -> None:

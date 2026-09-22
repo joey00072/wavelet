@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Literal, TextIO
 
 from wavelet.configs.config import DeploymentConfig, RLConfig, SFTConfig, TrainerConfig
-from wavelet.launch.placement import required_inference_devices
+from wavelet.orchestrator.placement import required_inference_devices
 from wavelet.utils.config import load_config
 from wavelet.utils.pathing import get_config_dir, launch_config_paths
 from wavelet.utils.serialization import dump_yaml
@@ -478,14 +478,14 @@ def run_rl_worker(
     config_dir: Path | None = None,
 ) -> int:
     from wavelet.inference.policy import expected_served_model_names
-    from wavelet.launch.runtime import (
+    from wavelet.monitor import finish_shared_wandb_run
+    from wavelet.orchestrator.runtime import (
         _config_path_for_role,
         _inference_replica_config,
         _rollout_client_config,
         _shared_wandb_environment,
         _write_subconfigs,
     )
-    from wavelet.monitor import finish_shared_wandb_run
 
     inference_count = config.deployment.num_inference_nodes
     inference_hosts = hosts[:inference_count]

@@ -9,8 +9,8 @@ from vllm.lora.request import LoRARequest
 
 from wavelet.configs.config import RLConfig
 from wavelet.data.rl import RLExample
-from wavelet.inference.vllm import engine as engine_module
-from wavelet.inference.vllm.engine import VLLMPolicyInferenceEngine
+from wavelet.inference import engine as engine_module
+from wavelet.inference.engine import VLLMPolicyInferenceEngine
 
 
 class _FakeLLMEngine:

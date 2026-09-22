@@ -11,7 +11,6 @@ from dataclasses import replace
 from pathlib import Path
 
 from wavelet.configs.config import RLConfig
-from wavelet.contracts.schedule import required_policy_step, target_steps
 from wavelet.data.rl import RLExample, load_rl_records, serialize_rl_record
 from wavelet.inference.policy import RLInference
 from wavelet.orchestrator.admission import RolloutAdmissionController
@@ -23,7 +22,8 @@ from wavelet.orchestrator.algorithms import (
     uses_group_advantages,
 )
 from wavelet.orchestrator.reward import RLRewardScorer, assistant_text
-from wavelet.transport.rollouts.filesystem import (
+from wavelet.orchestrator.schedule import required_policy_step, target_steps
+from wavelet.transport.queue import (
     FileSystemRolloutSender,
     QueueEvent,
     RolloutBatch,

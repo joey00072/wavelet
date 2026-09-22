@@ -21,8 +21,8 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.v1.engine.core import DPEngineCoreProc
 
 from wavelet.configs.config import RLConfig
-from wavelet.inference.vllm import patches as inference_patches
-from wavelet.inference.vllm import server
+from wavelet.inference import patches as inference_patches
+from wavelet.inference import server
 
 
 def test_chat_token_endpoint_preserves_custom_json_responses() -> None:

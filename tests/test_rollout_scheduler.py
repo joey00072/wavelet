@@ -13,10 +13,7 @@ from wavelet.orchestrator.scheduler import (
     resolve_rollout_schedule,
 )
 from wavelet.orchestrator.sources import RolloutSourceKind
-from wavelet.transport.rollouts.filesystem import (
-    FileSystemPolicyReceiver,
-    FileSystemRolloutSender,
-)
+from wavelet.transport.queue import FileSystemPolicyReceiver, FileSystemRolloutSender
 from wavelet.utils.pathing import STABLE_CHECKPOINT_MARKER
 
 

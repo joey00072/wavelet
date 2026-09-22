@@ -10,14 +10,14 @@ import torch
 from peft import LoraConfig, get_peft_model
 from torch import nn
 
-import wavelet.trainer.policy_export as policy_module
 from wavelet.configs.config import CheckpointConfig, RLConfig
 from wavelet.kernels.lora import LoRA_W
 from wavelet.kernels.smart_gc import WaveletCheckpointFunction
 from wavelet.trainer import model as model_module
 from wavelet.trainer.ckpt import CheckpointManager, TrainerState
 from wavelet.trainer.distributed import World
-from wavelet.trainer.policy_export import PolicyExporter
+from wavelet.transport import policy as policy_module
+from wavelet.transport.policy import PolicyExportMixin
 
 
 def _world(world_size: int = 1) -> World:
@@ -74,7 +74,7 @@ def test_async_save_waits_for_staging_before_returning(monkeypatch, tmp_path) ->
 # ── forced NCCL export on resume ──────────────────────────────────────────────
 
 
-class _PolicyExporter(PolicyExporter):
+class _PolicyExporter(PolicyExportMixin):
     pass
 
 
@@ -87,14 +87,12 @@ def test_forced_nccl_export_prunes_newer_stable_snapshots(monkeypatch) -> None:
             )
         }
     )
-    trainer = SimpleNamespace(
-        config=config,
-        model=object(),
-        tokenizer=object(),
-        world=_world(),
-        output_dir=Path("outputs/run"),
-    )
-    exporter = _PolicyExporter(trainer)
+    exporter = _PolicyExporter()
+    exporter.config = config
+    exporter.model = object()
+    exporter.tokenizer = object()
+    exporter.world = _world()
+    exporter.output_dir = Path("outputs/run")
     exporter._export_nccl_policy = Mock(return_value=Path("policy"))
     pruned: list[tuple[Path, int]] = []
     monkeypatch.setattr(
@@ -181,7 +179,7 @@ def test_lora_w_backward_accepts_2d_and_3d_inputs(shape: tuple[int, ...]) -> Non
 
 
 def test_prune_rollout_batches_from_removes_only_later_steps(tmp_path) -> None:
-    from wavelet.transport.rollouts.filesystem import prune_rollout_batches_from
+    from wavelet.transport.queue import prune_rollout_batches_from
 
     queue_dir = tmp_path / "queue"
     for step in (3, 4, 5):

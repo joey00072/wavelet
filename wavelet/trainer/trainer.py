@@ -73,6 +73,7 @@ from wavelet.trainer.model import (
 )
 from wavelet.trainer.moe import (
     configure_hf_moe_routers,
+    install_moe_load_balance_hook,
     moe_load_balance_metrics,
 )
 from wavelet.trainer.optim import (
@@ -592,6 +593,11 @@ class BaseTrainer:
             parallel_dims=self.parallel_dims,
             initialize_on_meta=use_fsdp2_meta_init,
         )
+        if (
+            getattr(model.config, "model_type", None) == "deepseek_v4"
+            and self.config.loss_impl != "torch"
+        ):
+            raise ValueError('Native eager DeepSeek-V4 requires loss_impl="torch".')
         # Keep the compatibility default aligned with the base model while allowing
         # explicit FP32 adapter parameters for higher-fidelity optimizer updates.
         # "auto" + "model" aligns to whatever dtype the base weights loaded as.
@@ -810,6 +816,7 @@ class BaseTrainer:
             self.config.optim,
             self.model.named_parameters(),
         )
+        install_moe_load_balance_hook(self.optimizer, self.model)
         if self.config.optim.cpu_offload:
             enable_optimizer_state_offload(self.optimizer)
 

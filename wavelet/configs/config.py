@@ -10,7 +10,7 @@ from pydantic import (
     model_validator,
 )
 
-from wavelet.configs.constants import VERIFIER_ROLLOUT_FUNCTION
+from wavelet.orchestrator.sources import VERIFIER_ROLLOUT_FUNCTION
 
 
 class ConfigModel(BaseModel):

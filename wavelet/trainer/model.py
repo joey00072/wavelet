@@ -85,12 +85,9 @@ from wavelet.trainer.moe import (
     configure_hf_moe_expert_parallel,
     hf_moe_experts,
     hf_moe_routers,
+    mark_moe_buffers_ddp_ignored,
 )
 from wavelet.trainer.types import LORA_STATE_ATTRS, lora_adapter_name_from_key
-from wavelet.utils.modules import (
-    strip_training_wrapper_segments as _strip_training_wrapper_segments,
-)
-from wavelet.utils.modules import unwrap_model as _unwrap_model
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +163,7 @@ def multimodal_forward_kwargs(batch: dict[str, Tensor]) -> dict[str, Tensor]:
 
 
 def pre_download_model(model_name: str) -> Path | None:
-    """Populate the Hugging Face cache before launcher roles start."""
+    """Populate the Hugging Face cache once before launcher roles start."""
     local_path = Path(model_name)
     if model_name == DEBUG_MODEL_NAME or local_path.exists():
         logger.info("Model %s is local; skipping pre-download.", model_name)
@@ -227,7 +224,9 @@ def prepare_kbit_model(
 
 
 def setup_tokenizer(config: ModelConfig) -> PreTrainedTokenizerBase:
-    """Load and normalize the tokenizer for a model or adapter."""
+    from wavelet.trainer.models.deepseek_v4 import register_model
+
+    register_model()
     if config.name == DEBUG_MODEL_NAME:
         return build_debug_tokenizer(model_max_length=4096)
     tokenizer_source = config.adapter_path or config.name
@@ -272,9 +271,14 @@ def apply_liger_kernel(
     """
     if loss_impl not in ("liger", "liger_fused"):
         return
+    from wavelet.trainer.models.deepseek_v4 import register_model
+
+    register_model()
     architecture = AutoConfig.from_pretrained(
         model_name, trust_remote_code=trust_remote_code
     )
+    if getattr(architecture, "model_type", None) == "deepseek_v4":
+        raise ValueError('Native eager DeepSeek-V4 requires loss_impl="torch".')
     model_type = getattr(architecture, "model_type", None)
     patch_name = _LIGER_MODEL_PATCHES.get(model_type)
     if patch_name is None:
@@ -547,12 +551,55 @@ def setup_model(
             parallel_dims=parallel_dims,
         )
 
+    from wavelet.trainer.models.deepseek_v4 import register_model
+
+    register_model()
     setup_runtime(config)
     model_kwargs, model_is_prequantized, attention = _model_load_kwargs(
         config,
         distributed=distributed,
         parallel_dims=parallel_dims,
     )
+    architecture = AutoConfig.from_pretrained(
+        config.name, trust_remote_code=config.trust_remote_code
+    )
+    if getattr(architecture, "model_type", None) == "deepseek_v4":
+        if (
+            getattr(architecture, "wavelet_checkpoint_format", None)
+            != "deepseek_v4_native_v1"
+        ):
+            raise ValueError(
+                "DeepSeek-V4 requires a converted native checkpoint; run "
+                "python -m wavelet.trainer.models.deepseek_v4.conversion RAW_DIR NATIVE_DIR first."
+            )
+        if config.experts_implementation not in {None, "eager"}:
+            raise ValueError(
+                "Native DeepSeek-V4 currently supports eager experts only."
+            )
+        model_kwargs.pop("experts_implementation", None)
+        if config.attn_implementation not in {"auto", "eager"}:
+            raise ValueError(
+                "Native DeepSeek-V4 currently supports eager attention only."
+            )
+        if (
+            config.load_in_4bit
+            or initialize_on_meta
+            or config.smart_gc
+            or config.fused_lm_head_token_chunk_size != "disabled"
+        ):
+            raise ValueError(
+                "Native DeepSeek-V4 does not support 4-bit, meta initialization, smart GC or fused LM-head injection."
+            )
+        if parallel_dims is not None and (
+            parallel_dims.cp_enabled
+            or parallel_dims.tp_enabled
+            or parallel_dims.ep_enabled
+        ):
+            raise ValueError(
+                "Native eager DeepSeek-V4 currently requires CP/TP/EP sizes of one."
+            )
+        attention = "eager"
+        model_kwargs["attn_implementation"] = attention
     if initialize_on_meta:
         if config.load_in_4bit:
             raise ValueError(
@@ -988,6 +1035,9 @@ def maybe_wrap_fsdp(
     if not fsdp_config.enabled:
         return model
 
+    if getattr(model.config, "model_type", None) == "deepseek_v4":
+        raise ValueError("Native eager DeepSeek-V4 does not yet support FSDP wrapping.")
+
     if not torch.distributed.is_initialized():
         raise RuntimeError(
             "FSDP requires an initialized torch.distributed process group."
@@ -1173,6 +1223,7 @@ def maybe_wrap_ddp(
         if world.device.type == "cuda"
         else {}
     )
+    mark_moe_buffers_ddp_ignored(model)
     return cast(PreTrainedModel, DDP(model, **ddp_kwargs))
 
 
@@ -1247,7 +1298,10 @@ def is_fsdp_model(model: nn.Module) -> bool:
 
 
 def unwrap_model(model: nn.Module) -> PreTrainedModel:
-    return cast(PreTrainedModel, _unwrap_model(model))
+    current = model
+    while hasattr(current, "module"):
+        current = cast(nn.Module, current.module)
+    return cast(PreTrainedModel, current)
 
 
 def _transformer_layer_classes(model: nn.Module) -> set[type[nn.Module]]:
@@ -1767,6 +1821,15 @@ def _split_lora_state_key(key: str) -> tuple[str | None, str | None]:
         if marker in key:
             return key.split(marker, 1)[0], attr
     return None, None
+
+
+def _strip_training_wrapper_segments(key: str) -> str:
+    """Keep adapter keys compatible with the unwrapped inference model."""
+    return ".".join(
+        segment
+        for segment in key.split(".")
+        if segment not in {"_fsdp_wrapped_module", "_checkpoint_wrapped_module"}
+    )
 
 
 def _lora_parameter_shapes(model: PeftModel) -> dict[str, tuple[int, ...]]:

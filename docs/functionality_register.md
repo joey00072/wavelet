@@ -41,7 +41,7 @@ run in the ordinary test suite.
 | NCCL policy transport | Run the dedicated two-GPU configuration and `uv run pytest tests/test_vllm_weight_update.py` |
 | Colocate and sleep choreography | Run the colocate and colocate-sleep smoke configs under `examples/qwen30b_math/` after checking GPU availability |
 | Ray launcher backend | Set `launcher.backend: ray` in a temporary process-mode config and run preflight plus the resolved launcher |
-| Multi-node SLURM deployment | Dry-run `examples/multinode/{sft,rl}.yaml`, inspect the generated sbatch scripts, then run the site-configured GPU smoke and verify `slurm_allocation.json` plus per-role logs |
+| Native SLURM backend | Dry-run `examples/multinode/{sft,rl}.yaml`, inspect the generated sbatch scripts, then run the site-configured GPU smoke and verify `slurm_allocation.json` plus per-role logs |
 | Dashboard API and artifact readers | `uv run pytest tests/test_dashboard.py` |
 | Per-node trainer telemetry and heartbeat rank table | `uv run pytest tests/test_telemetry.py tests/test_monitoring.py` |
 | Web UI compatibility | `cd webui && bun run build && bun run test:e2e`; the suite verifies run selection, all-metric exploration, the three-pane trace viewer, evaluation reports, merged/split logs, config, empty/error states, and mobile layout against synthetic runs |
@@ -57,10 +57,10 @@ Each contract has one implementation owner:
 | Contract | Canonical owner |
 |---|---|
 | SFT and RL data pipelines | `wavelet.data.sft`, `wavelet.data.rl` |
-| Rollout scheduling and source selection | `wavelet.contracts.schedule`, `wavelet.orchestrator.scheduler`, `wavelet.orchestrator.sources` |
+| Rollout scheduling and source selection | `wavelet.orchestrator.scheduler`, `wavelet.orchestrator.sources` |
 | Verifier clients, environments, and evaluation | `wavelet.orchestrator.envs` |
-| Queue artifacts, lifecycle, metrics, and inspection | `wavelet.transport.rollouts.filesystem` |
-| Filesystem and NCCL policy transfer | `wavelet.transport.weights` |
+| Queue artifacts, lifecycle, metrics, and inspection | `wavelet.transport.queue` |
+| Filesystem and NCCL policy transfer | `wavelet.transport.policy` |
 | Model loading, LoRA, and QLoRA | `wavelet.trainer.model` |
 | Distributed world and device meshes | `wavelet.trainer.distributed` |
 | SLURM submission and allocation lifecycle | `wavelet.deployment.slurm` |

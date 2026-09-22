@@ -111,9 +111,7 @@ def test_muon_orthogonalization_handles_tall_and_batched_matrices() -> None:
 
 
 def _dtensor_muon_worker(rank: int, world_size: int, rendezvous: str, dim: int) -> None:
-    dist.init_process_group(
-        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size
-    )
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=world_size)
     mesh = init_device_mesh("cpu", (world_size,))
     base = torch.arange(24, dtype=torch.float32).reshape(6, 4) / 10
     reference = torch.nn.Parameter(base.clone())
@@ -143,9 +141,7 @@ def _dtensor_muon_worker(rank: int, world_size: int, rendezvous: str, dim: int) 
 @pytest.mark.parametrize("dim", [0, 1])
 def test_muon_dtensor_cpu_gloo_matches_unsharded_and_resumes(dim: int) -> None:
     with tempfile.NamedTemporaryFile() as rendezvous:
-        mp.spawn(
-            _dtensor_muon_worker, args=(2, rendezvous.name, dim), nprocs=2, join=True
-        )
+        mp.spawn(_dtensor_muon_worker, args=(2, rendezvous.name, dim), nprocs=2, join=True)
 
 
 def test_optimizer_state_offload_preserves_updates_and_cpu_state() -> None:
@@ -203,19 +199,9 @@ def test_optimizer_state_offload_reuses_pinned_buffers_across_steps() -> None:
         parameter.grad = torch.tensor([value], device="cuda")
         optimizer.step()
         state = optimizer.state[parameter]
-        pointers.append(
-            {
-                key: tensor.data_ptr()
-                for key, tensor in state.items()
-                if torch.is_tensor(tensor)
-            }
-        )
+        pointers.append({key: tensor.data_ptr() for key, tensor in state.items() if torch.is_tensor(tensor)})
     assert pointers[0] == pointers[1] == pointers[2]
-    assert all(
-        tensor.is_pinned()
-        for tensor in optimizer.state[parameter].values()
-        if torch.is_tensor(tensor)
-    )
+    assert all(tensor.is_pinned() for tensor in optimizer.state[parameter].values() if torch.is_tensor(tensor))
     assert offloader._cpu_buffers
 
 

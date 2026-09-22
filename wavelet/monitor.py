@@ -20,13 +20,13 @@ from typing import Any
 import torch
 
 from wavelet.configs.config import RLConfig, SFTConfig, WandbConfig
-from wavelet.contracts.rollout_metadata import (
+from wavelet.dashboard.jsonl import read_json as _read_json  # noqa: F401
+from wavelet.orchestrator.rollout_metadata import (
     error_metric_name,
     metadata_harness_name,
     metadata_task_name,
 )
-from wavelet.contracts.trace import append_trace_event_best_effort, make_trace_event
-from wavelet.dashboard.jsonl import read_json as _read_json  # noqa: F401
+from wavelet.orchestrator.trace import append_trace_event_best_effort, make_trace_event
 from wavelet.trainer.distributed import World, get_world
 
 _SECRET_KEYS = {

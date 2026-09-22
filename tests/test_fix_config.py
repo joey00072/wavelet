@@ -20,8 +20,8 @@ from wavelet.configs.config import (
 )
 from wavelet.kernels import lora as lora_kernels
 from wavelet.kernels import patch as kernel_patch
-from wavelet.launch import roles as launcher_module
-from wavelet.launch.roles import RayRoleHandle, RoleSpec
+from wavelet.orchestrator import launcher as launcher_module
+from wavelet.orchestrator.launcher import RayRoleHandle, RoleSpec
 from wavelet.trainer import model as model_module
 from wavelet.trainer.debug import DEBUG_LORA_TARGET_MODULES
 
@@ -395,7 +395,7 @@ def test_preflight_torchrun_check_covers_every_multi_role_mode(
 
 
 def test_launcher_rejects_passthrough_reward_for_generated_rollouts() -> None:
-    from wavelet.launch.placement import (
+    from wavelet.orchestrator.placement import (
         rollout_reward_mode_error,
         validate_rollout_reward_mode,
     )

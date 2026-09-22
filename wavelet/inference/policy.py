@@ -39,7 +39,7 @@ def require_expected_served_model(
 
 def create_policy_inference_engine(config: RLConfig) -> PolicyInferenceEngine:
     if config.inference.mode == "vllm_http":
-        from wavelet.inference.vllm.engine import HTTPPolicyInferenceEngine
+        from wavelet.inference.engine import HTTPPolicyInferenceEngine
 
         return HTTPPolicyInferenceEngine(config)
     if config.inference.mode == "passthrough":

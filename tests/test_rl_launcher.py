@@ -13,21 +13,17 @@ import pytest
 import wavelet.orchestrator.envs as verifier_envs
 import wavelet.trainer.rl as trainer_runtime
 from wavelet.configs.config import RLConfig
-from wavelet.contracts.schedule import (
-    chunks_per_step,
-    rollout_chunk_examples,
-    rollout_groups_for_chunk,
-)
 from wavelet.data.rl import RLExample
-from wavelet.inference.vllm import server as inference_server
-from wavelet.inference.vllm.engine import (
+from wavelet.inference import server as inference_server
+from wavelet.inference.engine import (
     HTTPPolicyInferenceEngine,
     VLLMPolicyInferenceEngine,
     _shift_completion_sample,
 )
-from wavelet.inference.vllm.server import _fit_chat_request_to_context, _serve_argv
-from wavelet.launch import runtime
-from wavelet.launch.runtime import (
+from wavelet.inference.server import _fit_chat_request_to_context, _serve_argv
+from wavelet.orchestrator import runtime
+from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.runtime import (
     _config_path_for_role,
     _config_with_nccl_inference_world_size,
     _publish_rollout_timed,
@@ -39,7 +35,11 @@ from wavelet.launch.runtime import (
     _trainer_device_group,
     _wait_for_vllm_http_server,
 )
-from wavelet.orchestrator.rollouts import RLOrchestrator
+from wavelet.orchestrator.schedule import (
+    chunks_per_step,
+    rollout_chunk_examples,
+    rollout_groups_for_chunk,
+)
 from wavelet.orchestrator.scheduler import (
     PublishMode,
     _colocated_trainer_device_ids,
@@ -54,12 +54,12 @@ from wavelet.trainer.rl import (
     _validate_rollout_batch,
     _validate_streaming_rollout_batch,
 )
-from wavelet.transport.rollouts.filesystem import (
+from wavelet.transport.policy import NCCL_READY_MARKER
+from wavelet.transport.queue import (
     FileSystemRolloutSender,
     RolloutChunkAccumulator,
     publish_adapter_policy_snapshot,
 )
-from wavelet.transport.weights.handshake import NCCL_READY_MARKER
 
 
 class _FakeWorld:
@@ -788,7 +788,7 @@ def test_inference_server_uses_nccl_worker_for_nccl_transfer() -> None:
 
     assert (
         _argv_value(argv, "--worker-extension-cls")
-        == "wavelet.inference.vllm.weight_update_worker.NCCLWeightUpdateWorker"
+        == "wavelet.transport.policy.NCCLWeightUpdateWorker"
     )
 
 
@@ -1126,7 +1126,7 @@ def test_sleep_colocate_initial_sleep_targets_all_vllm_servers(monkeypatch) -> N
         calls.append(port)
 
     monkeypatch.setattr(
-        "wavelet.launch.runtime._sleep_vllm_http_server",
+        "wavelet.orchestrator.runtime._sleep_vllm_http_server",
         fake_sleep,
     )
 
@@ -1140,11 +1140,10 @@ def test_http_inference_sleep_discards_vllm_gpu_allocations() -> None:
     engine = HTTPPolicyInferenceEngine(config)
     calls = []
 
-    def fake_request(method: str, path: str, payload: dict) -> dict:
+    def fake_request_all(method: str, path: str, payload: dict) -> None:
         calls.append((method, path, payload))
-        return {}
 
-    engine.admin[0]._request = fake_request
+    engine._request_all = fake_request_all  # type: ignore[method-assign]
 
     engine.sleep()
 

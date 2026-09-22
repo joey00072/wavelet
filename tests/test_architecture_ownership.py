@@ -7,7 +7,7 @@ from wavelet.orchestrator import scheduler
 
 
 def test_verifier_rollout_function_path_resolves_to_scheduler() -> None:
-    assert verifier_rollout_module.generate_rollouts is scheduler.generate_rollouts
+    assert verifier_rollout_module is scheduler
 
 
 def test_modules_do_not_shadow_top_level_definitions() -> None:
