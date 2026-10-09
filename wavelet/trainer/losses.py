@@ -123,8 +123,11 @@ def _trust_region_loss(
     keep_mask = loss_mask & ~invalid
 
     log_importance_ratio = trainer_logprobs - inputs.inference_logprobs
-    importance_ratio = torch.exp(log_importance_ratio)
-    mismatch_kl = importance_ratio - log_importance_ratio - 1
+    # Rejected tokens must never evaluate an overflowing exponential in the
+    # autograd graph: multiplying inf by a zero mask still produces NaN.
+    importance_ratio = torch.exp(torch.where(keep_mask, log_importance_ratio, 0.0))
+    with torch.no_grad():
+        mismatch_kl = torch.exp(log_importance_ratio) - log_importance_ratio - 1
 
     scaled_advantages = loss_config.adv_tau * advantages
     teacher_kl = None
@@ -134,8 +137,8 @@ def _trust_region_loss(
             scaled_advantages + loss_config.teacher_tau * teacher_kl.detach()
         )
 
-    pg_loss = keep_mask * scaled_advantages * importance_ratio
-    kl_loss = loss_mask * log_importance_ratio.square()
+    pg_loss = torch.where(keep_mask, scaled_advantages, 0.0) * importance_ratio
+    kl_loss = torch.where(loss_mask, log_importance_ratio, 0.0).square()
     per_token_loss = -pg_loss + loss_config.kl_tau * kl_loss
     if inputs.loss_weights is not None:
         per_token_loss = per_token_loss * inputs.loss_weights
@@ -192,13 +195,24 @@ def ipo_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
 def icepop_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
     """Importance-ratio policy gradient with an inclusive acceptance band."""
     log_ratio = inputs.trainer_logprobs - inputs.inference_logprobs
-    low = torch.log(torch.as_tensor(getattr(loss_config, "ratio_low", 0.2), device=log_ratio.device))
-    high = torch.log(torch.as_tensor(getattr(loss_config, "ratio_high", 5.0), device=log_ratio.device))
+    low = torch.log(
+        torch.as_tensor(getattr(loss_config, "ratio_low", 0.2), device=log_ratio.device)
+    )
+    high = torch.log(
+        torch.as_tensor(
+            getattr(loss_config, "ratio_high", 5.0), device=log_ratio.device
+        )
+    )
     rejected = (log_ratio.detach() < low) | (log_ratio.detach() > high)
     keep = inputs.loss_mask & ~rejected
     # Mask before exp: rejected very large ratios must not create inf*0 NaNs.
     safe_ratio = torch.exp(torch.where(keep, log_ratio, torch.zeros_like(log_ratio)))
-    per_token = -keep.to(inputs.advantages.dtype) * getattr(loss_config, "adv_tau", 1.0) * inputs.advantages * safe_ratio
+    per_token = (
+        -keep.to(inputs.advantages.dtype)
+        * getattr(loss_config, "adv_tau", 1.0)
+        * inputs.advantages
+        * safe_ratio
+    )
     if inputs.loss_weights is not None:
         per_token = per_token * inputs.loss_weights
     mismatch = torch.exp(log_ratio) - log_ratio - 1
@@ -210,6 +224,8 @@ def icepop_loss_fn(inputs: LossInputs, loss_config: RLLossConfig) -> LossOutput:
             "is_masked": _safe_mean(rejected.float(), inputs.loss_mask),
         },
     )
+
+
 def ce_loss_fn(inputs: LossInputs) -> LossOutput:
     """Return weighted next-token cross entropy for one sequence."""
     per_token_loss = -inputs.trainer_logprobs
@@ -229,16 +245,17 @@ def ref_kl_loss_fn(inputs: LossInputs) -> LossOutput:
         )
 
     log_ratio = inputs.trainer_logprobs - inputs.inference_logprobs
-    importance_ratio = torch.exp(log_ratio)
-    mismatch_kl = importance_ratio - log_ratio - 1
+    with torch.no_grad():
+        mismatch_kl = torch.exp(log_ratio) - log_ratio - 1
     probability_delta = torch.exp(inputs.trainer_logprobs) - torch.exp(
         inputs.inference_logprobs
     )
     invalid = probability_delta < -0.2
     keep_mask = inputs.loss_mask & ~invalid
+    importance_ratio = torch.exp(torch.where(keep_mask, log_ratio, 0.0))
     teacher_kl = inputs.teacher_logprobs - inputs.trainer_logprobs
-    policy_loss = -(keep_mask * teacher_kl.detach() * importance_ratio)
-    regularizer = inputs.loss_mask * log_ratio.square()
+    policy_loss = -(torch.where(keep_mask, teacher_kl.detach(), 0.0) * importance_ratio)
+    regularizer = torch.where(inputs.loss_mask, log_ratio, 0.0).square()
     per_token_loss = policy_loss + 1e-3 * regularizer
     if inputs.loss_weights is not None:
         per_token_loss = per_token_loss * inputs.loss_weights
@@ -291,8 +308,10 @@ def setup_rl_loss_fn(loss_config: RLLossConfig) -> LossFn:
         return ipo_loss
 
     if loss_config.type == "icepop":
+
         def icepop_loss(inputs: LossInputs) -> LossOutput:
             return icepop_loss_fn(inputs, loss_config)
+
         return icepop_loss
 
     def dppo_loss(inputs: LossInputs) -> LossOutput:
@@ -950,7 +969,10 @@ class _ChunkedLogprobFn(torch.autograd.Function):
                         masked_log_z = log_z_chunk[masked_rows]
                         masked_probs = (
                             torch.exp(
-                                scaled_logits[masked_rows] - masked_log_z.unsqueeze(-1)
+                                scaled_logits[masked_rows].masked_fill(
+                                    mask_indicator == 0, float("-inf")
+                                )
+                                - masked_log_z.unsqueeze(-1)
                             )
                             * mask_indicator
                         )

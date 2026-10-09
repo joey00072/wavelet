@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import re
@@ -1002,6 +1003,9 @@ def save_model(
         )
     else:
         target = output_dir / ("adapter" if is_peft else "model")
+        saved_dtype = (
+            None if state_dict is None or is_peft else _uniform_float_dtype(state_dict)
+        )
         extra = {} if state_dict is None else {"state_dict": state_dict}
         tp_size = getattr(model, "_tp_size", None)
         state_is_already_gathered = (
@@ -1019,9 +1023,26 @@ def save_model(
         finally:
             if state_is_already_gathered:
                 model._tp_size = tp_size
+        if is_main_process and saved_dtype is not None:
+            _record_saved_dtype(target, saved_dtype)
     if is_main_process:
         tokenizer.save_pretrained(target)
     return target
+
+
+def _uniform_float_dtype(state_dict: dict[str, torch.Tensor]) -> torch.dtype | None:
+    dtypes = {value.dtype for value in state_dict.values() if value.is_floating_point()}
+    return dtypes.pop() if len(dtypes) == 1 else None
+
+
+def _record_saved_dtype(target: Path, dtype: torch.dtype) -> None:
+    """Record the exported tensor dtype rather than the live master dtype."""
+    path = target / "config.json"
+    config = json.loads(path.read_text())
+    config["dtype"] = str(dtype).removeprefix("torch.")
+    if "torch_dtype" in config:
+        config["torch_dtype"] = config["dtype"]
+    path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
 
 def maybe_wrap_fsdp(

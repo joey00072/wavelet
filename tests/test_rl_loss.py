@@ -17,13 +17,54 @@ from wavelet.trainer.losses import (
 from wavelet.trainer.types import LossOutput
 
 
+@pytest.mark.parametrize("loss_type", ["dppo", "ipo"])
+def test_trust_region_rejects_overflowing_ratios_before_exp(loss_type: str) -> None:
+    trainer = torch.tensor([[-1.0, -1.0]], requires_grad=True)
+    output = compute_loss(
+        trainer,
+        torch.full_like(trainer, -100.0),
+        None,
+        torch.ones_like(trainer),
+        torch.tensor([[True, False]]),
+        RLLossConfig(type=loss_type, kl_tau=0.01),
+    )
+    output.loss.backward()
+
+    assert output.loss.item() == pytest.approx(0.01 * 99**2)
+    torch.testing.assert_close(trainer.grad, torch.tensor([[1.98, 0.0]]))
+    assert output.metrics["is_masked"].item() == 1.0
+
+
+def test_ref_kl_ignores_overflowing_ratios_outside_component_mask() -> None:
+    trainer = torch.tensor([[-1.0, -1.0]], requires_grad=True)
+    output = compute_loss(
+        trainer,
+        torch.tensor([[-1.0, -100.0]]),
+        torch.full_like(trainer, -2.0),
+        torch.zeros_like(trainer),
+        torch.ones_like(trainer, dtype=torch.bool),
+        RLLossConfig(),
+        rl_weights=torch.zeros_like(trainer),
+        ref_kl_weights=torch.tensor([[1.0, 0.0]]),
+    )
+    output.loss.backward()
+
+    assert torch.isfinite(output.loss)
+    torch.testing.assert_close(trainer.grad, torch.tensor([[1.0, 0.0]]))
+
+
 def test_icepop_loss_masks_out_of_band_ratios_without_nan() -> None:
     config = RLLossConfig(type="icepop", ratio_low=0.2, ratio_high=5.0)
     ratios = torch.tensor([0.1, 0.2, 1.0, 5.0, 10.0])
     trainer = ratios.log().unsqueeze(0).requires_grad_()
     output = compute_loss(
-        trainer, torch.zeros_like(trainer), None, torch.ones_like(trainer),
-        torch.ones_like(trainer, dtype=torch.bool), config, loss_scale=1,
+        trainer,
+        torch.zeros_like(trainer),
+        None,
+        torch.ones_like(trainer),
+        torch.ones_like(trainer, dtype=torch.bool),
+        config,
+        loss_scale=1,
     )
     assert output.metrics["is_masked"] == pytest.approx(0.4)
     output.loss.backward()

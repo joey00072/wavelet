@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -84,6 +85,52 @@ def test_forced_resume_reuses_complete_policy_snapshot(tmp_path) -> None:
     assert exporter.export_policy(step=5, force=True) == step_dir
     assert (adapter_dir / "adapter_model.safetensors").read_bytes() == b"weights"
     assert not future.exists()
+
+
+@pytest.mark.parametrize("reset_progress", [True, False])
+def test_forced_resume_reexports_policy_after_reset_or_external_checkpoint(
+    tmp_path: Path,
+    reset_progress: bool,
+) -> None:
+    step = 0 if reset_progress else 5
+    config = RLConfig(
+        output_dir=tmp_path,
+        ckpt={
+            "mode": "async",
+            "interval": 1,
+            "resume_step": 5 if reset_progress else None,
+            "resume_dir": None if reset_progress else tmp_path / "checkpoint-5",
+            "skip_progress": reset_progress,
+        },
+    )
+    step_dir = _stable_policy_dir(tmp_path / "policies", step)
+    adapter = step_dir / "adapter" / "adapter_model.safetensors"
+    adapter.parent.mkdir()
+    adapter.write_bytes(b"old weights")
+    metadata = {"format_version": 1, "step": step, "kind": "adapter"}
+    (step_dir / "policy.json").write_text(json.dumps(metadata))
+    exporter = PolicyExportMixin()
+    exporter.config = config
+    exporter.output_dir = tmp_path
+    exporter.model = object()
+    exporter.tokenizer = object()
+    exporter.world = SimpleNamespace(is_main=True, world_size=1)
+    exporter.offload_after_refit = Mock()
+
+    def save_current_weights(tmp_dir: Path) -> Path:
+        target = tmp_dir / "adapter"
+        target.mkdir()
+        (target / "adapter_model.safetensors").write_bytes(b"restored weights")
+        return target
+
+    exporter._save_filesystem_policy = Mock(side_effect=save_current_weights)
+    exporter._write_policy_metadata = lambda tmp_dir, **_kwargs: (
+        tmp_dir / "policy.json"
+    ).write_text(json.dumps(metadata))
+
+    assert exporter.export_policy(step=step, force=True) == step_dir
+    exporter._save_filesystem_policy.assert_called_once()
+    assert adapter.read_bytes() == b"restored weights"
 
 
 def test_ordinary_export_does_not_overwrite_stable_policy(tmp_path) -> None:

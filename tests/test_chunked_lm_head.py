@@ -10,6 +10,27 @@ from wavelet.trainer.losses import (
 )
 
 
+@pytest.mark.parametrize("excluded_token", [0, 8192])
+def test_chunked_support_excludes_large_logits_before_exp(excluded_token: int) -> None:
+    head = ChunkedLogprobLmHead(1, 8201, chunk_size=1)
+    with torch.no_grad():
+        head.weight.zero_()
+        head.weight[excluded_token] = 100.0
+    hidden = torch.ones((1, 1, 1), requires_grad=True)
+    output = head(
+        hidden,
+        labels=torch.tensor([[1]]),
+        temperature=torch.ones((1, 1)),
+        sampling_mask_ids=torch.tensor([[[1]]]),
+        sampling_mask_lengths=torch.tensor([[1]]),
+    )
+    output["logprobs"].sum().backward()
+
+    torch.testing.assert_close(output["logprobs"], torch.zeros((1, 1)))
+    torch.testing.assert_close(hidden.grad, torch.zeros_like(hidden))
+    torch.testing.assert_close(head.weight.grad, torch.zeros_like(head.weight))
+
+
 @pytest.mark.parametrize("vocab_size", [11, 8201])
 def test_chunked_lm_head_matches_full_logits_logprobs(vocab_size: int) -> None:
     torch.manual_seed(0)

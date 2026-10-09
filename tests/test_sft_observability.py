@@ -134,6 +134,11 @@ def test_sft_train_step_reports_gradient_norm() -> None:
         return_value={}
     )
 
-    output = trainer._train_step({"input_ids": torch.ones((1, 1), dtype=torch.long)})
+    output = trainer._train_step(
+        {
+            "input_ids": torch.ones((1, 1), dtype=torch.long),
+            "labels": torch.ones((1, 1), dtype=torch.long),
+        }
+    )
 
     assert output.metrics["optim/grad_norm"] == pytest.approx(1.25)

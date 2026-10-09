@@ -104,6 +104,35 @@ counts once per optimizer update, including unequal packed rank lengths and
 ranks containing only padding.
 Checkpoint logs report the pending upload path and when its stable marker is
 written; a final Hugging Face export can take additional time afterward.
+The run remains active until that export succeeds on every trainer rank. Export
+or final checkpoint failures mark the run failed rather than completed.
+
+Filesystem full-model exports record the saved tensor dtype in `config.json`
+when the floating tensors share one dtype. Exporting bf16 weights from fp32
+master parameters therefore preserves bf16 when reloaded with `dtype="auto"`.
+The live trainer parameters retain their original dtype.
+
+A resume that resets progress (`ckpt.skip_progress: true`) or selects an
+explicit `ckpt.resume_dir` exports the restored weights again. It cannot reuse
+an existing policy merely because its step number matches. Ordinary resumes
+within the same run can reuse the matching complete snapshot.
+
+SFT normalizes each optimizer update by the supervised-token count over all
+its micro-batches and data/context ranks. Splitting a batch or enabling CP does
+not give shorter micro-batches more weight. This applies to both the Torch and
+Liger fused losses; empty supervised shards contribute zero loss.
+
+Before either SFT or RL updates parameters, every rank checks its local gradient
+shards for finite values, even when gradient clipping is disabled. A non-finite
+gradient or clipping norm aborts the update across ranks without advancing the
+optimizer or scheduler. RL ranks also agree whether reference-policy forwards
+or auxiliary-component normalization are needed; padding-only ranks participate
+in those operations so collective ordering stays consistent.
+
+DPPO/IPO exclude rejected tokens before exponentiating their importance ratios.
+Extreme accepted ratios remain subject to the finite-loss check; they are not
+silently clipped. Sampling-mask replay excludes unsupported logits before
+exponentiation in the chunked LM head's backward pass.
 
 Context parallel SFT and RL require SDPA, token normalization, and a sequence
 length divisible by `2 * fsdp.cp`. Losses are normalized over the explicit

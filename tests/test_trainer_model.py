@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Literal
 from unittest.mock import Mock
@@ -8,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 from torch.utils.checkpoint import CheckpointPolicy
+from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from wavelet.configs.config import (
     ActivationCheckpointingConfig,
@@ -28,6 +30,28 @@ class _Tokenizer:
     eos_token = "<eos>"
     chat_template = "original"
     padding_side = "right"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_saved_config_matches_downcast_export_dtype(tmp_path: Path, dtype) -> None:
+    model = Qwen3ForCausalLM(
+        Qwen3Config(
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=8,
+        )
+    ).float()
+    _, state_dict = model_utils.export_model_for_save(model, state_dict_dtype=dtype)
+    target = model_utils.save_model(model, Mock(), tmp_path, state_dict=state_dict)
+
+    config = json.loads((target / "config.json").read_text())
+    assert config["dtype"] == str(dtype).removeprefix("torch.")
+    assert model.dtype == torch.float32
+    assert Qwen3ForCausalLM.from_pretrained(target, dtype="auto").dtype == dtype
 
 
 @pytest.mark.parametrize("tp,replicate", [(1, 1), (2, 1), (1, 2)])

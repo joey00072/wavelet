@@ -36,6 +36,8 @@ def test_full_tp_save_does_not_gather_an_already_full_state_again(
             calls["path"] = path
             calls["tp_size_during_save"] = self._tp_size
             calls.update(kwargs)
+            path.mkdir(parents=True, exist_ok=True)
+            (path / "config.json").write_text('{"dtype": "float32"}')
 
     class Tokenizer:
         def save_pretrained(self, path: Path) -> None:

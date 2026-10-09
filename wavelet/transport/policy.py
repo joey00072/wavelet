@@ -618,7 +618,11 @@ class PolicyExportMixin:
                 and self.config.policy_transfer.lightweight_lora
                 else "model"
             )
-            if _is_reusable_policy_snapshot(
+            checkpoint = self.config.ckpt
+            can_reuse = checkpoint is None or (
+                not checkpoint.skip_progress and checkpoint.resume_dir is None
+            )
+            if can_reuse and _is_reusable_policy_snapshot(
                 step_dir,
                 step=export_step,
                 expected_kind=expected_kind,

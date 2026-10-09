@@ -58,7 +58,7 @@ def _batch(rank: int, microstep: int, count: int) -> dict[str, torch.Tensor]:
     }
 
 
-def _accumulation_worker(rank: int, rendezvous: str) -> None:
+def _accumulation_worker(rank: int, rendezvous: str, cp: int) -> None:
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2
@@ -82,7 +82,7 @@ def _accumulation_worker(rank: int, rendezvous: str) -> None:
                 local_world_size=2,
                 device=torch.device("cpu"),
             )
-            trainer.parallel_dims = ParallelDims(cp=2, dp_shard=1, world_size=2)
+            trainer.parallel_dims = ParallelDims(cp=cp, dp_shard=2 // cp, world_size=2)
             trainer.model = DistributedDataParallel(model)
             trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
             trainer.scheduler = torch.optim.lr_scheduler.ConstantLR(
@@ -132,12 +132,14 @@ def _accumulation_worker(rank: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
-def test_cp_accumulation_matches_global_token_objective_and_empty_fused_shards(
+@pytest.mark.parametrize("cp", [1, 2])
+def test_accumulation_matches_global_token_objective_and_empty_fused_shards(
     tmp_path: Path,
+    cp: int,
 ) -> None:
     workers = mp.spawn(
         _accumulation_worker,
-        args=(str(tmp_path / "gloo-rendezvous"),),
+        args=(str(tmp_path / "gloo-rendezvous"), cp),
         nprocs=2,
         join=False,
     )
@@ -151,6 +153,37 @@ def test_cp_accumulation_matches_global_token_objective_and_empty_fused_shards(
             if process.is_alive():
                 process.terminate()
             process.join(timeout=5)
+
+
+@pytest.mark.parametrize("loss_impl", ["torch", "liger_fused"])
+def test_single_rank_accumulation_matches_concatenated_token_objective(
+    loss_impl: str,
+) -> None:
+    torch.manual_seed(83)
+    model = _TinyTextModel()
+    reference = copy.deepcopy(model)
+    trainer = SFTTrainer(SFTConfig(loss_impl=loss_impl, max_grad_norm=0.0))
+    trainer.model = model
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    trainer.scheduler = torch.optim.lr_scheduler.ConstantLR(
+        trainer.optimizer, factor=1.0
+    )
+    trainer.accumulation_steps = 2
+    trainer._finish_step_performance_metrics = dict
+    expected_sum = torch.zeros(())
+    for microstep, count in enumerate((1, 3)):
+        batch = _batch(rank=0, microstep=microstep, count=count)
+        logits = reference(**batch).logits
+        expected_sum = expected_sum + F.cross_entropy(
+            logits.flatten(0, 1), batch["labels"].flatten(), reduction="sum"
+        )
+        trainer._train_step(batch)
+    (expected_sum / 4).backward()
+    torch.optim.SGD(reference.parameters(), lr=0.1).step()
+    for actual, expected in zip(
+        model.parameters(), reference.parameters(), strict=True
+    ):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_nonempty_fused_loss_preserves_nonfinite_failure() -> None:

@@ -602,10 +602,13 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             if status == "completed" and self.ckpt_manager is not None:
                 self._save_final_checkpoint()
                 self.ckpt_manager.wait_for_pending_save()
-            self.monitor.finish(status=status, step=self.step)
-            self._run_closed = True
-            if status == "completed" and not self._uses_sleep_colocation():
-                self._save_model()
+            self._finish_run(
+                status=status, save_model=not self._uses_sleep_colocation()
+            )
+        except Exception:
+            if not self._run_closed:
+                self._finish_run(status="failed", save_model=False)
+            raise
         finally:
             self._close_garbage_collector()
 
@@ -755,10 +758,10 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
                 attention_mask = attention_mask.to(dtype=mask_dtype)
 
         rl_weights, ce_weights, ref_kl_weights = self._component_weights(batch)
-        has_auxiliary_component = bool(
-            (ce_weights != 0).any() or (ref_kl_weights != 0).any()
-        )
-        if has_auxiliary_component and self._optimizer_batch_loss_scales is None:
+        if self._optimizer_batch_loss_scales is None and any_rank_true(
+            bool((ce_weights != 0).any() or (ref_kl_weights != 0).any()),
+            device=batch["input_ids"].device,
+        ):
             local_scales = component_normalization_unit_counts(
                 batch["loss_mask"],
                 rl_weights=rl_weights,
@@ -856,6 +859,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         batch: dict[str, Tensor],
         attention_mask: Tensor | None,
     ) -> LossOutput:
+        # Run the no-grad reference pass before the trainable pass so wrappers
+        # such as DDP retain the reducer state for the upcoming backward.
+        inference_logprobs = self._inference_logprobs(batch, attention_mask)
         trainer_logprobs, entropy, moe_metrics = self._model_logprobs_and_entropy(
             batch,
             attention_mask,
@@ -868,7 +874,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
         rl_weights, ce_weights, ref_kl_weights = self._component_weights(batch)
         output = compute_loss(
             trainer_logprobs,
-            self._inference_logprobs(batch, attention_mask),
+            inference_logprobs,
             self._teacher_logprobs(batch),
             batch["advantages"],
             batch["loss_mask"],
@@ -929,6 +935,7 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             )
         self._apply_gradient_accumulation_loss_scale()
         sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
+        self._require_finite_gradients()
         grad_norm = self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
         self.optimizer.step()
         self.scheduler.step()
@@ -1004,7 +1011,9 @@ class RLTrainer(PolicyExportMixin, BaseTrainer):
             dim=1
         )
         missing_required = ~has_inference & needs_inference
-        if not missing_required.any():
+        if not any_rank_true(
+            bool(missing_required.any()), device=inference_logprobs.device
+        ):
             inference_logprobs[~has_inference] = 0.0
             return inference_logprobs
 

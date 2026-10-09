@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import IterableDataset
@@ -44,6 +45,7 @@ from wavelet.trainer.distributed import (
     World,
     all_ranks_true,
     clip_grad_norm_across_meshes_,
+    collective_device,
     distributed_uses_cuda,
     get_world,
     set_world,
@@ -415,16 +417,35 @@ class BaseTrainer:
     def _finish_if_requested(self, finish_run: bool, *, status: str) -> None:
         if not finish_run:
             return
-        monitor = self._require_monitor()
         self._close_step_profiler()
         self._close_memory_profiler()
         try:
-            monitor.finish(status=status, step=self.step)
-            self._run_closed = True
-            if status == "completed":
-                self._save_model()
+            self._finish_run(status=status)
         finally:
             self._close_garbage_collector()
+
+    def _finish_run(self, *, status: str, save_model: bool = True) -> None:
+        """Publish completion only after every rank finishes its final export."""
+        monitor = self._require_monitor()
+        error: Exception | None = None
+        if status == "completed" and save_model:
+            try:
+                self._save_model()
+            except Exception as exc:  # noqa: BLE001 - record and re-raise export failures
+                error = exc
+            device = (
+                collective_device(self.world)
+                if self.world is not None
+                else torch.device("cpu")
+            )
+            if not all_ranks_true(error is None, device=device):
+                monitor.finish(status="failed", step=self.step)
+                self._run_closed = True
+                if error is not None:
+                    raise error
+                raise RuntimeError("Final model export failed on another rank.")
+        monitor.finish(status=status, step=self.step)
+        self._run_closed = True
 
     def _ensure_garbage_collector(self) -> None:
         if self.config.gc is None or self._garbage_collector is not None:
@@ -1028,11 +1049,46 @@ class BaseTrainer:
                 self.config.max_grad_norm,
             )
         if isinstance(clipped, Tensor):
+            self._require_finite_loss(clipped, label="gradient norm")
             return float(clipped.detach().item())
+        device = self.world.device if self.world is not None else torch.device("cpu")
+        self._require_finite_loss(
+            torch.tensor(clipped, device=device), label="gradient norm"
+        )
         return float(clipped)
 
+    def _require_finite_gradients(self) -> None:
+        """Reject non-finite local gradient shards before any optimizer update."""
+        if self.model is None:
+            raise RuntimeError("Model not set up")
+        device = (
+            collective_device(self.world)
+            if self.world is not None
+            else next(self.model.parameters()).device
+        )
+        checks: list[Tensor] = []
+        for parameter in self.model.parameters():
+            grad = parameter.grad
+            if grad is None:
+                continue
+            if isinstance(grad, DTensor):
+                grad = grad.to_local()
+            if grad.is_sparse:
+                grad = grad._values()
+            checks.append(torch.isfinite(grad).all().to(device))
+        local_finite = not checks or bool(torch.stack(checks).all().item())
+        if all_ranks_true(local_finite, device=device):
+            return
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+        location = "this rank" if not local_finite else "another rank"
+        raise FloatingPointError(
+            f"Non-finite gradients detected on {location} at optimizer step "
+            f"{self.step}; aborting before the optimizer update."
+        )
+
     def _require_finite_loss(self, loss: Tensor, *, label: str) -> None:
-        """Abort every rank together when any rank observes a non-finite loss."""
+        """Abort every rank together when any rank observes a non-finite value."""
         local_finite = bool(torch.isfinite(loss.detach()).all().item())
         if all_ranks_true(local_finite, device=loss.device):
             return
@@ -1041,7 +1097,7 @@ class BaseTrainer:
         location = "this rank" if not local_finite else "another rank"
         raise FloatingPointError(
             f"Non-finite {label} detected on {location} at optimizer step "
-            f"{self.step}; aborting before backward to keep ranks synchronized."
+            f"{self.step}; aborting before updating parameters to keep ranks synchronized."
         )
 
     def _step_performance_metrics(
@@ -1273,17 +1329,13 @@ class SFTTrainer(BaseTrainer):
 
             self._require_finite_loss(loss, label="SFT loss")
 
-            if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
-                group = self.parallel_dims.get_mesh("dp_cp").get_group()
-                count = (batch["labels"] != -100).sum().float()
+            count = (batch["labels"] != -100).sum().float()
+            if torch.distributed.is_initialized():
+                group = self._sft_normalization_group()
                 torch.distributed.all_reduce(count, group=group)
-                average_count = float(count.item()) / torch.distributed.get_world_size(
-                    group
-                )
-                self._sft_accumulated_tokens += average_count
-                (loss * average_count).backward()
-            else:
-                (loss / self.accumulation_steps).backward()
+                count /= torch.distributed.get_world_size(group)
+            self._sft_accumulated_tokens += float(count.item())
+            (loss * count).backward()
 
         self._sft_moe_metric_accum.append(
             {
@@ -1295,17 +1347,17 @@ class SFTTrainer(BaseTrainer):
 
         self._micro_step += 1
         if self._micro_step % self.accumulation_steps == 0:
-            if self.parallel_dims is not None and self.parallel_dims.cp_enabled:
-                denominator = (
-                    self._sft_accumulated_tokens
-                    if self._sft_accumulated_tokens > 0
-                    else 1.0
-                )
-                for parameter in self.model.parameters():
-                    if parameter.grad is not None:
-                        parameter.grad.div_(denominator)
-                self._sft_accumulated_tokens = 0.0
+            denominator = (
+                self._sft_accumulated_tokens
+                if self._sft_accumulated_tokens > 0
+                else 1.0
+            )
+            for parameter in self.model.parameters():
+                if parameter.grad is not None:
+                    parameter.grad.div_(denominator)
+            self._sft_accumulated_tokens = 0.0
             sync_hf_tp_lora_replicated_grads(self.model, self.parallel_dims)
+            self._require_finite_gradients()
             grad_norm = (
                 self._clip_grad_norm() if self.config.max_grad_norm > 0 else None
             )
@@ -1441,10 +1493,10 @@ class SFTTrainer(BaseTrainer):
         return result
 
     def _normalize_fused_loss(self, loss: Tensor, labels: Tensor) -> Tensor:
-        """Convert a CP-local fused mean into the global-token objective."""
-        if not self.parallel_dims or not self.parallel_dims.cp_enabled:
+        """Convert a rank-local fused mean into the global-token objective."""
+        if not torch.distributed.is_initialized():
             return loss
-        group = self.parallel_dims.get_mesh("dp_cp").get_group()
+        group = self._sft_normalization_group()
         local_count = (labels != -100).sum().detach()
         global_count = local_count.clone()
         torch.distributed.all_reduce(
@@ -1457,6 +1509,13 @@ class SFTTrainer(BaseTrainer):
             torch.zeros_like(global_count, dtype=loss.dtype),
         )
         return loss * scale
+
+    def _sft_normalization_group(self) -> torch.distributed.ProcessGroup | None:
+        """Use the ranks that average gradients, excluding model replicas."""
+        if self.parallel_dims is None:
+            return None
+        mesh = "dp_cp" if self.parallel_dims.cp_enabled else "dp"
+        return self.parallel_dims.get_mesh(mesh).get_group()
 
     def compute_loss(
         self,
@@ -1477,13 +1536,9 @@ class SFTTrainer(BaseTrainer):
         valid = (flat_labels != -100).sum()
         normalization_count = valid
         normalization_group_size = 1
-        if (
-            self.parallel_dims is not None
-            and self.parallel_dims.cp_enabled
-            and torch.distributed.is_initialized()
-        ):
+        if torch.distributed.is_initialized():
             normalization_count = valid.detach().clone()
-            normalization_group = self.parallel_dims.get_mesh("dp_cp").get_group()
+            normalization_group = self._sft_normalization_group()
             normalization_group_size = torch.distributed.get_world_size(
                 normalization_group
             )
